@@ -69,7 +69,7 @@ func (a *agent) writeInput(ctx context.Context, w io.Writer, sid int64, cfg conf
 	for {
 		var raw string
 		var next int64
-		err := a.db.QueryRowContext(ctx, `SELECT c.position,i.payload FROM context_items c JOIN items i ON i.id=c.item_id WHERE c.session_id=? AND c.position>? AND c.draft=0 ORDER BY c.position LIMIT 1`, sid, pos).Scan(&next, &raw)
+		err := a.db.QueryRowContext(ctx, `SELECT c.position,i.payload FROM context_items c JOIN items i ON i.id=c.item_id WHERE c.session_id=? AND c.position>? ORDER BY c.position LIMIT 1`, sid, pos).Scan(&next, &raw)
 		if errors.Is(err, sql.ErrNoRows) {
 			break
 		}

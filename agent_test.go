@@ -102,9 +102,9 @@ func TestRetryAndQueue(t *testing.T) {
 			if !strings.Contains(in, "function_call_output") {
 				t.Error("missing clock result")
 			}
-			answer(w, "discard-me") // EOF before response.completed
+			answer(w, "first answer") // EOF before response.completed
 		case 3:
-			if strings.Contains(in, "discard-me") || !strings.Contains(in, "checking") {
+			if strings.Count(in, "first answer") != 1 || !strings.Contains(in, "checking") {
 				t.Errorf("bad replay: %s", in)
 			}
 			answer(w, "confirmed")
@@ -131,7 +131,7 @@ func TestRetryAndQueue(t *testing.T) {
 		t.Fatal(w.Body.String())
 	}
 	log := f.request("GET", "/sessions/1/items", "", 200)
-	if !strings.Contains(log, "discard-me") || !strings.Contains(log, "withdrawal") {
+	if !strings.Contains(log, "first answer") || !strings.Contains(log, "withdrawal") {
 		t.Fatal(log)
 	}
 	var history []struct {
@@ -147,7 +147,7 @@ func TestRetryAndQueue(t *testing.T) {
 	for _, e := range history {
 		seq = append(seq, e.Payload.Role+e.Payload.Type)
 	}
-	if !reflect.DeepEqual(seq, []string{"user", "assistantmessage", "function_call", "function_call_output", "assistantmessage"}) {
+	if !reflect.DeepEqual(seq, []string{"user", "assistantmessage", "function_call", "function_call_output", "assistantmessage", "assistantmessage"}) {
 		t.Fatal(seq)
 	}
 	f.request("DELETE", "/sessions/1/queue/1", "", 409)
@@ -241,7 +241,7 @@ func TestRestartAndSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec(`INSERT INTO sessions(status) VALUES('running'); INSERT INTO items(session_id,kind,payload) VALUES(1,'assistant_message','{}');INSERT INTO context_items(session_id,item_id,draft) VALUES(1,1,1)`)
+	_, err = db.Exec(`INSERT INTO sessions(status) VALUES('running'); INSERT INTO items(session_id,kind,payload) VALUES(1,'assistant_message','{}');INSERT INTO context_items(session_id,item_id) VALUES(1,1)`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,9 +251,9 @@ func TestRestartAndSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	var status string
-	var drafts, logs int
-	if err = db.QueryRow(`SELECT status,(SELECT count(*) FROM context_items),(SELECT count(*) FROM items) FROM sessions`).Scan(&status, &drafts, &logs); err != nil || status != "paused" || drafts != 0 || logs != 1 {
-		t.Fatalf("recovery %s %d %d %v", status, drafts, logs, err)
+	var visible, logs int
+	if err = db.QueryRow(`SELECT status,(SELECT count(*) FROM context_items),(SELECT count(*) FROM items) FROM sessions`).Scan(&status, &visible, &logs); err != nil || status != "paused" || visible != 1 || logs != 1 {
+		t.Fatalf("recovery %s %d %d %v", status, visible, logs, err)
 	}
 	if _, err = db.Exec(`ALTER TABLE sessions ADD COLUMN extra TEXT`); err != nil {
 		t.Fatal(err)

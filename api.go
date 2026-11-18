@@ -200,7 +200,7 @@ func (a *agent) list(w http.ResponseWriter, r *http.Request) error {
 		case strings.HasSuffix(r.URL.Path, "/items"):
 			query = `SELECT json_object('id',id,'kind',kind,'payload',json(payload),'attempt_id',attempt_id,'target_id',target_id) FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?`
 		case strings.HasSuffix(r.URL.Path, "/context"):
-			query = `SELECT json_object('position',c.position,'item_id',i.id,'payload',json(i.payload)) FROM context_items c JOIN items i ON i.id=c.item_id WHERE c.session_id=? AND c.position>? AND c.draft=0 ORDER BY c.position LIMIT ?`
+			query = `SELECT json_object('position',c.position,'item_id',i.id,'payload',json(i.payload)) FROM context_items c JOIN items i ON i.id=c.item_id WHERE c.session_id=? AND c.position>? ORDER BY c.position LIMIT ?`
 		default:
 			query = `SELECT json_object('id',i.id,'text',json_extract(i.payload,'$.content'))` + pending + ` AND i.id>? ORDER BY i.id LIMIT ?`
 		}

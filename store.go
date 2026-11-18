@@ -47,8 +47,7 @@ func openStore(path string) (*sql.DB, error) {
 		} else if err := validateSchema(tx); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`DELETE FROM context_items WHERE draft=1;
-			UPDATE sessions SET status='paused',last_error='daemon restarted' WHERE status IN ('running','pausing')`)
+		_, err := tx.Exec(`UPDATE sessions SET status='paused',last_error='daemon restarted' WHERE status IN ('running','pausing')`)
 		return err
 	})
 	if err != nil {

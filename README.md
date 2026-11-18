@@ -18,7 +18,7 @@ curl -sS "$api/sessions/1/context"
 
 ## 读代码
 
-从 `agent.go` 的 `run` 开始。每次循环先取队列，再调用模型。`accept` 处理完整条目，`complete` 在收到 `response.completed` 后发布助手草稿。断流时日志保留，重试只读可见的视图。每个活跃会话有自己的循环。
+从 `agent.go` 的 `run` 开始。每次循环先取队列，再调用模型。`accept` 收到完整助手消息时，在同一事务中写入日志和上下文。若随后断流，重试会带上这条消息，模型可能再回答一次。收到 `response.completed` 后，`complete` 决定会话继续、暂停还是回到空闲。每个活跃会话有自己的循环。
 
 `schema.sql` 定义四张表。`store.go` 的 `pending` 描述哪些用户消息还可以撤回，`finishTool` 把调用和结果一起放进视图。`responses.go` 负责发送历史和读取 SSE，`api.go` 提供 HTTP 入口。运行 `go test -race ./...` 可在模拟网关上复现断线和暂停。
 
@@ -37,7 +37,7 @@ curl -sS "$api/sessions/1/context"
 
 列表接受 `limit`（默认 50，最多 200）和 `after`。上下文按 `position` 翻页，其余按 `id` 翻页。
 
-启动执行的请求默认等待 JSON，带 `Accept: text/event-stream` 可收到 `text.delta`、`tool.called` 和最终的 `turn.completed`、`turn.paused` 或 `turn.failed`。`attempt.retry` 指示丢弃该 `attempt_id` 的流式草稿。调用方断开连接后 daemon 会继续工作。模型的瞬时故障自动重试，工具往返次数不限。
+启动执行的请求默认等待 JSON，带 `Accept: text/event-stream` 可收到 `text.delta`、`tool.called` 和最终的 `turn.completed`、`turn.paused` 或 `turn.failed`。`attempt.retry` 标明哪次模型请求中断并触发了重试。只有文字片段的消息不会写入数据库。调用方断开连接后 daemon 会继续工作。模型的瞬时故障自动重试，工具往返次数不限。
 
 ## 数据库启动规则
 

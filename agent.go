@@ -94,13 +94,7 @@ func (a *agent) stop(j *job, cause error) {
 	if cause != nil && !j.pausing() {
 		reason = cause.Error()
 	}
-	err := transaction(a.db, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM context_items WHERE session_id=? AND draft=1`, j.sid); err != nil {
-			return err
-		}
-		_, err := tx.Exec(`UPDATE sessions SET status='paused',last_error=? WHERE id=?`, reason, j.sid)
-		return err
-	})
+	_, err := a.db.Exec(`UPDATE sessions SET status='paused',last_error=? WHERE id=?`, reason, j.sid)
 	if err != nil {
 		reason = err.Error()
 	}
@@ -159,13 +153,7 @@ func (a *agent) run(j *job) {
 		})
 		var transient retryable
 		if errors.As(err, &transient) && j.ctx.Err() == nil {
-			// 日志保留完整的草稿，但下次请求只读已确认的视图和工具结果。
-			_, dbErr := a.db.Exec(`DELETE FROM context_items WHERE session_id=? AND draft=1`, j.sid)
-			if dbErr != nil {
-				a.stop(j, dbErr)
-				return
-			}
-			j.notify(notice{"attempt.retry", step.id, "discard draft"})
+			j.notify(notice{"attempt.retry", step.id, "retrying from current context"})
 			select {
 			case <-j.pause:
 			case <-time.After(delay):
@@ -236,8 +224,7 @@ func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
 		return transaction(a.db, func(tx *sql.Tx) error { return finishTool(tx, j.sid, id, item.CallID, output, s.id) })
 	}
 	kind := item.Type
-	draft := kind == "message" && item.Role == "assistant"
-	if draft {
+	if kind == "message" && item.Role == "assistant" {
 		kind = "assistant_message"
 		for _, part := range item.Content {
 			switch part.Type {
@@ -250,13 +237,12 @@ func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
 			}
 		}
 	}
-	// 助手消息先占一个视图位置。completed 到达后一起发布，保持原顺序。
 	return transaction(a.db, func(tx *sql.Tx) error {
 		id, err := addItem(tx, j.sid, kind, raw, s.id, nil)
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(`INSERT INTO context_items(session_id,item_id,draft) VALUES(?,?,?)`, j.sid, id, draft)
+		_, err = tx.Exec(`INSERT INTO context_items(session_id,item_id) VALUES(?,?)`, j.sid, id)
 		return err
 	})
 }
@@ -269,9 +255,6 @@ func (a *agent) complete(j *job, s *attempt) (bool, error) {
 	}
 	state := "running"
 	err := transaction(a.db, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`UPDATE context_items SET draft=0 WHERE session_id=? AND draft=1`, j.sid); err != nil {
-			return err
-		}
 		if j.pausing() {
 			state = "paused"
 		} else if !s.usedTool {
@@ -359,7 +342,7 @@ func (a *agent) submit(sid int64, message *string, listener context.Context, sse
 		}
 		if message == nil {
 			var hasInput bool
-			if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM context_items WHERE session_id=? AND draft=0) OR EXISTS(SELECT 1`+pending+`)`, sid, sid).Scan(&hasInput); err != nil {
+			if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM context_items WHERE session_id=?) OR EXISTS(SELECT 1`+pending+`)`, sid, sid).Scan(&hasInput); err != nil {
 				return err
 			}
 			if !hasInput {

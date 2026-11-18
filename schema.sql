@@ -30,8 +30,6 @@ CREATE TABLE context_items (
     position INTEGER PRIMARY KEY,
     session_id INTEGER NOT NULL,
     item_id INTEGER NOT NULL UNIQUE,
-    -- 助手草稿先占位；只有收到 response.completed 才发布。
-    draft INTEGER NOT NULL DEFAULT 0 CHECK (draft IN (0,1)),
     FOREIGN KEY (session_id, item_id) REFERENCES items(session_id, id)
 );
 CREATE INDEX context_by_session ON context_items(session_id, position);
