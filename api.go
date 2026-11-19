@@ -37,6 +37,7 @@ func (a *agent) routes() http.Handler {
 	}
 	on("PUT /config", a.setConfig)
 	on("GET /config", a.getConfig)
+	on("PATCH /config", a.patchConfig)
 	on("POST /sessions", a.createSession)
 	on("GET /sessions", a.list)
 	on("GET /sessions/{sid}", a.session)
@@ -91,16 +92,47 @@ func pathID(r *http.Request, key string) (int64, error) {
 }
 func validEffort(e *string) bool { return e == nil || *e == "low" || *e == "high" || *e == "max" }
 
+func parseEffort(raw json.RawMessage, field string) (*string, error) {
+	var e *string
+	if json.Unmarshal(raw, &e) != nil || !validEffort(e) {
+		return nil, httpError{400, "expected " + field + ": low, high, max or null"}
+	}
+	return e, nil
+}
+
+func validateConfig(c config) error {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.TrimSpace(c.Model) == "" || !validEffort(c.Effort) {
+		return httpError{400, "invalid base_url, model or default_reasoning_effort"}
+	}
+	return nil
+}
+
+func writeConfig(w http.ResponseWriter, c config, hasKey bool) {
+	writeJSON(w, 200, map[string]any{"configured": true, "base_url": c.BaseURL, "has_api_key": hasKey, "model": c.Model, "instructions": c.Instructions, "default_reasoning_effort": c.Effort})
+}
+
+func patchString(raw json.RawMessage, dst *string) error {
+	if raw == nil {
+		return nil
+	}
+	var v *string
+	if json.Unmarshal(raw, &v) != nil || v == nil {
+		return httpError{400, "expected string value"}
+	}
+	*dst = *v
+	return nil
+}
+
 func (a *agent) setConfig(w http.ResponseWriter, r *http.Request) error {
 	var c config
 	if err := decode(r, &c, false); err != nil {
 		return err
 	}
-	u, err := url.Parse(c.BaseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.TrimSpace(c.Model) == "" || !validEffort(c.Effort) {
-		return httpError{400, "invalid base_url, model or default_reasoning_effort"}
+	if err := validateConfig(c); err != nil {
+		return err
 	}
-	_, err = a.db.Exec(`INSERT OR REPLACE INTO config VALUES(1,?,?,?,?,?)`, c.BaseURL, c.APIKey, c.Model, c.Instructions, c.Effort)
+	_, err := a.db.Exec(`INSERT OR REPLACE INTO config VALUES(1,?,?,?,?,?)`, c.BaseURL, c.APIKey, c.Model, c.Instructions, c.Effort)
 	if err == nil {
 		w.WriteHeader(204)
 	}
@@ -117,7 +149,60 @@ func (a *agent) getConfig(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	writeJSON(w, 200, map[string]any{"configured": true, "base_url": c.BaseURL, "has_api_key": hasKey, "model": c.Model, "instructions": c.Instructions, "default_reasoning_effort": c.Effort})
+	writeConfig(w, c, hasKey)
+	return nil
+}
+
+// 局部更新配置时保留未传字段，避免客户端不知旧密钥时丢失 api_key。
+func (a *agent) patchConfig(w http.ResponseWriter, r *http.Request) error {
+	var in struct {
+		BaseURL      json.RawMessage `json:"base_url"`
+		APIKey       json.RawMessage `json:"api_key"`
+		Model        json.RawMessage `json:"model"`
+		Instructions json.RawMessage `json:"instructions"`
+		Effort       json.RawMessage `json:"default_reasoning_effort"`
+	}
+	if err := decode(r, &in, false); err != nil {
+		return err
+	}
+	if in.BaseURL == nil && in.APIKey == nil && in.Model == nil && in.Instructions == nil && in.Effort == nil {
+		return httpError{400, "expected at least one config field"}
+	}
+	var c config
+	err := transaction(a.db, func(tx *sql.Tx) error {
+		if err := tx.QueryRow(`SELECT base_url,api_key,model,instructions,default_reasoning_effort FROM config`).Scan(&c.BaseURL, &c.APIKey, &c.Model, &c.Instructions, &c.Effort); err != nil {
+			return err
+		}
+		for _, item := range []struct {
+			raw json.RawMessage
+			dst *string
+		}{
+			{in.BaseURL, &c.BaseURL},
+			{in.APIKey, &c.APIKey},
+			{in.Model, &c.Model},
+			{in.Instructions, &c.Instructions},
+		} {
+			if err := patchString(item.raw, item.dst); err != nil {
+				return err
+			}
+		}
+		if in.Effort != nil {
+			e, err := parseEffort(in.Effort, "default_reasoning_effort")
+			if err != nil {
+				return err
+			}
+			c.Effort = e
+		}
+		if err := validateConfig(c); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`UPDATE config SET base_url=?,api_key=?,model=?,instructions=?,default_reasoning_effort=? WHERE id=1`, c.BaseURL, c.APIKey, c.Model, c.Instructions, c.Effort)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	writeConfig(w, c, c.APIKey != "")
 	return nil
 }
 
@@ -132,9 +217,9 @@ func readEffort(r *http.Request, create bool) (*string, bool, error) {
 	if input.Effort == nil && create {
 		return nil, true, nil
 	}
-	var e *string
-	if json.Unmarshal(input.Effort, &e) != nil || !validEffort(e) {
-		return nil, false, httpError{400, "expected reasoning_effort: low, high, max or null"}
+	e, err := parseEffort(input.Effort, "reasoning_effort")
+	if err != nil {
+		return nil, false, err
 	}
 	return e, false, nil
 }
@@ -149,6 +234,7 @@ func (a *agent) createSession(w http.ResponseWriter, r *http.Request) error {
 	}
 	id, err := res.LastInsertId()
 	if err == nil {
+		w.Header().Set("Location", fmt.Sprintf("/sessions/%d", id))
 		writeJSON(w, 201, map[string]any{"id": id, "status": "idle"})
 	}
 	return err
