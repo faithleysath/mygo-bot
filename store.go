@@ -145,8 +145,14 @@ func addUserMessage(tx *sql.Tx, sid int64, payload json.RawMessage, idempotencyK
 	return r.LastInsertId()
 }
 
-func linkReplies(tx *sql.Tx, sid, replyID int64) error {
-	_, err := tx.Exec(`UPDATE items SET reply_id=? WHERE session_id=? AND kind='user_message' AND reply_id IS NULL AND EXISTS (SELECT 1 FROM context_items c WHERE c.item_id=items.id)`, replyID, sid)
+// 同一回合可消费多条用户消息，按入队顺序共用一个结果。恢复时若没有新输入，保留原结果。
+func saveTurnResult(tx *sql.Tx, sid int64, text string) error {
+	_, err := tx.Exec(`INSERT INTO items(session_id,kind,payload,target_id)
+		SELECT c.session_id,'turn.completed',json_object('text',?),c.item_id
+		FROM context_items c JOIN items i ON i.id=c.item_id
+		WHERE c.session_id=? AND i.kind='user_message'
+		ORDER BY c.position DESC LIMIT 1
+		ON CONFLICT(kind,target_id) DO NOTHING`, text, sid)
 	return err
 }
 

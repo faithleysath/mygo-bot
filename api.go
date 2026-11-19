@@ -296,7 +296,7 @@ func (a *agent) list(w http.ResponseWriter, r *http.Request) error {
 		args = []any{sid, after, limit}
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/items"):
-			query = `SELECT json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'reply_id',reply_id) FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?`
+			query = `SELECT json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id) FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?`
 		case strings.HasSuffix(r.URL.Path, "/context"):
 			query = `SELECT json_object('position',c.position,'item_id',i.id,'payload',json(i.payload)) FROM context_items c JOIN items i ON i.id=c.item_id WHERE c.session_id=? AND c.position>? ORDER BY c.position LIMIT ?`
 		default:
@@ -431,61 +431,65 @@ func (a *agent) send(w http.ResponseWriter, r *http.Request) error {
 	if id > 0 {
 		w.Header().Set("Location", fmt.Sprintf("/sessions/%d/messages/%d", sid, id))
 	}
+	var result reply
 	if j == nil {
-		if duplicate && !sse {
-			if res, err := a.messageStatus(sid, id); err == nil && res.Status == "completed" {
-				writeJSON(w, 200, res)
+		if duplicate {
+			result, err = a.messageStatus(sid, id)
+			if err != nil {
+				return err
+			}
+		}
+		if result.Status != "completed" && result.Status != "withdrawn" {
+			writeJSON(w, http.StatusAccepted, map[string]any{"item_id": id})
+			return nil
+		}
+	}
+
+	if sse {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		if http.NewResponseController(w).Flush() != nil {
+			return nil
+		}
+	}
+	if j != nil {
+	selectResult:
+		for {
+			select {
+			case <-r.Context().Done():
 				return nil
+			case event := <-j.events:
+				if err := writeEvent(w, event.Type, event); err != nil {
+					return nil
+				}
+			case <-j.ready:
+				result = j.result
+				break selectResult
 			}
 		}
-		writeJSON(w, 202, map[string]any{"item_id": id})
+	}
+	result.ItemID = id
+	if sse {
+		_ = writeEvent(w, "turn."+result.Status, result)
 		return nil
 	}
-	if !sse {
-		select {
-		case <-j.ready:
-			status := 200
-			if j.result.Status == "failed" {
-				status = 502
-			}
-			result := j.result
-			result.ItemID = id
-			writeJSON(w, status, result)
-		case <-r.Context().Done():
-		}
-		return nil
+	status := http.StatusOK
+	if result.Status == "failed" {
+		status = http.StatusBadGateway
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	writeJSON(w, status, result)
+	return nil
+}
+
+func writeEvent(w http.ResponseWriter, name string, data any) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
 	ctrl := http.NewResponseController(w)
-	if ctrl.Flush() != nil {
-		return nil
+	_ = ctrl.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b); err != nil {
+		return err
 	}
-	for {
-		var event notice
-		var data any
-		var name string
-		last := false
-		select {
-		case <-r.Context().Done():
-			return nil
-		case event = <-j.events:
-			name = event.Type
-			data = event
-		case <-j.ready:
-			last = true
-			name = "turn." + j.result.Status
-			result := j.result
-			result.ItemID = id
-			data = result
-		}
-		b, _ := json.Marshal(data)
-		_ = ctrl.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b); err != nil {
-			return nil
-		}
-		if ctrl.Flush() != nil || last {
-			return nil
-		}
-	}
+	return ctrl.Flush()
 }
