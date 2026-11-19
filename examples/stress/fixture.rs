@@ -44,7 +44,7 @@ impl Agent {
         #[cfg(unix)]
         command.args(["--unix-socket", "agent.sock"]);
         let child = command
-            .args(["--token", &token])
+            .args(["--daemon", "--foreground", "--token", &token])
             .current_dir(dir)
             .env("NO_PROXY", "*")
             .env("no_proxy", "*")

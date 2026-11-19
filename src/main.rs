@@ -1,5 +1,6 @@
 mod agent;
 mod api;
+mod daemon;
 mod events;
 mod model;
 #[cfg(unix)]
@@ -12,7 +13,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use serde_json::json;
 use std::{fmt, io, net::SocketAddr, path::Path, process::ExitCode, sync::Arc, time::Duration};
 use store::Db;
@@ -69,6 +70,12 @@ struct App {
 #[derive(Parser)]
 #[command(version, about = "Run the MyGo-Bot HTTP and SSE API")]
 struct Options {
+    /// Start the server in the background and append logs to ./mygo-bot.log.
+    #[arg(long)]
+    daemon: bool,
+    /// With --daemon, keep the server attached to this terminal and log to stderr.
+    #[arg(long)]
+    foreground: bool,
     /// TCP bind address. Port 0 lets the OS choose a free port.
     #[arg(long, default_value = "127.0.0.1:0", value_name = "IP:PORT")]
     listen: SocketAddr,
@@ -79,16 +86,25 @@ struct Options {
     #[cfg(unix)]
     #[arg(long, value_name = "PATH")]
     unix_socket: Option<std::path::PathBuf>,
+    /// Disable the local Unix socket and serve only TCP.
+    #[cfg(unix)]
+    #[arg(long, conflicts_with = "unix_socket")]
+    no_unix_socket: bool,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let options = Options::parse();
+    if !options.daemon {
+        Options::command()
+            .print_help()
+            .unwrap_or_else(|e| clap::Error::from(e).exit());
+        return ExitCode::SUCCESS;
+    }
     tracing_subscriber::fmt()
         .with_target(false)
         .with_writer(io::stderr)
         .init();
-    match run(options).await {
+    match daemon::start(options) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "server failed");
@@ -97,7 +113,11 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn run(
+    options: Options,
+    parent: &mut Option<io::Stdout>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let generated = options.token.is_none();
     let token = match options.token {
         Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_graphic()) => value,
@@ -115,7 +135,9 @@ async fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Er
         .map_err(|e| io::Error::new(e.kind(), format!("bind TCP {}: {e}", options.listen)))?;
     let listen = listener.local_addr()?;
     #[cfg(unix)]
-    let (unix, socket_file) = socket::SocketFile::bind(options.unix_socket.as_deref())?;
+    let unix = (!options.no_unix_socket)
+        .then(|| socket::SocketFile::bind(options.unix_socket.as_deref()))
+        .transpose()?;
     let app = App {
         db: Db::open(Path::new("mygo-bot.sqlite3"))?,
         client: reqwest::Client::builder()
@@ -126,30 +148,38 @@ async fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Er
         workers: TaskTracker::new(),
     };
     let routes = api::routes(app.clone());
-    if generated {
-        tracing::info!(%token, "generated TCP Bearer token");
+    let signal = shutdown_signal()?;
+    daemon::Ready {
+        listen,
+        #[cfg(unix)]
+        socket: unix
+            .as_ref()
+            .map(|(_, file)| file.path.display().to_string()),
+        #[cfg(not(unix))]
+        socket: None,
+        token: generated.then(|| token.clone()),
     }
-    #[cfg(unix)]
-    tracing::info!(path = %socket_file.path.display(), "Unix socket ready");
-    tracing::info!(%listen, "TCP ready");
+    .announce(parent)?;
     let tcp_routes = routes.clone().layer(axum::middleware::from_fn_with_state(
         Arc::<str>::from(token),
         api::authorize_tcp,
     ));
     let tcp_server = axum::serve(listener, tcp_routes)
         .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
-    #[cfg(unix)]
     let server = async {
-        let unix_server = axum::serve(unix, routes)
-            .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
-        tokio::try_join!(tcp_server.into_future(), unix_server.into_future()).map(|_| ())
+        #[cfg(unix)]
+        if let Some((listener, _socket_file)) = unix {
+            let unix_server = axum::serve(listener, routes)
+                .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
+            return tokio::try_join!(tcp_server.into_future(), unix_server.into_future())
+                .map(|_| ());
+        }
+        tcp_server.await
     };
-    #[cfg(not(unix))]
-    let server = tcp_server.into_future();
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => return Ok(result?),
-        signal = shutdown_signal() => signal?,
+        result = signal => result?,
     }
     let (workers, http) = tokio::join!(
         app.shutdown(),
@@ -162,12 +192,16 @@ async fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-async fn shutdown_signal() -> std::io::Result<()> {
+fn shutdown_signal() -> io::Result<impl Future<Output = io::Result<()>>> {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! { result=tokio::signal::ctrl_c()=>result, _=term.recv()=>Ok(()) }
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! { _ = interrupt.recv() => Ok(()), _ = term.recv() => Ok(()) }
+        })
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
+    Ok(tokio::signal::ctrl_c())
 }
