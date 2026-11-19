@@ -2,7 +2,7 @@ use std::{collections::HashMap, fs::OpenOptions, path::Path, thread};
 
 use axum::body::Bytes;
 use reqwest::Body;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -11,7 +11,23 @@ use crate::{Error, Result, agent::Control, events::Notice};
 // One owner serializes transactions and the matching in-memory worker transitions.
 // A slow disk never blocks the HTTP executor. No job holds SQLite across network I/O.
 type Acknowledge = Box<dyn FnOnce(&mut Store, &Result<()>)>;
-type Write = Box<dyn FnOnce(Result<&Connection>) -> (bool, Acknowledge) + Send>;
+type ApplyWrite = Box<dyn FnOnce(Result<&Connection>, bool) -> (bool, Acknowledge) + Send>;
+
+struct Write {
+    start_session: Option<i64>,
+    apply: ApplyWrite,
+}
+
+impl Write {
+    fn can_join(&self, batch: &[Write]) -> bool {
+        let starts = batch[0].start_session.is_some();
+        match self.start_session {
+            None => !starts,
+            // A repeated start must observe the worker published by the previous commit.
+            Some(sid) => starts && !batch.iter().any(|write| write.start_session == Some(sid)),
+        }
+    }
+}
 
 enum Command {
     Call(Box<dyn FnOnce(&mut Store) + Send>),
@@ -79,10 +95,12 @@ impl Db {
                         Command::Call(call) => call(&mut store),
                         Command::Write(first) => {
                             batch.push(first);
-                            // Only group adjacent arrivals. A read or run command is a FIFO boundary.
+                            // Drain only compatible writes already waiting at the head of the queue.
                             while batch.len() < 32 {
                                 match receiver.try_recv() {
-                                    Ok(Command::Write(write)) => batch.push(write),
+                                    Ok(Command::Write(write)) if write.can_join(&batch) => {
+                                        batch.push(write)
+                                    }
                                     other => {
                                         next = other.ok();
                                         break;
@@ -128,20 +146,42 @@ impl Db {
         apply: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
+        self.grouped_write(None, move |conn, _| apply(conn), publish)
+            .await
+    }
+
+    pub async fn start_write<T: 'static, R: Send + 'static>(
+        &self,
+        sid: i64,
+        apply: impl FnOnce(&Connection, bool) -> Result<T> + Send + 'static,
+        publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        self.grouped_write(Some(sid), apply, publish).await
+    }
+
+    async fn grouped_write<T: 'static, R: Send + 'static>(
+        &self,
+        start_session: Option<i64>,
+        apply: impl FnOnce(&Connection, bool) -> Result<T> + Send + 'static,
+        publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
         self.submit(|reply| {
-            Command::Write(Box::new(move |conn| {
-                let result = conn.and_then(apply);
-                (
-                    result.is_ok(),
-                    Box::new(move |store, committed| {
-                        let result = match committed {
-                            Ok(()) => result.and_then(|value| publish(store, value)),
-                            Err(error) => Err(error.clone()),
-                        };
-                        let _ = reply.send(result);
-                    }),
-                )
-            }))
+            Command::Write(Write {
+                start_session,
+                apply: Box::new(move |conn, active| {
+                    let result = conn.and_then(|conn| apply(conn, active));
+                    (
+                        result.is_ok(),
+                        Box::new(move |store, committed| {
+                            let result = match committed {
+                                Ok(()) => result.and_then(|value| publish(store, value)),
+                                Err(error) => Err(error.clone()),
+                            };
+                            let _ = reply.send(result);
+                        }),
+                    )
+                }),
+            })
         })
         .await
     }
@@ -190,17 +230,28 @@ impl Enqueue {
 
 impl Store {
     fn commit_batch(&mut self, batch: &mut Vec<Write>) {
+        let starting = batch[0].start_session.is_some();
         let mut replies = Vec::with_capacity(batch.len());
         let mut pending = batch.drain(..);
         let committed = (|| -> Result<()> {
+            if starting && self.closing {
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "shutting down".into(),
+                ));
+            }
             let mut tx = self.conn.transaction()?;
             for write in pending.by_ref() {
                 // A failed multi-statement operation must not leave part of its reply in the DB.
                 let savepoint = tx.savepoint();
-                let (ok, reply) = write(
+                let active = write
+                    .start_session
+                    .is_some_and(|id| self.active.contains_key(&id));
+                let (ok, reply) = (write.apply)(
                     savepoint
                         .as_deref()
                         .map_err(|e| Error::internal(e.to_string())),
+                    active,
                 );
                 replies.push(reply);
                 let savepoint = savepoint?;
@@ -214,7 +265,7 @@ impl Store {
             Ok(())
         })();
         if let Err(error) = &committed {
-            replies.extend(pending.map(|write| write(Err(error.clone())).1));
+            replies.extend(pending.map(|write| (write.apply)(Err(error.clone()), false).1));
         }
         for reply in replies {
             reply(self, &committed);
@@ -248,6 +299,11 @@ impl Store {
             "UPDATE sessions SET status=?2,last_error=?3 WHERE id=?1",
             (sid, state, reason),
         )?;
+        self.notify_status(sid, state, reason);
+        Ok(())
+    }
+
+    pub fn notify_status(&self, sid: i64, state: &str, reason: &str) {
         if let Some(channel) = self.channels.get(&sid).and_then(|w| w.upgrade()) {
             Notice::publish(
                 &channel,
@@ -255,7 +311,6 @@ impl Store {
                 json!({"status":state,"reason":reason}),
             );
         }
-        Ok(())
     }
 }
 
@@ -287,7 +342,7 @@ pub fn has_pending(conn: &Connection, sid: i64) -> Result<bool> {
     )?)
 }
 
-pub fn take_pending(tx: &Transaction<'_>, sid: i64) -> Result<()> {
+pub fn take_pending(tx: &Connection, sid: i64) -> Result<()> {
     let added = tx.execute("INSERT INTO context_items(session_id,item_id) SELECT session_id,id FROM pending WHERE session_id=? ORDER BY id",[sid])?;
     if added > 0 {
         tx.execute("UPDATE sessions SET needs_model=1,user_queue_cursor=(SELECT max(id) FROM items WHERE session_id=?1 AND kind='user_message') WHERE id=?1",[sid])?;

@@ -21,7 +21,7 @@ tokio-util = { version = "0.7", features = ["io", "codec", "rt"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [profile.release]
-opt-level = "s"
-lto = "thin"
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"

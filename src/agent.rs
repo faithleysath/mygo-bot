@@ -8,7 +8,6 @@ use crate::{
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,65 +21,79 @@ pub struct Control {
     pub hard: CancellationToken,
 }
 
+enum StartEffect {
+    None,
+    Idle,
+    Worker(Vec<i64>),
+}
+
 pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Value>> {
     let worker = app.clone();
     app.db
-        .call(move |s| {
-            if s.closing {
-                return Err(Error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "shutting down".into(),
-                ));
-            }
-            let current = session(&s.conn, sid)?;
-            if current["status"] == "pausing" {
-                return Err(Error::conflict("session is pausing"));
-            }
-            if s.active.contains_key(&sid) {
-                return Ok(Json(current));
-            }
-            let unfinished: bool =
-                s.conn
-                    .query_row("SELECT needs_model FROM sessions WHERE id=?", [sid], |r| {
+        .start_write(
+            sid,
+            move |conn, active| {
+                let current = session(conn, sid)?;
+                if current["status"] == "pausing" {
+                    return Err(Error::conflict("session is pausing"));
+                }
+                if active {
+                    return Ok((current, StartEffect::None));
+                }
+                let unfinished: bool =
+                    conn.query_row("SELECT needs_model FROM sessions WHERE id=?", [sid], |r| {
                         r.get(0)
                     })?;
-            if !unfinished && !store::has_pending(&s.conn, sid)? {
-                if current["status"] == "paused" {
-                    s.status(sid, "idle", "")?;
+                if !unfinished && !store::has_pending(conn, sid)? {
+                    if current["status"] == "paused" {
+                        conn.execute(
+                            "UPDATE sessions SET status='idle',last_error='' WHERE id=?",
+                            [sid],
+                        )?;
+                        return Ok((session(conn, sid)?, StartEffect::Idle));
+                    }
+                    return Ok((current, StartEffect::None));
                 }
-                return Ok(Json(session(&s.conn, sid)?));
-            }
-            if Config::load(&s.conn)?.is_none() {
-                return Err(Error::conflict("configure the model first"));
-            }
-            let tx = s.conn.transaction()?;
-            let recovered = if unfinished {
-                store::publish_tools(&tx, sid, true)?
-            } else {
-                Vec::new()
-            };
-            store::take_pending(&tx, sid)?;
-            tx.execute(
-                "UPDATE sessions SET status='running',last_error='' WHERE id=?",
-                [sid],
-            )?;
-            tx.commit()?;
-            for id in recovered {
-                s.item_saved(sid, id)?;
-            }
-            let channel = s.channel(sid);
-            Notice::publish(
-                &channel,
-                "session.status",
-                json!({"status":"running","reason":""}),
-            );
-            let control = Control::default();
-            s.active.insert(sid, control.clone());
-            // Launch in the same store command as the state change, even if the client disconnects.
-            let tracker = worker.workers.clone();
-            tracker.spawn(worker.run(sid, control, channel));
-            Ok(Json(session(&s.conn, sid)?))
-        })
+                if Config::load(conn)?.is_none() {
+                    return Err(Error::conflict("configure the model first"));
+                }
+                let recovered = if unfinished {
+                    store::publish_tools(conn, sid, true)?
+                } else {
+                    Vec::new()
+                };
+                store::take_pending(conn, sid)?;
+                conn.execute(
+                    "UPDATE sessions SET status='running',last_error='' WHERE id=?",
+                    [sid],
+                )?;
+                Ok((session(conn, sid)?, StartEffect::Worker(recovered)))
+            },
+            move |s, (current, effect)| {
+                match effect {
+                    StartEffect::None => (),
+                    StartEffect::Idle => s.notify_status(sid, "idle", ""),
+                    StartEffect::Worker(recovered) => {
+                        let notices = recovered
+                            .into_iter()
+                            .try_for_each(|id| s.item_saved(sid, id));
+                        let channel = s.channel(sid);
+                        Notice::publish(
+                            &channel,
+                            "session.status",
+                            json!({"status":"running","reason":""}),
+                        );
+                        let control = Control::default();
+                        s.active.insert(sid, control.clone());
+                        let tracker = worker.workers.clone();
+                        // A committed start owns a worker even if the client left or a notice failed.
+                        tracker.spawn(worker.run(sid, control, channel));
+                        notices?;
+                    }
+                }
+                Ok(Json(current))
+            },
+        )
         .await
 }
 #[derive(Deserialize, Default)]
