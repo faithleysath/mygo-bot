@@ -1,7 +1,6 @@
 use crate::{
     App, Error, Result,
     api::Config,
-    events::Notice,
     store::{self, Db},
 };
 use chrono::{Local, SecondsFormat};
@@ -11,7 +10,6 @@ use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
 use std::{io, time::Duration};
 use tokio::{
-    sync::broadcast,
     task::JoinSet,
     time::{Instant, timeout, timeout_at},
 };
@@ -64,8 +62,6 @@ async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
 struct Frame<'a> {
     #[serde(rename = "type")]
     kind: String,
-    #[serde(default)]
-    delta: String,
     item: Option<Value>,
     message: Option<String>,
     // Terminal events can repeat the entire output. Only error handling needs fields from it.
@@ -113,8 +109,6 @@ impl App {
         &self,
         sid: i64,
         input: Input,
-        attempt: u64,
-        channel: &broadcast::Sender<Notice>,
         out: &mut Output,
     ) -> std::result::Result<(), Failure> {
         let body = body(self.db.clone(), sid, &input).await?;
@@ -203,15 +197,6 @@ impl App {
                         .or(frame.message.as_deref())
                         .unwrap_or("model request unsuccessful");
                     return Err(fatal(format!("{}: {detail}", frame.kind)));
-                }
-                "response.output_text.delta" => {
-                    if channel.receiver_count() > 0 {
-                        Notice::publish(
-                            channel,
-                            "text.delta",
-                            json!({"attempt":attempt,"text":frame.delta}),
-                        );
-                    }
                 }
                 "response.output_item.done" => {
                     let item = frame.item.ok_or_else(|| fatal("missing output item"))?;

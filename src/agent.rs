@@ -231,7 +231,7 @@ impl App {
             };
             attempt += 1;
             let mut output = model::Output::default();
-            let streamed = tokio::select! {biased; _=control.hard.cancelled()=>Err(Failure::Fatal(Error::conflict("paused"))), result=self.stream(sid,input,attempt,channel,&mut output)=>result};
+            let streamed = tokio::select! {biased; _=control.hard.cancelled()=>Err(Failure::Fatal(Error::conflict("paused"))), result=self.stream(sid,input,&mut output)=>result};
             // Tool writes outlive a transient upstream disconnect. Publish only once all finish.
             while let Some(result) = output.tasks.join_next().await {
                 result.map_err(|e| Error::internal(e.to_string()))??;
