@@ -44,10 +44,11 @@ type notice struct {
 	Data    string `json:"data"`
 }
 type reply struct {
-	ItemID int64  `json:"item_id,omitempty"`
-	Status string `json:"status"`
-	Text   string `json:"text,omitempty"`
-	Error  string `json:"error,omitempty"`
+	ItemID  int64  `json:"item_id,omitempty"`
+	ReplyID int64  `json:"reply_id,omitempty"`
+	Status  string `json:"status"`
+	Text    string `json:"text,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 type job struct {
 	sid      int64
@@ -204,10 +205,33 @@ func (a *agent) run(j *job) {
 }
 
 type attempt struct {
-	id        string
-	tools     []<-chan error
-	hasAnswer bool
-	text      strings.Builder
+	id          string
+	tools       []<-chan error
+	hasAnswer   bool
+	lastReplyID int64
+	text        strings.Builder
+}
+
+func extractAssistantText(raw json.RawMessage) (string, bool) {
+	var item struct {
+		Content []struct{ Type, Text, Refusal string }
+	}
+	if json.Unmarshal(raw, &item) != nil {
+		return "", false
+	}
+	var out strings.Builder
+	has := false
+	for _, part := range item.Content {
+		switch part.Type {
+		case "output_text":
+			has = true
+			out.WriteString(part.Text)
+		case "refusal":
+			has = true
+			out.WriteString(part.Refusal)
+		}
+	}
+	return out.String(), has
 }
 
 func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
@@ -246,27 +270,29 @@ func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
 		return nil
 	}
 	kind := item.Type
+	isAnswer := false
 	if kind == "message" && item.Role == "assistant" {
 		kind = "assistant_message"
-		for _, part := range item.Content {
-			switch part.Type {
-			case "output_text":
-				s.hasAnswer = true
-				s.text.WriteString(part.Text)
-			case "refusal":
-				s.hasAnswer = true
-				s.text.WriteString(part.Refusal)
-			}
+		if text, has := extractAssistantText(raw); has {
+			s.hasAnswer = true
+			s.text.WriteString(text)
+			isAnswer = true
 		}
 	}
-	return transaction(a.db, func(tx *sql.Tx) error {
+	var savedID int64
+	err := transaction(a.db, func(tx *sql.Tx) error {
 		id, err := addItem(tx, j.sid, kind, raw, nil)
 		if err != nil {
 			return err
 		}
+		savedID = id
 		_, err = tx.Exec(`INSERT INTO context_items(session_id,item_id) VALUES(?,?)`, j.sid, id)
 		return err
 	})
+	if err == nil && isAnswer {
+		s.lastReplyID = savedID
+	}
+	return err
 }
 
 func (a *agent) runTool(j *job, id int64, callID, name, args string) error {
@@ -302,6 +328,11 @@ func (a *agent) complete(j *job, s *attempt) (bool, error) {
 	}
 	state := "running"
 	err := transaction(a.db, func(tx *sql.Tx) error {
+		if len(s.tools) == 0 && s.lastReplyID > 0 {
+			if err := linkReplies(tx, j.sid, s.lastReplyID); err != nil {
+				return err
+			}
+		}
 		if j.pausing() {
 			state = "paused"
 		} else if len(s.tools) == 0 {
@@ -320,7 +351,7 @@ func (a *agent) complete(j *job, s *attempt) (bool, error) {
 		return false, err
 	}
 	if len(s.tools) == 0 {
-		j.answer(reply{Status: "completed", Text: s.text.String()})
+		j.answer(reply{Status: "completed", ReplyID: s.lastReplyID, Text: s.text.String()})
 	}
 	if state != "running" {
 		delete(a.active, j.sid)
@@ -367,25 +398,48 @@ func (j *job) requestPause(reason string, hard bool) {
 	}
 }
 
-func (a *agent) submit(sid int64, message *string, listener context.Context, sse bool) (int64, *job, error) {
+func (a *agent) submit(sid int64, message *string, idempotencyKey *string, listener context.Context, sse bool) (int64, *job, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.closing {
-		return 0, nil, httpError{503, reasonShutdown}
+		return 0, nil, false, httpError{503, reasonShutdown}
 	}
 	var id int64
-	var start bool
+	var start, duplicate bool
 	err := transaction(a.db, func(tx *sql.Tx) error {
 		var status, reason string
 		if err := tx.QueryRow(`SELECT status,last_error FROM sessions WHERE id=?`, sid).Scan(&status, &reason); err != nil {
 			return err
 		}
 		if message != nil {
+			if idempotencyKey != nil {
+				var existingText string
+				err := tx.QueryRow(`SELECT id,json_extract(payload,'$.content') FROM items WHERE session_id=? AND kind='user_message' AND idempotency_key=?`, sid, *idempotencyKey).Scan(&id, &existingText)
+				if err == nil {
+					if existingText != *message {
+						return httpError{409, "idempotency key reused with different text"}
+					}
+					duplicate = true
+					return nil
+				}
+				if !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+			}
 			payload, _ := json.Marshal(map[string]string{"role": "user", "content": *message})
 			var err error
-			id, err = addItem(tx, sid, "user_message", payload, nil)
+			id, err = addUserMessage(tx, sid, payload, idempotencyKey)
 			if err != nil {
 				return err
+			}
+		} else if status != "paused" {
+			switch status {
+			case "idle":
+				return httpError{409, "session is not paused"}
+			case "pausing":
+				return httpError{409, "session is pausing"}
+			default:
+				return httpError{409, "session is already running"}
 			}
 		}
 		start = a.active[sid] == nil && (message == nil || status == "idle")
@@ -415,12 +469,55 @@ func (a *agent) submit(sid int64, message *string, listener context.Context, sse
 		return err
 	})
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	if !start {
-		return id, nil, nil
+		return id, nil, duplicate, nil
 	}
-	return id, a.launch(sid, listener, sse), nil
+	return id, a.launch(sid, listener, sse), false, nil
+}
+
+func (a *agent) messageStatus(sid, itemID int64) (reply, error) {
+	var r reply
+	var sessionStatus, lastError string
+	var replyID sql.NullInt64
+	var replyPayload sql.NullString
+	var withdrawn, inContext bool
+	err := a.db.QueryRow(`SELECT
+		s.status,
+		s.last_error,
+		i.reply_id,
+		r.payload,
+		EXISTS(SELECT 1 FROM items w WHERE w.kind='withdrawal' AND w.target_id=i.id),
+		EXISTS(SELECT 1 FROM context_items c WHERE c.item_id=i.id)
+	FROM items i
+	JOIN sessions s ON s.id=i.session_id
+	LEFT JOIN items r ON r.id=i.reply_id
+	WHERE i.session_id=? AND i.id=? AND i.kind='user_message'`, sid, itemID).Scan(
+		&sessionStatus, &lastError, &replyID, &replyPayload, &withdrawn, &inContext,
+	)
+	if err != nil {
+		return r, err
+	}
+	r.ItemID = itemID
+	switch {
+	case withdrawn:
+		r.Status = "withdrawn"
+	case replyID.Valid:
+		r.Status = "completed"
+		r.ReplyID = replyID.Int64
+		if replyPayload.Valid {
+			r.Text, _ = extractAssistantText(json.RawMessage(replyPayload.String))
+		}
+	case sessionStatus == "paused":
+		r.Status = "paused"
+		r.Error = lastError
+	case inContext:
+		r.Status = "processing"
+	default:
+		r.Status = "queued"
+	}
+	return r, nil
 }
 
 type httpError struct {

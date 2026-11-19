@@ -47,6 +47,7 @@ func (a *agent) routes() http.Handler {
 	}
 	on("DELETE /sessions/{sid}/queue/{item}", a.withdraw)
 	on("POST /sessions/{sid}/messages", a.send)
+	on("GET /sessions/{sid}/messages/{item}", a.message)
 	on("POST /sessions/{sid}/resume", a.send)
 	on("POST /sessions/{sid}/pause", a.pauseHTTP)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -295,7 +296,7 @@ func (a *agent) list(w http.ResponseWriter, r *http.Request) error {
 		args = []any{sid, after, limit}
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/items"):
-			query = `SELECT json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id) FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?`
+			query = `SELECT json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'reply_id',reply_id) FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?`
 		case strings.HasSuffix(r.URL.Path, "/context"):
 			query = `SELECT json_object('position',c.position,'item_id',i.id,'payload',json(i.payload)) FROM context_items c JOIN items i ON i.id=c.item_id WHERE c.session_id=? AND c.position>? ORDER BY c.position LIMIT ?`
 		default:
@@ -371,13 +372,41 @@ func (a *agent) pauseHTTP(w http.ResponseWriter, r *http.Request) error {
 	return err
 }
 
+func (a *agent) message(w http.ResponseWriter, r *http.Request) error {
+	sid, err := pathID(r, "sid")
+	if err != nil {
+		return err
+	}
+	id, err := pathID(r, "item")
+	if err != nil {
+		return err
+	}
+	res, err := a.messageStatus(sid, id)
+	if err != nil {
+		return err
+	}
+	writeJSON(w, 200, res)
+	return nil
+}
+
 func (a *agent) send(w http.ResponseWriter, r *http.Request) error {
 	sid, err := pathID(r, "sid")
 	if err != nil {
 		return err
 	}
 	var message *string
+	var idempotencyKey *string
 	if strings.HasSuffix(r.URL.Path, "/messages") {
+		if values := r.Header.Values("Idempotency-Key"); len(values) > 0 {
+			if len(values) > 1 {
+				return httpError{400, "expected single Idempotency-Key header"}
+			}
+			k := strings.TrimSpace(values[0])
+			if k == "" || len(k) > 256 {
+				return httpError{400, "invalid Idempotency-Key"}
+			}
+			idempotencyKey = &k
+		}
 		var in struct {
 			Text string `json:"text"`
 		}
@@ -395,14 +424,19 @@ func (a *agent) send(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	sse := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
-	id, j, err := a.submit(sid, message, r.Context(), sse)
+	id, j, duplicate, err := a.submit(sid, message, idempotencyKey, r.Context(), sse)
 	if err != nil {
 		return err
 	}
+	if id > 0 {
+		w.Header().Set("Location", fmt.Sprintf("/sessions/%d/messages/%d", sid, id))
+	}
 	if j == nil {
-		if message == nil {
-			w.WriteHeader(http.StatusAccepted)
-			return nil
+		if duplicate && !sse {
+			if res, err := a.messageStatus(sid, id); err == nil && res.Status == "completed" {
+				writeJSON(w, 200, res)
+				return nil
+			}
 		}
 		writeJSON(w, 202, map[string]any{"item_id": id})
 		return nil

@@ -20,11 +20,15 @@ CREATE TABLE items (
     payload TEXT NOT NULL CHECK (json_valid(payload)),
     -- 工具结果指向原调用，撤回记录指向原用户消息。
     target_id INTEGER,
+    idempotency_key TEXT,
+    reply_id INTEGER,
     UNIQUE (session_id, id),
     UNIQUE (kind, target_id),
-    FOREIGN KEY (session_id, target_id) REFERENCES items(session_id, id)
+    FOREIGN KEY (session_id, target_id) REFERENCES items(session_id, id),
+    FOREIGN KEY (session_id, reply_id) REFERENCES items(session_id, id)
 );
 CREATE INDEX items_by_kind ON items(session_id, kind, id);
+CREATE UNIQUE INDEX items_by_idempotency ON items(session_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE TABLE context_items (
     position INTEGER PRIMARY KEY,
     session_id INTEGER NOT NULL,

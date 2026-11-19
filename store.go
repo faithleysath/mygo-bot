@@ -137,6 +137,19 @@ func addItem(tx *sql.Tx, sid int64, kind string, payload json.RawMessage, target
 	return r.LastInsertId()
 }
 
+func addUserMessage(tx *sql.Tx, sid int64, payload json.RawMessage, idempotencyKey *string) (int64, error) {
+	r, err := tx.Exec(`INSERT INTO items(session_id,kind,payload,idempotency_key) VALUES(?,'user_message',?,?)`, sid, string(payload), idempotencyKey)
+	if err != nil {
+		return 0, err
+	}
+	return r.LastInsertId()
+}
+
+func linkReplies(tx *sql.Tx, sid, replyID int64) error {
+	_, err := tx.Exec(`UPDATE items SET reply_id=? WHERE session_id=? AND kind='user_message' AND reply_id IS NULL AND EXISTS (SELECT 1 FROM context_items c WHERE c.item_id=items.id)`, replyID, sid)
+	return err
+}
+
 func saveToolResult(tx *sql.Tx, sid, callItem int64, callID, output string) (int64, error) {
 	payload, _ := json.Marshal(map[string]string{"type": "function_call_output", "call_id": callID, "output": output})
 	return addItem(tx, sid, "function_call_output", payload, callItem)
