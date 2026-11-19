@@ -3,6 +3,7 @@ mod api;
 mod events;
 mod model;
 mod store;
+mod tools;
 
 use axum::{
     Json,

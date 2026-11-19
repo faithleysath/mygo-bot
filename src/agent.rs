@@ -231,23 +231,35 @@ impl App {
             };
             attempt += 1;
             let mut output = model::Output::default();
-            let streamed = tokio::select! {biased; _=control.hard.cancelled()=>Err(Failure::Fatal(Error::conflict("paused"))), result=self.stream(sid,input,&mut output)=>result};
+            let streamed = tokio::select! {
+                biased;
+                _ = control.hard.cancelled() => Err(Failure::Fatal(Error::conflict("paused"))),
+                result = self.stream(sid, input, &mut output, &control.hard) => result,
+            };
             // Tool writes outlive a transient upstream disconnect. Publish only once all finish.
             while let Some(result) = output.tasks.join_next().await {
-                result.map_err(|e| Error::internal(e.to_string()))??;
+                if let Err(err) = result.unwrap_or_else(|e| Err(Error::internal(e.to_string()))) {
+                    output.tasks.shutdown().await;
+                    return Err(err);
+                }
             }
-            if control.hard.is_cancelled() && output.final_item.is_none() {
-                return Err(Error::conflict("paused"));
-            }
-            if output.tools {
+            let interrupted = control.hard.is_cancelled() && output.final_item.is_none();
+            // A call may have reached the store just as the stream was cancelled, before spawn.
+            if output.tools || interrupted {
                 self.db
                     .call(move |s| {
                         let tx = s.conn.transaction()?;
-                        store::publish_tools(&tx, sid, false)?;
+                        let missing = store::publish_tools(&tx, sid, interrupted)?;
                         tx.commit()?;
+                        for id in missing {
+                            s.item_saved(sid, id)?;
+                        }
                         Ok(())
                     })
                     .await?;
+            }
+            if interrupted {
+                return Err(Error::conflict("paused"));
             }
             match streamed {
                 Err(Failure::Transient(reason)) if retries < 3 => {

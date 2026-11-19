@@ -2,8 +2,8 @@ use crate::{
     App, Error, Result,
     api::Config,
     store::{self, Db},
+    tools,
 };
-use chrono::{Local, SecondsFormat};
 use futures_util::{StreamExt, TryStreamExt};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
@@ -16,6 +16,7 @@ use tokio::{
 use tokio_util::{
     codec::{FramedRead, LinesCodec},
     io::StreamReader,
+    sync::CancellationToken,
 };
 
 pub struct Input {
@@ -46,8 +47,7 @@ const IDLE: Duration = Duration::from_secs(60);
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 
 async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
-    let tool = json!({"type":"function","name":"current_time","description":"Read the current local time, including the UTC offset.","parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false}});
-    let mut header = json!({"model":input.config.model,"instructions":input.config.instructions,"tools":[tool],"stream":true,"store":false});
+    let mut header = json!({"model":input.config.model,"instructions":input.config.instructions,"tools":tools::definitions(),"stream":true,"store":false});
     if let Some(e) = &input.effort {
         header["reasoning"] = json!({"effort":e});
     }
@@ -110,6 +110,7 @@ impl App {
         sid: i64,
         input: Input,
         out: &mut Output,
+        hard: &CancellationToken,
     ) -> std::result::Result<(), Failure> {
         let body = body(self.db.clone(), sid, &input).await?;
         let mut request = self
@@ -205,7 +206,7 @@ impl App {
                         out.final_item = Some(item);
                         return Ok(());
                     }
-                    self.accept(sid, item, out).await?
+                    self.accept(sid, item, out, hard).await?
                 }
                 _ => (),
             }
@@ -214,7 +215,13 @@ impl App {
         }
     }
 
-    async fn accept(&self, sid: i64, item: Value, out: &mut Output) -> Result<()> {
+    async fn accept(
+        &self,
+        sid: i64,
+        item: Value,
+        out: &mut Output,
+        hard: &CancellationToken,
+    ) -> Result<()> {
         let kind = item["type"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -257,14 +264,13 @@ impl App {
                 return Ok(());
             };
             let db = self.db.clone();
+            let hard = hard.clone();
             out.tasks.spawn(async move {
-                let valid_args = serde_json::from_str::<serde_json::Map<String, Value>>(&args)
-                    .is_ok_and(|o| o.is_empty());
-                let output = if name == "current_time" && valid_args {
-                    Local::now().to_rfc3339_opts(SecondsFormat::Secs, false)
-                } else {
-                    "Tool error: expected current_time with empty arguments {}.".to_owned()
+                let Some(output) = hard.run_until_cancelled(tools::execute(&name, &args)).await
+                else {
+                    return Ok(());
                 };
+                // Once the tool returns, finish saving its result even if a pause arrives.
                 let payload = json!({"type":"function_call_output","call_id":call,"output":output});
                 db.call(move |s| {
                     let id =
