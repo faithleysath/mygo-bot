@@ -227,35 +227,11 @@ async fn enqueue(
     if keys.next().is_some() || key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
         return Err(Error::bad("invalid idempotency key"));
     }
-    app.db
-        .call(move |s| {
-            session(&s.conn, sid)?;
-            let lookup = "SELECT id,json_extract(payload,'$.content') FROM items
-                      WHERE session_id=? AND idempotency_key=?";
-            if let Some(ref key) = key
-                && let Some((id, text)) = s
-                    .conn
-                    .query_row(lookup, (sid, key), |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-                    })
-                    .optional()?
-            {
-                if text != message.text {
-                    return Err(Error::conflict(
-                        "idempotency key reused with different text",
-                    ));
-                }
-                return Ok((StatusCode::OK, Json(json!({"id": id}))));
-            }
-            let payload = json!({"role":"user","content":message.text});
-            let insert = "INSERT INTO items(session_id,kind,payload,idempotency_key)
-                      VALUES(?,'user_message',?,?)";
-            s.conn.execute(insert, params![sid, payload, key])?;
-            let id = s.conn.last_insert_rowid();
-            s.item_saved(sid, id)?;
-            Ok((StatusCode::CREATED, Json(json!({"id":id}))))
-        })
-        .await
+    let (status, id) = match app.db.enqueue(sid, message.text, key).await? {
+        store::Enqueued::Created(id) => (StatusCode::CREATED, id),
+        store::Enqueued::Existing(id) => (StatusCode::OK, id),
+    };
+    Ok((status, Json(json!({"id": id}))))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

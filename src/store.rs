@@ -10,7 +10,23 @@ use crate::{Error, Result, agent::Control, events::Notice};
 
 // One owner serializes transactions and the matching in-memory worker transitions.
 // A slow disk never blocks the HTTP executor. No job holds SQLite across network I/O.
-type Command = Box<dyn FnOnce(&mut Store) + Send>;
+enum Command {
+    Call(Box<dyn FnOnce(&mut Store) + Send>),
+    Enqueue(Enqueue),
+}
+
+struct Enqueue {
+    sid: i64,
+    text: String,
+    key: Option<String>,
+    reply: oneshot::Sender<Result<Enqueued>>,
+}
+
+pub enum Enqueued {
+    Created(i64),
+    Existing(i64),
+}
+
 #[derive(Clone)]
 pub struct Db(mpsc::Sender<Command>);
 
@@ -54,8 +70,26 @@ impl Db {
                     channels: HashMap::new(),
                     closing: false,
                 };
-                while let Some(command) = receiver.blocking_recv() {
-                    command(&mut store);
+                let mut next = None;
+                let mut batch = Vec::new();
+                while let Some(command) = next.take().or_else(|| receiver.blocking_recv()) {
+                    match command {
+                        Command::Call(call) => call(&mut store),
+                        Command::Enqueue(first) => {
+                            batch.push(first);
+                            // Only group adjacent arrivals. A read or run command is a FIFO boundary.
+                            while batch.len() < 32 {
+                                match receiver.try_recv() {
+                                    Ok(Command::Enqueue(message)) => batch.push(message),
+                                    other => {
+                                        next = other.ok();
+                                        break;
+                                    }
+                                }
+                            }
+                            store.enqueue_batch(&mut batch);
+                        }
+                    }
                 }
             })?;
         Ok(Self(sender))
@@ -65,11 +99,33 @@ impl Db {
         &self,
         f: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.submit(|reply| {
+            Command::Call(Box::new(move |store| {
+                let _ = reply.send(f(store));
+            }))
+        })
+        .await
+    }
+
+    pub async fn enqueue(&self, sid: i64, text: String, key: Option<String>) -> Result<Enqueued> {
+        self.submit(|reply| {
+            Command::Enqueue(Enqueue {
+                sid,
+                text,
+                key,
+                reply,
+            })
+        })
+        .await
+    }
+
+    async fn submit<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
+    ) -> Result<T> {
         let (send, recv) = oneshot::channel();
         self.0
-            .send(Box::new(move |store| {
-                let _ = send.send(f(store));
-            }))
+            .send(command(send))
             .await
             .map_err(|_| Error::internal("database worker stopped"))?;
         recv.await
@@ -77,7 +133,73 @@ impl Db {
     }
 }
 
+impl Enqueue {
+    fn insert(&self, conn: &Connection) -> Result<Enqueued> {
+        if let Some(key) = &self.key {
+            let mut lookup = conn.prepare_cached("SELECT id,json_extract(payload,'$.content') FROM items WHERE session_id=? AND idempotency_key=?")?;
+            if let Some((id, text)) = lookup
+                .query_row((self.sid, key), |row| {
+                    Ok((row.get(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()?
+            {
+                if text != self.text {
+                    return Err(Error::conflict(
+                        "idempotency key reused with different text",
+                    ));
+                }
+                return Ok(Enqueued::Existing(id));
+            }
+        }
+        let inserted = conn.prepare_cached("INSERT INTO items(session_id,kind,payload,idempotency_key)
+            SELECT id,'user_message',json_object('content',?2,'role','user'),?3 FROM sessions WHERE id=?1")?
+            .execute(params![self.sid, self.text, self.key])?;
+        if inserted == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+        Ok(Enqueued::Created(conn.last_insert_rowid()))
+    }
+}
+
+fn commit_messages(conn: &mut Connection, batch: &[Enqueue]) -> Result<Vec<Result<Enqueued>>> {
+    let tx = conn.transaction()?;
+    let mut results = Vec::with_capacity(batch.len());
+    for request in batch {
+        let result = request.insert(&tx);
+        // An I/O error can roll back the whole transaction inside sqlite3_step.
+        if tx.is_autocommit() {
+            return Err(result
+                .err()
+                .unwrap_or_else(|| Error::internal("transaction rolled back")));
+        }
+        results.push(result);
+    }
+    tx.commit()?;
+    Ok(results)
+}
+
 impl Store {
+    fn enqueue_batch(&mut self, batch: &mut Vec<Enqueue>) {
+        match commit_messages(&mut self.conn, batch) {
+            Ok(results) => {
+                for (request, result) in batch.drain(..).zip(results) {
+                    let result = result.and_then(|saved| {
+                        if let Enqueued::Created(id) = saved {
+                            self.item_saved(request.sid, id)?;
+                        }
+                        Ok(saved)
+                    });
+                    let _ = request.reply.send(result);
+                }
+            }
+            Err(error) => {
+                for request in batch.drain(..) {
+                    let _ = request.reply.send(Err(error.clone()));
+                }
+            }
+        }
+    }
+
     pub fn channel(&mut self, sid: i64) -> broadcast::Sender<Notice> {
         if let Some(sender) = self.channels.get(&sid).and_then(|w| w.upgrade()) {
             return sender;
@@ -124,11 +246,9 @@ pub fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 }
 
 pub fn session(conn: &Connection, sid: i64) -> Result<Value> {
-    Ok(conn.query_row(
-        "SELECT id,status,reasoning_effort,last_error FROM sessions WHERE id=?",
-        [sid],
-        session_row,
-    )?)
+    let mut stmt = conn
+        .prepare_cached("SELECT id,status,reasoning_effort,last_error FROM sessions WHERE id=?")?;
+    Ok(stmt.query_row([sid], session_row)?)
 }
 
 pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {

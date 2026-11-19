@@ -15,7 +15,7 @@ use store::Db;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 type Result<T> = std::result::Result<T, Error>;
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Error(StatusCode, String);
 impl Error {
     fn bad(message: impl Into<String>) -> Self {
