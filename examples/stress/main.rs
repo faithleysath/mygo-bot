@@ -5,7 +5,6 @@ mod model;
 mod options;
 mod scenarios;
 
-use client::Api;
 use fixture::{Agent, Directory, rss_kib};
 use model::Model;
 use options::{HELP, Options};
@@ -79,10 +78,13 @@ async fn restart(
     for (_, ticket) in &in_flight {
         ticket.control.release.notify_one();
     }
-    *agent = Agent::launch(bin, dir).await?;
+    #[cfg(unix)]
+    fs::remove_file(dir.join("agent.sock"))?; // SIGKILL left this fixture's socket behind.
+    let (replacement, api) = Agent::launch(bin, dir, limit).await?;
+    *agent = replacement;
     let mut resume = JoinSet::new();
     for (path, ticket) in in_flight {
-        let api = work.api.clone();
+        let api = api.clone();
         resume.spawn(async move {
             let state = api.get(&path).await?;
             check(
@@ -141,9 +143,8 @@ async fn stage(
     c: usize,
 ) -> Result<Value> {
     let dir = Directory::new()?;
-    let mut agent = Agent::launch(bin, &dir.0).await?;
+    let (mut agent, api) = Agent::launch(bin, &dir.0, opts.limit()).await?;
     let idle = rss_kib(agent.pid())?;
-    let api = Api::new(opts.limit())?;
     api.json(
         Method::PATCH,
         "/config",

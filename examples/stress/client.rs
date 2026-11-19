@@ -1,23 +1,28 @@
 use crate::{Result, check};
 use futures_util::TryStreamExt;
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Client, Method, RequestBuilder, header};
 use serde_json::{Value, json};
-use std::{io, pin::Pin, time::Duration};
+use std::{io, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
 use tokio_util::io::StreamReader;
 
-const BASE: &str = "http://127.0.0.1:8080";
-
 #[derive(Clone)]
 pub struct Api {
+    address: SocketAddr,
     client: Client,
     timeout: Duration,
 }
 
 impl Api {
-    pub fn new(timeout: Duration) -> Result<Self> {
+    pub fn new(address: SocketAddr, token: &str, timeout: Duration) -> Result<Self> {
+        let mut bearer = header::HeaderValue::from_str(&format!("Bearer {token}"))?;
+        bearer.set_sensitive(true);
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, bearer);
         Ok(Self {
+            address,
             client: Client::builder()
+                .default_headers(headers)
                 .no_proxy()
                 .http1_only()
                 .redirect(reqwest::redirect::Policy::none())
@@ -30,7 +35,7 @@ impl Api {
     pub fn request(&self, method: Method, path: &str, body: Option<Value>) -> RequestBuilder {
         let req = self
             .client
-            .request(method, format!("{BASE}{path}"))
+            .request(method, format!("http://{}{path}", self.address))
             .timeout(self.timeout);
         match body {
             Some(body) => req
@@ -108,7 +113,7 @@ impl Api {
     async fn open_events(&self, path: &str) -> Result<Events> {
         let res = self
             .client
-            .get(format!("{BASE}{path}/events"))
+            .get(format!("http://{}{path}/events", self.address))
             .send()
             .await?
             .error_for_status()?;

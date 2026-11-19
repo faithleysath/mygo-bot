@@ -190,7 +190,7 @@ impl App {
                 })
                 .await;
             if let Err(err) = settled {
-                eprintln!("cannot pause session {sid}: {err}");
+                tracing::error!(sid, error = %err, "cannot pause session");
             }
         }
     }

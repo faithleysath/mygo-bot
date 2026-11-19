@@ -9,13 +9,21 @@ publish = false
 async-stream = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.6", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
 rusqlite = { version = "0.43", features = ["bundled", "serde_json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+subtle = "2.6"
 tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "net", "time"] }
 tokio-util = { version = "0.7", features = ["io", "codec", "rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread"] }

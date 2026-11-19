@@ -29,7 +29,7 @@ pub(super) const HELP: &str = r#"MyGo-Bot 压测 · macOS / Linux
   --fail-on-drop             定速发压遇到容量丢弃或漏发时失败
   --output FILE              新建 JSONL 报告，默认保存在系统临时目录
 
-运行需要空闲的 127.0.0.1:8080。工具启动 release 进程、独立 SQLite 库和本地模拟模型。
+每个进程使用系统分配的本机端口、独立 SQLite 库和本地模拟模型。
 operation_ms 统计整个操作，enqueue_to_idle_ms 从发第一条消息计到最后一次收到 idle。
 分位数只取成功样本，按微秒向上取整后记入直方图，桶宽最大为所在量级的 1.57%。
 吞吐计入等待在途操作结束的时间。定速模式从计划到达时刻计时，调度迟到超过 5 ms 记为漏发。

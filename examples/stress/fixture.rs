@@ -1,4 +1,4 @@
-use crate::{Result, check};
+use crate::{Result, check, client::Api};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -35,9 +35,16 @@ impl Drop for Agent {
     }
 }
 impl Agent {
-    pub async fn launch(bin: &Path, dir: &Path) -> Result<Self> {
+    pub async fn launch(bin: &Path, dir: &Path, timeout: Duration) -> Result<(Self, Api)> {
         let log = dir.join("agent.log");
-        let child = Command::new(bin)
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes)?;
+        let token = format!("{:032x}", u128::from_ne_bytes(bytes));
+        let mut command = Command::new(bin);
+        #[cfg(unix)]
+        command.args(["--unix-socket", "agent.sock"]);
+        let child = command
+            .args(["--token", &token])
             .current_dir(dir)
             .env("NO_PROXY", "*")
             .env("no_proxy", "*")
@@ -50,18 +57,16 @@ impl Agent {
         loop {
             let message = fs::read_to_string(&log)?;
             if let Some(status) = agent.0.try_wait()? {
-                return Err(format!(
-                    "agent startup {status}: {} (requires free 127.0.0.1:8080)",
-                    message.trim()
-                )
-                .into());
+                return Err(format!("agent startup {status}: {}", message.trim()).into());
             }
-            // Only send API traffic after this particular child successfully bound its socket.
-            if message
-                .lines()
-                .any(|line| line == "listening on http://127.0.0.1:8080")
-            {
-                return Ok(agent);
+            if let Some(address) = message.split_whitespace().find_map(|field| {
+                field
+                    .strip_prefix("listen=")
+                    .and_then(|value| value.parse().ok())
+            }) {
+                let api = Api::new(address, &token, timeout)?;
+                api.get("/config").await?;
+                return Ok((agent, api));
             }
             check(
                 Instant::now() < deadline,

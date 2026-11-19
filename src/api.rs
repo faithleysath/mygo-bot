@@ -4,7 +4,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -12,6 +12,38 @@ use axum::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::sync::Arc;
+use subtle::ConstantTimeEq;
+
+pub async fn authorize_tcp(
+    State(token): State<Arc<str>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut headers = request.headers().get_all(header::AUTHORIZATION).iter();
+    let authorized = headers
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .is_some_and(|(scheme, credential)| {
+            scheme.eq_ignore_ascii_case("Bearer")
+                && bool::from(
+                    token
+                        .as_bytes()
+                        .ct_eq(credential.trim_start_matches(' ').as_bytes()),
+                )
+        });
+    if authorized && headers.next().is_none() {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(json!({"error":"unauthorized"})),
+        )
+            .into_response()
+    }
+}
 
 pub fn routes(app: App) -> Router {
     Router::new()
