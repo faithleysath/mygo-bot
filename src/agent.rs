@@ -273,46 +273,50 @@ impl App {
             }
             retries = 0;
             let tools = output.tools;
+            let soft = control.soft.clone();
             let stopped = self
                 .db
-                .call(move |s| {
-                    let tx = s.conn.transaction()?;
-                    let saved = if let Some(item) = output.final_item {
-                        Some(store::add_context_item(
-                            &tx,
-                            sid,
-                            "assistant_message",
-                            &item,
-                        )?)
-                    } else {
-                        None
-                    };
-                    let state = if s.active[&sid].soft.is_cancelled() {
-                        "paused"
-                    } else if tools || store::has_pending(&tx, sid)? {
-                        "running"
-                    } else {
-                        "idle"
-                    };
-                    tx.execute(
-                        "UPDATE sessions SET needs_model=?2,status=?3 WHERE id=?1",
-                        (sid, tools, state),
-                    )?;
-                    tx.commit()?;
-                    if let Some(id) = saved {
-                        s.item_saved(sid, id)?;
-                    }
-                    if state != "running" {
-                        s.active.remove(&sid);
-                        let info = session(&s.conn, sid)?;
-                        Notice::publish(
-                            &s.channel(sid),
-                            "session.status",
-                            json!({"status":state,"reason":info["last_error"]}),
-                        );
-                    }
-                    Ok(state != "running")
-                })
+                .write(
+                    move |conn| {
+                        let saved = if let Some(item) = output.final_item {
+                            Some(store::add_context_item(
+                                conn,
+                                sid,
+                                "assistant_message",
+                                &item,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let state = if soft.is_cancelled() {
+                            "paused"
+                        } else if tools || store::has_pending(conn, sid)? {
+                            "running"
+                        } else {
+                            "idle"
+                        };
+                        conn.execute(
+                            "UPDATE sessions SET needs_model=?2,status=?3 WHERE id=?1",
+                            (sid, tools, state),
+                        )?;
+                        Ok((saved, state))
+                    },
+                    move |s, (saved, state)| {
+                        if let Some(id) = saved {
+                            s.item_saved(sid, id)?;
+                        }
+                        if state != "running" {
+                            s.active.remove(&sid);
+                            let info = session(&s.conn, sid)?;
+                            Notice::publish(
+                                &s.channel(sid),
+                                "session.status",
+                                json!({"status":state,"reason":info["last_error"]}),
+                            );
+                        }
+                        Ok(state != "running")
+                    },
+                )
                 .await?;
             if stopped {
                 return Ok(());

@@ -134,20 +134,29 @@ async fn create_session(
     body: Option<Document>,
 ) -> Result<(StatusCode, Json<Value>)> {
     let effort = effort_field(body.map(|x| x.0).unwrap_or_default())?;
-    app.db
-        .call(move |s| {
-            let effort = match effort {
-                Some(e) => e,
-                None => Config::load(&s.conn)?.and_then(|c| c.default_reasoning_effort),
-            };
-            s.conn
-                .execute("INSERT INTO sessions(reasoning_effort) VALUES(?)", [effort])?;
-            Ok((
-                StatusCode::CREATED,
-                Json(session(&s.conn, s.conn.last_insert_rowid())?),
-            ))
-        })
-        .await
+    let created = app
+        .db
+        .write(
+            move |conn| {
+                let effort = match effort {
+                    Some(e) => e,
+                    None => conn
+                        .query_row(
+                            "SELECT default_reasoning_effort FROM config WHERE id=1",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .optional()?
+                        .flatten(),
+                };
+                conn.prepare_cached("INSERT INTO sessions(reasoning_effort) VALUES(?)")?
+                    .execute([effort])?;
+                session(conn, conn.last_insert_rowid())
+            },
+            |_, created| Ok(created),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(created)))
 }
 async fn get_session(State(app): State<App>, Path(sid): Path<i64>) -> Data {
     app.db.call(move |s| Ok(Json(session(&s.conn, sid)?))).await

@@ -10,16 +10,18 @@ use crate::{Error, Result, agent::Control, events::Notice};
 
 // One owner serializes transactions and the matching in-memory worker transitions.
 // A slow disk never blocks the HTTP executor. No job holds SQLite across network I/O.
+type Acknowledge = Box<dyn FnOnce(&mut Store, &Result<()>)>;
+type Write = Box<dyn FnOnce(Result<&Connection>) -> (bool, Acknowledge) + Send>;
+
 enum Command {
     Call(Box<dyn FnOnce(&mut Store) + Send>),
-    Enqueue(Enqueue),
+    Write(Write),
 }
 
 struct Enqueue {
     sid: i64,
     text: String,
     key: Option<String>,
-    reply: oneshot::Sender<Result<Enqueued>>,
 }
 
 pub enum Enqueued {
@@ -75,19 +77,19 @@ impl Db {
                 while let Some(command) = next.take().or_else(|| receiver.blocking_recv()) {
                     match command {
                         Command::Call(call) => call(&mut store),
-                        Command::Enqueue(first) => {
+                        Command::Write(first) => {
                             batch.push(first);
                             // Only group adjacent arrivals. A read or run command is a FIFO boundary.
                             while batch.len() < 32 {
                                 match receiver.try_recv() {
-                                    Ok(Command::Enqueue(message)) => batch.push(message),
+                                    Ok(Command::Write(write)) => batch.push(write),
                                     other => {
                                         next = other.ok();
                                         break;
                                     }
                                 }
                             }
-                            store.enqueue_batch(&mut batch);
+                            store.commit_batch(&mut batch);
                         }
                     }
                 }
@@ -108,13 +110,38 @@ impl Db {
     }
 
     pub async fn enqueue(&self, sid: i64, text: String, key: Option<String>) -> Result<Enqueued> {
+        self.write(
+            move |conn| Enqueue { sid, text, key }.insert(conn),
+            move |store, saved| {
+                if let Enqueued::Created(id) = saved {
+                    store.item_saved(sid, id)?;
+                }
+                Ok(saved)
+            },
+        )
+        .await
+    }
+
+    // The database thread runs apply in FIFO order, then publish in that same order after COMMIT.
+    pub async fn write<T: 'static, R: Send + 'static>(
+        &self,
+        apply: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+        publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
         self.submit(|reply| {
-            Command::Enqueue(Enqueue {
-                sid,
-                text,
-                key,
-                reply,
-            })
+            Command::Write(Box::new(move |conn| {
+                let result = conn.and_then(apply);
+                (
+                    result.is_ok(),
+                    Box::new(move |store, committed| {
+                        let result = match committed {
+                            Ok(()) => result.and_then(|value| publish(store, value)),
+                            Err(error) => Err(error.clone()),
+                        };
+                        let _ = reply.send(result);
+                    }),
+                )
+            }))
         })
         .await
     }
@@ -161,42 +188,36 @@ impl Enqueue {
     }
 }
 
-fn commit_messages(conn: &mut Connection, batch: &[Enqueue]) -> Result<Vec<Result<Enqueued>>> {
-    let tx = conn.transaction()?;
-    let mut results = Vec::with_capacity(batch.len());
-    for request in batch {
-        let result = request.insert(&tx);
-        // An I/O error can roll back the whole transaction inside sqlite3_step.
-        if tx.is_autocommit() {
-            return Err(result
-                .err()
-                .unwrap_or_else(|| Error::internal("transaction rolled back")));
-        }
-        results.push(result);
-    }
-    tx.commit()?;
-    Ok(results)
-}
-
 impl Store {
-    fn enqueue_batch(&mut self, batch: &mut Vec<Enqueue>) {
-        match commit_messages(&mut self.conn, batch) {
-            Ok(results) => {
-                for (request, result) in batch.drain(..).zip(results) {
-                    let result = result.and_then(|saved| {
-                        if let Enqueued::Created(id) = saved {
-                            self.item_saved(request.sid, id)?;
-                        }
-                        Ok(saved)
-                    });
-                    let _ = request.reply.send(result);
+    fn commit_batch(&mut self, batch: &mut Vec<Write>) {
+        let mut replies = Vec::with_capacity(batch.len());
+        let mut pending = batch.drain(..);
+        let committed = (|| -> Result<()> {
+            let mut tx = self.conn.transaction()?;
+            for write in pending.by_ref() {
+                // A failed multi-statement operation must not leave part of its reply in the DB.
+                let savepoint = tx.savepoint();
+                let (ok, reply) = write(
+                    savepoint
+                        .as_deref()
+                        .map_err(|e| Error::internal(e.to_string())),
+                );
+                replies.push(reply);
+                let savepoint = savepoint?;
+                if ok {
+                    savepoint.commit()?;
+                } else {
+                    savepoint.finish()?;
                 }
             }
-            Err(error) => {
-                for request in batch.drain(..) {
-                    let _ = request.reply.send(Err(error.clone()));
-                }
-            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = &committed {
+            replies.extend(pending.map(|write| write(Err(error.clone())).1));
+        }
+        for reply in replies {
+            reply(self, &committed);
         }
     }
 
@@ -288,7 +309,7 @@ pub fn add_item(
     Ok(conn.last_insert_rowid())
 }
 
-pub fn add_context_item(tx: &Transaction<'_>, sid: i64, kind: &str, item: &Value) -> Result<i64> {
+pub fn add_context_item(tx: &Connection, sid: i64, kind: &str, item: &Value) -> Result<i64> {
     let id = add_item(tx, sid, kind, item, None)?;
     tx.execute(
         "INSERT INTO context_items(session_id,item_id) VALUES(?,?)",
