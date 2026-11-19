@@ -90,7 +90,11 @@ func (a *agent) writeInput(ctx context.Context, w io.Writer, sid int64, cfg conf
 	return err
 }
 
-func (a *agent) stream(ctx context.Context, sid int64, cfg config, handle func(modelEvent) error) error {
+var errFrameTimeout = errors.New("model stream idle timeout")
+
+func (a *agent) stream(parent context.Context, sid int64, cfg config, handle func(modelEvent) error) error {
+	ctx, cancel := context.WithCancelCause(parent)
+	defer cancel(nil)
 	body, writer := io.Pipe()
 	defer body.Close()
 	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(cfg.BaseURL, "/")+"/responses", body)
@@ -102,12 +106,16 @@ func (a *agent) stream(ctx context.Context, sid int64, cfg config, handle func(m
 	if cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	}
-	go func() { writer.CloseWithError(a.writeInput(ctx, writer, sid, cfg)) }()
+	uploaded := make(chan struct{})
+	go func() { defer close(uploaded); writer.CloseWithError(a.writeInput(ctx, writer, sid, cfg)) }()
+	defer func() { cancel(nil); body.Close(); <-uploaded }()
 	res, err := a.client.Do(req)
 	if err != nil {
 		return retryable{err}
 	}
 	defer res.Body.Close()
+	idle := time.AfterFunc(a.frameTimeout, func() { cancel(errFrameTimeout) })
+	defer idle.Stop()
 	if res.StatusCode != 200 {
 		detail, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 		err := fmt.Errorf("model HTTP %d: %s", res.StatusCode, detail)
@@ -124,15 +132,28 @@ func (a *agent) stream(ctx context.Context, sid int64, cfg config, handle func(m
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if cause := context.Cause(ctx); cause != nil {
+				return retryable{cause}
+			}
 			return retryable{err}
 		}
 		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, ":") { // 一行完整的 SSE 心跳也算活跃。
+			if !idle.Reset(a.frameTimeout) {
+				return retryable{errFrameTimeout}
+			}
+			continue
+		}
 		if strings.HasPrefix(line, "data:") {
 			data = append(data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
 			continue
 		}
 		if line != "" || len(data) == 0 {
 			continue
+		}
+		// 本地落库、转发事件时停止计时；只衡量等待下一帧的时间。
+		if !idle.Stop() {
+			return retryable{errFrameTimeout}
 		}
 		payload := strings.Join(data, "\n")
 		data = nil
@@ -156,6 +177,7 @@ func (a *agent) stream(ctx context.Context, sid int64, cfg config, handle func(m
 			if err := handle(event); err != nil {
 				return err
 			}
+			idle.Reset(a.frameTimeout)
 		}
 	}
 }

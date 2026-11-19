@@ -18,7 +18,6 @@ CREATE TABLE items (
     session_id INTEGER NOT NULL REFERENCES sessions,
     kind TEXT NOT NULL,
     payload TEXT NOT NULL CHECK (json_valid(payload)),
-    attempt_id TEXT,
     -- 工具结果指向原调用，撤回记录指向原用户消息。
     target_id INTEGER,
     UNIQUE (session_id, id),

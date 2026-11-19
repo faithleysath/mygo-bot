@@ -48,7 +48,18 @@ func (a *agent) routes() http.Handler {
 	on("POST /sessions/{sid}/messages", a.send)
 	on("POST /sessions/{sid}/resume", a.send)
 	on("POST /sessions/{sid}/pause", a.pauseHTTP)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.mu.Lock()
+		if a.closing {
+			a.mu.Unlock()
+			writeJSON(w, 503, map[string]string{"error": reasonShutdown})
+			return
+		}
+		a.handlers.Add(1)
+		a.mu.Unlock()
+		defer a.handlers.Done()
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -198,7 +209,7 @@ func (a *agent) list(w http.ResponseWriter, r *http.Request) error {
 		args = []any{sid, after, limit}
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/items"):
-			query = `SELECT json_object('id',id,'kind',kind,'payload',json(payload),'attempt_id',attempt_id,'target_id',target_id) FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?`
+			query = `SELECT json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id) FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?`
 		case strings.HasSuffix(r.URL.Path, "/context"):
 			query = `SELECT json_object('position',c.position,'item_id',i.id,'payload',json(i.payload)) FROM context_items c JOIN items i ON i.id=c.item_id WHERE c.session_id=? AND c.position>? ORDER BY c.position LIMIT ?`
 		default:
@@ -244,7 +255,7 @@ func (a *agent) withdraw(w http.ResponseWriter, r *http.Request) error {
 		if id <= cursor {
 			return httpError{409, "message already included in context"}
 		}
-		_, err = addItem(tx, sid, "withdrawal", json.RawMessage(`{}`), "", id)
+		_, err = addItem(tx, sid, "withdrawal", json.RawMessage(`{}`), id)
 		return err
 	})
 	if err == nil {

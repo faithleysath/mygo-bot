@@ -6,10 +6,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	reasonUser     = "paused by user"
+	reasonShutdown = "daemon shutting down"
+	reasonRestart  = "daemon restarted"
+	maxRetries     = 3
 )
 
 type agent struct {
@@ -17,12 +25,17 @@ type agent struct {
 	client *http.Client
 	tool   func(context.Context, string, string) (string, error)
 	// 创建和退出循环时，同时修改会话状态。等模型或工具期间不持锁。
-	mu     sync.Mutex
-	active map[int64]*job
+	mu                sync.Mutex
+	active            map[int64]*job
+	closing           bool
+	workers, handlers sync.WaitGroup
+	frameTimeout      time.Duration
 }
 
 func newAgent(db *sql.DB) *agent {
-	return &agent{db: db, client: http.DefaultClient, tool: currentTime, active: make(map[int64]*job)}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	return &agent{db: db, client: &http.Client{Transport: transport}, tool: currentTime, active: make(map[int64]*job), frameTimeout: 60 * time.Second}
 }
 
 type notice struct {
@@ -41,6 +54,7 @@ type job struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	pause    chan struct{}
+	reason   string // 由 agent.mu 保护
 	listener context.Context
 	events   chan notice
 	ready    chan struct{}
@@ -83,14 +97,14 @@ func (a *agent) launch(sid int64, listener context.Context, sse bool) *job {
 		j.events = make(chan notice)
 	}
 	a.active[sid] = j
-	go a.run(j)
+	a.workers.Go(func() { a.run(j) })
 	return j
 }
 
 func (a *agent) stop(j *job, cause error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	reason := "paused by user"
+	reason := j.reason
 	if cause != nil && !j.pausing() {
 		reason = cause.Error()
 	}
@@ -111,7 +125,7 @@ func (a *agent) stop(j *job, cause error) {
 func (a *agent) run(j *job) {
 	var cfg config
 	first := true
-	delay := 250 * time.Millisecond
+	retries := 0
 	for {
 		a.mu.Lock()
 		if j.pausing() {
@@ -120,11 +134,6 @@ func (a *agent) run(j *job) {
 			return
 		}
 		err := transaction(a.db, func(tx *sql.Tx) error {
-			if first {
-				if err := recoverTools(tx, j.sid); err != nil {
-					return err
-				}
-			}
 			added, err := includePending(tx, j.sid)
 			if err != nil {
 				return err
@@ -151,17 +160,31 @@ func (a *agent) run(j *job) {
 			}
 			return nil
 		})
+		// 即使流已断开或取消，也先等全部工具退出。工具独立于单次网络请求。
+		if toolErr := a.waitTools(j, &step); toolErr != nil {
+			a.stop(j, toolErr)
+			return
+		}
 		var transient retryable
 		if errors.As(err, &transient) && j.ctx.Err() == nil {
+			if j.pausing() {
+				a.stop(j, nil)
+				return
+			}
+			if retries == maxRetries {
+				a.stop(j, fmt.Errorf("retry limit reached (%d): %w", maxRetries, err))
+				return
+			}
+			delay := (250 * time.Millisecond) << retries
+			retries++
 			j.notify(notice{"attempt.retry", step.id, "retrying from current context"})
 			select {
 			case <-j.pause:
 			case <-time.After(delay):
 			}
-			delay = min(2*delay, 5*time.Second)
 			continue
 		}
-		if err == nil && !step.usedTool && !step.hasAnswer {
+		if err == nil && len(step.tools) == 0 && !step.hasAnswer {
 			err = errors.New("response completed without an answer or tool call")
 		}
 		if err != nil {
@@ -176,14 +199,15 @@ func (a *agent) run(j *job) {
 		if finished {
 			return
 		}
-		delay = 250 * time.Millisecond
+		retries = 0
 	}
 }
 
 type attempt struct {
-	id                  string
-	usedTool, hasAnswer bool
-	text                strings.Builder
+	id        string
+	tools     []<-chan error
+	hasAnswer bool
+	text      strings.Builder
 }
 
 func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
@@ -202,12 +226,11 @@ func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
 		if item.CallID == "" {
 			return errors.New("missing call_id")
 		}
-		s.usedTool = true
 		// 先记录调用。若执行途中过早退出，恢复时补一个「结果未知」，避免重跑。
 		var id int64
 		err := transaction(a.db, func(tx *sql.Tx) error {
 			var err error
-			id, err = addItem(tx, j.sid, item.Type, raw, s.id, nil)
+			id, err = addItem(tx, j.sid, item.Type, raw, nil)
 			return err
 		})
 		if err != nil {
@@ -217,11 +240,10 @@ func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
 		if err := j.ctx.Err(); err != nil {
 			return err
 		}
-		output, err := a.tool(j.ctx, item.Name, item.Arguments)
-		if err != nil {
-			return err
-		}
-		return transaction(a.db, func(tx *sql.Tx) error { return finishTool(tx, j.sid, id, item.CallID, output, s.id) })
+		done := make(chan error, 1)
+		s.tools = append(s.tools, done)
+		go func() { done <- a.runTool(j, id, item.CallID, item.Name, item.Arguments) }()
+		return nil
 	}
 	kind := item.Type
 	if kind == "message" && item.Role == "assistant" {
@@ -238,13 +260,38 @@ func (a *agent) accept(j *job, s *attempt, raw json.RawMessage) error {
 		}
 	}
 	return transaction(a.db, func(tx *sql.Tx) error {
-		id, err := addItem(tx, j.sid, kind, raw, s.id, nil)
+		id, err := addItem(tx, j.sid, kind, raw, nil)
 		if err != nil {
 			return err
 		}
 		_, err = tx.Exec(`INSERT INTO context_items(session_id,item_id) VALUES(?,?)`, j.sid, id)
 		return err
 	})
+}
+
+func (a *agent) runTool(j *job, id int64, callID, name, args string) error {
+	output, err := a.tool(j.ctx, name, args)
+	if err != nil {
+		if j.ctx.Err() != nil {
+			return nil // 恢复时用 last_error 解释缺失的结果。
+		}
+		output = "Tool error: " + err.Error()
+	}
+	return transaction(a.db, func(tx *sql.Tx) error {
+		_, err := saveToolResult(tx, j.sid, id, callID, output)
+		return err
+	})
+}
+
+func (a *agent) waitTools(j *job, s *attempt) error {
+	var err error
+	for _, done := range s.tools {
+		err = errors.Join(err, <-done) // 即使其中一个写库失败，也要等其余任务退出。
+	}
+	if err = errors.Join(err, j.ctx.Err()); err != nil || len(s.tools) == 0 {
+		return err
+	}
+	return transaction(a.db, func(tx *sql.Tx) error { return publishTools(tx, j.sid, false, "") })
 }
 
 func (a *agent) complete(j *job, s *attempt) (bool, error) {
@@ -257,7 +304,7 @@ func (a *agent) complete(j *job, s *attempt) (bool, error) {
 	err := transaction(a.db, func(tx *sql.Tx) error {
 		if j.pausing() {
 			state = "paused"
-		} else if !s.usedTool {
+		} else if len(s.tools) == 0 {
 			var queued bool
 			if err := tx.QueryRow(`SELECT EXISTS(SELECT 1`+pending+`)`, j.sid).Scan(&queued); err != nil {
 				return err
@@ -266,13 +313,13 @@ func (a *agent) complete(j *job, s *attempt) (bool, error) {
 				state = "idle"
 			}
 		}
-		_, err := tx.Exec(`UPDATE sessions SET status=?,last_error=CASE WHEN ?='paused' THEN 'paused by user' ELSE '' END WHERE id=?`, state, state, j.sid)
+		_, err := tx.Exec(`UPDATE sessions SET status=?,last_error=? WHERE id=?`, state, j.reason, j.sid)
 		return err
 	})
 	if err != nil {
 		return false, err
 	}
-	if !s.usedTool {
+	if len(s.tools) == 0 {
 		j.answer(reply{Status: "completed", Text: s.text.String()})
 	}
 	if state != "running" {
@@ -292,7 +339,10 @@ func (a *agent) pause(sid int64, hard bool) (string, error) {
 	if j != nil {
 		state = "pausing"
 	}
-	r, err := a.db.Exec(`UPDATE sessions SET status=?,last_error='paused by user' WHERE id=?`, state, sid)
+	if a.closing {
+		return "", httpError{503, reasonShutdown}
+	}
+	r, err := a.db.Exec(`UPDATE sessions SET status=?,last_error=CASE WHEN status='paused' THEN last_error ELSE ? END WHERE id=?`, state, reasonUser, sid)
 	if err != nil {
 		return "", err
 	}
@@ -301,30 +351,39 @@ func (a *agent) pause(sid int64, hard bool) (string, error) {
 		return "", sql.ErrNoRows
 	}
 	if j != nil {
-		if !j.pausing() {
-			close(j.pause)
-		}
-		if hard {
-			j.cancel()
-		}
+		j.requestPause(reasonUser, hard)
 	}
 	return state, nil
+}
+
+// 调用时持有 agent.mu。重复请求可以把软暂停升级成硬暂停。
+func (j *job) requestPause(reason string, hard bool) {
+	if !j.pausing() {
+		j.reason = reason
+		close(j.pause)
+	}
+	if hard {
+		j.cancel()
+	}
 }
 
 func (a *agent) submit(sid int64, message *string, listener context.Context, sse bool) (int64, *job, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closing {
+		return 0, nil, httpError{503, reasonShutdown}
+	}
 	var id int64
 	var start bool
 	err := transaction(a.db, func(tx *sql.Tx) error {
-		var status string
-		if err := tx.QueryRow(`SELECT status FROM sessions WHERE id=?`, sid).Scan(&status); err != nil {
+		var status, reason string
+		if err := tx.QueryRow(`SELECT status,last_error FROM sessions WHERE id=?`, sid).Scan(&status, &reason); err != nil {
 			return err
 		}
 		if message != nil {
 			payload, _ := json.Marshal(map[string]string{"role": "user", "content": *message})
 			var err error
-			id, err = addItem(tx, sid, "user_message", payload, "", nil)
+			id, err = addItem(tx, sid, "user_message", payload, nil)
 			if err != nil {
 				return err
 			}
@@ -339,6 +398,9 @@ func (a *agent) submit(sid int64, message *string, listener context.Context, sse
 		}
 		if !configured {
 			return httpError{503, "configure the model first"}
+		}
+		if err := publishTools(tx, sid, true, reason); err != nil {
+			return err
 		}
 		if message == nil {
 			var hasInput bool

@@ -211,7 +211,7 @@ func TestHardPauseTool(t *testing.T) {
 		if n.Add(1) == 1 {
 			item(w, call)
 		} else {
-			if !strings.Contains(in, "result unknown") {
+			if !strings.Contains(in, "User paused the session; result unknown") {
 				t.Error(in)
 			}
 			answer(w, "ok")

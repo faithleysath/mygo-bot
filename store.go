@@ -47,7 +47,7 @@ func openStore(path string) (*sql.DB, error) {
 		} else if err := validateSchema(tx); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`UPDATE sessions SET status='paused',last_error='daemon restarted' WHERE status IN ('running','pausing')`)
+		_, err := tx.Exec(`UPDATE sessions SET status='paused',last_error=? WHERE status IN ('running','pausing')`, reasonRestart)
 		return err
 	})
 	if err != nil {
@@ -129,39 +129,54 @@ func includePending(tx *sql.Tx, sid int64) (bool, error) {
 	return count > 0, err
 }
 
-func addItem(tx *sql.Tx, sid int64, kind string, payload json.RawMessage, attempt string, target any) (int64, error) {
-	r, err := tx.Exec(`INSERT INTO items(session_id,kind,payload,attempt_id,target_id) VALUES(?,?,?,nullif(?,''),?)`, sid, kind, string(payload), attempt, target)
+func addItem(tx *sql.Tx, sid int64, kind string, payload json.RawMessage, target any) (int64, error) {
+	r, err := tx.Exec(`INSERT INTO items(session_id,kind,payload,target_id) VALUES(?,?,?,?)`, sid, kind, string(payload), target)
 	if err != nil {
 		return 0, err
 	}
 	return r.LastInsertId()
 }
 
-func finishTool(tx *sql.Tx, sid, callItem int64, callID, output, attempt string) error {
+func saveToolResult(tx *sql.Tx, sid, callItem int64, callID, output string) (int64, error) {
 	payload, _ := json.Marshal(map[string]string{"type": "function_call_output", "call_id": callID, "output": output})
-	id, err := addItem(tx, sid, "function_call_output", payload, attempt, callItem)
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(`INSERT INTO context_items(session_id,item_id) VALUES(?,?),(?,?)`, sid, callItem, sid, id)
-	return err
+	return addItem(tx, sid, "function_call_output", payload, callItem)
 }
 
-func recoverTools(tx *sql.Tx, sid int64) error {
+// 屏障和恢复共用这段逻辑。按调用顺序取出尚未发布的记录，优先使用已落库的结果。
+func publishTools(tx *sql.Tx, sid int64, recovering bool, reason string) error {
 	for {
-		var id int64
-		var callID, attempt string
-		err := tx.QueryRow(`SELECT id, json_extract(payload,'$.call_id'), attempt_id FROM items c
-			WHERE session_id=? AND kind='function_call' AND NOT EXISTS (
-				SELECT 1 FROM items r WHERE r.target_id=c.id AND r.kind='function_call_output'
-			) ORDER BY id LIMIT 1`, sid).Scan(&id, &callID, &attempt)
+		var call int64
+		var callID string
+		var result sql.NullInt64
+		err := tx.QueryRow(`SELECT c.id,json_extract(c.payload,'$.call_id'),r.id FROM items c
+			LEFT JOIN items r ON r.kind='function_call_output' AND r.target_id=c.id
+			WHERE c.session_id=? AND c.kind='function_call' AND NOT EXISTS
+			(SELECT 1 FROM context_items WHERE item_id=c.id) ORDER BY c.id LIMIT 1`, sid).Scan(&call, &callID, &result)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		if err := finishTool(tx, sid, id, callID, "Execution interrupted; result unknown.", attempt); err != nil {
+		if !result.Valid {
+			if !recovering {
+				return fmt.Errorf("missing result for tool call %d", call)
+			}
+			output := "Execution interrupted; result unknown."
+			switch reason {
+			case reasonUser:
+				output = "User paused the session; result unknown."
+			case reasonRestart:
+				output = "Daemon restarted; result unknown."
+			case reasonShutdown:
+				output = "Daemon shut down; result unknown."
+			}
+			result.Int64, err = saveToolResult(tx, sid, call, callID, output)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err = tx.Exec(`INSERT INTO context_items(session_id,item_id) VALUES(?,?),(?,?)`, sid, call, sid, result.Int64); err != nil {
 			return err
 		}
 	}
