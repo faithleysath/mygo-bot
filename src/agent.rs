@@ -245,7 +245,7 @@ impl App {
             }
             let interrupted = control.hard.is_cancelled() && output.final_item.is_none();
             // A call may have reached the store just as the stream was cancelled, before spawn.
-            if output.tools || interrupted {
+            if interrupted || (output.tools && streamed.is_err()) {
                 self.db
                     .call(move |s| {
                         let tx = s.conn.transaction()?;
@@ -290,6 +290,9 @@ impl App {
                 .db
                 .write(
                     move |conn| {
+                        if tools {
+                            store::publish_tools(conn, sid, false)?;
+                        }
                         let saved = if let Some(item) = output.final_item {
                             Some(store::add_context_item(
                                 conn,

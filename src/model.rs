@@ -237,27 +237,39 @@ impl App {
             let call_key = call.clone();
             let id = self
                 .db
-                .call(move |s| {
-                    let sql =
-                        "SELECT payload FROM items WHERE session_id=? AND kind='function_call'
+                .write(
+                    move |conn| {
+                        let sql =
+                            "SELECT payload FROM items WHERE session_id=? AND kind='function_call'
                            AND json_extract(payload,'$.call_id')=?";
-                    let existing: Option<Value> = s
-                        .conn
-                        .query_row(sql, (sid, call_key), |r| r.get(0))
-                        .optional()?;
-                    if let Some(saved) = existing {
-                        if saved["name"] != item["name"] || saved["arguments"] != item["arguments"]
-                        {
-                            return Err(Error::internal(
-                                "model reused call_id for a different tool call",
-                            ));
+                        let existing: Option<Value> = conn
+                            .query_row(sql, (sid, call_key), |r| r.get(0))
+                            .optional()?;
+                        if let Some(saved) = existing {
+                            if saved["name"] != item["name"]
+                                || saved["arguments"] != item["arguments"]
+                            {
+                                return Err(Error::internal(
+                                    "model reused call_id for a different tool call",
+                                ));
+                            }
+                            return Ok(None);
                         }
-                        return Ok(None);
-                    }
-                    let id = store::add_item(&s.conn, sid, "function_call", &item, None)?;
-                    s.item_saved(sid, id)?;
-                    Ok(Some(id))
-                })
+                        Ok(Some(store::add_item(
+                            conn,
+                            sid,
+                            "function_call",
+                            &item,
+                            None,
+                        )?))
+                    },
+                    move |s, id| {
+                        if let Some(id) = id {
+                            s.item_saved(sid, id)?;
+                        }
+                        Ok(id)
+                    },
+                )
                 .await?;
             out.tools = true;
             let Some(id) = id else {
@@ -272,12 +284,12 @@ impl App {
                 };
                 // Once the tool returns, finish saving its result even if a pause arrives.
                 let payload = json!({"type":"function_call_output","call_id":call,"output":output});
-                db.call(move |s| {
-                    let id =
-                        store::add_item(&s.conn, sid, "function_call_output", &payload, Some(id))?;
-                    s.item_saved(sid, id)?;
-                    Ok(())
-                })
+                db.write(
+                    move |conn| {
+                        store::add_item(conn, sid, "function_call_output", &payload, Some(id))
+                    },
+                    move |s, id| s.item_saved(sid, id),
+                )
                 .await
             });
             return Ok(());

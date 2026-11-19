@@ -320,7 +320,7 @@ pub fn add_context_item(tx: &Connection, sid: i64, kind: &str, item: &Value) -> 
 
 // Publish all completed tools in call order. A missing result after interruption
 // is recorded explicitly: replaying an already executed tool could repeat its effect.
-pub fn publish_tools(tx: &Transaction<'_>, sid: i64, recovering: bool) -> Result<Vec<i64>> {
+pub fn publish_tools(tx: &Connection, sid: i64, recovering: bool) -> Result<Vec<i64>> {
     let mut recovered = Vec::new();
     let mut after = 0;
     let mut pending = tx.prepare_cached(
