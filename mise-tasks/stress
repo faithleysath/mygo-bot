@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+#MISE description="MyGo-Bot 压测。列出场景用 mise run stress --list，完整用法见 mise run stress -- --help"
+set -eu
+cd "$(dirname "$0")/.."
+case "${1:-}" in
+  --help|--list|-h) ;;
+  *) cargo build --locked --release --bin mygo-bot ;;
+esac
+exec cargo run --locked --release --example stress -- "$@"

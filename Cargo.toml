@@ -17,6 +17,9 @@ serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "net", "time"] }
 tokio-util = { version = "0.7", features = ["io", "codec", "rt"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
 [profile.release]
 opt-level = "s"
 lto = "thin"
