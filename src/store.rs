@@ -297,7 +297,11 @@ impl Store {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT id,kind,payload,target_id,llm_call_id FROM items WHERE id=?",
             )?;
-            Notice::publish(&channel, "item.saved", stmt.query_row([id], history_row)?);
+            Notice::publish(
+                &channel,
+                "item.saved",
+                json!(stmt.query_row([id], history_row)?),
+            );
         }
         Ok(())
     }
@@ -322,18 +326,45 @@ impl Store {
     }
 }
 
-pub fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    Ok(json!({
-        "id": row.get::<_, i64>(0)?, "kind": row.get::<_, String>(1)?,
-        "payload": row.get::<_, Value>(2)?, "target_id": row.get::<_, Option<i64>>(3)?, "llm_call_id": row.get::<_, Option<i64>>(4)?
-    }))
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct HistoryItem {
+    id: i64,
+    kind: String,
+    /// 由 kind 决定的内容对象。
+    #[schema(value_type = Object)]
+    payload: Value,
+    #[schema(required)]
+    target_id: Option<i64>,
+    #[schema(required)]
+    llm_call_id: Option<i64>,
 }
 
-pub fn session(conn: &Connection, sid: i64) -> Result<Value> {
+/// 按 position 排序的上下文记录，由 SQLite 直接流式输出。
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ContextItem {
+    position: i64,
+    item_id: i64,
+    #[schema(required)]
+    llm_call_id: Option<i64>,
+    #[schema(value_type = Object)]
+    payload: Value,
+}
+
+fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
+    Ok(HistoryItem {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        payload: row.get(2)?,
+        target_id: row.get(3)?,
+        llm_call_id: row.get(4)?,
+    })
+}
+
+pub fn session(conn: &Connection, sid: i64) -> Result<Session> {
     let mut stmt = conn.prepare_cached(
         "SELECT id,status,reasoning_effort,last_error,model_id FROM sessions WHERE id=?",
     )?;
-    Ok(json!(stmt.query_row([sid], session_row)?))
+    Ok(stmt.query_row([sid], session_row)?)
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -341,20 +372,20 @@ pub struct Session {
     /// 会话 ID。
     id: i64,
     /// 当前运行状态。
-    status: SessionStatus,
+    pub status: SessionStatus,
     /// 推理强度。未指定时为 null。
     #[schema(required)]
     reasoning_effort: Option<String>,
     /// 最近的错误或暂停原因。无记录时为空字符串。
-    last_error: String,
+    pub last_error: String,
     /// 选中的模型 ID。未选择时为 null。
     #[schema(required)]
-    model_id: Option<i64>,
+    pub model_id: Option<i64>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+#[derive(PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
-enum SessionStatus {
+pub enum SessionStatus {
     Idle,
     Running,
     Pausing,

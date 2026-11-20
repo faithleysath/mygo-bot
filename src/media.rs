@@ -1,10 +1,9 @@
 use axum::{
-    Json, Router,
+    Json,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use rusqlite::{Connection, OptionalExtension};
@@ -12,20 +11,95 @@ use serde_json::{Value, json};
 
 use crate::{App, Error, Result};
 
-pub fn routes() -> Router<App> {
-    Router::new()
-        .route(
-            "/attachments",
-            post(upload).layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
-        )
-        .route("/attachments/{id}", get(download))
+pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
+    use utoipa_axum::{router::OpenApiRouter, routes};
+    OpenApiRouter::new()
+        .routes(routes!(upload))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+        .routes(routes!(download))
 }
 
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct Attachment {
+    id: i64,
+    mime_type: String,
+}
+
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+struct AttachmentBytes(());
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TextKind {
+    Text,
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Image,
+    Audio,
+    Video,
+}
+
+impl MediaKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+/// 消息内容块。媒体引用通过附件上传接口取得的 ID。
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ContentBlock<'a> {
+    #[schema(max_properties = 2)]
+    Text {
+        #[serde(rename = "type")]
+        kind: TextKind,
+        #[schema(min_length = 1)]
+        text: &'a str,
+    },
+    #[schema(max_properties = 2)]
+    Media {
+        #[serde(rename = "type")]
+        kind: MediaKind,
+        #[schema(minimum = 1)]
+        attachment_id: i64,
+    },
+}
+
+/// 上传附件
+///
+/// 直接发送非空的原始文件字节，指定具体的 image、audio 或 video MIME 类型，最大 50 MiB。
+///
+/// ```sh
+/// curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: image/png' --data-binary @photo.png "$BASE/attachments"
+/// ```
+#[utoipa::path(
+    post,
+    path = "/attachments",
+    tag = "附件",
+    request_body(content(
+        (AttachmentBytes = "image/png"), (AttachmentBytes = "audio/wav"), (AttachmentBytes = "video/mp4"),
+        (AttachmentBytes = "image/*"), (AttachmentBytes = "audio/*"), (AttachmentBytes = "video/*")
+    )),
+    responses(
+        (status = 201, description = "创建成功", body = Attachment),
+        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
+        (status = 413, description = "附件超过 50 MiB", body = String, content_type = "text/plain"),
+        crate::docs::ServiceErrors
+    )
+)]
 async fn upload(
     State(app): State<App>,
     headers: HeaderMap,
     data: Bytes,
-) -> Result<(StatusCode, Json<Value>)> {
+) -> Result<(StatusCode, Json<Attachment>)> {
     let mut types = headers.get_all(header::CONTENT_TYPE).iter();
     let mime: mime::Mime = types
         .next()
@@ -49,7 +123,10 @@ async fn upload(
                     "INSERT INTO attachments(mime_type,data) VALUES(?,?)",
                     (mime.as_ref(), data.as_ref()),
                 )?;
-                Ok(json!({"id":conn.last_insert_rowid(),"mime_type":mime.as_ref()}))
+                Ok(Attachment {
+                    id: conn.last_insert_rowid(),
+                    mime_type: mime.to_string(),
+                })
             },
             |_, saved| Ok(saved),
         )
@@ -57,6 +134,21 @@ async fn upload(
     Ok((StatusCode::CREATED, Json(saved)))
 }
 
+/// 下载附件
+///
+/// 返回原始文件字节，Content-Type 为上传时保存的 MIME 类型。
+#[utoipa::path(
+    get,
+    path = "/attachments/{id}",
+    tag = "附件",
+    params(("id" = i64, Path, description = "附件 ID")),
+    responses(
+        (status = 200, description = "原始附件", content((crate::media::AttachmentBytes = "image/*"), (crate::media::AttachmentBytes = "audio/*"), (crate::media::AttachmentBytes = "video/*"))),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
 async fn download(State(app): State<App>, Path(id): Path<i64>) -> Result<Response> {
     let (mime, data) = app
         .db
@@ -79,45 +171,57 @@ async fn download(State(app): State<App>, Path(id): Path<i64>) -> Result<Respons
         .into_response())
 }
 
-enum Block<'a> {
-    Text(&'a str),
-    Media { kind: &'a str, id: i64 },
-}
-
-impl<'a> Block<'a> {
+impl<'a> ContentBlock<'a> {
     fn parse(part: &'a Value) -> Result<Self> {
         let fields = part
             .as_object()
             .ok_or_else(|| Error::bad("expected a content block"))?;
-        match part["type"].as_str() {
-            Some("text") if fields.len() == 2 => part["text"]
-                .as_str()
-                .filter(|s| !s.trim().is_empty())
-                .map(Self::Text)
-                .ok_or_else(|| Error::bad("text block requires nonempty text")),
-            Some(kind @ ("image" | "audio" | "video")) if fields.len() == 2 => {
-                let id = part["attachment_id"]
-                    .as_i64()
-                    .filter(|&id| id > 0)
-                    .ok_or_else(|| {
-                        Error::bad("media block requires a positive integer attachment_id")
-                    })?;
-                Ok(Self::Media { kind, id })
+        let kind = match part["type"].as_str() {
+            Some("text") => {
+                if fields.len() != 2 {
+                    return Err(Error::bad("text block accepts only type and text"));
+                }
+                let text = part["text"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| Error::bad("text block requires nonempty text"))?;
+                return Ok(Self::Text {
+                    kind: TextKind::Text,
+                    text,
+                });
             }
-            Some("text") => Err(Error::bad("text block accepts only type and text")),
-            Some("image" | "audio" | "video") => Err(Error::bad(
+            Some("image") => MediaKind::Image,
+            Some("audio") => MediaKind::Audio,
+            Some("video") => MediaKind::Video,
+            _ => {
+                return Err(Error::bad(
+                    "expected block type text, image, audio or video",
+                ));
+            }
+        };
+        if fields.len() != 2 {
+            return Err(Error::bad(
                 "media block accepts only type and attachment_id",
-            )),
-            _ => Err(Error::bad(
-                "expected block type text, image, audio or video",
-            )),
+            ));
         }
+        let attachment_id = part["attachment_id"]
+            .as_i64()
+            .filter(|&id| id > 0)
+            .ok_or_else(|| Error::bad("media block requires a positive integer attachment_id"))?;
+        Ok(Self::Media {
+            kind,
+            attachment_id,
+        })
     }
 
     fn modality(&self, conn: &Connection) -> Result<&str> {
         match self {
-            Self::Text(_) => Ok("text"),
-            Self::Media { kind, id } => {
+            Self::Text { .. } => Ok("text"),
+            Self::Media {
+                kind,
+                attachment_id: id,
+            } => {
+                let kind = kind.as_str();
                 let mime: String = conn
                     .prepare_cached("SELECT mime_type FROM attachments WHERE id=?")?
                     .query_row([id], |row| row.get(0))
@@ -131,8 +235,11 @@ impl<'a> Block<'a> {
 
     fn wire(self, conn: &Connection) -> Result<Value> {
         let (kind, id) = match self {
-            Self::Text(text) => return Ok(json!({"type":"input_text","text":text})),
-            Self::Media { kind, id } => (kind, id),
+            Self::Text { text, .. } => return Ok(json!({"type":"input_text","text":text})),
+            Self::Media {
+                kind,
+                attachment_id,
+            } => (kind.as_str(), attachment_id),
         };
         let (mime, data): (String, Vec<u8>) = conn
             .prepare_cached("SELECT mime_type,data FROM attachments WHERE id=?")?
@@ -194,7 +301,7 @@ pub fn validate_message(conn: &Connection, content: &Value, modalities: &Value) 
         .filter(|parts| !parts.is_empty())
         .ok_or_else(|| Error::bad("content must be a nonempty array"))?;
     for (index, part) in parts.iter().enumerate() {
-        Block::parse(part)
+        ContentBlock::parse(part)
             .and_then(|block| require(modalities, block.modality(conn)?))
             .map_err(|e| at_part(index, e))?;
     }
@@ -232,7 +339,8 @@ fn check_parts(conn: &Connection, content: &Value, modalities: &Value) -> Result
                     )),
                 }
             }
-            _ => Block::parse(part).and_then(|block| require(modalities, block.modality(conn)?)),
+            _ => ContentBlock::parse(part)
+                .and_then(|block| require(modalities, block.modality(conn)?)),
         };
         checked.map_err(|e| at_part(index, e))?;
     }
@@ -311,7 +419,7 @@ pub fn wire_message(conn: &Connection, mut payload: Value) -> Result<Value> {
         {
             continue;
         }
-        *part = Block::parse(part)
+        *part = ContentBlock::parse(part)
             .and_then(|block| block.wire(conn))
             .map_err(|e| at_part(index, e))?;
     }

@@ -2,14 +2,14 @@ use crate::{
     App, Error, Result, calls,
     events::Notice,
     model::{self, Failure},
-    store::{self, Store, session},
+    store::{self, Session, SessionStatus, Store, session},
 };
 use axum::{
     Json,
     extract::{Path, Query, State},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -26,18 +26,35 @@ enum StartEffect {
     Worker(Vec<i64>),
 }
 
-pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Value>> {
+/// 启动或恢复会话
+///
+/// 会话需要可用模型；没有待处理工作时返回当前会话。
+#[utoipa::path(
+    put,
+    path = "/sessions/{sid}/run",
+    tag = "运行",
+    params(("sid" = i64, Path, description = "会话 ID")),
+    responses(
+        (status = 200, description = "启动或恢复会话", body = Session),
+        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
+        (status = 503, description = "服务正在关闭", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
+pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Session>> {
     let worker = app.clone();
     app.db
         .start_write(
             sid,
             move |conn, active| {
                 let current = session(conn, sid)?;
-                let model_id = current["model_id"]
-                    .as_i64()
+                let model_id = current
+                    .model_id
                     .ok_or_else(|| Error::conflict("select a session model before running"))?;
                 crate::catalog::available_capabilities(conn, model_id)?;
-                if current["status"] == "pausing" {
+                if current.status == SessionStatus::Pausing {
                     return Err(Error::conflict("session is pausing"));
                 }
                 if active {
@@ -48,7 +65,7 @@ pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<
                         r.get(0)
                     })?;
                 if !unfinished && !store::has_pending(conn, sid)? {
-                    if current["status"] == "paused" {
+                    if current.status == SessionStatus::Paused {
                         conn.execute(
                             "UPDATE sessions SET status='idle',last_error='' WHERE id=?",
                             [sid],
@@ -96,28 +113,44 @@ pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<
         )
         .await
 }
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 enum PauseMode {
     #[default]
     Soft,
     Hard,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct Pause {
     #[serde(default)]
+    /// soft 等待当前工作结束，hard 取消当前工作。默认 soft。
+    #[param(inline)]
     mode: PauseMode,
 }
+/// 暂停会话
+#[utoipa::path(
+    delete,
+    path = "/sessions/{sid}/run",
+    tag = "运行",
+    params(("sid" = i64, Path, description = "会话 ID"), Pause),
+    responses(
+        (status = 200, description = "暂停会话", body = Session),
+        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
 pub async fn pause(
     State(app): State<App>,
     Path(sid): Path<i64>,
     Query(q): Query<Pause>,
-) -> Result<Json<Value>> {
+) -> Result<Json<Session>> {
     app.db
         .call(move |s| {
             let current = session(&s.conn, sid)?;
-            if current["status"] != "paused" {
+            if current.status != SessionStatus::Paused {
                 request_pause(s, sid, matches!(q.mode, PauseMode::Hard), "paused by user")?;
             }
             Ok(Json(session(&s.conn, sid)?))
@@ -359,7 +392,7 @@ impl App {
                             Notice::publish(
                                 &s.channel(sid),
                                 "session.status",
-                                json!({"status":state,"reason":info["last_error"]}),
+                                json!({"status":state,"reason":info.last_error}),
                             );
                         }
                         Ok(state != "running")

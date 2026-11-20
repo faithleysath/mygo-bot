@@ -23,6 +23,21 @@ impl Notice {
         }
     }
 }
+/// 订阅会话事件
+///
+/// 连接后首先收到 ready 和当前会话。item.saved、session.status、attempt.retry 等事件携带 JSON。收到 resync 时重新查询状态和历史。
+#[utoipa::path(
+    get,
+    path = "/sessions/{sid}/events",
+    tag = "运行",
+    params(("sid" = i64, Path, description = "会话 ID")),
+    responses(
+        (status = 200, description = "持续推送的 SSE 事件", body = String, content_type = "text/event-stream", example = json!("event: ready\ndata: {\"id\":1,\"status\":\"idle\",\"reasoning_effort\":null,\"last_error\":\"\",\"model_id\":null}\n\n")),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
 pub async fn subscribe(
     State(app): State<App>,
     Path(sid): Path<i64>,
@@ -38,7 +53,7 @@ pub async fn subscribe(
         .await?;
     let stream = async_stream::stream! {
         let _channel=channel;
-        yield Ok(Event::default().event("ready").data(initial.to_string()));
+        yield Ok(Event::default().event("ready").data(serde_json::json!(initial).to_string()));
         loop {
             let received=tokio::select!{ biased; _=app.stopping.cancelled()=>break, msg=rx.recv()=>msg };
             match received {

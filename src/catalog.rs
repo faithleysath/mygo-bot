@@ -1,34 +1,26 @@
 use crate::{App, Error, Result, media, pricing};
 use axum::{
-    Json, Router,
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
 };
 use rusqlite::{Connection, OptionalExtension, Row, ffi, params, types::Type};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 
+type ProviderPatch = crate::docs::Patch<Provider>;
+type ModelPatch = crate::docs::Patch<Model>;
 type Document = Json<Map<String, Value>>;
-type Data = Result<Json<Value>>;
-
-pub fn routes() -> Router<App> {
-    Router::new()
-        .route("/providers", get(list_providers).post(create_provider))
-        .route(
-            "/providers/{id}",
-            get(get_provider)
-                .patch(patch_provider)
-                .delete(archive_provider),
-        )
-        .route("/providers/{id}/restore", post(restore_provider))
-        .route("/models", get(list_models).post(create_model))
-        .route(
-            "/models/{id}",
-            get(get_model).patch(patch_model).delete(archive_model),
-        )
-        .route("/models/{id}/restore", post(restore_model))
+pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
+    use utoipa_axum::{router::OpenApiRouter, routes};
+    OpenApiRouter::new()
+        .routes(routes!(list_providers, create_provider))
+        .routes(routes!(get_provider, patch_provider, archive_provider))
+        .routes(routes!(restore_provider))
+        .routes(routes!(list_models, create_model))
+        .routes(routes!(get_model, patch_model, archive_model))
+        .routes(routes!(restore_model))
 }
 
 fn document<T: DeserializeOwned + Serialize>(old: Option<&T>, fields: Document) -> Result<T> {
@@ -53,22 +45,25 @@ fn record<T>(
     Ok(stmt.query_row([id], read)?)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 struct ListOptions {
     #[serde(default)]
+    /// 同时返回已归档的记录。默认仅返回可用记录。
+    #[param(default = false)]
     include_archived: bool,
 }
 
-fn list(
+fn list<T>(
     conn: &Connection,
     select: &str,
     filter: &str,
-    read: fn(&Row) -> rusqlite::Result<Value>,
-) -> Data {
+    read: fn(&Row) -> rusqlite::Result<T>,
+) -> Result<Json<Vec<T>>> {
     let mut stmt = conn.prepare_cached(&format!("{select} {filter} ORDER BY id"))?;
     let values = stmt.query_map([], read)?.collect::<rusqlite::Result<_>>()?;
-    Ok(Json(Value::Array(values)))
+    Ok(Json(values))
 }
 
 fn catalog_error(err: rusqlite::Error) -> Error {
@@ -111,15 +106,77 @@ async fn set_archived(app: App, table: &'static str, id: i64, archive: bool) -> 
         .await
 }
 
+/// 归档供应商
+///
+/// 保留已有记录，并清除因此失效的默认模型配置。
+#[utoipa::path(
+    delete,
+    path = "/providers/{id}",
+    tag = "供应商",
+    params(("id" = i64, Path, description = "供应商 ID")),
+    responses(
+        (status = 204, description = "操作成功，无响应体", ),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
 async fn archive_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
     set_archived(app, "llm_providers", id, true).await
 }
+/// 恢复供应商
+///
+/// 存在重名的可用记录时返回 409。
+#[utoipa::path(
+    post,
+    path = "/providers/{id}/restore",
+    tag = "供应商",
+    params(("id" = i64, Path, description = "供应商 ID")),
+    responses(
+        (status = 204, description = "操作成功，无响应体", ),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
 async fn restore_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
     set_archived(app, "llm_providers", id, false).await
 }
+/// 归档模型
+///
+/// 保留已有记录，并清除因此失效的默认模型配置。
+#[utoipa::path(
+    delete,
+    path = "/models/{id}",
+    tag = "模型",
+    params(("id" = i64, Path, description = "模型 ID")),
+    responses(
+        (status = 204, description = "操作成功，无响应体", ),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
 async fn archive_model(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
     set_archived(app, "llm_models", id, true).await
 }
+/// 恢复模型
+///
+/// 存在重名的可用记录时返回 409。
+#[utoipa::path(
+    post,
+    path = "/models/{id}/restore",
+    tag = "模型",
+    params(("id" = i64, Path, description = "模型 ID")),
+    responses(
+        (status = 204, description = "操作成功，无响应体", ),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
 async fn restore_model(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
     set_archived(app, "llm_models", id, false).await
 }
@@ -138,31 +195,79 @@ pub fn available_capabilities(conn: &Connection, id: i64) -> Result<(Value, Valu
     Ok((modalities, efforts))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Provider {
     name: String,
+    /// HTTP(S) 地址，禁止凭据、查询参数或片段。
     base_url: String,
+    /// PATCH 时省略表示保留，传空字符串或 null 清除密钥。
+    #[schema(write_only)]
     api_key: Option<String>,
 }
 
 const PROVIDER: &str =
     "SELECT id,name,base_url,coalesce(api_key,'')<>'',archived_at FROM llm_providers";
 
-fn public_provider(row: &Row) -> rusqlite::Result<Value> {
-    Ok(
-        json!({"id": row.get::<_,i64>(0)?, "name": row.get::<_,String>(1)?,
-        "base_url": row.get::<_,String>(2)?, "has_api_key": row.get::<_,bool>(3)?, "archived_at": row.get::<_,Option<i64>>(4)?}),
-    )
+#[derive(Serialize, utoipa::ToSchema)]
+struct ProviderInfo {
+    id: i64,
+    name: String,
+    base_url: String,
+    /// 仅公开是否已设置密钥。
+    has_api_key: bool,
+    /// 归档时间（Unix 毫秒）。
+    #[schema(required)]
+    archived_at: Option<i64>,
 }
 
-async fn get_provider(State(app): State<App>, Path(id): Path<i64>) -> Data {
+fn public_provider(row: &Row) -> rusqlite::Result<ProviderInfo> {
+    Ok(ProviderInfo {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        base_url: row.get(2)?,
+        has_api_key: row.get(3)?,
+        archived_at: row.get(4)?,
+    })
+}
+
+/// 读取供应商
+#[utoipa::path(
+    get,
+    path = "/providers/{id}",
+    tag = "供应商",
+    params(("id" = i64, Path, description = "供应商 ID")),
+    responses(
+        (status = 200, description = "读取供应商", body = ProviderInfo),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
+async fn get_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<ProviderInfo>> {
     app.db
         .call(move |s| Ok(Json(record(&s.conn, PROVIDER, id, public_provider)?)))
         .await
 }
 
-async fn list_providers(State(app): State<App>, Query(opts): Query<ListOptions>) -> Data {
+/// 查询供应商列表
+///
+/// 按 ID 升序返回，默认隐藏归档记录。
+#[utoipa::path(
+    get,
+    path = "/providers",
+    tag = "供应商",
+    params(ListOptions),
+    responses(
+        (status = 200, description = "查询供应商列表", body = Vec<ProviderInfo>),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        crate::docs::ServiceErrors
+    )
+)]
+async fn list_providers(
+    State(app): State<App>,
+    Query(opts): Query<ListOptions>,
+) -> Result<Json<Vec<ProviderInfo>>> {
     let filter = if opts.include_archived {
         ""
     } else {
@@ -173,12 +278,12 @@ async fn list_providers(State(app): State<App>, Query(opts): Query<ListOptions>)
         .await
 }
 
-async fn save(
+async fn save<T: Send + 'static>(
     app: App,
     id: Option<i64>,
     fields: Document,
-    apply: fn(&Connection, Option<i64>, Document) -> Result<Value>,
-) -> Data {
+    apply: fn(&Connection, Option<i64>, Document) -> Result<T>,
+) -> Result<Json<T>> {
     app.db
         .write(
             move |conn| apply(conn, id, fields),
@@ -187,7 +292,7 @@ async fn save(
         .await
 }
 
-fn save_provider(conn: &Connection, id: Option<i64>, fields: Document) -> Result<Value> {
+fn save_provider(conn: &Connection, id: Option<i64>, fields: Document) -> Result<ProviderInfo> {
     let old = id
         .map(|id| {
             conn.query_row(
@@ -230,29 +335,69 @@ fn save_provider(conn: &Connection, id: Option<i64>, fields: Document) -> Result
     record(conn, PROVIDER, id, public_provider)
 }
 
+/// 创建供应商
+#[utoipa::path(
+    post,
+    path = "/providers",
+    tag = "供应商",
+    request_body(content = Provider, example = json!({"name":"本机服务","base_url":"http://127.0.0.1:8080/v1"})),
+    responses(
+        (status = 201, description = "创建成功", body = ProviderInfo),
+        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
+        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
+        crate::docs::ServiceErrors,
+        crate::docs::JsonBodyErrors
+    )
+)]
 async fn create_provider(
     State(app): State<App>,
     fields: Document,
-) -> Result<(StatusCode, Json<Value>)> {
+) -> Result<(StatusCode, Json<ProviderInfo>)> {
     Ok((
         StatusCode::CREATED,
         save(app, None, fields, save_provider).await?,
     ))
 }
 
-async fn patch_provider(State(app): State<App>, Path(id): Path<i64>, fields: Document) -> Data {
+/// 更新供应商
+///
+/// 只传需要修改的字段，至少一项。可空字段接受 null。
+#[utoipa::path(
+    patch,
+    path = "/providers/{id}",
+    tag = "供应商",
+    params(("id" = i64, Path, description = "供应商 ID")),
+    request_body = ProviderPatch,
+    responses(
+        (status = 200, description = "更新供应商", body = ProviderInfo),
+        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
+        crate::docs::ServiceErrors,
+        crate::docs::JsonBodyErrors
+    )
+)]
+async fn patch_provider(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    fields: Document,
+) -> Result<Json<ProviderInfo>> {
     save(app, Some(id), fields, save_provider).await
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Model {
     provider_id: i64,
     model_key: String,
+    #[schema(minimum = 1)]
     context_window_tokens: Option<i64>,
+    /// 允许 text、image、audio、video，至少一项且不得重复。
+    #[schema(min_items = 1)]
     input_modalities: Vec<String>,
     #[serde(default)]
     reasoning_efforts: Vec<String>,
+    #[schema(value_type = Option<pricing::PriceBook>)]
     pricing: Option<Value>,
 }
 
@@ -369,21 +514,75 @@ impl Model {
     }
 }
 
-fn public_model(row: &Row) -> rusqlite::Result<Value> {
-    let mut value = json!(Model::read(row)?);
-    value["id"] = json!(row.get::<_, i64>(0)?);
-    value["archived_at"] = json!(row.get::<_, Option<i64>>(7)?);
-    value["provider_archived_at"] = json!(row.get::<_, Option<i64>>(8)?);
-    Ok(value)
+#[derive(Serialize, utoipa::ToSchema)]
+struct ModelInfo {
+    id: i64,
+    provider_id: i64,
+    model_key: String,
+    #[schema(required)]
+    context_window_tokens: Option<i64>,
+    input_modalities: Vec<String>,
+    reasoning_efforts: Vec<String>,
+    #[schema(required, value_type = Option<pricing::PriceBook>)]
+    pricing: Option<Value>,
+    #[schema(required)]
+    archived_at: Option<i64>,
+    #[schema(required)]
+    provider_archived_at: Option<i64>,
 }
 
-async fn get_model(State(app): State<App>, Path(id): Path<i64>) -> Data {
+fn public_model(row: &Row) -> rusqlite::Result<ModelInfo> {
+    let model = Model::read(row)?;
+    Ok(ModelInfo {
+        id: row.get(0)?,
+        provider_id: model.provider_id,
+        model_key: model.model_key,
+        context_window_tokens: model.context_window_tokens,
+        input_modalities: model.input_modalities,
+        reasoning_efforts: model.reasoning_efforts,
+        pricing: model.pricing,
+        archived_at: row.get(7)?,
+        provider_archived_at: row.get(8)?,
+    })
+}
+
+/// 读取模型
+#[utoipa::path(
+    get,
+    path = "/models/{id}",
+    tag = "模型",
+    params(("id" = i64, Path, description = "模型 ID")),
+    responses(
+        (status = 200, description = "读取模型", body = ModelInfo),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        crate::docs::ServiceErrors
+    )
+)]
+async fn get_model(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<ModelInfo>> {
     app.db
         .call(move |s| Ok(Json(record(&s.conn, MODEL, id, public_model)?)))
         .await
 }
 
-async fn list_models(State(app): State<App>, Query(opts): Query<ListOptions>) -> Data {
+/// 查询模型列表
+///
+/// 按 ID 升序返回，默认隐藏归档记录。
+#[utoipa::path(
+    get,
+    path = "/models",
+    tag = "模型",
+    params(ListOptions),
+    responses(
+        (status = 200, description = "查询模型列表", body = Vec<ModelInfo>),
+        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
+        crate::docs::ServiceErrors
+    )
+)]
+async fn list_models(
+    State(app): State<App>,
+    Query(opts): Query<ListOptions>,
+) -> Result<Json<Vec<ModelInfo>>> {
     let filter = if opts.include_archived {
         ""
     } else {
@@ -394,7 +593,7 @@ async fn list_models(State(app): State<App>, Query(opts): Query<ListOptions>) ->
         .await
 }
 
-fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<Value> {
+fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<ModelInfo> {
     let old = id
         .map(|id| record(conn, MODEL, id, Model::read))
         .transpose()?;
@@ -435,16 +634,52 @@ fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<Va
     record(conn, MODEL, id, public_model)
 }
 
+/// 创建模型
+#[utoipa::path(
+    post,
+    path = "/models",
+    tag = "模型",
+    request_body(content = Model, example = json!({"provider_id":1,"model_key":"my-model","input_modalities":["text"]})),
+    responses(
+        (status = 201, description = "创建成功", body = ModelInfo),
+        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
+        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
+        crate::docs::ServiceErrors,
+        crate::docs::JsonBodyErrors
+    )
+)]
 async fn create_model(
     State(app): State<App>,
     fields: Document,
-) -> Result<(StatusCode, Json<Value>)> {
+) -> Result<(StatusCode, Json<ModelInfo>)> {
     Ok((
         StatusCode::CREATED,
         save(app, None, fields, save_model).await?,
     ))
 }
 
-async fn patch_model(State(app): State<App>, Path(id): Path<i64>, fields: Document) -> Data {
+/// 更新模型
+///
+/// 只传需要修改的字段，至少一项。可空字段接受 null。
+#[utoipa::path(
+    patch,
+    path = "/models/{id}",
+    tag = "模型",
+    params(("id" = i64, Path, description = "模型 ID")),
+    request_body = ModelPatch,
+    responses(
+        (status = 200, description = "更新模型", body = ModelInfo),
+        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
+        (status = 404, description = "记录不存在", body = crate::ErrorBody),
+        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
+        crate::docs::ServiceErrors,
+        crate::docs::JsonBodyErrors
+    )
+)]
+async fn patch_model(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    fields: Document,
+) -> Result<Json<ModelInfo>> {
     save(app, Some(id), fields, save_model).await
 }

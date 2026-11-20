@@ -7,13 +7,23 @@ use serde_json::{Value, json};
 
 use crate::{Error, Result};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct PriceBook {
+pub struct PriceBook {
+    /// 只接受 UTC。
+    #[schema(pattern = "^UTC$", example = "UTC")]
     timezone: String,
+    #[schema(min_items = 1)]
     versions: Vec<Version>,
     #[serde(flatten)]
     calendar: Calendar,
+}
+
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+enum EffectiveFrom {
+    UnixMillis(i64),
+    Timestamp(String),
 }
 
 impl PriceBook {
@@ -27,10 +37,12 @@ impl PriceBook {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Version {
-    effective_from: Value,
+    /// 生效时刻，RFC3339 字符串或 Unix 毫秒时间戳。
+    effective_from: EffectiveFrom,
+    #[schema(min_items = 1)]
     default_tiers: Vec<Tier>,
     #[serde(default)]
     periods: Vec<Period>,
@@ -38,31 +50,39 @@ struct Version {
     calendar: Calendar,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct Calendar {
     holiday_dates: Option<Vec<String>>,
     covered_years: Option<Vec<i32>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Period {
-    weekdays: Vec<u8>, // ISO weekday, Monday = 1.
+    /// ISO 星期，星期一为 1，星期日为 7。
+    #[schema(min_items = 1)]
+    weekdays: Vec<u8>,
+    /// 起始分钟（含）。
+    #[schema(maximum = 1439)]
     start_minute: u16,
+    /// 结束分钟（不含），必须大于起始分钟。
+    #[schema(minimum = 1, maximum = 1440)]
     end_minute: u16,
     #[serde(default)]
     exclude_holidays: bool,
     tiers: Vec<Tier>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Tier {
+    /// 输入 token 数的闭区间上限。末档为 null，表示无上限。
     up_to_input_tokens: Option<i64>,
+    /// 每百万 token 的美元单价，使用非负十进制字符串。
     rates: Rates,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Rates {
     input: Option<String>,
@@ -71,13 +91,13 @@ struct Rates {
     output: Option<String>,
 }
 
-fn effective_from(value: &Value) -> Option<DateTime<Utc>> {
-    if let Some(ms) = value.as_i64() {
-        return DateTime::from_timestamp_millis(ms);
+fn effective_from(value: &EffectiveFrom) -> Option<DateTime<Utc>> {
+    match value {
+        EffectiveFrom::UnixMillis(ms) => DateTime::from_timestamp_millis(*ms),
+        EffectiveFrom::Timestamp(text) => DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|at| at.to_utc()),
     }
-    DateTime::parse_from_rfc3339(value.as_str()?)
-        .ok()
-        .map(|at| at.to_utc())
 }
 
 impl Calendar {
@@ -207,6 +227,27 @@ pub fn validate(pricing: &Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+struct PeriodRule<'a> {
+    weekdays: &'a [u8],
+    start_minute: u16,
+    end_minute: u16,
+    exclude_holidays: bool,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct PricingSnapshot<'a> {
+    timezone: &'a str,
+    effective_from: &'a EffectiveFrom,
+    #[schema(required)]
+    period_index: Option<usize>,
+    #[schema(required)]
+    period: Option<PeriodRule<'a>>,
+    tiers: &'a [Tier],
+    #[schema(required)]
+    matched_tier_index: Option<usize>,
+}
+
 pub fn snapshot(pricing: &Value, at_ms: i64) -> Option<Value> {
     let book = PriceBook::parse(pricing).ok()?;
     let at = DateTime::from_timestamp_millis(at_ms)?;
@@ -219,7 +260,7 @@ pub fn snapshot(pricing: &Value, at_ms: i64) -> Option<Value> {
     let weekday = at.weekday().number_from_monday() as u8;
     let minute = (at.hour() * 60 + at.minute()) as u16;
     let mut period_index = None;
-    let mut period_rule = Value::Null;
+    let mut period_rule = None;
     let mut tiers = &version.default_tiers;
     for (i, period) in version.periods.iter().enumerate() {
         if !period.weekdays.contains(&weekday)
@@ -240,22 +281,22 @@ pub fn snapshot(pricing: &Value, at_ms: i64) -> Option<Value> {
             }
         }
         period_index = Some(i);
-        period_rule = json!({
-            "weekdays": period.weekdays,
-            "start_minute": period.start_minute,
-            "end_minute": period.end_minute,
-            "exclude_holidays": period.exclude_holidays,
+        period_rule = Some(PeriodRule {
+            weekdays: &period.weekdays,
+            start_minute: period.start_minute,
+            end_minute: period.end_minute,
+            exclude_holidays: period.exclude_holidays,
         });
         tiers = &period.tiers;
         break;
     }
-    Some(json!({
-        "timezone": book.timezone,
-        "effective_from": version.effective_from,
-        "period_index": period_index,
-        "period": period_rule,
-        "tiers": tiers,
-        "matched_tier_index": Value::Null,
+    Some(json!(PricingSnapshot {
+        timezone: &book.timezone,
+        effective_from: &version.effective_from,
+        period_index,
+        period: period_rule,
+        tiers,
+        matched_tier_index: None,
     }))
 }
 

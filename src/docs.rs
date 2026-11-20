@@ -4,6 +4,57 @@ use utoipa::openapi::{
     security::{Http, HttpAuthScheme, SecurityRequirement, SecurityScheme},
 };
 
+/// 部分更新沿用完整对象的字段类型与可空性，每个字段均可省略。
+/// 处理函数在数据库事务里把传入字段合并到当前值后校验。
+pub struct Patch<T>(std::marker::PhantomData<T>);
+
+type Schema = utoipa::openapi::RefOr<utoipa::openapi::Schema>;
+
+impl<T: utoipa::ToSchema> utoipa::PartialSchema for Patch<T> {
+    fn schema() -> Schema {
+        let mut schema = T::schema();
+        if let Schema::T(utoipa::openapi::Schema::Object(object)) = &mut schema {
+            object.required.clear();
+            object.min_properties = Some(1);
+        }
+        schema
+    }
+}
+
+impl<T: utoipa::ToSchema> utoipa::ToSchema for Patch<T> {
+    fn name() -> std::borrow::Cow<'static, str> {
+        format!("{}Patch", T::name()).into()
+    }
+    fn schemas(schemas: &mut Vec<(String, Schema)>) {
+        T::schemas(schemas);
+    }
+}
+
+#[derive(utoipa::IntoResponses)]
+#[allow(dead_code)]
+pub enum ServiceErrors {
+    /// 缺少或无效的 Bearer token。
+    #[response(status = 401)]
+    Unauthorized(crate::ErrorBody),
+    /// 服务内部错误。
+    #[response(status = 500)]
+    Internal(crate::ErrorBody),
+}
+
+#[derive(utoipa::IntoResponses)]
+#[allow(dead_code)]
+pub enum JsonBodyErrors {
+    /// 请求体超过大小限制。
+    #[response(status = 413, content_type = "text/plain")]
+    TooLarge(String),
+    /// 请求体需要 application/json。
+    #[response(status = 415, content_type = "text/plain")]
+    MediaType(String),
+    /// JSON 结构与请求对象不匹配。
+    #[response(status = 422, content_type = "text/plain")]
+    InvalidType(String),
+}
+
 const PAGE: &str = r#"<!doctype html>
 <html lang="zh-CN">
 <head>
