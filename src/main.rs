@@ -1,8 +1,12 @@
 mod agent;
 mod api;
+mod calls;
+mod catalog;
 mod daemon;
 mod events;
+mod media;
 mod model;
+mod pricing;
 #[cfg(unix)]
 mod socket;
 mod store;
@@ -141,6 +145,8 @@ async fn run(
     let app = App {
         db: Db::open(Path::new("mygo-bot.sqlite3"))?,
         client: reqwest::Client::builder()
+            // Each retry gets its own llm_calls row in the worker loop.
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,

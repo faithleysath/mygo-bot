@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -47,6 +47,9 @@ pub async fn authorize_tcp(
 
 pub fn routes(app: App) -> Router {
     Router::new()
+        .merge(crate::catalog::routes())
+        .merge(crate::media::routes())
+        .merge(crate::calls::routes())
         .route("/config", get(get_config).patch(patch_config))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/{sid}", get(get_session).patch(patch_session))
@@ -64,125 +67,115 @@ pub fn routes(app: App) -> Router {
 
 type Document = Json<Map<String, Value>>;
 type Data = Result<Json<Value>>;
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-    pub instructions: String,
-    pub default_reasoning_effort: Option<String>,
+struct Selection {
+    model_id: Option<i64>,
+    reasoning_effort: Option<String>,
 }
-impl Config {
-    pub fn load(conn: &Connection) -> Result<Option<Self>> {
-        let sql = "SELECT base_url,api_key,model,instructions,default_reasoning_effort
-                   FROM config WHERE id=1";
-        Ok(conn
-            .query_row(sql, [], |r| {
-                Ok(Self {
-                    base_url: r.get(0)?,
-                    api_key: r.get(1)?,
-                    model: r.get(2)?,
-                    instructions: r.get(3)?,
-                    default_reasoning_effort: r.get(4)?,
-                })
-            })
-            .optional()?)
+
+impl Selection {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            model_id: row.get(0)?,
+            reasoning_effort: row.get(1)?,
+        })
     }
-    fn public(self) -> Value {
-        json!({"configured":true,"base_url":self.base_url,"model":self.model,"instructions":self.instructions,"has_api_key":!self.api_key.is_empty(),"default_reasoning_effort":self.default_reasoning_effort})
+
+    fn defaults(conn: &Connection) -> Result<Self> {
+        Ok(conn.query_row(
+            "SELECT default_model_id,default_reasoning_effort FROM config WHERE id=1",
+            [],
+            Self::read,
+        )?)
+    }
+
+    fn apply(self, fields: Map<String, Value>) -> Result<Self> {
+        let mut data = json!(self);
+        if fields.get("model_id").is_some_and(Value::is_null) {
+            data["reasoning_effort"] = Value::Null;
+        }
+        data.as_object_mut().unwrap().extend(fields);
+        serde_json::from_value(data).map_err(|e| Error::bad(e.to_string()))
+    }
+
+    fn validate(&self, conn: &Connection) -> Result<Option<Value>> {
+        let Some(id) = self.model_id else {
+            if self.reasoning_effort.is_some() {
+                return Err(Error::bad(
+                    "select a model before specifying reasoning effort",
+                ));
+            }
+            return Ok(None);
+        };
+        let (modalities, efforts): (Value, Value) = conn.query_row(
+            "SELECT input_modalities,reasoning_efforts FROM llm_models WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get::<_, Value>(1)?)),
+        )?;
+        if let Some(effort) = &self.reasoning_effort
+            && !efforts
+                .as_array()
+                .is_some_and(|opts| opts.iter().any(|v| v.as_str() == Some(effort)))
+        {
+            return Err(Error::bad(format!(
+                "model {id} does not support effort {effort}; available: {efforts}"
+            )));
+        }
+        Ok(Some(modalities))
+    }
+
+    fn config(&self) -> Value {
+        json!({"default_model_id":self.model_id,"default_reasoning_effort":self.reasoning_effort})
     }
 }
-fn validate_effort(e: Option<&str>) -> Result<()> {
-    if matches!(e, None | Some("low" | "high" | "max")) {
-        Ok(())
-    } else {
-        Err(Error::bad("expected low, high, max or null"))
-    }
-}
+
 async fn get_config(State(app): State<App>) -> Data {
     app.db
-        .call(|s| {
-            Ok(Json(
-                Config::load(&s.conn)?
-                    .map(Config::public)
-                    .unwrap_or(json!({"configured":false})),
-            ))
-        })
+        .call(|s| Ok(Json(Selection::defaults(&s.conn)?.config())))
         .await
 }
 async fn patch_config(State(app): State<App>, Json(fields): Document) -> Data {
-    if fields.is_empty() {
+    let mut selection = Map::new();
+    for (key, value) in fields {
+        let field = match key.as_str() {
+            "default_model_id" => "model_id",
+            "default_reasoning_effort" => "reasoning_effort",
+            _ => return Err(Error::bad("unknown configuration field")),
+        };
+        selection.insert(field.into(), value);
+    }
+    if selection.is_empty() {
         return Err(Error::bad("expected configuration fields"));
     }
     app.db
         .call(move |s| {
-            let mut value = json!(Config::load(&s.conn)?.unwrap_or_default());
-            value.as_object_mut().unwrap().extend(fields);
-            let cfg: Config =
-                serde_json::from_value(value).map_err(|e| Error::bad(e.to_string()))?;
-            let url =
-                reqwest::Url::parse(&cfg.base_url).map_err(|_| Error::bad("invalid base_url"))?;
-            if !matches!(url.scheme(), "http" | "https")
-                || url.host().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || cfg.model.trim().is_empty()
-            {
-                return Err(Error::bad("expected model name and HTTP(S) base_url"));
-            }
-            validate_effort(cfg.default_reasoning_effort.as_deref())?;
+            let next = Selection::defaults(&s.conn)?.apply(selection)?;
+            next.validate(&s.conn)?;
             s.conn.execute(
-                "INSERT OR REPLACE INTO config VALUES(1,?,?,?,?,?)",
-                params![
-                    cfg.base_url,
-                    cfg.api_key,
-                    cfg.model,
-                    cfg.instructions,
-                    cfg.default_reasoning_effort
-                ],
+                "UPDATE config SET default_model_id=?, default_reasoning_effort=? WHERE id=1",
+                params![next.model_id, next.reasoning_effort],
             )?;
-            Ok(Json(cfg.public()))
+            Ok(Json(next.config()))
         })
         .await
 }
 
-fn effort_field(mut fields: Map<String, Value>) -> Result<Option<Option<String>>> {
-    let effort = fields
-        .remove("reasoning_effort")
-        .map(serde_json::from_value::<Option<String>>)
-        .transpose()
-        .map_err(|e| Error::bad(e.to_string()))?;
-    if !fields.is_empty() {
-        return Err(Error::bad("unknown session setting"));
-    }
-    validate_effort(effort.as_ref().and_then(|x| x.as_deref()))?;
-    Ok(effort)
-}
 async fn create_session(
     State(app): State<App>,
     body: Option<Document>,
 ) -> Result<(StatusCode, Json<Value>)> {
-    let effort = effort_field(body.map(|x| x.0).unwrap_or_default())?;
+    let fields = body.map(|x| x.0).unwrap_or_default();
     let created = app
         .db
         .write(
             move |conn| {
-                let effort = match effort {
-                    Some(e) => e,
-                    None => conn
-                        .query_row(
-                            "SELECT default_reasoning_effort FROM config WHERE id=1",
-                            [],
-                            |r| r.get(0),
-                        )
-                        .optional()?
-                        .flatten(),
-                };
-                conn.prepare_cached("INSERT INTO sessions(reasoning_effort) VALUES(?)")?
-                    .execute([effort])?;
+                let next = Selection::defaults(conn)?.apply(fields)?;
+                next.validate(conn)?;
+                conn.execute(
+                    "INSERT INTO sessions(model_id,reasoning_effort) VALUES(?,?)",
+                    params![next.model_id, next.reasoning_effort],
+                )?;
                 session(conn, conn.last_insert_rowid())
             },
             |_, created| Ok(created),
@@ -193,16 +186,49 @@ async fn create_session(
 async fn get_session(State(app): State<App>, Path(sid): Path<i64>) -> Data {
     app.db.call(move |s| Ok(Json(session(&s.conn, sid)?))).await
 }
-async fn patch_session(State(app): State<App>, Path(sid): Path<i64>, Json(body): Document) -> Data {
-    let effort = effort_field(body)?.ok_or_else(|| Error::bad("expected reasoning_effort"))?;
+async fn patch_session(
+    State(app): State<App>,
+    Path(sid): Path<i64>,
+    Json(fields): Document,
+) -> Data {
+    if fields.is_empty() {
+        return Err(Error::bad("expected session settings"));
+    }
     app.db
-        .call(move |s| {
-            s.conn.execute(
-                "UPDATE sessions SET reasoning_effort=? WHERE id=?",
-                (effort, sid),
-            )?;
-            Ok(Json(session(&s.conn, sid)?))
-        })
+        .write(
+            move |conn| {
+                let current = conn.query_row(
+                    "SELECT model_id,reasoning_effort FROM sessions WHERE id=?",
+                    [sid],
+                    Selection::read,
+                )?;
+                let old_id = current.model_id;
+                let next = current.apply(fields)?;
+                let modalities = next.validate(conn)?;
+                if next.model_id != old_id {
+                    if let Some(modalities) = modalities {
+                        crate::media::check_session(conn, sid, &modalities)?;
+                    } else {
+                        let has_context: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM context_items WHERE session_id=?1
+                     UNION ALL SELECT 1 FROM pending WHERE session_id=?1
+                     UNION ALL SELECT 1 FROM items WHERE session_id=?1 AND kind='function_call')",
+                            [sid],
+                            |r| r.get(0),
+                        )?;
+                        if has_context {
+                            return Err(Error::conflict("only an empty session may have no model"));
+                        }
+                    }
+                }
+                conn.execute(
+                    "UPDATE sessions SET model_id=?,reasoning_effort=? WHERE id=?",
+                    params![next.model_id, next.reasoning_effort, sid],
+                )?;
+                session(conn, sid)
+            },
+            |_, updated| Ok(Json(updated)),
+        )
         .await
 }
 
@@ -230,7 +256,7 @@ async fn list_sessions(State(app): State<App>, Query(page): Query<Page>) -> Data
     page.check()?;
     app.db
         .call(move |s| {
-            let sql = "SELECT id,status,reasoning_effort,last_error FROM sessions
+            let sql = "SELECT id,status,reasoning_effort,last_error,model_id FROM sessions
                    WHERE id>? ORDER BY id LIMIT ?";
             let mut stmt = s.conn.prepare_cached(sql)?;
             let rows = stmt
@@ -244,7 +270,7 @@ async fn list_sessions(State(app): State<App>, Query(page): Query<Page>) -> Data
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Message {
-    text: String,
+    content: Value,
 }
 async fn enqueue(
     State(app): State<App>,
@@ -252,9 +278,6 @@ async fn enqueue(
     headers: HeaderMap,
     Json(message): Json<Message>,
 ) -> Result<(StatusCode, Json<Value>)> {
-    if message.text.trim().is_empty() {
-        return Err(Error::bad("text is required"));
-    }
     let mut keys = headers.get_all("idempotency-key").iter();
     let key = keys
         .next()
@@ -268,7 +291,7 @@ async fn enqueue(
     if keys.next().is_some() || key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
         return Err(Error::bad("invalid idempotency key"));
     }
-    let (status, id) = match app.db.enqueue(sid, message.text, key).await? {
+    let (status, id) = match app.db.enqueue(sid, message.content, key).await? {
         store::Enqueued::Created(id) => (StatusCode::CREATED, id),
         store::Enqueued::Existing(id) => (StatusCode::OK, id),
     };
@@ -322,7 +345,7 @@ async fn messages(State(app): State<App>, Path(sid): Path<i64>, Query(q): Query<
                 .query_map(args, |r| {
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?,
-                        "text": r.get::<_, String>(1)?,
+                        "content": r.get::<_, Value>(1)?,
                         "status": r.get::<_, String>(2)?
                     }))
                 })?
@@ -347,7 +370,7 @@ async fn withdraw(
                 return Err(Error::conflict("message already included"));
             }
             if !withdrawn {
-                let id = store::add_item(&s.conn, sid, "withdrawal", &json!({}), Some(mid))?;
+                let id = store::add_item(&s.conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
                 s.item_saved(sid, id)?;
             }
             Ok(StatusCode::NO_CONTENT)

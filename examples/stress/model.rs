@@ -93,12 +93,18 @@ async fn respond(State(model): State<Model>, Json(request): Json<Value>) -> Resp
     }
 }
 
+fn user_text(message: &Value) -> Result<&str> {
+    check(message["role"] == "user", "expected a user message")?;
+    let Some([block]) = message["content"].as_array().map(Vec::as_slice) else {
+        return Err("expected one user content block".into());
+    };
+    check(block["type"] == "input_text", "expected input_text block")?;
+    Ok(block["text"].as_str().ok_or("missing user text")?)
+}
+
 async fn reply(model: Model, request: Value) -> Result<Response> {
     let input = request["input"].as_array().ok_or("missing input")?;
-    let key = input
-        .first()
-        .and_then(|v| v["content"].as_str())
-        .ok_or("missing user message")?;
+    let key = user_text(input.first().ok_or("missing user message")?)?;
     let control = model
         .0
         .lock()
@@ -125,7 +131,7 @@ async fn reply(model: Model, request: Value) -> Result<Response> {
         "long-context" => {
             check(input.len() == 9, "missing context items")?;
             for (i, v) in input.iter().skip(1).enumerate() {
-                let text = v["content"].as_str().ok_or("missing context text")?;
+                let text = user_text(v)?;
                 check(
                     text.len() == 16385
                         && text.starts_with(&i.to_string())
@@ -136,9 +142,15 @@ async fn reply(model: Model, request: Value) -> Result<Response> {
         }
         "multi-turn" | "enqueue-running" => {
             check(input.len() == 2 * attempt - 1, "wrong history length")?;
-            for (i, v) in input.iter().enumerate() {
-                let role = if i % 2 == 0 { "user" } else { "assistant" };
-                check(v["role"] == role, "wrong history order")?;
+            for (i, v) in input.iter().enumerate().skip(1) {
+                if i % 2 == 0 {
+                    check(
+                        user_text(v)? == "next round",
+                        "wrong user message in history",
+                    )?;
+                } else {
+                    check(v["role"] == "assistant", "wrong history order")?;
+                }
             }
         }
         "tools" if attempt == 1 => {

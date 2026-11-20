@@ -1,8 +1,7 @@
 use crate::{
-    App, Error, Result,
-    api::Config,
+    App, Error, Result, calls,
     events::Notice,
-    model::{self, Failure, Input},
+    model::{self, Failure},
     store::{self, Store, session},
 };
 use axum::{
@@ -34,6 +33,9 @@ pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<
             sid,
             move |conn, active| {
                 let current = session(conn, sid)?;
+                if current["model_id"].is_null() {
+                    return Err(Error::conflict("select a session model before running"));
+                }
                 if current["status"] == "pausing" {
                     return Err(Error::conflict("session is pausing"));
                 }
@@ -53,9 +55,6 @@ pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<
                         return Ok((session(conn, sid)?, StartEffect::Idle));
                     }
                     return Ok((current, StartEffect::None));
-                }
-                if Config::load(conn)?.is_none() {
-                    return Err(Error::conflict("configure the model first"));
                 }
                 let recovered = if unfinished {
                     store::publish_tools(conn, sid, true)?
@@ -212,13 +211,10 @@ impl App {
                     }
                     let tx = s.conn.transaction()?;
                     store::take_pending(&tx, sid)?;
-                    let config = Config::load(&tx)?
-                        .ok_or_else(|| Error::conflict("model configuration missing"))?;
-                    let (effort, needed) = tx.query_row(
-                        "SELECT reasoning_effort, needs_model FROM sessions WHERE id=?",
-                        [sid],
-                        |r| Ok((r.get(0)?, r.get::<_, bool>(1)?)),
-                    )?;
+                    let needed: bool =
+                        tx.query_row("SELECT needs_model FROM sessions WHERE id=?", [sid], |r| {
+                            r.get(0)
+                        })?;
                     // A queued message can be withdrawn before this worker takes it.
                     if !needed {
                         tx.commit()?;
@@ -231,23 +227,41 @@ impl App {
                         [sid],
                         |r| r.get(0),
                     )?;
+                    let input = calls::begin(&tx, sid, end)?;
                     tx.commit()?;
-                    Ok(Some(Input {
-                        config,
-                        effort,
-                        end,
-                    }))
+                    Ok(Some(input))
                 })
                 .await?;
             let Some(input) = input else {
                 return Ok(());
             };
             attempt += 1;
+            let call_id = input.call_id;
             let mut output = model::Output::default();
             let streamed = tokio::select! {
                 biased;
-                _ = control.hard.cancelled() => Err(Failure::Fatal(Error::conflict("paused"))),
+                _ = control.hard.cancelled() => Err(Failure::Cancelled),
                 result = self.stream(sid, input, &mut output, &control.hard) => result,
+            };
+            let finished_at = chrono::Utc::now().timestamp_millis();
+            let report = std::mem::take(&mut output.report);
+            // The buffered terminal reply and its billing record can commit together.
+            let final_report = if output.final_item.is_some() {
+                Some(report)
+            } else {
+                let (status, reason) = match &streamed {
+                    Ok(()) => ("succeeded", None),
+                    Err(Failure::Cancelled) => ("cancelled", Some("request cancelled locally")),
+                    Err(Failure::Transient(_)) => (
+                        "failed",
+                        Some("upstream connection or temporary response error"),
+                    ),
+                    Err(Failure::Fatal(_)) => ("failed", Some("model request failed")),
+                };
+                self.db
+                    .call(move |s| report.finish(&s.conn, call_id, status, reason, finished_at))
+                    .await?;
+                None
             };
             // Tool writes outlive a transient upstream disconnect. Publish only once all finish.
             while let Some(result) = output.tasks.join_next().await {
@@ -288,6 +302,7 @@ impl App {
                 Err(Failure::Transient(reason)) => {
                     return Err(Error::internal(format!("retry limit reached: {reason}")));
                 }
+                Err(Failure::Cancelled) => return Err(Error::conflict("paused")),
                 Err(Failure::Fatal(err)) => return Err(err),
                 Ok(()) if !output.answer && !output.tools => {
                     return Err(Error::internal(
@@ -306,12 +321,16 @@ impl App {
                         if tools {
                             store::publish_tools(conn, sid, false)?;
                         }
+                        if let Some(report) = final_report {
+                            report.finish(conn, call_id, "succeeded", None, finished_at)?;
+                        }
                         let saved = if let Some(item) = output.final_item {
                             Some(store::add_context_item(
                                 conn,
                                 sid,
                                 "assistant_message",
                                 &item,
+                                call_id,
                             )?)
                         } else {
                             None

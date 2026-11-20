@@ -1,13 +1,13 @@
 use crate::{
     App, Error, Result,
-    api::Config,
+    calls::Report,
     store::{self, Db},
     tools,
 };
 use futures_util::{StreamExt, TryStreamExt};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
-use serde_json::{Value, json, value::RawValue};
+use serde_json::{Value, json};
 use std::{io, time::Duration};
 use tokio::{
     task::JoinSet,
@@ -20,18 +20,23 @@ use tokio_util::{
 };
 
 pub struct Input {
-    pub config: Config,
+    pub call_id: i64,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
     pub effort: Option<String>,
     pub end: i64,
 }
 #[derive(Default)]
 pub struct Output {
+    pub report: Report,
     pub answer: bool,
     pub final_item: Option<Value>,
     pub tools: bool,
     pub tasks: JoinSet<Result<()>>,
 }
 pub enum Failure {
+    Cancelled,
     Transient(String),
     Fatal(Error),
 }
@@ -47,7 +52,8 @@ const IDLE: Duration = Duration::from_secs(60);
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 
 async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
-    let mut header = json!({"model":input.config.model,"instructions":input.config.instructions,"tools":tools::definitions(),"stream":true,"store":false});
+    let mut header =
+        json!({"model":input.model,"tools":tools::definitions(),"stream":true,"store":false});
     if let Some(e) = &input.effort {
         header["reasoning"] = json!({"effort":e});
     }
@@ -59,39 +65,51 @@ async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
         .await
 }
 #[derive(Deserialize)]
-struct Frame<'a> {
+struct Frame {
     #[serde(rename = "type")]
     kind: String,
     item: Option<Value>,
     message: Option<String>,
-    // Terminal events can repeat the entire output. Only error handling needs fields from it.
-    #[serde(borrow)]
-    response: Option<&'a RawValue>,
+    response: Option<ResponseMetadata>,
 }
 
-// Peek only at a complete terminal event already delivered to the decoder.
-// Fragmented, multiline or unfamiliar event layouts use the regular parser.
-fn completed_in_buffer(buffer: &[u8]) -> bool {
+// Responses terminal events may repeat the whole model output. Deserialize only billing metadata.
+#[derive(Deserialize)]
+struct ResponseMetadata {
+    id: Option<String>,
+    usage: Option<Value>,
+    error: Option<Value>,
+}
+impl Frame {
+    fn observe(&mut self, report: &mut Report) {
+        if let Some(r) = &mut self.response {
+            if let Some(id) = r.id.take() {
+                report.response_id = Some(id);
+            }
+            if let Some(usage) = r.usage.take() {
+                report.usage = Some(usage);
+            }
+        }
+    }
+}
+
+// Fragmented or multiline events use the regular parser.
+fn completed_in_buffer(buffer: &[u8]) -> Option<Frame> {
     let mut lines = buffer.split_inclusive(|&byte| byte == b'\n');
-    let Some(mut line) = lines.next() else {
-        return false;
-    };
+    let mut line = lines.next()?;
     if line.starts_with(b"event:") {
         if line.len() - 1 > FRAME_LIMIT || std::str::from_utf8(line).is_err() {
-            return false;
+            return None;
         }
-        let Some(next) = lines.next() else {
-            return false;
-        };
-        line = next;
+        line = lines.next()?;
     }
-    let Some(data) = line.strip_prefix(b"data:") else {
-        return false;
-    };
+    let data = line.strip_prefix(b"data:")?;
     if !matches!(lines.next(), Some(b"\n" | b"\r\n")) || line.len() - 1 > FRAME_LIMIT {
-        return false;
+        return None;
     }
-    serde_json::from_slice::<Frame>(data).is_ok_and(|f| f.kind == "response.completed")
+    serde_json::from_slice::<Frame>(data)
+        .ok()
+        .filter(|f| f.kind == "response.completed")
 }
 
 fn has_answer(item: &Value) -> bool {
@@ -117,19 +135,20 @@ impl App {
             .client
             .post(format!(
                 "{}/responses",
-                input.config.base_url.trim_end_matches('/')
+                input.base_url.trim_end_matches('/')
             ))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .body(body);
-        if !input.config.api_key.is_empty() {
-            request = request.bearer_auth(input.config.api_key);
+        if let Some(key) = input.api_key {
+            request = request.bearer_auth(key);
         }
         let res = timeout(Duration::from_secs(30), request.send())
             .await
             .map_err(|_| Failure::Transient("model response timeout".into()))?
             .map_err(|e| Failure::Transient(e.without_url().to_string()))?;
         let status = res.status();
+        out.report.http_status = Some(status.as_u16());
         if !status.is_success() {
             let reason = format!("model HTTP {status}");
             return Err(
@@ -183,17 +202,17 @@ impl App {
             if data.trim_end() == "[DONE]" {
                 return Err(Failure::Transient("missing response.completed".into()));
             }
-            let frame: Frame<'_> = serde_json::from_str(&data)
+            let mut frame: Frame = serde_json::from_str(&data)
                 .map_err(|e| fatal(format!("invalid model event: {e}")))?;
+            frame.observe(&mut out.report);
             match frame.kind.as_str() {
                 "response.completed" => return Ok(()),
                 "response.failed" | "response.incomplete" | "error" => {
-                    let response = frame
+                    let detail = frame
                         .response
-                        .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok());
-                    let detail = response
                         .as_ref()
-                        .and_then(|r| r.pointer("/error/message"))
+                        .and_then(|r| r.error.as_ref())
+                        .and_then(|e| e.get("message"))
                         .and_then(Value::as_str)
                         .or(frame.message.as_deref())
                         .unwrap_or("model request unsuccessful");
@@ -201,12 +220,16 @@ impl App {
                 }
                 "response.output_item.done" => {
                     let item = frame.item.ok_or_else(|| fatal("missing output item"))?;
-                    if !out.tools && has_answer(&item) && completed_in_buffer(lines.read_buffer()) {
+                    if !out.tools
+                        && has_answer(&item)
+                        && let Some(mut terminal) = completed_in_buffer(lines.read_buffer())
+                    {
+                        terminal.observe(&mut out.report);
                         out.answer = true;
                         out.final_item = Some(item);
                         return Ok(());
                     }
-                    self.accept(sid, item, out, hard).await?
+                    self.accept(sid, input.call_id, item, out, hard).await?
                 }
                 _ => (),
             }
@@ -218,6 +241,7 @@ impl App {
     async fn accept(
         &self,
         sid: i64,
+        llm_call_id: i64,
         item: Value,
         out: &mut Output,
         hard: &CancellationToken,
@@ -261,6 +285,7 @@ impl App {
                             "function_call",
                             &item,
                             None,
+                            Some(llm_call_id),
                         )?))
                     },
                     move |s, id| {
@@ -286,7 +311,7 @@ impl App {
                 let payload = json!({"type":"function_call_output","call_id":call,"output":output});
                 db.write(
                     move |conn| {
-                        store::add_item(conn, sid, "function_call_output", &payload, Some(id))
+                        store::add_item(conn, sid, "function_call_output", &payload, Some(id), None)
                     },
                     move |s, id| s.item_saved(sid, id),
                 )
@@ -310,7 +335,7 @@ impl App {
         self.db
             .call(move |s| {
                 let tx = s.conn.transaction()?;
-                let id = store::add_context_item(&tx, sid, &kind, &item)?;
+                let id = store::add_context_item(&tx, sid, &kind, &item, llm_call_id)?;
                 tx.commit()?;
                 s.item_saved(sid, id)?;
                 Ok(())

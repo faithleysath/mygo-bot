@@ -6,6 +6,10 @@ use std::{io, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
 use tokio_util::io::StreamReader;
 
+pub fn text_message(text: &str) -> Value {
+    json!({"content": [{"type": "text", "text": text}]})
+}
+
 #[derive(Clone)]
 pub struct Api {
     address: SocketAddr,
@@ -82,6 +86,40 @@ impl Api {
         self.json(Method::GET, path, None, 200).await
     }
 
+    pub async fn configure_model(&self, url: &str, model_key: &str) -> Result<()> {
+        let provider = self
+            .json(
+                Method::POST,
+                "/providers",
+                Some(json!({"name": "stress", "base_url": url})),
+                201,
+            )
+            .await?;
+        let provider_id = provider["id"].as_u64().ok_or("missing provider id")?;
+        let model = self
+            .json(
+                Method::POST,
+                "/models",
+                Some(json!({
+                    "provider_id": provider_id,
+                    "model_key": model_key,
+                    "input_modalities": ["text"],
+                    "reasoning_efforts": ["high"]
+                })),
+                201,
+            )
+            .await?;
+        let model_id = model["id"].as_u64().ok_or("missing model id")?;
+        self.json(
+            Method::PATCH,
+            "/config",
+            Some(json!({"default_model_id": model_id})),
+            200,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn session(&self) -> Result<String> {
         let data = self.json(Method::POST, "/sessions", None, 201).await?;
         let id = data["id"].as_u64().ok_or("missing session id")?;
@@ -93,7 +131,7 @@ impl Api {
             .json(
                 Method::POST,
                 &format!("{path}/messages"),
-                Some(json!({"text":text})),
+                Some(text_message(text)),
                 201,
             )
             .await?;

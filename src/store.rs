@@ -36,7 +36,7 @@ enum Command {
 
 struct Enqueue {
     sid: i64,
-    text: String,
+    content: Value,
     key: Option<String>,
 }
 
@@ -71,9 +71,15 @@ impl Db {
         let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         match version {
             0 => tx.execute_batch(include_str!("../schema.sql"))?,
-            1 => (),
+            1 if tx.table_exists(None, "llm_calls")? => (),
+            1 => {
+                return Err(Error::internal(
+                    "database uses the previous schema; select a new database directory",
+                ));
+            }
             _ => return Err(Error::internal("unsupported database version")),
         }
+        tx.execute("UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE status='in_flight'", [])?;
         tx.execute("UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE status IN ('running','pausing')", [])?;
         tx.commit()?;
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
@@ -127,9 +133,9 @@ impl Db {
         .await
     }
 
-    pub async fn enqueue(&self, sid: i64, text: String, key: Option<String>) -> Result<Enqueued> {
+    pub async fn enqueue(&self, sid: i64, content: Value, key: Option<String>) -> Result<Enqueued> {
         self.write(
-            move |conn| Enqueue { sid, text, key }.insert(conn),
+            move |conn| Enqueue { sid, content, key }.insert(conn),
             move |store, saved| {
                 if let Enqueued::Created(id) = saved {
                     store.item_saved(sid, id)?;
@@ -204,26 +210,25 @@ impl Enqueue {
     fn insert(&self, conn: &Connection) -> Result<Enqueued> {
         if let Some(key) = &self.key {
             let mut lookup = conn.prepare_cached("SELECT id,json_extract(payload,'$.content') FROM items WHERE session_id=? AND idempotency_key=?")?;
-            if let Some((id, text)) = lookup
+            if let Some((id, content)) = lookup
                 .query_row((self.sid, key), |row| {
-                    Ok((row.get(0)?, row.get::<_, String>(1)?))
+                    Ok((row.get(0)?, row.get::<_, Value>(1)?))
                 })
                 .optional()?
             {
-                if text != self.text {
+                if content != self.content {
                     return Err(Error::conflict(
-                        "idempotency key reused with different text",
+                        "idempotency key reused with different content",
                     ));
                 }
                 return Ok(Enqueued::Existing(id));
             }
         }
-        let inserted = conn.prepare_cached("INSERT INTO items(session_id,kind,payload,idempotency_key)
-            SELECT id,'user_message',json_object('content',?2,'role','user'),?3 FROM sessions WHERE id=?1")?
-            .execute(params![self.sid, self.text, self.key])?;
-        if inserted == 0 {
-            return Err(rusqlite::Error::QueryReturnedNoRows.into());
-        }
+        let modalities: Option<Value> = conn.prepare_cached("SELECT m.input_modalities FROM sessions s LEFT JOIN llm_models m ON m.id=s.model_id WHERE s.id=?")?.query_row([self.sid], |r| r.get(0))?;
+        let modalities = modalities
+            .ok_or_else(|| Error::conflict("select a session model before sending messages"))?;
+        crate::media::validate_message(conn, &self.content, &modalities)?;
+        conn.prepare_cached("INSERT INTO items(session_id,kind,payload,idempotency_key) VALUES(?1,'user_message',json_object('content',json(?2),'role','user'),?3)")?.execute(params![self.sid, self.content, self.key])?;
         Ok(Enqueued::Created(conn.last_insert_rowid()))
     }
 }
@@ -286,9 +291,9 @@ impl Store {
         if let Some(channel) = self.channels.get(&sid).and_then(|w| w.upgrade())
             && channel.receiver_count() > 0
         {
-            let mut stmt = self
-                .conn
-                .prepare_cached("SELECT id,kind,payload,target_id FROM items WHERE id=?")?;
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT id,kind,payload,target_id,llm_call_id FROM items WHERE id=?",
+            )?;
             Notice::publish(&channel, "item.saved", stmt.query_row([id], history_row)?);
         }
         Ok(())
@@ -317,19 +322,20 @@ impl Store {
 pub fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(json!({
         "id": row.get::<_, i64>(0)?, "kind": row.get::<_, String>(1)?,
-        "payload": row.get::<_, Value>(2)?, "target_id": row.get::<_, Option<i64>>(3)?
+        "payload": row.get::<_, Value>(2)?, "target_id": row.get::<_, Option<i64>>(3)?, "llm_call_id": row.get::<_, Option<i64>>(4)?
     }))
 }
 
 pub fn session(conn: &Connection, sid: i64) -> Result<Value> {
-    let mut stmt = conn
-        .prepare_cached("SELECT id,status,reasoning_effort,last_error FROM sessions WHERE id=?")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id,status,reasoning_effort,last_error,model_id FROM sessions WHERE id=?",
+    )?;
     Ok(stmt.query_row([sid], session_row)?)
 }
 
 pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(
-        json!({"id":row.get::<_,i64>(0)?,"status":row.get::<_,String>(1)?,"reasoning_effort":row.get::<_,Option<String>>(2)?,"last_error":row.get::<_,String>(3)?}),
+        json!({"id":row.get::<_,i64>(0)?,"status":row.get::<_,String>(1)?,"reasoning_effort":row.get::<_,Option<String>>(2)?,"last_error":row.get::<_,String>(3)?,"model_id":row.get::<_,Option<i64>>(4)?}),
     )
 }
 
@@ -356,16 +362,23 @@ pub fn add_item(
     kind: &str,
     payload: &Value,
     target: Option<i64>,
+    llm_call_id: Option<i64>,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO items(session_id,kind,payload,target_id) VALUES(?,?,?,?)",
-        params![sid, kind, payload, target],
+        "INSERT INTO items(session_id,kind,payload,target_id,llm_call_id) VALUES(?,?,?,?,?)",
+        params![sid, kind, payload, target, llm_call_id],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-pub fn add_context_item(tx: &Connection, sid: i64, kind: &str, item: &Value) -> Result<i64> {
-    let id = add_item(tx, sid, kind, item, None)?;
+pub fn add_context_item(
+    tx: &Connection,
+    sid: i64,
+    kind: &str,
+    item: &Value,
+    call_id: i64,
+) -> Result<i64> {
+    let id = add_item(tx, sid, kind, item, None, Some(call_id))?;
     tx.execute(
         "INSERT INTO context_items(session_id,item_id) VALUES(?,?)",
         (sid, id),
@@ -400,7 +413,7 @@ pub fn publish_tools(tx: &Connection, sid: i64, recovering: bool) -> Result<Vec<
             Some(id) => id,
             None if recovering => {
                 let payload = json!({"type":"function_call_output","call_id":call,"output":"Execution interrupted; result unknown."});
-                let result = add_item(tx, sid, "function_call_output", &payload, Some(id))?;
+                let result = add_item(tx, sid, "function_call_output", &payload, Some(id), None)?;
                 recovered.push(result);
                 result
             }
@@ -452,22 +465,31 @@ impl JsonRows {
         mut comma: bool,
     ) -> Result<(Vec<u8>, i64)> {
         let sql = match self {
-            Self::ModelInput => "SELECT c.position,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
+            Self::ModelInput => "SELECT c.position,i.payload,i.kind FROM context_items c JOIN items i ON i.id=c.item_id
                        WHERE c.session_id=? AND c.position>? AND c.position<=? ORDER BY c.position LIMIT ?",
-            Self::Context => "SELECT c.position,json_object('position',c.position,'item_id',i.id,'payload',json(i.payload))
+            Self::Context => "SELECT c.position,json_object('position',c.position,'item_id',i.id,'llm_call_id',i.llm_call_id,'payload',json(i.payload))
                        FROM context_items c JOIN items i ON i.id=c.item_id
                        WHERE c.session_id=? AND c.position>? AND c.position<=? ORDER BY c.position LIMIT ?",
-            Self::History => "SELECT id,json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id)
+            Self::History => "SELECT id,json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'llm_call_id',llm_call_id)
                        FROM items WHERE session_id=? AND id>? AND id<=? ORDER BY id LIMIT ?",
         };
         let mut stmt = conn.prepare_cached(sql)?;
         let mut rows = stmt.query((sid, after, end, BATCH_ITEMS))?;
         let mut position = after;
         while let Some(row) = rows.next()? {
-            let raw = row
-                .get_ref(1)?
-                .as_bytes()
-                .map_err(|e| Error::internal(e.to_string()))?;
+            let encoded;
+            let raw = if matches!(self, Self::ModelInput)
+                && matches!(
+                    row.get_ref(2)?.as_str().ok(),
+                    Some("user_message" | "function_call_output")
+                ) {
+                encoded = crate::media::wire_message(conn, row.get(1)?)?.to_string();
+                encoded.as_bytes()
+            } else {
+                row.get_ref(1)?
+                    .as_bytes()
+                    .map_err(|e| Error::internal(e.to_string()))?
+            };
             if position != after && bytes.len() + raw.len() + 1 > BATCH_BYTES {
                 break;
             }

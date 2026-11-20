@@ -1,6 +1,6 @@
 use crate::{
     Result, check,
-    client::{Api, Events},
+    client::{Api, Events, text_message},
     model::{Model, Ticket},
 };
 use reqwest::Method;
@@ -216,7 +216,10 @@ impl Work {
                     api.get(&page)
                 )?;
                 check(
-                    session["status"] == "idle" && config["configured"] == true && list.is_array(),
+                    session["status"] == "idle"
+                        && config["default_model_id"].is_u64()
+                        && session["model_id"] == config["default_model_id"]
+                        && list.is_array(),
                     "invalid mixed response",
                 )?;
                 Ok(Outcome::writes(1))
@@ -224,7 +227,7 @@ impl Work {
             "idempotency" => {
                 let key = self.sequence.fetch_add(1, Ordering::Relaxed).to_string();
                 let request = |text: &str| {
-                    api.request(Method::POST, &messages, Some(json!({"text":text})))
+                    api.request(Method::POST, &messages, Some(text_message(text)))
                         .header("Idempotency-Key", &key)
                 };
                 let (a, b) = tokio::try_join!(
@@ -254,7 +257,7 @@ impl Work {
                 Ok(Outcome::writes(1))
             }
             "invalid" => {
-                api.json(Method::POST, &messages, Some(json!({"text":" "})), 400)
+                api.json(Method::POST, &messages, Some(text_message(" ")), 400)
                     .await?;
                 api.json(Method::GET, "/sessions/0", None, 404).await?;
                 api.json(Method::GET, "/sessions?limit=201", None, 400)

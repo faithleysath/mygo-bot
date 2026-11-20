@@ -8,7 +8,6 @@ mod scenarios;
 use fixture::{Agent, Directory, rss_kib};
 use model::Model;
 use options::{HELP, Options};
-use reqwest::Method;
 use scenarios::{CASES, Work};
 use serde_json::{Value, json};
 use std::{
@@ -145,13 +144,7 @@ async fn stage(
     let dir = Directory::new()?;
     let (mut agent, api) = Agent::launch(bin, &dir.0, opts.limit()).await?;
     let idle = rss_kib(agent.pid())?;
-    api.json(
-        Method::PATCH,
-        "/config",
-        Some(json!({"base_url":url,"model":case})),
-        200,
-    )
-    .await?;
+    api.configure_model(url, case).await?;
     let work = Work::new(api, model.clone(), case, c).await?;
     let (mut row, users, answers) = if case == "restart" {
         let recovery = restart(&mut agent, bin, &dir.0, &work, c, opts.limit()).await?;
