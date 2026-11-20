@@ -1,4 +1,4 @@
-use axum::{Json, Router, http::header, response::Html, routing::get};
+use axum::{Json, Router, response::Html, routing::get};
 use utoipa::openapi::{
     OpenApi,
     security::{Http, HttpAuthScheme, SecurityRequirement, SecurityScheme},
@@ -12,24 +12,47 @@ const PAGE: &str = r#"<!doctype html>
   <title>MyGo-Bot API</title>
 </head>
 <body>
+  <p id="loading"><span role="status">正在加载接口文档…</span> <a href="/openapi.json">查看 OpenAPI JSON</a></p>
   <div id="app"></div>
-  <script src="/docs/scalar.js"></script>
-  <script>
-    Scalar.createApiReference('#app', {
-      url: '/openapi.json',
-      servers: [{ url: window.location.origin }],
-      withDefaultFonts: false,
-      showDeveloperTools: 'never',
-      showToolbar: 'never',
-      agent: { disabled: true },
-      telemetry: false,
-    })
+  <script type="module">
+    const version = '1.82.0';
+    const file = 'dist/browser/standalone.js';
+    const primary = `https://cdn.jsdelivr.net/npm/@scalar/api-reference@${version}/${file}`;
+    const backup = `https://registry.npmmirror.com/@scalar/api-reference/${version}/files/${file}`;
+    const integrity = 'sha384-S7zqZOKmB//ONrjKcth/ItE41a3xEDWW4dqHu2nQ/Ggxt06ROPonIfJ03dSBGuXs';
+
+    async function download(url, timeout) {
+      const response = await fetch(url, {
+        integrity,
+        credentials: 'omit',
+        signal: AbortSignal.timeout(timeout),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.text();
+    }
+
+    try {
+      const source = await download(primary, 8000).catch(() => download(backup, 20000));
+      const script = document.createElement('script');
+      script.textContent = source;
+      document.head.append(script);
+      script.remove();
+      window.Scalar.createApiReference('#app', {
+        url: '/openapi.json',
+        servers: [{ url: window.location.origin }],
+        withDefaultFonts: false,
+        showDeveloperTools: 'never',
+        showToolbar: 'never',
+        agent: { disabled: true },
+        telemetry: false,
+      });
+      document.getElementById('loading').remove();
+    } catch {
+      document.querySelector('#loading span').textContent = '接口文档页面加载失败，请刷新重试。';
+    }
   </script>
 </body>
 </html>"#;
-
-// The npm package's dist/browser/standalone.js with its MIT notice, gzip -9.
-const SCALAR_JS: &[u8] = include_bytes!("../vendor/scalar-api-reference-1.82.0.js.gz");
 
 pub fn routes(mut spec: OpenApi) -> Router {
     spec.components.get_or_insert_default().add_security_scheme(
@@ -43,17 +66,5 @@ pub fn routes(mut spec: OpenApi) -> Router {
     let spec = Json(spec);
     Router::new()
         .route("/docs", get(|| async { Html(PAGE) }))
-        .route(
-            "/docs/scalar.js",
-            get(|| async {
-                (
-                    [
-                        (header::CONTENT_TYPE, "text/javascript"),
-                        (header::CONTENT_ENCODING, "gzip"),
-                    ],
-                    SCALAR_JS,
-                )
-            }),
-        )
         .route("/openapi.json", get(move || async move { spec }))
 }

@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 
 use bigdecimal::{BigDecimal, RoundingMode, ToPrimitive};
-use chrono::{DateTime, Datelike, NaiveDate, Offset, TimeZone, Timelike, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -15,6 +14,17 @@ struct PriceBook {
     versions: Vec<Version>,
     #[serde(flatten)]
     calendar: Calendar,
+}
+
+impl PriceBook {
+    fn parse(pricing: &Value) -> Result<Self> {
+        let book =
+            Self::deserialize(pricing).map_err(|e| Error::bad(format!("invalid pricing: {e}")))?;
+        if book.timezone != "UTC" {
+            return Err(Error::bad("pricing timezone must be UTC"));
+        }
+        Ok(book)
+    }
 }
 
 #[derive(Deserialize)]
@@ -150,11 +160,7 @@ pub fn validate(pricing: &Value) -> Result<()> {
     if pricing.is_null() {
         return Ok(());
     }
-    let book =
-        PriceBook::deserialize(pricing).map_err(|e| Error::bad(format!("invalid pricing: {e}")))?;
-    book.timezone
-        .parse::<Tz>()
-        .map_err(|_| Error::bad("invalid pricing timezone"))?;
+    let book = PriceBook::parse(pricing)?;
     book.calendar.validate()?;
     if book.versions.is_empty() {
         return Err(Error::bad("pricing requires at least one version"));
@@ -202,19 +208,16 @@ pub fn validate(pricing: &Value) -> Result<()> {
 }
 
 pub fn snapshot(pricing: &Value, at_ms: i64) -> Option<Value> {
-    let book = PriceBook::deserialize(pricing).ok()?;
+    let book = PriceBook::parse(pricing).ok()?;
     let at = DateTime::from_timestamp_millis(at_ms)?;
-    let timezone = book.timezone.parse::<Tz>().ok()?;
-    let utc = at.naive_utc();
-    let local = utc.checked_add_offset(timezone.offset_from_utc_datetime(&utc).fix())?;
     let (_, version) = book
         .versions
         .iter()
         .filter_map(|v| Some((effective_from(&v.effective_from)?, v)))
         .filter(|(start, _)| *start <= at)
         .max_by_key(|(start, _)| *start)?;
-    let weekday = local.weekday().number_from_monday() as u8;
-    let minute = (local.hour() * 60 + local.minute()) as u16;
+    let weekday = at.weekday().number_from_monday() as u8;
+    let minute = (at.hour() * 60 + at.minute()) as u16;
     let mut period_index = None;
     let mut period_rule = Value::Null;
     let mut tiers = &version.default_tiers;
@@ -232,7 +235,7 @@ pub fn snapshot(pricing: &Value, at_ms: i64) -> Option<Value> {
             } else {
                 &book.calendar
             };
-            if calendar.is_holiday(local.date())? {
+            if calendar.is_holiday(at.date_naive())? {
                 continue;
             }
         }
