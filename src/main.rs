@@ -3,6 +3,7 @@ mod api;
 mod calls;
 mod catalog;
 mod daemon;
+mod docs;
 mod events;
 mod media;
 mod model;
@@ -18,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use clap::{CommandFactory, Parser};
-use serde_json::json;
+use serde::Serialize;
 use std::{fmt, io, net::SocketAddr, path::Path, process::ExitCode, sync::Arc, time::Duration};
 use store::Db;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -57,9 +58,14 @@ impl From<std::io::Error> for Error {
         Self::internal(e.to_string())
     }
 }
+#[derive(Serialize, utoipa::ToSchema)]
+struct ErrorBody {
+    error: String,
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error":self.1}))).into_response()
+        (self.0, Json(ErrorBody { error: self.1 })).into_response()
     }
 }
 
@@ -153,7 +159,7 @@ async fn run(
         stopping: CancellationToken::new(),
         workers: TaskTracker::new(),
     };
-    let routes = api::routes(app.clone());
+    let (routes, openapi) = api::routes(app.clone());
     let signal = shutdown_signal()?;
     daemon::Ready {
         listen,
@@ -166,10 +172,13 @@ async fn run(
         token: generated.then(|| token.clone()),
     }
     .announce(parent)?;
-    let tcp_routes = routes.clone().layer(axum::middleware::from_fn_with_state(
+    let mut tcp_routes = routes.clone().layer(axum::middleware::from_fn_with_state(
         Arc::<str>::from(token),
         api::authorize_tcp,
     ));
+    if listen.ip().is_loopback() {
+        tcp_routes = tcp_routes.merge(docs::routes(openapi));
+    }
     let tcp_server = axum::serve(listener, tcp_routes)
         .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
     let server = async {

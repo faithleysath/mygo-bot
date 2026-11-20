@@ -333,13 +333,52 @@ pub fn session(conn: &Connection, sid: i64) -> Result<Value> {
     let mut stmt = conn.prepare_cached(
         "SELECT id,status,reasoning_effort,last_error,model_id FROM sessions WHERE id=?",
     )?;
-    Ok(stmt.query_row([sid], session_row)?)
+    Ok(json!(stmt.query_row([sid], session_row)?))
 }
 
-pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    Ok(
-        json!({"id":row.get::<_,i64>(0)?,"status":row.get::<_,String>(1)?,"reasoning_effort":row.get::<_,Option<String>>(2)?,"last_error":row.get::<_,String>(3)?,"model_id":row.get::<_,Option<i64>>(4)?}),
-    )
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct Session {
+    /// 会话 ID。
+    id: i64,
+    /// 当前运行状态。
+    status: SessionStatus,
+    /// 推理强度。未指定时为 null。
+    #[schema(required)]
+    reasoning_effort: Option<String>,
+    /// 最近的错误或暂停原因。无记录时为空字符串。
+    last_error: String,
+    /// 选中的模型 ID。未选择时为 null。
+    #[schema(required)]
+    model_id: Option<i64>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum SessionStatus {
+    Idle,
+    Running,
+    Pausing,
+    Paused,
+}
+
+impl rusqlite::types::FromSql for SessionStatus {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        use serde::{Deserialize, de::value::StrDeserializer};
+        Self::deserialize(StrDeserializer::<serde::de::value::Error>::new(
+            value.as_str()?,
+        ))
+        .map_err(|err| rusqlite::types::FromSqlError::Other(Box::new(err)))
+    }
+}
+
+pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: row.get(0)?,
+        status: row.get(1)?,
+        reasoning_effort: row.get(2)?,
+        last_error: row.get(3)?,
+        model_id: row.get(4)?,
+    })
 }
 
 // This view is shared by queue inspection, consumption and the idle transition.

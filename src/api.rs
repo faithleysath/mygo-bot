@@ -1,6 +1,6 @@
 use crate::{
-    App, Error, Result, agent, events,
-    store::{self, session},
+    App, Error, ErrorBody, Result, agent, events,
+    store::{self, Session, session},
 };
 use axum::{
     Json, Router,
@@ -39,19 +39,32 @@ pub async fn authorize_tcp(
         (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
-            Json(json!({"error":"unauthorized"})),
+            Json(ErrorBody {
+                error: "unauthorized".into(),
+            }),
         )
             .into_response()
     }
 }
 
-pub fn routes(app: App) -> Router {
-    Router::new()
+#[derive(utoipa::OpenApi)]
+#[openapi(info(
+    title = "MyGo-Bot API",
+    description = "输入服务的 Bearer token，即可在本页试调接口。"
+))]
+struct ApiDoc;
+
+pub fn routes(app: App) -> (Router, utoipa::openapi::OpenApi) {
+    use utoipa::OpenApi;
+    let (router, openapi) = utoipa_axum::router::OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(utoipa_axum::routes!(list_sessions))
+        .split_for_parts();
+    let router = router
         .merge(crate::catalog::routes())
         .merge(crate::media::routes())
         .merge(crate::calls::routes())
         .route("/config", get(get_config).patch(patch_config))
-        .route("/sessions", post(create_session).get(list_sessions))
+        .route("/sessions", post(create_session))
         .route("/sessions/{sid}", get(get_session).patch(patch_session))
         .route("/sessions/{sid}/messages", post(enqueue).get(messages))
         .route("/sessions/{sid}/messages/{mid}", delete(withdraw))
@@ -62,7 +75,8 @@ pub fn routes(app: App) -> Router {
         .route("/sessions/{sid}/history", get(history))
         .route("/sessions/{sid}/context", get(context))
         .route("/sessions/{sid}/events", get(events::subscribe))
-        .with_state(app)
+        .with_state(app);
+    (router, openapi)
 }
 
 type Document = Json<Map<String, Value>>;
@@ -228,12 +242,17 @@ async fn patch_session(
         .await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 struct Page {
+    /// 只返回 ID 大于此值的记录。
     #[serde(default)]
+    #[param(minimum = 0, default = 0)]
     after: i64,
+    /// 最多返回的记录数。
     #[serde(default = "default_limit")]
+    #[param(minimum = 1, maximum = 200, default = default_limit)]
     limit: i64,
 }
 fn default_limit() -> i64 {
@@ -248,7 +267,21 @@ impl Page {
         }
     }
 }
-async fn list_sessions(State(app): State<App>, Query(page): Query<Page>) -> Data {
+/// 查询会话列表
+///
+/// 按 ID 升序返回会话。下一页使用本页最后一个会话的 ID 作为 `after`。
+#[utoipa::path(get, path = "/sessions", tag = "会话", params(Page), responses(
+    (status = 200, description = "当前页的会话", body = Vec<Session>,
+        example = json!([{"id": 1, "status": "idle", "model_id": null, "reasoning_effort": null, "last_error": ""}])),
+    (status = 400, description = "分页参数越界（JSON）或无法解析查询参数（纯文本）",
+        content((ErrorBody = "application/json"), (String = "text/plain"))),
+    (status = 401, description = "缺少或无效的 Bearer token", body = ErrorBody),
+    (status = 500, description = "服务器内部错误", body = ErrorBody)
+))]
+async fn list_sessions(
+    State(app): State<App>,
+    Query(page): Query<Page>,
+) -> Result<Json<Vec<Session>>> {
     page.check()?;
     app.db
         .call(move |s| {
@@ -258,7 +291,7 @@ async fn list_sessions(State(app): State<App>, Query(page): Query<Page>) -> Data
             let rows = stmt
                 .query_map((page.after, page.limit), store::session_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(Json(Value::Array(rows)))
+            Ok(Json(rows))
         })
         .await
 }

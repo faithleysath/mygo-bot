@@ -25,6 +25,8 @@ tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "net", "t
 tokio-util = { version = "0.7", features = ["io", "codec", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+utoipa = "6.0.0"
+utoipa-axum = "0.3.0"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }
