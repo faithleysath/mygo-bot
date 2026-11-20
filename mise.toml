@@ -1,2 +1,7 @@
 [tools]
 rust = "1.100.0"
+
+[tasks.release]
+description = "构建 UPX 发布产物。macOS 同时生成可挂载运行的 DMG。需要 PATH 中有 UPX 5.3+。"
+tools = { python = "3.15.2" }
+run = "python tools/release.py"
