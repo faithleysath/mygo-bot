@@ -69,23 +69,17 @@ impl Db {
         let mut conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;")?;
         let tx = conn.transaction()?;
-        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        match version {
-            0 if !tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')",
-                [],
-                |r| r.get::<_, bool>(0),
-            )? =>
-            {
-                tx.execute_batch(include_str!("../schema.sql"))?
-            }
-            2 => (),
-            0 | 1 => {
-                return Err(Error::internal(
-                    "database uses the previous schema; select a new database directory",
-                ));
-            }
-            _ => return Err(Error::internal("unsupported database version")),
+        let initialized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !initialized {
+            tx.execute_batch(include_str!("../schema.sql"))?;
+        } else if !tx.column_exists(None, "sessions", "input_queue_cursor")? {
+            return Err(Error::internal(
+                "incompatible database schema; select a new database directory",
+            ));
         }
         tx.execute("UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE status='in_flight'", [])?;
         tx.execute("UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE status IN ('running','pausing')", [])?;

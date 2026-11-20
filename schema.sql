@@ -118,4 +118,4 @@ WHERE i.kind IN ('user_message','sandbox_event') AND i.id>s.input_queue_cursor
 AND ((i.kind='user_message' AND NOT EXISTS (SELECT 1 FROM items w WHERE w.kind='withdrawal' AND w.target_id=i.id))
   OR (i.kind='sandbox_event' AND json_extract(i.payload,'$.notify')
       AND NOT EXISTS (SELECT 1 FROM invalidated_warnings w WHERE w.item_id=i.id)));
-PRAGMA user_version = 2;
+PRAGMA user_version = 1;
