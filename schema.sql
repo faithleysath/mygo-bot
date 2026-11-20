@@ -32,7 +32,7 @@ CREATE TABLE sessions (
     status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle','running','pausing','paused')),
     model_id INTEGER REFERENCES llm_models,
     reasoning_effort TEXT,
-    user_queue_cursor INTEGER NOT NULL DEFAULT 0,
+    input_queue_cursor INTEGER NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
     needs_model INTEGER NOT NULL DEFAULT 0 CHECK (needs_model IN (0,1))
 );
@@ -53,7 +53,7 @@ CREATE TABLE llm_calls (
     cache_read_tokens INTEGER CHECK(cache_read_tokens>=0),
     cache_write_tokens INTEGER CHECK(cache_write_tokens>=0),
     output_tokens INTEGER CHECK(output_tokens>=0),
-    pricing_snapshot TEXT CHECK(json_valid(pricing_snapshot)),
+    pricing_snapshot TEXT CHECK(pricing_snapshot IS NULL OR json_valid(pricing_snapshot)),
     cost_nano_usd INTEGER CHECK(cost_nano_usd>=0),
     UNIQUE(session_id, id)
 );
@@ -73,6 +73,16 @@ CREATE TABLE items (
     target_id INTEGER,
     llm_call_id INTEGER,
     idempotency_key TEXT,
+    sandbox_call_item_id INTEGER,
+    CHECK (sandbox_call_item_id IS NULL OR kind='sandbox_event'
+           OR (kind='function_call_output' AND target_id IS sandbox_call_item_id)),
+    CHECK (kind!='sandbox_event' OR (sandbox_call_item_id IS NOT NULL AND target_id IS NULL
+           AND json_type(payload,'$.sequence') IS 'integer'
+           AND coalesce(json_extract(payload,'$.event'),'') IN ('message','lease_warning','completed')
+           AND coalesce(json_type(payload,'$.notify'),'') IN ('true','false')
+           AND (json_extract(payload,'$.event')='completed' OR json_extract(payload,'$.notify')=1)
+           AND json_type(payload,'$.content') IS 'array')),
+    FOREIGN KEY (session_id, sandbox_call_item_id) REFERENCES items(session_id, id),
     FOREIGN KEY (session_id, llm_call_id) REFERENCES llm_calls(session_id, id),
     UNIQUE (session_id, id),
     UNIQUE (kind, target_id),
@@ -82,6 +92,19 @@ CREATE INDEX items_by_llm_call ON items(llm_call_id) WHERE llm_call_id IS NOT NU
 CREATE INDEX items_by_kind ON items(session_id, kind, id);
 CREATE UNIQUE INDEX tools_by_call ON items(session_id,json_extract(payload,'$.call_id')) WHERE kind='function_call';
 CREATE UNIQUE INDEX items_by_idempotency ON items(session_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX sandbox_receipts ON items(sandbox_call_item_id)
+    WHERE kind='function_call_output' AND sandbox_call_item_id IS NOT NULL;
+CREATE UNIQUE INDEX sandbox_event_sequence ON items(sandbox_call_item_id,json_extract(payload,'$.sequence'))
+    WHERE kind='sandbox_event';
+CREATE UNIQUE INDEX sandbox_completed ON items(sandbox_call_item_id)
+    WHERE kind='sandbox_event' AND json_extract(payload,'$.event')='completed';
+CREATE INDEX sandbox_warnings ON items(sandbox_call_item_id,id)
+    WHERE kind='sandbox_event' AND json_extract(payload,'$.event')='lease_warning';
+-- 续租或结束会使未消费的租期提醒失效。提醒内容及已消费的上下文保留。
+CREATE TABLE invalidated_warnings (
+    item_id INTEGER PRIMARY KEY REFERENCES items(id)
+);
+CREATE INDEX queue_by_session ON items(session_id,id) WHERE kind IN ('user_message','sandbox_event');
 CREATE TABLE context_items (
     position INTEGER PRIMARY KEY,
     session_id INTEGER NOT NULL,
@@ -91,6 +114,8 @@ CREATE TABLE context_items (
 CREATE INDEX context_by_session ON context_items(session_id, position);
 CREATE VIEW pending AS
 SELECT i.id,i.session_id FROM items i JOIN sessions s ON s.id=i.session_id
-WHERE i.kind='user_message' AND i.id>s.user_queue_cursor
-AND NOT EXISTS (SELECT 1 FROM items w WHERE w.kind='withdrawal' AND w.target_id=i.id);
-PRAGMA user_version = 1;
+WHERE i.kind IN ('user_message','sandbox_event') AND i.id>s.input_queue_cursor
+AND ((i.kind='user_message' AND NOT EXISTS (SELECT 1 FROM items w WHERE w.kind='withdrawal' AND w.target_id=i.id))
+  OR (i.kind='sandbox_event' AND json_extract(i.payload,'$.notify')
+      AND NOT EXISTS (SELECT 1 FROM invalidated_warnings w WHERE w.item_id=i.id)));
+PRAGMA user_version = 2;

@@ -155,8 +155,12 @@ async fn reply(model: Model, request: Value) -> Result<Response> {
         }
         "tools" if attempt == 1 => {
             let mut body = String::new();
-            for i in 0..2 {
-                body.push_str(&item(json!({"type":"function_call","call_id":format!("{key}-{i}"),"name":"current_time","arguments":"{}"})));
+            for (i, method) in ["toISOString", "toString"].into_iter().enumerate() {
+                let code = format!("return new Date().{method}()");
+                body.push_str(&item(json!({
+                    "type": "function_call", "call_id": format!("{key}-{i}"),
+                    "name": "codemode", "arguments": json!({"code": code}).to_string()
+                })));
             }
             body.push_str(DONE);
             return Ok(sse(Body::from(body)));
@@ -174,9 +178,30 @@ async fn reply(model: Model, request: Value) -> Result<Response> {
                         && call["call_id"] == result["call_id"],
                     "unpaired tool output",
                 )?;
-                chrono::DateTime::parse_from_rfc3339(
-                    result["output"].as_str().ok_or("missing tool output")?,
+                let outcome: Value = serde_json::from_str(
+                    result["output"].as_str().ok_or("missing sandbox result")?,
                 )?;
+                let id = outcome["id"]
+                    .as_str()
+                    .and_then(|id| id.strip_prefix("sb_"))
+                    .ok_or("missing sandbox ID")?;
+                check(
+                    id.parse::<u64>()? > 0 && outcome["status"] == "succeeded",
+                    "invalid sandbox clock result",
+                )?;
+                let date = outcome["output"].as_str().ok_or("missing sandbox date")?;
+                if i == 0 {
+                    check(date.ends_with('Z'), "expected a UTC timestamp")?;
+                    chrono::DateTime::parse_from_rfc3339(date)?;
+                } else {
+                    let local = date.split_once(" (").map_or(date, |(time, _)| time);
+                    let parsed =
+                        chrono::DateTime::parse_from_str(local, "%a %b %d %Y %H:%M:%S GMT%z")?;
+                    check(
+                        parsed.offset() == parsed.with_timezone(&chrono::Local).offset(),
+                        "wrong local UTC offset",
+                    )?;
+                }
             }
         }
         _ => (),

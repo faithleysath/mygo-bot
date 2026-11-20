@@ -44,7 +44,7 @@ pub const CASES: &[(&str, &str)] = &[
     ),
     (
         "tools",
-        "并行调用两次 current_time，核对输出与调用配对再完成回答",
+        "并行用 codemode 取 UTC 和本地时间，核对时间格式与调用配对顺序",
     ),
     ("duplicate-run", "同一会话并发启动四次，核对模型调用次数"),
     ("fanout", "每客户端复用八个 SSE 订阅，逐条核对持久化广播"),

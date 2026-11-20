@@ -16,11 +16,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = { version = "0.4", features = ["std"] }
 mime = "0.3.18"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
+rquickjs = { version = "0.14.0", features = ["futures"] }
 rusqlite = { version = "0.43", features = ["serde_json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 subtle = "2.6"
-tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "net", "time", "fs", "process", "io-util"] }
 tokio-util = { version = "0.7", features = ["io", "codec", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
@@ -31,6 +32,7 @@ utoipa-axum = "0.3.0"
 rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 # Generate SQLite bindings and leave the choice of Windows import library to build.rs.
 libsqlite3-sys = { version = "0.40", features = ["in_gecko"] }
 

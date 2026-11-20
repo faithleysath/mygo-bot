@@ -51,6 +51,7 @@ pub struct Db(mpsc::Sender<Command>);
 pub struct Store {
     pub conn: Connection,
     pub active: HashMap<i64, Control>,
+    pub sandboxes: HashMap<i64, crate::sandbox::Task>,
     channels: HashMap<i64, broadcast::WeakSender<Notice>>,
     pub closing: bool,
 }
@@ -70,9 +71,16 @@ impl Db {
         let tx = conn.transaction()?;
         let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         match version {
-            0 => tx.execute_batch(include_str!("../schema.sql"))?,
-            1 if tx.column_exists(None, "llm_models", "archived_at")? => (),
-            1 => {
+            0 if !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )? =>
+            {
+                tx.execute_batch(include_str!("../schema.sql"))?
+            }
+            2 => (),
+            0 | 1 => {
                 return Err(Error::internal(
                     "database uses the previous schema; select a new database directory",
                 ));
@@ -81,6 +89,7 @@ impl Db {
         }
         tx.execute("UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE status='in_flight'", [])?;
         tx.execute("UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE status IN ('running','pausing')", [])?;
+        crate::sandbox::ledger::recover(&tx)?;
         tx.commit()?;
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
         let runtime = tokio::runtime::Handle::current();
@@ -91,6 +100,7 @@ impl Db {
                 let mut store = Store {
                     conn,
                     active: HashMap::new(),
+                    sandboxes: HashMap::new(),
                     channels: HashMap::new(),
                     closing: false,
                 };
@@ -414,18 +424,30 @@ pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 
 // This view is shared by queue inspection, consumption and the idle transition.
 pub fn has_pending(conn: &Connection, sid: i64) -> Result<bool> {
-    Ok(conn.query_row(
+    let ready: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id=?)",
         [sid],
         |r| r.get(0),
-    )?)
+    )?;
+    // The caller can go idle without calling take_pending when only discarded inputs remain.
+    if !ready {
+        advance_queue(conn, sid, false)?;
+    }
+    Ok(ready)
 }
 
 pub fn take_pending(tx: &Connection, sid: i64) -> Result<()> {
     let added = tx.execute("INSERT INTO context_items(session_id,item_id) SELECT session_id,id FROM pending WHERE session_id=? ORDER BY id",[sid])?;
-    if added > 0 {
-        tx.execute("UPDATE sessions SET needs_model=1,user_queue_cursor=(SELECT max(id) FROM items WHERE session_id=?1 AND kind='user_message') WHERE id=?1",[sid])?;
-    }
+    advance_queue(tx, sid, added > 0)
+}
+
+fn advance_queue(conn: &Connection, sid: i64, added: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET input_queue_cursor=last_id,needs_model=needs_model OR ?2
+         FROM (SELECT max(id) AS last_id FROM items WHERE session_id=?1 AND kind IN ('user_message','sandbox_event'))
+         WHERE sessions.id=?1 AND input_queue_cursor<last_id",
+        (sid, added),
+    )?;
     Ok(())
 }
 
@@ -552,11 +574,10 @@ impl JsonRows {
         while let Some(row) = rows.next()? {
             let encoded;
             let raw = if matches!(self, Self::ModelInput)
-                && matches!(
-                    row.get_ref(2)?.as_str().ok(),
-                    Some("user_message" | "function_call_output")
-                ) {
-                encoded = crate::media::wire_message(conn, row.get(1)?)?.to_string();
+                && let Some(kind @ ("user_message" | "function_call_output" | "sandbox_event")) =
+                    row.get_ref(2)?.as_str().ok()
+            {
+                encoded = crate::media::wire_message(conn, kind, row.get(1)?)?.to_string();
                 encoded.as_bytes()
             } else {
                 row.get_ref(1)?

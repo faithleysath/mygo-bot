@@ -8,6 +8,7 @@ mod events;
 mod media;
 mod model;
 mod pricing;
+mod sandbox;
 #[cfg(unix)]
 mod socket;
 mod store;
@@ -72,6 +73,7 @@ impl IntoResponse for Error {
 #[derive(Clone)]
 struct App {
     db: Db,
+    sandbox: Arc<sandbox::Engine>,
     client: reqwest::Client,
     stopping: CancellationToken,
     workers: TaskTracker,
@@ -86,6 +88,9 @@ struct Options {
     /// With --daemon, keep the server attached to this terminal and log to stderr.
     #[arg(long)]
     foreground: bool,
+    /// Fixed number of JavaScript worker threads (defaults to at most four logical CPUs).
+    #[arg(long, value_name = "COUNT")]
+    js_threads: Option<std::num::NonZeroUsize>,
     /// TCP bind address. Port 0 lets the OS choose a free port.
     #[arg(long, default_value = "127.0.0.1:0", value_name = "IP:PORT")]
     listen: SocketAddr,
@@ -123,8 +128,20 @@ fn main() -> ExitCode {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn run(
+fn run(
+    options: Options,
+    parent: &mut Option<io::Stdout>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(serve(options, parent));
+    // Blocking filesystem calls may outlive their cancelled owner on an unresponsive volume.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn serve(
     options: Options,
     parent: &mut Option<io::Stdout>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -148,7 +165,12 @@ async fn run(
     let unix = (!options.no_unix_socket)
         .then(|| socket::SocketFile::bind(options.unix_socket.as_deref()))
         .transpose()?;
+    let threads = options.js_threads.map_or_else(
+        || std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+        |n| n.get(),
+    );
     let app = App {
+        sandbox: Arc::new(sandbox::Engine::new(threads)?),
         db: Db::open(Path::new("mygo-bot.sqlite3"))?,
         client: reqwest::Client::builder()
             // Each retry gets its own llm_calls row in the worker loop.

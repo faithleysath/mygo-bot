@@ -300,22 +300,11 @@ impl App {
             let Some(id) = id else {
                 return Ok(());
             };
-            let db = self.db.clone();
+            let app = self.clone();
             let hard = hard.clone();
             out.tasks.spawn(async move {
-                let Some(output) = hard.run_until_cancelled(tools::execute(&name, &args)).await
-                else {
-                    return Ok(());
-                };
-                // Once the tool returns, finish saving its result even if a pause arrives.
-                let payload = json!({"type":"function_call_output","call_id":call,"output":output});
-                db.write(
-                    move |conn| {
-                        store::add_item(conn, sid, "function_call_output", &payload, Some(id), None)
-                    },
-                    move |s, id| s.item_saved(sid, id),
-                )
-                .await
+                let call = crate::sandbox::Call { sid, id, call };
+                tools::execute(app, call, &name, &args, hard).await
             });
             return Ok(());
         }
@@ -325,7 +314,11 @@ impl App {
         } else {
             if matches!(
                 kind,
-                "user_message" | "withdrawal" | "assistant_message" | "function_call_output"
+                "user_message"
+                    | "withdrawal"
+                    | "assistant_message"
+                    | "function_call_output"
+                    | "sandbox_event"
             ) {
                 return Err(Error::internal("unexpected reserved output item type"));
             }

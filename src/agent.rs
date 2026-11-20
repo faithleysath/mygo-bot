@@ -44,74 +44,112 @@ enum StartEffect {
     )
 )]
 pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Session>> {
-    let worker = app.clone();
-    app.db
-        .start_write(
-            sid,
-            move |conn, active| {
-                let current = session(conn, sid)?;
-                let model_id = current
-                    .model_id
-                    .ok_or_else(|| Error::conflict("select a session model before running"))?;
-                crate::catalog::available_capabilities(conn, model_id)?;
-                if current.status == SessionStatus::Pausing {
-                    return Err(Error::conflict("session is pausing"));
-                }
-                if active {
-                    return Ok((current, StartEffect::None));
-                }
-                let unfinished: bool =
-                    conn.query_row("SELECT needs_model FROM sessions WHERE id=?", [sid], |r| {
-                        r.get(0)
-                    })?;
-                if !unfinished && !store::has_pending(conn, sid)? {
-                    if current.status == SessionStatus::Paused {
-                        conn.execute(
-                            "UPDATE sessions SET status='idle',last_error='' WHERE id=?",
-                            [sid],
-                        )?;
-                        return Ok((session(conn, sid)?, StartEffect::Idle));
+    app.start_worker(sid, false).await
+}
+
+impl App {
+    pub fn wake(&self, sid: i64) {
+        let app = self.clone();
+        self.workers.spawn(async move {
+            if let Err(e) = app.start_worker(sid, true).await
+                && !app.stopping.is_cancelled()
+            {
+                tracing::error!(sid,error=%e,"could not start session for a task event");
+                // Preserve a visible recovery path if the selected model became unavailable.
+                let _ = app
+                    .db
+                    .call(move |s| {
+                        if !s.closing
+                            && session(&s.conn, sid)?.status == SessionStatus::Idle
+                            && store::has_pending(&s.conn, sid)?
+                        {
+                            s.status(sid, "paused", &e.to_string())?;
+                        }
+                        Ok(())
+                    })
+                    .await;
+            }
+        });
+    }
+
+    async fn start_worker(&self, sid: i64, automatic: bool) -> Result<Json<Session>> {
+        let worker = self.clone();
+        self.db
+            .start_write(
+                sid,
+                move |conn, active| {
+                    let current = session(conn, sid)?;
+                    if automatic
+                        && (active
+                            || current.status != SessionStatus::Idle
+                            || !store::has_pending(conn, sid)?)
+                    {
+                        return Ok((current, StartEffect::None));
                     }
-                    return Ok((current, StartEffect::None));
-                }
-                let recovered = if unfinished {
-                    store::publish_tools(conn, sid, true)?
-                } else {
-                    Vec::new()
-                };
-                store::take_pending(conn, sid)?;
-                conn.execute(
-                    "UPDATE sessions SET status='running',last_error='' WHERE id=?",
-                    [sid],
-                )?;
-                Ok((session(conn, sid)?, StartEffect::Worker(recovered)))
-            },
-            move |s, (current, effect)| {
-                match effect {
-                    StartEffect::None => (),
-                    StartEffect::Idle => s.notify_status(sid, "idle", ""),
-                    StartEffect::Worker(recovered) => {
-                        let notices = recovered
-                            .into_iter()
-                            .try_for_each(|id| s.item_saved(sid, id));
-                        let channel = s.channel(sid);
-                        Notice::publish(
-                            &channel,
-                            "session.status",
-                            json!({"status":"running","reason":""}),
-                        );
-                        let control = Control::default();
-                        s.active.insert(sid, control.clone());
-                        let tracker = worker.workers.clone();
-                        // A committed start owns a worker even if the client left or a notice failed.
-                        tracker.spawn(worker.run(sid, control, channel));
-                        notices?;
+                    let model_id = current
+                        .model_id
+                        .ok_or_else(|| Error::conflict("select a session model before running"))?;
+                    crate::catalog::available_capabilities(conn, model_id)?;
+                    if current.status == SessionStatus::Pausing {
+                        return Err(Error::conflict("session is pausing"));
                     }
-                }
-                Ok(Json(current))
-            },
-        )
-        .await
+                    if active {
+                        return Ok((current, StartEffect::None));
+                    }
+                    let unfinished: bool = conn.query_row(
+                        "SELECT needs_model FROM sessions WHERE id=?",
+                        [sid],
+                        |r| r.get(0),
+                    )?;
+                    if !unfinished && !store::has_pending(conn, sid)? {
+                        if current.status == SessionStatus::Paused {
+                            conn.execute(
+                                "UPDATE sessions SET status='idle',last_error='' WHERE id=?",
+                                [sid],
+                            )?;
+                            return Ok((session(conn, sid)?, StartEffect::Idle));
+                        }
+                        return Ok((current, StartEffect::None));
+                    }
+                    let recovered = if unfinished {
+                        store::publish_tools(conn, sid, true)?
+                    } else {
+                        Vec::new()
+                    };
+                    store::take_pending(conn, sid)?;
+                    conn.execute(
+                        "UPDATE sessions SET status='running',last_error='' WHERE id=?",
+                        [sid],
+                    )?;
+                    Ok((session(conn, sid)?, StartEffect::Worker(recovered)))
+                },
+                move |s, (current, effect)| {
+                    match effect {
+                        StartEffect::None => (),
+                        StartEffect::Idle => s.notify_status(sid, "idle", ""),
+                        StartEffect::Worker(recovered) => {
+                            let notices = recovered
+                                .into_iter()
+                                .try_for_each(|id| s.item_saved(sid, id));
+                            let channel = s.channel(sid);
+                            Notice::publish(
+                                &channel,
+                                "session.status",
+                                json!({"status":"running","reason":""}),
+                            );
+                            let control = Control::default();
+                            s.active.insert(sid, control.clone());
+                            let tracker = worker.workers.clone();
+                            // A committed start owns a worker even if the client left or a notice failed.
+                            tracker.spawn(worker.run(sid, control, channel));
+                            notices?;
+                        }
+                    }
+                    Ok(Json(current))
+                },
+            )
+            .await
+    }
 }
 #[derive(Deserialize, Default, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -150,6 +188,9 @@ pub async fn pause(
     app.db
         .call(move |s| {
             let current = session(&s.conn, sid)?;
+            if matches!(q.mode, PauseMode::Hard) {
+                crate::sandbox::stop_session(s, sid);
+            }
             if current.status != SessionStatus::Paused {
                 request_pause(s, sid, matches!(q.mode, PauseMode::Hard), "paused by user")?;
             }
@@ -177,6 +218,7 @@ impl App {
         self.db
             .call(|s| {
                 s.closing = true;
+                crate::sandbox::shutdown_tasks(s, false)?;
                 for sid in s.active.keys().copied().collect::<Vec<_>>() {
                     request_pause(s, sid, false, "daemon shutting down")?;
                 }
@@ -191,13 +233,19 @@ impl App {
         {
             self.db
                 .call(|s| {
+                    crate::sandbox::shutdown_tasks(s, true)?;
                     for c in s.active.values() {
                         c.hard.cancel();
                     }
                     Ok(())
                 })
                 .await?;
-            self.workers.wait().await;
+            if tokio::time::timeout(Duration::from_secs(5), self.workers.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!("shutdown deadline reached with unfinished work");
+            }
         }
         Ok(())
     }

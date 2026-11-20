@@ -11,11 +11,13 @@ use serde_json::{Value, json};
 
 use crate::{App, Error, Result};
 
+const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+
 pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
     use utoipa_axum::{router::OpenApiRouter, routes};
     OpenApiRouter::new()
         .routes(routes!(upload))
-        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES))
         .routes(routes!(download))
 }
 
@@ -101,15 +103,7 @@ async fn upload(
     data: Bytes,
 ) -> Result<(StatusCode, Json<Attachment>)> {
     let mut types = headers.get_all(header::CONTENT_TYPE).iter();
-    let mime: mime::Mime = types
-        .next()
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .filter(|m: &mime::Mime| {
-            !m.essence_str().contains('*')
-                && matches!(m.type_().as_str(), "image" | "audio" | "video")
-        })
-        .ok_or_else(|| Error::bad("expected a concrete image, audio or video Content-Type"))?;
+    let mime = attachment_mime(types.next().and_then(|v| v.to_str().ok()).unwrap_or(""))?;
     if types.next().is_some() || data.is_empty() {
         return Err(Error::bad(
             "expected one Content-Type and a nonempty attachment",
@@ -119,12 +113,8 @@ async fn upload(
         .db
         .write(
             move |conn| {
-                conn.execute(
-                    "INSERT INTO attachments(mime_type,data) VALUES(?,?)",
-                    (mime.as_ref(), data.as_ref()),
-                )?;
                 Ok(Attachment {
-                    id: conn.last_insert_rowid(),
+                    id: save_attachment(conn, &mime, &data)?,
                     mime_type: mime.to_string(),
                 })
             },
@@ -132,6 +122,26 @@ async fn upload(
         )
         .await?;
     Ok((StatusCode::CREATED, Json(saved)))
+}
+
+pub fn attachment_mime(value: &str) -> Result<mime::Mime> {
+    value
+        .parse::<mime::Mime>()
+        .ok()
+        .filter(|m| {
+            !m.essence_str().contains('*')
+                && matches!(m.type_().as_str(), "image" | "audio" | "video")
+        })
+        .ok_or_else(|| Error::bad("expected a concrete image, audio or video Content-Type"))
+}
+
+pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Result<i64> {
+    if data.is_empty() || data.len() > MAX_ATTACHMENT_BYTES {
+        return Err(Error::bad("expected 1 byte to 50 MiB of attachment data"));
+    }
+    conn.prepare_cached("INSERT INTO attachments(mime_type,data) VALUES(?,?)")?
+        .execute((mime.as_ref(), data))?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// 下载附件
@@ -310,7 +320,7 @@ pub fn validate_message(conn: &Connection, content: &Value, modalities: &Value) 
 
 // Only inspect actual content slots. A tool name, argument, citation or JSON-looking
 // result string can mention media without carrying any media to the next request.
-fn check_parts(conn: &Connection, content: &Value, modalities: &Value) -> Result<()> {
+pub fn check_parts(conn: &Connection, content: &Value, modalities: &Value) -> Result<()> {
     if content.is_string() {
         return require(modalities, "text");
     }
@@ -347,12 +357,17 @@ fn check_parts(conn: &Connection, content: &Value, modalities: &Value) -> Result
     Ok(())
 }
 
+pub fn check_event(conn: &Connection, content: &Value, modalities: &Value) -> Result<()> {
+    require(modalities, "text")?; // The host adds a text block identifying the source.
+    check_parts(conn, content, modalities)
+}
+
 pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<()> {
     // Match context order first, then the tool results publish_tools will append in
     // call order, and finally the unwithdrawn queue take_pending will append by id.
     let queries = [
         "SELECT i.id,i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
-         WHERE c.session_id=? AND i.kind IN ('user_message','assistant_message','reasoning','function_call_output','image_generation_call')
+         WHERE c.session_id=? AND i.kind IN ('user_message','sandbox_event','assistant_message','reasoning','function_call_output','image_generation_call')
          ORDER BY c.position",
         "SELECT r.id,r.kind,r.payload FROM items c JOIN items r ON r.target_id=c.id AND r.kind='function_call_output'
          WHERE c.session_id=? AND c.kind='function_call'
@@ -370,6 +385,7 @@ pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<
             let payload: Value = row.get(2)?;
             let checked = match kind.as_str() {
                 "user_message" => validate_message(conn, &payload["content"], modalities),
+                "sandbox_event" => check_event(conn, &payload["content"], modalities),
                 "assistant_message" => check_parts(conn, &payload["content"], modalities),
                 "function_call_output" => check_parts(conn, &payload["output"], modalities),
                 "reasoning" => ["summary", "content"]
@@ -395,8 +411,28 @@ pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<
     Ok(())
 }
 
-pub fn wire_message(conn: &Connection, mut payload: Value) -> Result<Value> {
-    let is_tool = payload["type"] == "function_call_output";
+pub fn wire_message(conn: &Connection, kind: &str, mut payload: Value) -> Result<Value> {
+    if kind == "sandbox_event" {
+        let source = format!(
+            "Codemode {} event from {} (sequence {}).",
+            payload["event"]
+                .as_str()
+                .ok_or_else(|| Error::internal("missing event kind"))?,
+            payload["sandbox_id"]
+                .as_str()
+                .ok_or_else(|| Error::internal("missing sandbox ID"))?,
+            payload["sequence"]
+                .as_i64()
+                .ok_or_else(|| Error::internal("missing event sequence"))?
+        );
+        let mut content = payload["content"].take();
+        content
+            .as_array_mut()
+            .ok_or_else(|| Error::internal("missing event content"))?
+            .insert(0, json!({"type":"text","text":source}));
+        payload = json!({"role":"user","content":content});
+    }
+    let is_tool = kind == "function_call_output";
     let field = if is_tool {
         "output"
     } else if payload["role"] == "user" {

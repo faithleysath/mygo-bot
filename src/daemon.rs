@@ -53,11 +53,12 @@ pub fn start(options: super::Options) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(launch()?);
     }
     let mut parent = Some(io::stdout());
-    let result = (|| {
-        #[cfg(unix)]
-        rustix::process::setsid()?;
-        super::run(options, &mut parent)
-    })();
+    #[cfg(unix)]
+    let result = rustix::process::setsid()
+        .map_err(Into::into)
+        .and_then(|_| super::run(options, &mut parent));
+    #[cfg(not(unix))]
+    let result = super::run(options, &mut parent);
     if let (Err(error), Some(out)) = (&result, parent) {
         reply(out, Err(error.to_string()))?;
     }
