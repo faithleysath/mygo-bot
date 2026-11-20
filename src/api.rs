@@ -108,11 +108,7 @@ impl Selection {
             }
             return Ok(None);
         };
-        let (modalities, efforts): (Value, Value) = conn.query_row(
-            "SELECT input_modalities,reasoning_efforts FROM llm_models WHERE id=?",
-            [id],
-            |r| Ok((r.get(0)?, r.get::<_, Value>(1)?)),
-        )?;
+        let (modalities, efforts) = crate::catalog::available_capabilities(conn, id)?;
         if let Some(effort) = &self.reasoning_effort
             && !efforts
                 .as_array()

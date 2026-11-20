@@ -71,7 +71,7 @@ impl Db {
         let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         match version {
             0 => tx.execute_batch(include_str!("../schema.sql"))?,
-            1 if tx.table_exists(None, "llm_calls")? => (),
+            1 if tx.column_exists(None, "llm_models", "archived_at")? => (),
             1 => {
                 return Err(Error::internal(
                     "database uses the previous schema; select a new database directory",
@@ -224,9 +224,12 @@ impl Enqueue {
                 return Ok(Enqueued::Existing(id));
             }
         }
-        let modalities: Option<Value> = conn.prepare_cached("SELECT m.input_modalities FROM sessions s LEFT JOIN llm_models m ON m.id=s.model_id WHERE s.id=?")?.query_row([self.sid], |r| r.get(0))?;
-        let modalities = modalities
+        let model_id: Option<i64> = conn
+            .prepare_cached("SELECT model_id FROM sessions WHERE id=?")?
+            .query_row([self.sid], |row| row.get(0))?;
+        let model_id = model_id
             .ok_or_else(|| Error::conflict("select a session model before sending messages"))?;
+        let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
         crate::media::validate_message(conn, &self.content, &modalities)?;
         conn.prepare_cached("INSERT INTO items(session_id,kind,payload,idempotency_key) VALUES(?1,'user_message',json_object('content',json(?2),'role','user'),?3)")?.execute(params![self.sid, self.content, self.key])?;
         Ok(Enqueued::Created(conn.last_insert_rowid()))

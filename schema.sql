@@ -1,9 +1,11 @@
 CREATE TABLE llm_providers (
     id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
     base_url TEXT NOT NULL,
-    api_key TEXT
+    api_key TEXT,
+    archived_at INTEGER
 );
+CREATE UNIQUE INDEX active_provider_name ON llm_providers(name) WHERE archived_at IS NULL;
 CREATE TABLE llm_models (
     id INTEGER PRIMARY KEY,
     provider_id INTEGER NOT NULL REFERENCES llm_providers,
@@ -12,8 +14,13 @@ CREATE TABLE llm_models (
     input_modalities TEXT NOT NULL CHECK(json_type(input_modalities)='array'),
     reasoning_efforts TEXT NOT NULL CHECK(json_type(reasoning_efforts)='array'),
     pricing TEXT CHECK(json_type(pricing)='object'),
-    UNIQUE(provider_id, model_key)
+    archived_at INTEGER
 );
+CREATE UNIQUE INDEX active_model_key ON llm_models(provider_id, model_key) WHERE archived_at IS NULL;
+CREATE VIEW model_catalog AS
+SELECT m.*, p.archived_at AS provider_archived_at,
+       (m.archived_at IS NULL AND p.archived_at IS NULL) AS available
+FROM llm_models m JOIN llm_providers p ON p.id=m.provider_id;
 CREATE TABLE config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     default_model_id INTEGER REFERENCES llm_models,

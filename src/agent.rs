@@ -33,9 +33,10 @@ pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<
             sid,
             move |conn, active| {
                 let current = session(conn, sid)?;
-                if current["model_id"].is_null() {
-                    return Err(Error::conflict("select a session model before running"));
-                }
+                let model_id = current["model_id"]
+                    .as_i64()
+                    .ok_or_else(|| Error::conflict("select a session model before running"))?;
+                crate::catalog::available_capabilities(conn, model_id)?;
                 if current["status"] == "pausing" {
                     return Err(Error::conflict("session is pausing"));
                 }

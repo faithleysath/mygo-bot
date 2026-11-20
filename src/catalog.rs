@@ -1,9 +1,9 @@
 use crate::{App, Error, Result, media, pricing};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
 };
 use rusqlite::{Connection, OptionalExtension, Row, ffi, params, types::Type};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -16,9 +16,19 @@ type Data = Result<Json<Value>>;
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/providers", get(list_providers).post(create_provider))
-        .route("/providers/{id}", get(get_provider).patch(patch_provider))
+        .route(
+            "/providers/{id}",
+            get(get_provider)
+                .patch(patch_provider)
+                .delete(archive_provider),
+        )
+        .route("/providers/{id}/restore", post(restore_provider))
         .route("/models", get(list_models).post(create_model))
-        .route("/models/{id}", get(get_model).patch(patch_model))
+        .route(
+            "/models/{id}",
+            get(get_model).patch(patch_model).delete(archive_model),
+        )
+        .route("/models/{id}/restore", post(restore_model))
 }
 
 fn document<T: DeserializeOwned + Serialize>(old: Option<&T>, fields: Document) -> Result<T> {
@@ -43,18 +53,89 @@ fn record<T>(
     Ok(stmt.query_row([id], read)?)
 }
 
-fn list(conn: &Connection, select: &str, read: fn(&Row) -> rusqlite::Result<Value>) -> Data {
-    let mut stmt = conn.prepare_cached(&format!("{select} ORDER BY id"))?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListOptions {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+fn list(
+    conn: &Connection,
+    select: &str,
+    filter: &str,
+    read: fn(&Row) -> rusqlite::Result<Value>,
+) -> Data {
+    let mut stmt = conn.prepare_cached(&format!("{select} {filter} ORDER BY id"))?;
     let values = stmt.query_map([], read)?.collect::<rusqlite::Result<_>>()?;
     Ok(Json(Value::Array(values)))
 }
 
 fn catalog_error(err: rusqlite::Error) -> Error {
     match err.sqlite_error().map(|e| e.extended_code) {
-        Some(ffi::SQLITE_CONSTRAINT_UNIQUE) => Error::conflict("catalog entry already exists"),
+        Some(ffi::SQLITE_CONSTRAINT_UNIQUE) => {
+            Error::conflict("name is already in use by an active catalog entry")
+        }
         Some(ffi::SQLITE_CONSTRAINT_FOREIGNKEY) => Error::bad("unknown provider_id"),
         _ => err.into(),
     }
+}
+
+// The database worker commits this write (including any default change) atomically.
+async fn set_archived(app: App, table: &'static str, id: i64, archive: bool) -> Result<StatusCode> {
+    app.db
+        .write(
+            move |conn| {
+                let timestamp = archive.then(|| chrono::Utc::now().timestamp_millis());
+                let value = if archive {
+                    "coalesce(archived_at, ?1)"
+                } else {
+                    "?1"
+                };
+                let sql = format!("UPDATE {table} SET archived_at={value} WHERE id=?2");
+                if conn.execute(&sql, (timestamp, id)).map_err(catalog_error)? == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                }
+                if archive {
+                    conn.execute(
+                        "UPDATE config SET default_model_id=NULL, default_reasoning_effort=NULL
+                         WHERE EXISTS(SELECT 1 FROM model_catalog
+                                      WHERE id=config.default_model_id AND NOT available)",
+                        [],
+                    )?;
+                }
+                Ok(())
+            },
+            |_, ()| Ok(StatusCode::NO_CONTENT),
+        )
+        .await
+}
+
+async fn archive_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+    set_archived(app, "llm_providers", id, true).await
+}
+async fn restore_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+    set_archived(app, "llm_providers", id, false).await
+}
+async fn archive_model(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+    set_archived(app, "llm_models", id, true).await
+}
+async fn restore_model(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+    set_archived(app, "llm_models", id, false).await
+}
+
+pub fn available_capabilities(conn: &Connection, id: i64) -> Result<(Value, Value)> {
+    let (available, modalities, efforts) = conn
+        .prepare_cached(
+            "SELECT available,input_modalities,reasoning_efforts FROM model_catalog WHERE id=?",
+        )?
+        .query_row([id], |r| Ok((r.get::<_, bool>(0)?, r.get(1)?, r.get(2)?)))?;
+    if !available {
+        return Err(Error::conflict(format!(
+            "model {id} or its provider is archived; select another model"
+        )));
+    }
+    Ok((modalities, efforts))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -65,12 +146,13 @@ struct Provider {
     api_key: Option<String>,
 }
 
-const PROVIDER: &str = "SELECT id,name,base_url,coalesce(api_key,'')<>'' FROM llm_providers";
+const PROVIDER: &str =
+    "SELECT id,name,base_url,coalesce(api_key,'')<>'',archived_at FROM llm_providers";
 
 fn public_provider(row: &Row) -> rusqlite::Result<Value> {
     Ok(
         json!({"id": row.get::<_,i64>(0)?, "name": row.get::<_,String>(1)?,
-        "base_url": row.get::<_,String>(2)?, "has_api_key": row.get::<_,bool>(3)?}),
+        "base_url": row.get::<_,String>(2)?, "has_api_key": row.get::<_,bool>(3)?, "archived_at": row.get::<_,Option<i64>>(4)?}),
     )
 }
 
@@ -80,9 +162,14 @@ async fn get_provider(State(app): State<App>, Path(id): Path<i64>) -> Data {
         .await
 }
 
-async fn list_providers(State(app): State<App>) -> Data {
+async fn list_providers(State(app): State<App>, Query(opts): Query<ListOptions>) -> Data {
+    let filter = if opts.include_archived {
+        ""
+    } else {
+        "WHERE archived_at IS NULL"
+    };
     app.db
-        .call(|s| list(&s.conn, PROVIDER, public_provider))
+        .call(move |s| list(&s.conn, PROVIDER, filter, public_provider))
         .await
 }
 
@@ -169,7 +256,7 @@ struct Model {
     pricing: Option<Value>,
 }
 
-const MODEL: &str = "SELECT id,provider_id,model_key,context_window_tokens,input_modalities,reasoning_efforts,pricing FROM llm_models";
+const MODEL: &str = "SELECT id,provider_id,model_key,context_window_tokens,input_modalities,reasoning_efforts,pricing,archived_at,provider_archived_at FROM model_catalog";
 
 fn string_array(row: &Row, index: usize) -> rusqlite::Result<Vec<String>> {
     let raw: String = row.get(index)?;
@@ -187,12 +274,6 @@ impl Model {
             reasoning_efforts: string_array(row, 5)?,
             pricing: row.get(6)?,
         })
-    }
-
-    fn public(&self, id: i64) -> Value {
-        let mut value = json!(self);
-        value["id"] = json!(id);
-        value
     }
 
     fn validate(&self) -> Result<()> {
@@ -289,7 +370,11 @@ impl Model {
 }
 
 fn public_model(row: &Row) -> rusqlite::Result<Value> {
-    Ok(Model::read(row)?.public(row.get(0)?))
+    let mut value = json!(Model::read(row)?);
+    value["id"] = json!(row.get::<_, i64>(0)?);
+    value["archived_at"] = json!(row.get::<_, Option<i64>>(7)?);
+    value["provider_archived_at"] = json!(row.get::<_, Option<i64>>(8)?);
+    Ok(value)
 }
 
 async fn get_model(State(app): State<App>, Path(id): Path<i64>) -> Data {
@@ -298,8 +383,15 @@ async fn get_model(State(app): State<App>, Path(id): Path<i64>) -> Data {
         .await
 }
 
-async fn list_models(State(app): State<App>) -> Data {
-    app.db.call(|s| list(&s.conn, MODEL, public_model)).await
+async fn list_models(State(app): State<App>, Query(opts): Query<ListOptions>) -> Data {
+    let filter = if opts.include_archived {
+        ""
+    } else {
+        "WHERE available"
+    };
+    app.db
+        .call(move |s| list(&s.conn, MODEL, filter, public_model))
+        .await
 }
 
 fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<Value> {
@@ -308,6 +400,23 @@ fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<Va
         .transpose()?;
     let model = document(old.as_ref(), fields)?;
     model.validate()?;
+    if old
+        .as_ref()
+        .is_none_or(|previous| previous.provider_id != model.provider_id)
+    {
+        let archived: Option<bool> = conn
+            .query_row(
+                "SELECT archived_at IS NOT NULL FROM llm_providers WHERE id=?",
+                [model.provider_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match archived {
+            Some(false) => (),
+            Some(true) => return Err(Error::conflict("cannot add models to an archived provider")),
+            None => return Err(Error::bad("unknown provider_id")),
+        }
+    }
     if let (Some(id), Some(old)) = (id, old) {
         model.check_update(conn, id, &old)?;
     }
@@ -323,7 +432,7 @@ fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<Va
         ],
         |r| r.get(0),
     ).map_err(catalog_error)?;
-    Ok(model.public(id))
+    record(conn, MODEL, id, public_model)
 }
 
 async fn create_model(

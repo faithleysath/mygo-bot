@@ -11,15 +11,16 @@ use serde_json::{Map, Value};
 
 // Called inside the transaction which pins the session's input prefix.
 pub fn begin(conn: &Connection, sid: i64, end: i64) -> Result<Input> {
-    let (model_id, model, url, key, effort, modalities, prices) = conn.query_row(
-        "SELECT m.id,m.model_key,p.base_url,p.api_key,s.reasoning_effort,m.input_modalities,m.pricing
+    let (model_id, model, url, key, effort, prices) = conn.query_row(
+        "SELECT m.id,m.model_key,p.base_url,p.api_key,s.reasoning_effort,m.pricing
          FROM sessions s JOIN llm_models m ON m.id=s.model_id JOIN llm_providers p ON p.id=m.provider_id WHERE s.id=?",
         [sid],
         |r| Ok((
             r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
-            r.get::<_, Option<String>>(4)?, r.get(5)?, r.get::<_, Option<Value>>(6)?,
+            r.get::<_, Option<String>>(4)?, r.get::<_, Option<Value>>(5)?,
         )),
     )?;
+    let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
     media::check_session(conn, sid, &modalities)?;
     let started_at = Utc::now().timestamp_millis();
     let snapshot = prices
