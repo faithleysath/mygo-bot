@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+#MISE description="FrontierHarness Eval 选题、成对运行和轨迹对照。用 mise run eval -- --help 查看示例"
+set -eu
+exec python3 -B "$(dirname "$0")/../tools/frontier-eval/cli.py" "$@"

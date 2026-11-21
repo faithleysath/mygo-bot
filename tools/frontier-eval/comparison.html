@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MyGo 与 Pi · 轨迹对照</title>
+<style>
+:root{color-scheme:light dark;--paper:#f5f7fa;--ink:#182131;--muted:#48576a;--panel:#fff;--line:#c9d2dc;--mygo:#075d69;--pi:#65468e;--code:#eef2f6;--focus:#185bbb}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.55 'Source Sans 3',system-ui,sans-serif}main{max-width:1550px;margin:auto;padding:clamp(16px,3vw,48px)}header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px}h1{font-size:clamp(25px,3.2vw,42px);letter-spacing:-.04em;margin:0}h2{margin:0;font-size:22px}p{margin:.5rem 0;color:var(--muted)}nav{display:flex;flex-wrap:wrap;align-items:end;gap:15px;margin:20px 0}label{font-size:14px;color:var(--muted);display:grid;gap:3px}select{min-height:44px;max-width:100%;font:inherit;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:5px;padding:4px 12px}select:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}a{color:var(--focus)}details{border-bottom:1px solid var(--line)}summary{cursor:pointer;overflow-wrap:anywhere;padding:10px 0}.prompt{background:var(--panel);padding:0 16px;border:1px solid var(--line);border-radius:5px}.pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(12px,2vw,30px);margin-top:20px}article{background:var(--panel);padding:16px;border-top:4px solid var(--mygo);min-width:0}article.pi{border-color:var(--pi)}.heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;overflow-wrap:anywhere}.heading span{font-weight:650}.metrics,.links{display:flex;gap:5px 16px;flex-wrap:wrap;font-size:14px;color:var(--muted);margin:8px 0}.step{font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:14px}.step small{margin-right:10px;color:var(--muted)}pre{margin:4px 0 12px;padding:10px 12px;background:var(--code);white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.5 'IBM Plex Mono',ui-monospace,monospace;max-height:420px;overflow:auto}h3{margin:22px 0 4px;font-size:15px}.step h4{margin:6px 0 0;color:var(--muted);font:600 13px/1.4 system-ui}.receipt{color:var(--muted);font-size:14px}.steps{margin-top:10px}@media(max-width:720px){.pair{grid-template-columns:1fr}nav label:first-child{width:100%}}@media(prefers-color-scheme:dark){:root{--paper:#141a21;--panel:#1d2631;--ink:#e9edf2;--muted:#b4c1d0;--line:#495669;--code:#121920;--mygo:#6cc8c7;--pi:#b99cda;--focus:#99baff}}
+.requests{overflow:auto;max-height:350px}table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}th,td{text-align:right;padding:5px;border-bottom:1px solid var(--line)}th{position:sticky;top:0;background:var(--panel)}th:first-child,td:first-child{text-align:left}
+</style>
+<main><header><h1>轨迹对照</h1><p id="model"></p></header><p id="overview"></p><nav aria-label="选择场次"><label>题目<select id="task"></select></label><label>尝试<select id="attempt"></select></label></nav><details class="prompt"><summary>原始题面</summary><pre id="prompt"></pre></details><section class="pair" id="pair" aria-label="两个 harness 的独立轨迹"></section></main>
+<script id="data" type="application/json">/*__RUN_DATA__*/</script>
+<script>
+'use strict';
+const run = JSON.parse(document.getElementById('data').textContent);
+const byId = id => document.getElementById(id);
+function element(tag, text, cls) {
+  const el = document.createElement(tag);
+  if (text !== undefined) el.textContent = text;
+  if (cls) el.className = cls;
+  return el;
+}
+const task = byId('task'), attempt = byId('attempt');
+function options(select, values) {
+  select.replaceChildren(...values.map(value => new Option(String(value), String(value))));
+}
+function showAgent(name, agent) {
+  const card = element('article', undefined, name);
+  const heading = element('div', undefined, 'heading');
+  const status = agent?.reward == null ? agent?.status ?? '未开始' : agent.reward === 1 ? '通过' : '得分 '+agent.reward;
+  heading.append(element('h2', name === 'pi' ? 'Pi' : 'MyGo'),element('span', status)); card.append(heading);
+  if (!agent) return card;
+  if (agent.version) card.append(element('small', '版本 '+agent.version, 'receipt'));
+  if (agent.omitted_image) card.append(element('p','本场日志记录了由于模型输入配置而省略的图片。'));
+  if (agent.failed_tests.length) card.append(element('p','未通过检查：'+agent.failed_tests.join('、')));
+  const stats = element('div', undefined, 'metrics');
+  for (const [key,label,unit] of [['calls','模型调用',' 次'],['execution','作答',' 秒'],['setup','安装',' 秒'],['verifier','判分',' 秒'],['input','输入',' tokens'],['output','输出',' tokens']]) {
+    const value = agent.metrics[key];
+    if (value != null) stats.append(element('span',label+' '+value.toLocaleString()+unit));
+  }
+  const links = element('div', undefined, 'links');
+  for (const [label,href] of Object.entries(agent.files)) {
+    const a = element('a',label); a.href = href; links.append(a);
+  }
+  card.append(stats,links);
+  if (agent.requests.length) {
+    const details = element('details'); details.append(element('summary','逐次模型请求'));
+    const table = element('table'); const head = table.createTHead().insertRow();
+    for (const label of ['请求','状态','秒','输入','缓存读取','输出']) head.append(element('th',label));
+    const body = table.createTBody();
+    for (const req of agent.requests) {
+      const row = body.insertRow();
+      for (const k of ['id','status','seconds','input','cached','output']) row.insertCell().textContent = req[k]?.toLocaleString() ?? '—';
+    }
+    const scroll = element('div',undefined,'requests'); scroll.append(table); details.append(scroll); card.append(details);
+  }
+  for (const [i,step] of agent.steps.entries()) {
+    const details = element('details',undefined,'step'); const title = element('summary');
+    title.append(element('small',String(i+1).padStart(2,'0')),document.createTextNode(step.name));
+    if (step.call) title.append(element('small','　模型 #'+step.call));
+    if (step.seconds != null) title.append(element('small','　'+step.seconds+' 秒'));
+    details.append(title);
+    for (const [key,label] of [['args','参数'],['result','返回'],['text','内容']]) {
+      if (key in step) details.append(element('h4',label),element('pre',step[key] || '（空）'));
+    }
+    card.append(details);
+  }
+  if (!agent.steps.length) card.append(element('p','此场暂无已保存的轨迹。','receipt'));
+  return card;
+}
+function render() {
+  const pair = run.pairs.find(p => p.task === task.value && p.attempt === Number(attempt.value));
+  byId('prompt').textContent = pair.prompt || '此场尚未记录题面。';
+  byId('pair').replaceChildren(...['mygo','pi'].map(name => showAgent(name,pair.agents[name])));
+}
+function chooseTask() { options(attempt,run.pairs.filter(p => p.task===task.value).map(p => p.attempt)); render(); }
+const counts = name => {
+  const scores = run.pairs.map(p => p.agents[name]?.reward).filter(v => v != null);
+  return scores.filter(v => v===1).length+'/'+scores.length;
+};
+byId('model').textContent = run.model+' · '+run.effort;
+byId('overview').textContent = `${new Set(run.pairs.map(p=>p.task)).size} 道题 · ${run.pairs.length} 对尝试　通过场次　MyGo ${counts('mygo')}　Pi ${counts('pi')}`;
+options(task,[...new Set(run.pairs.map(p=>p.task))]); task.onchange=chooseTask; attempt.onchange=render; chooseTask();
+</script></html>
