@@ -2,13 +2,13 @@ mod agent;
 mod api;
 mod calls;
 mod catalog;
+mod codemode;
 mod daemon;
 mod docs;
 mod events;
 mod media;
 mod model;
 mod pricing;
-mod sandbox;
 #[cfg(unix)]
 mod socket;
 mod store;
@@ -73,7 +73,7 @@ impl IntoResponse for Error {
 #[derive(Clone)]
 struct App {
     db: Db,
-    sandbox: Arc<sandbox::Engine>,
+    codemode: Arc<codemode::Engine>,
     client: reqwest::Client,
     stopping: CancellationToken,
     workers: TaskTracker,
@@ -170,7 +170,7 @@ async fn serve(
         |n| n.get(),
     );
     let app = App {
-        sandbox: Arc::new(sandbox::Engine::new(threads)?),
+        codemode: Arc::new(codemode::Engine::new(threads)?),
         db: Db::open(Path::new("mygo-bot.sqlite3"))?,
         client: reqwest::Client::builder()
             // Each retry gets its own llm_calls row in the worker loop.

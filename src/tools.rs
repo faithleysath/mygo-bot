@@ -1,6 +1,6 @@
 use crate::{
     App, Result,
-    sandbox::{self, Call},
+    codemode::{self, Call},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ fn definition(name: &str, description: &str, properties: Value, required: &[&str
 }
 
 pub fn definitions() -> Value {
-    let id = json!({"type":"string", "description":"Task ID from this session (sb_...)."});
+    let id = json!({"type":"string", "description":"Task ID from this session (cm_...)."});
     json!([
         definition(
             "codemode",
@@ -90,10 +90,10 @@ fn action(name: &str, arguments: &str) -> std::result::Result<Action, String> {
         serde_json::from_str(s).map_err(|e| e.to_string())
     }
     fn target(id: &str) -> std::result::Result<i64, String> {
-        id.strip_prefix("sb_")
+        id.strip_prefix("cm_")
             .and_then(|n| n.parse::<i64>().ok())
-            .filter(|n| *n > 0 && format!("sb_{n}") == id)
-            .ok_or_else(|| "expected an sb_ task ID".to_owned())
+            .filter(|n| *n > 0 && format!("cm_{n}") == id)
+            .ok_or_else(|| "expected a cm_ task ID".to_owned())
     }
     match name {
         "codemode" => {
@@ -135,10 +135,10 @@ pub async fn execute(
         return Ok(());
     }
     match action(name, arguments) {
-        Ok(Action::Run(script)) => sandbox::run(app, call, script, hard).await,
-        Ok(Action::List) => sandbox::list(app, call).await,
-        Ok(Action::Kill(id)) => sandbox::kill(app, call, id, hard).await,
-        Ok(Action::Renew(id, seconds)) => sandbox::renew(app, call, id, seconds, hard).await,
+        Ok(Action::Run(script)) => codemode::run(app, call, script, hard).await,
+        Ok(Action::List) => codemode::list(app, call).await,
+        Ok(Action::Kill(id)) => codemode::kill(app, call, id, hard).await,
+        Ok(Action::Renew(id, seconds)) => codemode::renew(app, call, id, seconds, hard).await,
         Err(e) => {
             app.db
                 .call(move |s| call.reply(s, json!({"status":"error","error":e})))

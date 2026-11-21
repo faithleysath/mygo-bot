@@ -51,7 +51,7 @@ pub struct Db(mpsc::Sender<Command>);
 pub struct Store {
     pub conn: Connection,
     pub active: HashMap<i64, Control>,
-    pub sandboxes: HashMap<i64, crate::sandbox::Task>,
+    pub tasks: HashMap<i64, crate::codemode::Task>,
     channels: HashMap<i64, broadcast::WeakSender<Notice>>,
     pub closing: bool,
 }
@@ -76,14 +76,16 @@ impl Db {
         )?;
         if !initialized {
             tx.execute_batch(include_str!("../schema.sql"))?;
-        } else if !tx.column_exists(None, "sessions", "input_queue_cursor")? {
+        } else if !tx.column_exists(None, "sessions", "input_queue_cursor")?
+            || !tx.column_exists(None, "items", "codemode_call_item_id")?
+        {
             return Err(Error::internal(
                 "incompatible database schema; select a new database directory",
             ));
         }
         tx.execute("UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE status='in_flight'", [])?;
         tx.execute("UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE status IN ('running','pausing')", [])?;
-        crate::sandbox::ledger::recover(&tx)?;
+        crate::codemode::ledger::recover(&tx)?;
         tx.commit()?;
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
         let runtime = tokio::runtime::Handle::current();
@@ -94,7 +96,7 @@ impl Db {
                 let mut store = Store {
                     conn,
                     active: HashMap::new(),
-                    sandboxes: HashMap::new(),
+                    tasks: HashMap::new(),
                     channels: HashMap::new(),
                     closing: false,
                 };
@@ -438,7 +440,7 @@ pub fn take_pending(tx: &Connection, sid: i64) -> Result<()> {
 fn advance_queue(conn: &Connection, sid: i64, added: bool) -> Result<()> {
     conn.execute(
         "UPDATE sessions SET input_queue_cursor=last_id,needs_model=needs_model OR ?2
-         FROM (SELECT max(id) AS last_id FROM items WHERE session_id=?1 AND kind IN ('user_message','sandbox_event'))
+         FROM (SELECT max(id) AS last_id FROM items WHERE session_id=?1 AND kind IN ('user_message','codemode_event'))
          WHERE sessions.id=?1 AND input_queue_cursor<last_id",
         (sid, added),
     )?;
@@ -568,7 +570,7 @@ impl JsonRows {
         while let Some(row) = rows.next()? {
             let encoded;
             let raw = if matches!(self, Self::ModelInput)
-                && let Some(kind @ ("user_message" | "function_call_output" | "sandbox_event")) =
+                && let Some(kind @ ("user_message" | "function_call_output" | "codemode_event")) =
                     row.get_ref(2)?.as_str().ok()
             {
                 encoded = crate::media::wire_message(conn, kind, row.get(1)?)?.to_string();

@@ -179,17 +179,17 @@ async fn reply(model: Model, request: Value) -> Result<Response> {
                     "unpaired tool output",
                 )?;
                 let outcome: Value = serde_json::from_str(
-                    result["output"].as_str().ok_or("missing sandbox result")?,
+                    result["output"].as_str().ok_or("missing codemode result")?,
                 )?;
                 let id = outcome["id"]
                     .as_str()
-                    .and_then(|id| id.strip_prefix("sb_"))
-                    .ok_or("missing sandbox ID")?;
+                    .and_then(|id| id.strip_prefix("cm_"))
+                    .ok_or("missing task ID")?;
                 check(
                     id.parse::<u64>()? > 0 && outcome["status"] == "succeeded",
-                    "invalid sandbox clock result",
+                    "invalid codemode clock result",
                 )?;
-                let date = outcome["output"].as_str().ok_or("missing sandbox date")?;
+                let date = outcome["output"].as_str().ok_or("missing codemode date")?;
                 if i == 0 {
                     check(date.ends_with('Z'), "expected a UTC timestamp")?;
                     chrono::DateTime::parse_from_rfc3339(date)?;

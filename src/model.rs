@@ -303,7 +303,7 @@ impl App {
             let app = self.clone();
             let hard = hard.clone();
             out.tasks.spawn(async move {
-                let call = crate::sandbox::Call { sid, id, call };
+                let call = crate::codemode::Call { sid, id, call };
                 tools::execute(app, call, &name, &args, hard).await
             });
             return Ok(());
@@ -318,7 +318,7 @@ impl App {
                     | "withdrawal"
                     | "assistant_message"
                     | "function_call_output"
-                    | "sandbox_event"
+                    | "codemode_event"
             ) {
                 return Err(Error::internal("unexpected reserved output item type"));
             }

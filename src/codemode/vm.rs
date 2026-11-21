@@ -61,7 +61,7 @@ impl Pool {
             let load = active.clone();
             let stop = pool.stop.clone();
             thread::Builder::new()
-                .name(format!("sandbox-js-{index}"))
+                .name(format!("codemode-js-{index}"))
                 .stack_size(4 * MIB)
                 .spawn(move || {
                     let local = LocalSet::new();
@@ -125,7 +125,7 @@ impl Scope {
 
     fn admit(&self, ctx: &Ctx<'_>) -> JsResult<()> {
         if self.stopped() || !self.accepting.get() {
-            return Err(Exception::throw_message(ctx, "sandbox stopped"));
+            return Err(Exception::throw_message(ctx, "codemode task stopped"));
         }
         if self.jobs.borrow().len() >= HOST_CALLS {
             return Err(Exception::throw_message(
@@ -147,7 +147,7 @@ impl Scope {
         self.admit(ctx)?;
         let resolvers = resolvers
             .upgrade()
-            .ok_or_else(|| Exception::throw_message(ctx, "sandbox closed"))?;
+            .ok_or_else(|| Exception::throw_message(ctx, "codemode task closed"))?;
         let (promise, yes, no) = Promise::new(ctx)?;
         let task = self
             .jobs
@@ -162,7 +162,7 @@ impl Scope {
 
     fn append(&self, ctx: &Ctx<'_>, blocks: Blocks) -> JsResult<()> {
         if self.stopped() {
-            return Err(Exception::throw_message(ctx, "sandbox stopped"));
+            return Err(Exception::throw_message(ctx, "codemode task stopped"));
         }
         let appended = self.output.borrow_mut().append(blocks);
         appended.map_err(|e| Exception::throw_message(ctx, &e))
@@ -191,7 +191,7 @@ async fn run(job: Job, stop: CancellationToken) {
 
 async fn drive(scope: &Rc<Scope>, code: &str) -> Result<(), String> {
     if scope.stopped() {
-        return Err("sandbox cancelled".into());
+        return Err("codemode task cancelled".into());
     }
     let rt = AsyncRuntime::new().map_err(|e| e.to_string())?;
     rt.set_memory_limit(96 * MIB).await;
@@ -225,7 +225,7 @@ async fn drive(scope: &Rc<Scope>, code: &str) -> Result<(), String> {
         let mut idle = false;
         for turn in 0..JOBS_PER_TURN {
             if scope.stopped() {
-                return Err("sandbox cancelled".into());
+                return Err("codemode task cancelled".into());
             }
             let finished = context
                 .with(|ctx| {
@@ -275,8 +275,8 @@ async fn drive(scope: &Rc<Scope>, code: &str) -> Result<(), String> {
             // An empty JoinSet means the root can only wake through cancellation.
             ready = tokio::select! {
                 biased;
-                _ = scope.cancel.cancelled() => return Err("sandbox cancelled".into()),
-                _ = scope.stop.cancelled() => return Err("sandbox cancelled".into()),
+                _ = scope.cancel.cancelled() => return Err("codemode task cancelled".into()),
+                _ = scope.stop.cancelled() => return Err("codemode task cancelled".into()),
                 done = poll_fn(|cx| match scope.jobs.borrow_mut().poll_join_next_with_id(cx) {
                     Poll::Ready(None) => Poll::Pending,
                     other => other,

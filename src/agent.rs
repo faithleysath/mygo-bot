@@ -189,7 +189,7 @@ pub async fn pause(
         .call(move |s| {
             let current = session(&s.conn, sid)?;
             if matches!(q.mode, PauseMode::Hard) {
-                crate::sandbox::stop_session(s, sid);
+                crate::codemode::stop_session(s, sid);
             }
             if current.status != SessionStatus::Paused {
                 request_pause(s, sid, matches!(q.mode, PauseMode::Hard), "paused by user")?;
@@ -218,7 +218,7 @@ impl App {
         self.db
             .call(|s| {
                 s.closing = true;
-                crate::sandbox::shutdown_tasks(s, false)?;
+                crate::codemode::shutdown_tasks(s, false)?;
                 for sid in s.active.keys().copied().collect::<Vec<_>>() {
                     request_pause(s, sid, false, "daemon shutting down")?;
                 }
@@ -233,7 +233,7 @@ impl App {
         {
             self.db
                 .call(|s| {
-                    crate::sandbox::shutdown_tasks(s, true)?;
+                    crate::codemode::shutdown_tasks(s, true)?;
                     for c in s.active.values() {
                         c.hard.cancel();
                     }

@@ -94,7 +94,7 @@ impl Host {
             .db
             .call(move |s| {
                 let task = s
-                    .sandboxes
+                    .tasks
                     .get_mut(&origin)
                     .ok_or_else(|| Error::conflict("task no longer active"))?;
                 if task.reason.is_some() || task.expired() || task.cancel.is_cancelled() {
@@ -181,7 +181,7 @@ impl Task {
         let deadline = *self.deadline.borrow();
         let expiry = self.started_at + deadline.duration_since(self.created);
         json!({
-            "id": format!("sb_{}", self.origin.id),
+            "id": format!("cm_{}", self.origin.id),
             "label": self.label,
             "state": if self.reason.is_some() { "stopping" } else { "running" },
             "delivery": if self.background { "background" } else { "foreground" },
@@ -238,13 +238,13 @@ impl Task {
 }
 
 pub fn stop_session(s: &mut Store, sid: i64) {
-    for t in s.sandboxes.values_mut().filter(|t| t.origin.sid == sid) {
+    for t in s.tasks.values_mut().filter(|t| t.origin.sid == sid) {
         t.stop("killed");
     }
 }
 pub fn shutdown_tasks(s: &mut Store, hard: bool) -> Result<()> {
     let mut paused = std::collections::BTreeSet::new();
-    for t in s.sandboxes.values_mut() {
+    for t in s.tasks.values_mut() {
         if t.background || hard {
             t.stop("interrupted");
             if t.background {
@@ -265,7 +265,7 @@ pub async fn list(app: App, call: Call) -> Result<()> {
     app.db
         .call(move |s| {
             let mut tasks: Vec<_> = s
-                .sandboxes
+                .tasks
                 .values()
                 .filter(|t| t.origin.sid == call.sid)
                 .collect();
@@ -277,10 +277,10 @@ pub async fn list(app: App, call: Call) -> Result<()> {
 }
 
 fn owned(s: &Store, sid: i64, id: i64) -> Option<&Task> {
-    s.sandboxes.get(&id).filter(|t| t.origin.sid == sid)
+    s.tasks.get(&id).filter(|t| t.origin.sid == sid)
 }
 fn inactive(call: &Call, s: &mut Store, id: i64) -> Result<()> {
-    call.reply(s, json!({"id":format!("sb_{id}"),"status":"not_active"}))
+    call.reply(s, json!({"id":format!("cm_{id}"),"status":"not_active"}))
 }
 
 pub async fn renew(
@@ -308,14 +308,14 @@ pub async fn renew(
             let duration = Duration::from_secs(seconds.into());
             let expires = task.started_at + (now + duration - task.created);
             let response = json!({
-                "id": format!("sb_{id}"), "status":"renewed",
+                "id": format!("cm_{id}"), "status":"renewed",
                 "expires_at": expires.to_rfc3339(), "remaining_seconds": seconds
             });
             let tx = s.conn.transaction()?;
             ledger::invalidate(&tx, call.sid, id)?;
             let saved = call.save(&tx, &Value::String(response.to_string()), false)?;
             tx.commit()?;
-            s.sandboxes.get_mut(&id).unwrap().lease(now, duration);
+            s.tasks.get_mut(&id).unwrap().lease(now, duration);
             notice(s, call.sid, saved);
             Ok(())
         })
@@ -329,15 +329,11 @@ pub async fn kill(app: App, call: Call, id: i64, hard: CancellationToken) -> Res
             if hard.is_cancelled() {
                 return Ok(());
             }
-            let Some(task) = s
-                .sandboxes
-                .get_mut(&id)
-                .filter(|t| t.origin.sid == call.sid)
-            else {
+            let Some(task) = s.tasks.get_mut(&id).filter(|t| t.origin.sid == call.sid) else {
                 return inactive(&call, s, id);
             };
             if task.reason.is_some() {
-                return call.reply(s, json!({"status":"stopping","id":format!("sb_{id}")}));
+                return call.reply(s, json!({"status":"stopping","id":format!("cm_{id}")}));
             }
             task.stop(if task.expired() { "expired" } else { "killed" });
             task.kill = Some(KillWait {
@@ -361,8 +357,8 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             return Ok(());
         }
         if s.closing
-            || s.sandboxes.len() >= MAX_TASKS
-            || s.sandboxes
+            || s.tasks.len() >= MAX_TASKS
+            || s.tasks
                 .values()
                 .filter(|t| t.origin.sid == call.sid)
                 .count()
@@ -404,15 +400,15 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
         let (done, finish) = oneshot::channel();
         let host = Host {
             app: app.clone(),
-            client: app.sandbox.client.clone(),
+            client: app.codemode.client.clone(),
             sid,
             origin: id,
             cancel: cancel.clone(),
             deadline: lease,
             executor: Handle::current(),
         };
-        s.sandboxes.insert(id, task);
-        let submitted = app.sandbox.pool.submit(Job {
+        s.tasks.insert(id, task);
+        let submitted = app.codemode.pool.submit(Job {
             code: script.code,
             cancel,
             host,
@@ -429,27 +425,27 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
 }
 
 fn tick(s: &mut Store, app: &App, id: i64) -> Result<Option<Instant>> {
-    let task = s.sandboxes.get_mut(&id).expect("supervisor owns task");
+    let task = s.tasks.get_mut(&id).expect("supervisor owns task");
     let now = Instant::now();
     let sid = task.origin.sid;
     if task.kill.as_ref().is_some_and(|k| now >= k.until) {
         let k = task.kill.as_ref().unwrap();
         let saved = k.call.save(
             &s.conn,
-            &Value::String(json!({"status":"stopping","id":format!("sb_{id}")}).to_string()),
+            &Value::String(json!({"status":"stopping","id":format!("cm_{id}")}).to_string()),
             false,
         )?;
         let _ = task.kill.take().unwrap().committed.send(());
         notice(s, sid, saved);
     }
-    let task = s.sandboxes.get_mut(&id).unwrap();
+    let task = s.tasks.get_mut(&id).unwrap();
     if task.can_detach(s.closing) && now >= task.created + FRONT_WAIT {
         let saved = task.origin.save(&s.conn, &task.receipt(), true)?;
         task.background = true;
         task.delivered();
         notice(s, sid, saved);
     }
-    let task = s.sandboxes.get_mut(&id).unwrap();
+    let task = s.tasks.get_mut(&id).unwrap();
     if task.expired() {
         task.stop("expired");
     }
@@ -472,7 +468,7 @@ fn tick(s: &mut Store, app: &App, id: i64) -> Result<Option<Instant>> {
         task.warning += crossed;
         event_saved(s, app, sid, saved, true);
     }
-    Ok(s.sandboxes[&id].next_timer(s.closing))
+    Ok(s.tasks[&id].next_timer(s.closing))
 }
 
 async fn supervise(
@@ -535,7 +531,7 @@ async fn supervise(
 }
 
 fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
-    let task = &s.sandboxes[&id];
+    let task = &s.tasks[&id];
     let sid = task.origin.sid;
     let tx = s.conn.transaction()?;
     let status = task.reason.unwrap_or_else(|| {
@@ -547,7 +543,7 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
             "succeeded"
         }
     });
-    let mut summary = json!({"id":format!("sb_{id}"),"status":status});
+    let mut summary = json!({"id":format!("cm_{id}"),"status":status});
     if let Some(e) = &result.error {
         summary["error"] = json!(e);
     }
@@ -560,7 +556,7 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
     };
     let mut parts = match materialized {
         Ok(Value::Array(parts)) => parts,
-        Ok(_) => return Err(Error::internal("expected sandbox result blocks")),
+        Ok(_) => return Err(Error::internal("expected codemode result blocks")),
         Err(e) if e.0.is_client_error() => {
             if status == "succeeded" {
                 summary["status"] = json!("failed");
@@ -597,7 +593,7 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
         saved.push((k.call.save(&tx, wire, false)?, false));
     }
     tx.commit()?;
-    let mut task = s.sandboxes.remove(&id).unwrap();
+    let mut task = s.tasks.remove(&id).unwrap();
     task.delivered();
     if let Some(k) = task.kill {
         let _ = k.committed.send(());

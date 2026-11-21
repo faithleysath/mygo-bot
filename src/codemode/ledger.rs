@@ -13,8 +13,8 @@ pub fn tool_id(conn: &Connection, sid: i64, original: i64) -> Result<Option<i64>
 pub fn completed_id(conn: &Connection, sid: i64, origin: i64) -> Result<Option<i64>> {
     Ok(conn
         .prepare_cached(
-            "SELECT id FROM items WHERE session_id=? AND kind='sandbox_event'
-         AND sandbox_call_item_id=? AND json_extract(payload,'$.event')='completed'",
+            "SELECT id FROM items WHERE session_id=? AND kind='codemode_event'
+         AND codemode_call_item_id=? AND json_extract(payload,'$.event')='completed'",
         )?
         .query_row((sid, origin), |r| r.get(0))
         .optional()?)
@@ -35,7 +35,7 @@ pub fn tool(
     }
     let payload = json!({"type":"function_call_output","call_id":call,"output":output});
     let id = conn.prepare_cached(
-        "INSERT INTO items(session_id,kind,payload,target_id,sandbox_call_item_id)
+        "INSERT INTO items(session_id,kind,payload,target_id,codemode_call_item_id)
          SELECT session_id,'function_call_output',?4,id,?5 FROM items
          WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.call_id')=?3
          RETURNING id",
@@ -50,7 +50,7 @@ pub fn invalidate(conn: &Connection, sid: i64, origin: i64) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO invalidated_warnings(item_id)
          SELECT i.id FROM items i JOIN sessions s ON s.id=i.session_id
-         WHERE i.session_id=? AND i.sandbox_call_item_id=? AND i.kind='sandbox_event'
+         WHERE i.session_id=? AND i.codemode_call_item_id=? AND i.kind='codemode_event'
            AND i.id>s.input_queue_cursor AND json_extract(i.payload,'$.event')='lease_warning'
          ON CONFLICT(item_id) DO NOTHING",
     )?
@@ -70,25 +70,25 @@ pub fn event(
         || (!notify && kind != "completed")
         || !content.is_array()
     {
-        return Err(Error::internal("invalid sandbox event"));
+        return Err(Error::internal("invalid codemode event"));
     }
     if let Some(id) = completed_id(conn, sid, origin)? {
         return if kind == "completed" {
             Ok(id)
         } else {
-            Err(Error::conflict("sandbox already completed"))
+            Err(Error::conflict("codemode task already completed"))
         };
     }
     let background: Option<bool> = conn
         .prepare_cached(
-            "SELECT sandbox_call_item_id IS NOT NULL FROM items
+            "SELECT codemode_call_item_id IS NOT NULL FROM items
          WHERE session_id=? AND kind='function_call_output' AND target_id=?",
         )?
         .query_row((sid, origin), |row| row.get(0))
         .optional()?;
     if background == Some(false) || (kind == "completed" && background.is_none()) {
         return Err(Error::conflict(
-            "sandbox event conflicts with tool delivery",
+            "codemode event conflicts with tool delivery",
         ));
     }
     if kind == "message" {
@@ -97,13 +97,13 @@ pub fn event(
     let sequence: i64 = conn
         .prepare_cached(
             "SELECT coalesce(max(json_extract(payload,'$.sequence')),0)+1 FROM items
-         WHERE sandbox_call_item_id=? AND kind='sandbox_event'",
+         WHERE codemode_call_item_id=? AND kind='codemode_event'",
         )?
         .query_row([origin], |r| r.get(0))?;
-    let payload = json!({"event":kind,"sandbox_id":format!("sb_{origin}"),"sequence":sequence,"notify":notify,"content":content});
+    let payload = json!({"event":kind,"task_id":format!("cm_{origin}"),"sequence":sequence,"notify":notify,"content":content});
     let id = conn.prepare_cached(
-        "INSERT INTO items(session_id,kind,payload,sandbox_call_item_id)
-         SELECT session_id,'sandbox_event',?3,id FROM items
+        "INSERT INTO items(session_id,kind,payload,codemode_call_item_id)
+         SELECT session_id,'codemode_event',?3,id FROM items
          WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.name')='codemode'
          RETURNING id",
     )?.query_row(params![sid, origin, payload], |r| r.get(0))?;
@@ -117,7 +117,7 @@ pub fn pending_messages(conn: &Connection, sid: i64) -> Result<usize> {
     let count: i64 = conn
         .prepare_cached(
             "SELECT count(*) FROM items i JOIN sessions s ON s.id=i.session_id
-         WHERE i.session_id=? AND i.id>s.input_queue_cursor AND i.kind='sandbox_event'
+         WHERE i.session_id=? AND i.id>s.input_queue_cursor AND i.kind='codemode_event'
            AND json_extract(i.payload,'$.event')='message'",
         )?
         .query_row([sid], |r| r.get(0))?;
@@ -135,12 +135,12 @@ fn modalities(conn: &Connection, sid: i64) -> Result<Value> {
 pub fn materialize(conn: &Connection, sid: i64, blocks: &Blocks) -> Result<Value> {
     if conn.is_autocommit() {
         return Err(Error::internal(
-            "sandbox output requires a delivery transaction",
+            "codemode output requires a delivery transaction",
         ));
     }
     // A client error can be converted to a text-only terminal status in the same
     // outer transaction. Roll back any attachments created before that error.
-    conn.execute_batch("SAVEPOINT sandbox_blocks")?;
+    conn.execute_batch("SAVEPOINT codemode_blocks")?;
     let result = (|| {
         let mut parts = Vec::with_capacity(blocks.parts.len());
         for part in &blocks.parts {
@@ -165,33 +165,33 @@ pub fn materialize(conn: &Connection, sid: i64, blocks: &Blocks) -> Result<Value
         Ok(content)
     })();
     if result.is_err() {
-        conn.execute_batch("ROLLBACK TO sandbox_blocks")?;
+        conn.execute_batch("ROLLBACK TO codemode_blocks")?;
     }
-    conn.execute_batch("RELEASE sandbox_blocks")?;
+    conn.execute_batch("RELEASE codemode_blocks")?;
     result
 }
 
 pub fn recover(conn: &Connection) -> Result<()> {
-    // Foreground sandboxes may have emitted lease warnings too. No lease survives a restart.
+    // Foreground tasks may have emitted lease warnings too. No lease survives a restart.
     conn.execute(
         "INSERT INTO invalidated_warnings(item_id)
-         SELECT i.id FROM items i INDEXED BY sandbox_warnings JOIN sessions s ON s.id=i.session_id
-         WHERE i.kind='sandbox_event' AND json_extract(i.payload,'$.event')='lease_warning'
+         SELECT i.id FROM items i INDEXED BY codemode_warnings JOIN sessions s ON s.id=i.session_id
+         WHERE i.kind='codemode_event' AND json_extract(i.payload,'$.event')='lease_warning'
            AND i.id>s.input_queue_cursor ON CONFLICT(item_id) DO NOTHING",
         [],
     )?;
     let mut receipts = conn.prepare(
-        "SELECT r.session_id,r.sandbox_call_item_id FROM items r INDEXED BY sandbox_receipts
-         WHERE r.kind='function_call_output' AND r.sandbox_call_item_id IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM items e WHERE e.kind='sandbox_event'
-                           AND e.sandbox_call_item_id=r.sandbox_call_item_id AND json_extract(e.payload,'$.event')='completed')
+        "SELECT r.session_id,r.codemode_call_item_id FROM items r INDEXED BY codemode_receipts
+         WHERE r.kind='function_call_output' AND r.codemode_call_item_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM items e WHERE e.kind='codemode_event'
+                           AND e.codemode_call_item_id=r.codemode_call_item_id AND json_extract(e.payload,'$.event')='completed')
          ORDER BY r.id",
     )?;
     let missing = receipts
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
     for (sid, origin) in missing {
-        let status = json!({"id":format!("sb_{origin}"),"status":"interrupted","error":"Daemon restarted; result unknown."});
+        let status = json!({"id":format!("cm_{origin}"),"status":"interrupted","error":"Daemon restarted; result unknown."});
         let content = json!([{"type":"text","text":status.to_string()}]);
         event(conn, sid, origin, "completed", &content, true)?;
         conn.execute(
@@ -201,10 +201,10 @@ pub fn recover(conn: &Connection) -> Result<()> {
     }
     // A crash after committing an event can precede the idle worker's wake-up.
     conn.execute(
-        "UPDATE sessions SET status='paused',last_error='daemon restarted with pending sandbox events'
+        "UPDATE sessions SET status='paused',last_error='daemon restarted with pending codemode events'
          WHERE status='idle' AND EXISTS (
              SELECT 1 FROM pending p JOIN items i ON i.id=p.id
-             WHERE p.session_id=sessions.id AND i.kind='sandbox_event'
+             WHERE p.session_id=sessions.id AND i.kind='codemode_event'
          )",
         [],
     )?;

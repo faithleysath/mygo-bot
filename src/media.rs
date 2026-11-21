@@ -367,7 +367,7 @@ pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<
     // call order, and finally the unwithdrawn queue take_pending will append by id.
     let queries = [
         "SELECT i.id,i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
-         WHERE c.session_id=? AND i.kind IN ('user_message','sandbox_event','assistant_message','reasoning','function_call_output','image_generation_call')
+         WHERE c.session_id=? AND i.kind IN ('user_message','codemode_event','assistant_message','reasoning','function_call_output','image_generation_call')
          ORDER BY c.position",
         "SELECT r.id,r.kind,r.payload FROM items c JOIN items r ON r.target_id=c.id AND r.kind='function_call_output'
          WHERE c.session_id=? AND c.kind='function_call'
@@ -385,7 +385,7 @@ pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<
             let payload: Value = row.get(2)?;
             let checked = match kind.as_str() {
                 "user_message" => validate_message(conn, &payload["content"], modalities),
-                "sandbox_event" => check_event(conn, &payload["content"], modalities),
+                "codemode_event" => check_event(conn, &payload["content"], modalities),
                 "assistant_message" => check_parts(conn, &payload["content"], modalities),
                 "function_call_output" => check_parts(conn, &payload["output"], modalities),
                 "reasoning" => ["summary", "content"]
@@ -412,15 +412,15 @@ pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<
 }
 
 pub fn wire_message(conn: &Connection, kind: &str, mut payload: Value) -> Result<Value> {
-    if kind == "sandbox_event" {
+    if kind == "codemode_event" {
         let source = format!(
             "Codemode {} event from {} (sequence {}).",
             payload["event"]
                 .as_str()
                 .ok_or_else(|| Error::internal("missing event kind"))?,
-            payload["sandbox_id"]
+            payload["task_id"]
                 .as_str()
-                .ok_or_else(|| Error::internal("missing sandbox ID"))?,
+                .ok_or_else(|| Error::internal("missing task ID"))?,
             payload["sequence"]
                 .as_i64()
                 .ok_or_else(|| Error::internal("missing event sequence"))?
