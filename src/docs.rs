@@ -1,4 +1,4 @@
-use axum::{Json, Router, response::Html, routing::get};
+use axum::{Router, body::Bytes, http::header, response::Html, routing::get};
 use utoipa::openapi::{
     OpenApi,
     security::{Http, HttpAuthScheme, SecurityRequirement, SecurityScheme},
@@ -105,7 +105,7 @@ const PAGE: &str = r#"<!doctype html>
 </body>
 </html>"#;
 
-pub fn routes(mut spec: OpenApi) -> Router {
+pub fn routes(mut spec: OpenApi) -> serde_json::Result<Router> {
     spec.components.get_or_insert_default().add_security_scheme(
         "bearerAuth",
         SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
@@ -114,8 +114,11 @@ pub fn routes(mut spec: OpenApi) -> Router {
         "bearerAuth",
         [] as [&str; 0],
     )]);
-    let spec = Json(spec);
-    Router::new()
+    let json = Bytes::from(serde_json::to_vec(&spec)?);
+    Ok(Router::new()
         .route("/docs", get(|| async { Html(PAGE) }))
-        .route("/openapi.json", get(move || async move { spec }))
+        .route(
+            "/openapi.json",
+            get(move || async move { ([(header::CONTENT_TYPE, "application/json")], json) }),
+        ))
 }

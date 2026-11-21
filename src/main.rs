@@ -182,6 +182,11 @@ async fn serve(
         workers: TaskTracker::new(),
     };
     let (routes, openapi) = api::routes(app.clone());
+    let docs = listen
+        .ip()
+        .is_loopback()
+        .then(|| docs::routes(openapi))
+        .transpose()?;
     let signal = shutdown_signal()?;
     daemon::Ready {
         listen,
@@ -198,8 +203,8 @@ async fn serve(
         Arc::<str>::from(token),
         api::authorize_tcp,
     ));
-    if listen.ip().is_loopback() {
-        tcp_routes = tcp_routes.merge(docs::routes(openapi));
+    if let Some(docs) = docs {
+        tcp_routes = tcp_routes.merge(docs);
     }
     let tcp_server = axum::serve(listener, tcp_routes)
         .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
