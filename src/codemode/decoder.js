@@ -1,4 +1,4 @@
-((decode) => {
+((decode, encode) => {
     const empty = new Uint8Array(0);
     const chunkSize = 64 * 1024;
     const labels = new Set(["utf-8", "utf8", "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "x-unicode20utf8"]);
@@ -113,5 +113,74 @@
         }
     }
 
+    class TextEncoder {
+        #brand = true;
+
+        get encoding() { return this.#brand && "utf-8"; }
+        get [Symbol.toStringTag]() { return "TextEncoder"; }
+
+        encode(input = "") {
+            if (!this.#brand) throw new TypeError("invalid TextEncoder");
+            return encode(`${input}`);
+        }
+
+        encodeInto(source, destination) {
+            if (!this.#brand) throw new TypeError("invalid TextEncoder");
+            if (arguments.length < 2) throw new TypeError("expected source and destination");
+            const text = `${source}`;
+            if (!ArrayBuffer.isView(destination) || typedTag.call(destination) !== "Uint8Array") {
+                throw new TypeError("expected a Uint8Array");
+            }
+            let destLen;
+            try {
+                destLen = typed.length.call(destination);
+            } catch {
+                return { read: 0, written: 0 };
+            }
+            if (!destLen || !text.length) return { read: 0, written: 0 };
+            const out = new Uint8Array(typed.buffer.call(destination), typed.offset.call(destination), destLen);
+            let read = 0;
+            let written = 0;
+            while (read < text.length && written < destLen) {
+                const c = text.charCodeAt(read);
+                if (c < 0x80) {
+                    out[written++] = c;
+                    read++;
+                } else if (c < 0x800) {
+                    if (destLen - written < 2) break;
+                    out[written++] = 0xc0 | (c >> 6);
+                    out[written++] = 0x80 | (c & 0x3f);
+                    read++;
+                } else if (c >= 0xd800 && c <= 0xdbff && read + 1 < text.length) {
+                    const low = text.charCodeAt(read + 1);
+                    if (low >= 0xdc00 && low <= 0xdfff) {
+                        if (destLen - written < 4) break;
+                        const cp = 0x10000 + ((c - 0xd800) << 10) + (low - 0xdc00);
+                        out[written++] = 0xf0 | (cp >> 18);
+                        out[written++] = 0x80 | ((cp >> 12) & 0x3f);
+                        out[written++] = 0x80 | ((cp >> 6) & 0x3f);
+                        out[written++] = 0x80 | (cp & 0x3f);
+                        read += 2;
+                        continue;
+                    }
+                    if (destLen - written < 3) break;
+                    out[written++] = 0xef;
+                    out[written++] = 0xbf;
+                    out[written++] = 0xbd;
+                    read++;
+                } else {
+                    if (destLen - written < 3) break;
+                    const cp = c >= 0xd800 && c <= 0xdfff ? 0xfffd : c;
+                    out[written++] = 0xe0 | (cp >> 12);
+                    out[written++] = 0x80 | ((cp >> 6) & 0x3f);
+                    out[written++] = 0x80 | (cp & 0x3f);
+                    read++;
+                }
+            }
+            return { read, written };
+        }
+    }
+
     Object.defineProperty(globalThis, "TextDecoder", { value: TextDecoder, writable: true, configurable: true });
+    Object.defineProperty(globalThis, "TextEncoder", { value: TextEncoder, writable: true, configurable: true });
 })

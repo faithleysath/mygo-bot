@@ -17,26 +17,33 @@ pub fn definitions() -> Value {
         definition(
             "codemode",
             concat!(
-                "Execute JavaScript as an async function body in a fresh QuickJS runtime. Top-level await/return work. ",
-                "Native file and HTTP APIs work on devices without shell utilities. Await fs.read(path) for bytes, ",
-                "{encoding:'utf8'} for text, or {stream:true} for an async iterable of Uint8Array chunks. ",
+                "Execute JavaScript as an async function body in a fresh QuickJS runtime (96 MiB RAM). Top-level await/return work. ",
+                "No fetch, URL, Buffer or setTimeout; use built-in APIs, TextEncoder, TextDecoder, Date, console and await sleep(ms). ",
+                "At most 16 concurrent host calls or open streams per task; use proc.exec for heavy CPU or memory work. ",
+                "Native file and HTTP APIs work on devices without shell utilities. fs.read/write handle regular files only: ",
+                "await fs.read(path) for bytes, {encoding:'utf8'} for text, or {stream:true} for an async iterable of Uint8Array chunks. ",
                 "await fs.write(path,textOrBytesOrStream,{append}) returns bytes written. Example: await fs.write(dst,await fs.read(src,{stream:true})). ",
                 "for await (const {name,type} of fs.readDir(path)) iterates one directory. await fs.stat(path,{followSymlinks}) returns {type,size,mtimeMs}; ",
                 "types are file, directory, symlink or other. await fs.mkdir(path,{recursive}), fs.rename(from,to), fs.remove(path,{recursive}). ",
                 "File errors have a code such as ENOENT, EACCES or EXDEV. ",
-                "await http.request({url,method,headers,body,timeout_ms,stream}) returns status, headers and body. ",
-                "A buffered response has byte body and synchronous text()/json(). stream:true returns headers early and a single-use async byte iterable. ",
-                "Pass a byte stream as the request body to upload. Buffered reads and bodies are limited to 8 MiB. ",
+                "await http.request({url,method,headers,body,timeout_ms,stream}) (string header values, text/Uint8Array/stream body, no auto-redirects) ",
+                "returns status, headers and body. A buffered response has byte body and synchronous text()/json(). ",
+                "stream:true returns headers early and a single-use async byte iterable. Buffered reads and bodies are limited to 8 MiB. ",
                 "Use for await on streams; break closes them, or call await body.return() to discard an unread response. ",
                 "Use new TextDecoder().decode(chunk,{stream:true}) with the same decoder for each chunk, then decoder.decode() to flush. ",
-                "proc.exec(program,args,{cwd,env,stdin,timeout_ms}) runs an installed program and returns {exit_code,signal,stdout,stderr,truncated}. ",
-                "Use Date for time and await sleep(ms) to wait. Return text or an array of blocks as the final output. ",
-                "await emitEvent(textOrBlocks) queues a separate event in this session. Blocks: {type:'text',text}, ",
-                "{type:'image'|'audio'|'video',attachment_id} or {type,mime_type,data:Uint8Array}. ",
+                "await proc.exec(program,args,{cwd,env,stdin,timeout_ms}) runs an executable directly (no shell; text/Uint8Array stdin; ",
+                "Windows .bat/.cmd require cmd.exe), kills its process group on exit, and returns {exit_code,signal,stdout,stderr,truncated} (256 KiB cap per stream). ",
+                "Return text or an array of blocks as the final output (blank return text yields empty output; console attaches only on error). ",
+                "await emitEvent(textOrBlocks) queues a separate event in this session (rate-limited, nonempty). ",
+                "Blocks: {type:'text',text} (nonempty) or {type:'image'|'audio'|'video',mime_type,data:Uint8Array} (up to 50 MiB, when supported by the session model). ",
                 "Long listeners should use background:true. After 90s a running task goes to background automatically. ",
                 "Results and lease reminders wake the session. End your turn if there is nothing else to do."
             ),
-            json!({"code":{"type":"string"},"background":{"type":"boolean"},"label":{"type":"string"}}),
+            json!({
+                "code": {"type":"string", "description":"Async JavaScript function body (nonempty, up to 256 KiB)."},
+                "background": {"type":"boolean", "description":"Detach immediately and deliver completion via session events."},
+                "label": {"type":"string", "description":"Optional short name shown in task lists and lease warnings (up to 256 bytes)."}
+            }),
             &["code"]
         ),
         definition(
@@ -54,7 +61,15 @@ pub fn definitions() -> Value {
         definition(
             "codemode_task_renew",
             "Replace a live task's remaining lease with this duration, starting now. The initial lease is two hours.",
-            json!({"id":id,"duration_seconds":{"type":"integer","minimum":1,"maximum":86400}}),
+            json!({
+                "id":id,
+                "duration_seconds":{
+                    "type":"integer",
+                    "minimum":1,
+                    "maximum":86400,
+                    "description":"New remaining lease duration from now, in seconds (1 to 86400)."
+                }
+            }),
             &["id", "duration_seconds"]
         )
     ])

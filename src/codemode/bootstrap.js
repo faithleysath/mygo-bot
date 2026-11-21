@@ -1,8 +1,36 @@
-((io, emit, close, decode) => {
+((io, emit, close, decode, log) => {
     const stringify = JSON.stringify;
     const parse = JSON.parse;
+    const objectTag = Object.prototype.toString;
+    const isView = ArrayBuffer.isView;
     const call = (op, args, data) => io(op, stringify(args), data);
     const chunkSize = 64 * 1024;
+
+    function formatValue(value) {
+        if (typeof value === 'string') return value.length > 1024 ? `${value.slice(0, 1024)}…` : value;
+        if (value === null || typeof value !== 'object') return String(value);
+        try {
+            if (value instanceof Error) {
+                const text = value.stack || `${value.name || 'Error'}: ${value.message || ''}`;
+                return text.length > 1024 ? `${text.slice(0, 1024)}…` : text;
+            }
+            if (isView(value)) return `${value[Symbol.toStringTag] || 'DataView'}(${value.byteLength})`;
+            const json = stringify(value);
+            if (json !== undefined) return json.length > 1024 ? `${json.slice(0, 1024)}…` : json;
+            return objectTag.call(value);
+        } catch {
+            try { return objectTag.call(value); } catch { return '[object]'; }
+        }
+    }
+
+    function writeLog(prefix, args) {
+        const parts = [];
+        const limit = Math.min(args.length, 32);
+        for (let i = 0; i < limit; i++) parts.push(formatValue(args[i]));
+        if (args.length > limit) parts.push('…');
+        const line = prefix ? `${prefix}${parts.join(' ')}` : parts.join(' ');
+        log(line.length > 1024 ? `${line.slice(0, 1024)}…` : line);
+    }
 
     function reader(id) {
         let done = false;
@@ -128,5 +156,20 @@
         },
         async sleep(ms) { await call('sleep', { ms }); },
         async emitEvent(value) { return emit(value); },
+    });
+    Object.defineProperty(globalThis, 'console', {
+        value: {
+            log(...args) { writeLog('', args); },
+            info(...args) { writeLog('', args); },
+            debug(...args) { writeLog('', args); },
+            warn(...args) { writeLog('warn: ', args); },
+            error(...args) { writeLog('error: ', args); },
+            assert(condition, ...args) {
+                if (!condition) writeLog(args.length ? 'Assertion failed: ' : 'Assertion failed', args);
+            },
+            clear() { log(null); },
+        },
+        writable: true,
+        configurable: true,
     });
 })

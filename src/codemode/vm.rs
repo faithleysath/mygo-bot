@@ -5,7 +5,7 @@ use rquickjs::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::{Future, poll_fn},
     io,
     rc::{Rc, Weak},
@@ -28,6 +28,9 @@ const IO_BYTES: usize = 8 * MIB;
 const METADATA_BYTES: usize = 256 * 1024;
 const HOST_CALLS: usize = 16;
 const JOBS_PER_TURN: usize = 64;
+const LOG_LINES: usize = 32;
+const LOG_LINE_BYTES: usize = 1024;
+const LOG_TOTAL_BYTES: usize = 4096;
 static IO_SLOTS: Semaphore = Semaphore::const_new(32);
 
 struct Worker {
@@ -109,6 +112,47 @@ type Completed = Result<(Id, HostResult), JoinError>;
 type Callback = Persistent<Function<'static>>;
 type Resolvers = RefCell<HashMap<Id, (Callback, Callback)>>;
 
+#[derive(Default)]
+struct Logs {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl Logs {
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.bytes = 0;
+    }
+
+    fn push(&mut self, raw: &[u8]) {
+        let head = &raw[..raw.len().min(LOG_LINE_BYTES + 4)];
+        let mut line = String::from_utf8_lossy(head).into_owned();
+        if line.len() > LOG_LINE_BYTES || raw.len() > head.len() {
+            line.truncate(line.floor_char_boundary(LOG_LINE_BYTES));
+            line.push('…');
+        }
+        while !self.lines.is_empty()
+            && (self.lines.len() >= LOG_LINES || self.bytes + line.len() > LOG_TOTAL_BYTES)
+        {
+            if let Some(old) = self.lines.pop_front() {
+                self.bytes -= old.len();
+            }
+        }
+        self.bytes += line.len();
+        self.lines.push_back(line);
+    }
+
+    fn finish(&self) -> Option<String> {
+        (!self.lines.is_empty()).then(|| {
+            self.lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+}
+
 struct Scope {
     host: Host,
     cancel: CancellationToken,
@@ -116,6 +160,7 @@ struct Scope {
     accepting: Cell<bool>,
     jobs: RefCell<JoinSet<HostResult>>,
     output: RefCell<Blocks>,
+    logs: RefCell<Logs>,
 }
 
 impl Scope {
@@ -169,12 +214,19 @@ async fn run(job: Job, stop: CancellationToken) {
         accepting: Cell::new(true),
         jobs: RefCell::default(),
         output: RefCell::default(),
+        logs: RefCell::default(),
     });
-    let error = drive(&scope, &job.code).await.err();
+    let mut error = drive(&scope, &job.code).await.err();
     scope.cancel.cancel();
     // Never abort a host future. Managed commands finish process-group cleanup inside it.
     let mut jobs = scope.jobs.take();
     while jobs.join_next().await.is_some() {}
+    if let Some(err) = &mut error
+        && let Some(logs) = scope.logs.borrow().finish()
+    {
+        err.push_str("\n\nConsole output:\n");
+        err.push_str(&logs);
+    }
     let output = scope.output.take();
     drop(scope); // Release unread file and HTTP bodies before reporting completion.
     let _ = job.done.send(Outcome { error, output });
@@ -229,7 +281,7 @@ async fn drive(scope: &Rc<Scope>, code: &str) -> Result<(), String> {
                         scope.accepting.set(false);
                         let value = value?;
                         if !value.is_undefined() {
-                            *scope.output.borrow_mut() = blocks(&ctx, value)?;
+                            *scope.output.borrow_mut() = blocks(&ctx, value, true)?;
                         }
                         Ok(true)
                     };
@@ -358,7 +410,7 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
         let resolvers = Rc::downgrade(resolvers);
         Function::new(ctx.clone(), move |ctx: Ctx<'js>, value: Value<'js>| {
             scope.admit(&ctx)?;
-            let blocks = blocks(&ctx, value)?;
+            let blocks = blocks(&ctx, value, false)?;
             let host = scope.host.clone();
             scope.dispatch(&ctx, &resolvers, None, async move {
                 let id = host.emit(blocks).await?;
@@ -367,6 +419,22 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
                     data: None,
                 })
             })
+        })?
+    };
+    let log = {
+        let scope = scope.clone();
+        Function::new(ctx.clone(), move |line: Option<JsString<'_>>| {
+            if !scope.accepting.get() || scope.stopped() {
+                return;
+            }
+            match line {
+                Some(line) => {
+                    if let Ok(raw) = line.to_cstring() {
+                        scope.logs.borrow_mut().push(string_bytes(&raw));
+                    }
+                }
+                None => scope.logs.borrow_mut().clear(),
+            }
         })?
     };
     let streams = scope.host.streams.clone();
@@ -389,10 +457,23 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
             }
         },
     )?;
+    let encode = Function::new(ctx.clone(), |ctx: Ctx<'js>, text: JsString<'js>| {
+        let raw = text.to_cstring()?;
+        let bytes = string_bytes(&raw);
+        if bytes.len() > IO_BYTES {
+            return Err(Exception::throw_range(&ctx, "encoded text exceeds 8 MiB"));
+        }
+        if std::str::from_utf8(bytes).is_ok() {
+            return TypedArray::<u8>::new_copy(ctx, bytes);
+        }
+        let mut owned = bytes.to_vec();
+        wtf8_to_utf8(&mut owned);
+        TypedArray::<u8>::new_copy(ctx, &owned)
+    })?;
     let decoder: Function = ctx.eval(include_str!("decoder.js"))?;
-    decoder.call::<_, ()>((decode.clone(),))?;
+    decoder.call::<_, ()>((decode.clone(), encode))?;
     let init: Function = ctx.eval(include_str!("bootstrap.js"))?;
-    init.call((io, emit, close, decode))
+    init.call((io, emit, close, decode, log))
 }
 
 // QuickJS may encode an unpaired JS surrogate as WTF-8. Validate or decode lossily
@@ -400,6 +481,22 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
 fn string_bytes<'a>(s: &'a rquickjs::CString<'_>) -> &'a [u8] {
     // SAFETY: CString owns this possibly NUL-containing buffer for the borrow.
     unsafe { std::slice::from_raw_parts(s.as_ptr().cast(), s.len()) }
+}
+
+// Replace QuickJS 3-byte WTF-8 lone surrogates (ED A0..BF 80..BF) with UTF-8 U+FFFD.
+fn wtf8_to_utf8(bytes: &mut [u8]) {
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if bytes[i] == 0xed
+            && (0xa0..=0xbf).contains(&bytes[i + 1])
+            && (0x80..=0xbf).contains(&bytes[i + 2])
+        {
+            bytes[i..i + 3].copy_from_slice(&[0xef, 0xbf, 0xbd]);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn input_bytes(ctx: &Ctx<'_>, value: Value<'_>) -> JsResult<Option<Vec<u8>>> {
@@ -427,11 +524,15 @@ fn input_bytes(ctx: &Ctx<'_>, value: Value<'_>) -> JsResult<Option<Vec<u8>>> {
     copy(bytes)
 }
 
-fn blocks<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> JsResult<Blocks> {
+fn blocks<'js>(ctx: &Ctx<'js>, value: Value<'js>, allow_empty: bool) -> JsResult<Blocks> {
     let mut blocks = Blocks::default();
     let push = |r: Result<(), String>| r.map_err(|e| Exception::throw_message(ctx, &e));
     if let Some(text) = value.as_string() {
-        push(blocks.push_text(text.to_string()?))?;
+        let text = text.to_string()?;
+        if allow_empty && text.trim().is_empty() {
+            return Ok(blocks);
+        }
+        push(blocks.push_text(text))?;
         return Ok(blocks);
     }
     let array = value
