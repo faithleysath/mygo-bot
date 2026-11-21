@@ -1,7 +1,9 @@
+mod files;
 mod io;
 pub mod ledger;
 mod output;
 mod process;
+mod streams;
 mod vm;
 #[cfg(windows)]
 mod windows;
@@ -49,9 +51,67 @@ impl Engine {
     }
 }
 
+#[derive(Debug)]
+pub struct HostError {
+    message: String,
+    code: Option<&'static str>,
+}
+impl HostError {
+    pub(super) fn context(mut self, context: String) -> Self {
+        self.message = format!("{context}: {}", self.message);
+        self
+    }
+}
+impl From<String> for HostError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: None,
+        }
+    }
+}
+impl From<&str> for HostError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl From<std::io::Error> for HostError {
+    fn from(error: std::io::Error) -> Self {
+        use std::io::ErrorKind::*;
+        let code = match error.kind() {
+            NotFound => "ENOENT",
+            PermissionDenied => "EACCES",
+            AlreadyExists => "EEXIST",
+            NotADirectory => "ENOTDIR",
+            IsADirectory => "EISDIR",
+            DirectoryNotEmpty => "ENOTEMPTY",
+            CrossesDevices => "EXDEV",
+            ReadOnlyFilesystem => "EROFS",
+            StorageFull => "ENOSPC",
+            InvalidInput => "EINVAL",
+            InvalidData => "EILSEQ",
+            Unsupported => "ENOTSUP",
+            FileTooLarge => "EFBIG",
+            Interrupted => "EINTR",
+            ResourceBusy => "EBUSY",
+            QuotaExceeded => "EDQUOT",
+            _ => "EIO",
+        };
+        Self {
+            message: error.to_string(),
+            code: Some(code),
+        }
+    }
+}
+
 pub struct Reply {
     pub value: Value,
     pub data: Option<Vec<u8>>,
+}
+impl Reply {
+    fn value(value: Value) -> Self {
+        Self { value, data: None }
+    }
 }
 pub struct Outcome {
     pub error: Option<String>,
@@ -73,6 +133,7 @@ pub struct Host {
     pub client: reqwest::Client,
     pub cancel: CancellationToken,
     pub executor: Handle,
+    streams: Arc<streams::Streams>,
 }
 impl Host {
     pub async fn io(
@@ -80,7 +141,7 @@ impl Host {
         op: String,
         args: Value,
         data: Option<Vec<u8>>,
-    ) -> std::result::Result<Reply, String> {
+    ) -> std::result::Result<Reply, HostError> {
         if self.cancel.is_cancelled() || Instant::now() >= *self.deadline.borrow() {
             return Err("task stopped or expired".into());
         }
@@ -406,6 +467,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             cancel: cancel.clone(),
             deadline: lease,
             executor: Handle::current(),
+            streams: Arc::default(),
         };
         s.tasks.insert(id, task);
         let submitted = app.codemode.pool.submit(Job {

@@ -1,19 +1,17 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{io, time::Duration};
 
+use futures_util::TryStreamExt;
 use reqwest::{Method, Url};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{io::StreamReader, sync::CancellationToken};
 
-use super::{Host, Reply};
+use super::{
+    Host, HostError, Reply, files,
+    streams::{Reservation, Resource},
+};
 
-const BODY_LIMIT: usize = 8 * 1024 * 1024;
-const FILE_CHUNK: usize = 64 * 1024;
+pub(super) const BODY_LIMIT: usize = 8 * 1024 * 1024;
 const OUTPUT_LIMIT: usize = 256 * 1024;
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
@@ -22,63 +20,33 @@ pub async fn execute(
     op: &str,
     args: Value,
     data: Option<Vec<u8>>,
-) -> Result<Reply, String> {
-    if host.cancel.is_cancelled() {
-        return Err("cancelled".into());
-    }
+) -> Result<Reply, HostError> {
     if !args.is_object() {
-        return Err(format!("{op} expects an options object"));
+        return Err(format!("{op} expects an options object").into());
     }
-    if data.as_ref().is_some_and(|bytes| bytes.len() > BODY_LIMIT) {
-        return Err(format!("{op}: input exceeds {BODY_LIMIT} bytes"));
+    if op == "proc.exec" {
+        // Managed processes must finish their own cancellation and group cleanup.
+        return Ok(Reply::value(command(host, &args, data).await?));
     }
-    let value = match op {
-        "fs.read" | "fs.write" => {
-            let path = string(&args, "path")?;
-            let append = match args.get("append") {
-                Some(value) => value.as_bool().ok_or("append must be a boolean")?,
-                None => false,
-            };
-            let write = if op == "fs.write" {
-                Some(data.ok_or("fs.write requires data")?)
-            } else {
-                if let Some(encoding) = args.get("encoding")
-                    && encoding.as_str() != Some("utf8")
-                {
-                    return Err("fs.read supports utf8 encoding".into());
+    if op.starts_with("fs.") {
+        return files::execute(host, op, &args, data).await;
+    }
+    tokio::select! {
+        biased;
+        _ = host.cancel.cancelled() => Err("cancelled".into()),
+        result = async {
+            match op {
+                "http.request" => request(host, &args, data).await,
+                "upload.open" | "stream.next" | "stream.write" | "stream.finish" => host.streams.execute(op, &args["id"], data).await,
+                "sleep" => {
+                    let ms = args["ms"].as_u64().ok_or("ms must be a nonnegative integer")?;
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Ok(Reply::value(Value::Null))
                 }
-                None
-            };
-            let owned_path = PathBuf::from(path);
-            let cancel = host.cancel.clone();
-            return tokio::task::spawn_blocking(move || {
-                file_io(&owned_path, write, append, &cancel)
-            })
-            .await
-            .map_err(|e| format!("{op}: {e}"))?
-            .map_err(|e| format!("{op} {path}: {e}"));
-        }
-        "http.request" => {
-            tokio::select! {
-                biased;
-                _ = host.cancel.cancelled() => return Err("cancelled".into()),
-                reply = request(&host.client, &args, data) => return reply,
+                _ => Err(format!("unknown host operation {op}").into()),
             }
-        }
-        "proc.exec" | "bash" => command(host, op, &args, data).await?,
-        "sleep" => {
-            let ms = args["ms"]
-                .as_u64()
-                .ok_or("ms must be a nonnegative integer")?;
-            tokio::select! {
-                biased;
-                _ = host.cancel.cancelled() => return Err("cancelled".into()),
-                _ = tokio::time::sleep(Duration::from_millis(ms)) => Value::Null,
-            }
-        }
-        _ => return Err(format!("unknown host operation {op}")),
-    };
-    Ok(Reply { value, data: None })
+        } => result,
+    }
 }
 
 fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -98,120 +66,7 @@ pub(super) fn timeout(args: &Value) -> Result<Option<Duration>, String> {
         .transpose()
 }
 
-fn check_cancel(cancel: &CancellationToken) -> io::Result<()> {
-    if cancel.is_cancelled() {
-        return Err(io::Error::other("cancelled"));
-    }
-    Ok(())
-}
-
-fn file_io(
-    path: &Path,
-    write: Option<Vec<u8>>,
-    append: bool,
-    cancel: &CancellationToken,
-) -> io::Result<Reply> {
-    check_cancel(cancel)?;
-    let special = || io::Error::new(io::ErrorKind::Unsupported, "expected a regular file");
-    #[cfg(windows)]
-    if is_device_path(path) {
-        return Err(special());
-    }
-    match fs::metadata(path) {
-        Ok(metadata) if !metadata.is_file() => return Err(special()),
-        Err(e) if e.kind() != io::ErrorKind::NotFound || write.is_none() => return Err(e),
-        _ => (),
-    }
-
-    let mut options = OpenOptions::new();
-    if write.is_some() {
-        options.write(true).create(true).append(append);
-    } else {
-        options.read(true);
-    }
-    #[cfg(unix)]
-    {
-        use rustix::fs::OFlags;
-        use std::os::unix::fs::OpenOptionsExt;
-        // A FIFO or terminal can replace the path between metadata and open.
-        options.custom_flags((OFlags::NONBLOCK | OFlags::NOCTTY).bits() as _);
-    }
-    check_cancel(cancel)?;
-    let mut file = options.open(path)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
-        // SAFETY: the file owns the handle throughout this call.
-        if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
-            return Err(special());
-        }
-    }
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(special());
-    }
-    check_cancel(cancel)?;
-    if let Some(bytes) = write {
-        if !append {
-            file.set_len(0)?;
-        }
-        for chunk in bytes.chunks(FILE_CHUNK) {
-            check_cancel(cancel)?;
-            file.write_all(chunk)?;
-        }
-        return Ok(Reply {
-            value: json!(bytes.len()),
-            data: None,
-        });
-    }
-
-    let too_large = || io::Error::other(format!("file exceeds {BODY_LIMIT} bytes"));
-    if metadata.len() > BODY_LIMIT as u64 {
-        return Err(too_large());
-    }
-    let mut data = Vec::new();
-    let mut chunk = [0; FILE_CHUNK];
-    loop {
-        check_cancel(cancel)?;
-        let n = match file.read(&mut chunk) {
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            n => n?,
-        };
-        if n == 0 {
-            break;
-        }
-        if n > BODY_LIMIT - data.len() {
-            return Err(too_large());
-        }
-        data.extend_from_slice(&chunk[..n]);
-    }
-    Ok(Reply {
-        value: Value::Null,
-        data: Some(data),
-    })
-}
-
-#[cfg(windows)]
-fn is_device_path(path: &Path) -> bool {
-    use std::path::{Component, Prefix};
-    match path.components().next() {
-        Some(Component::Prefix(p)) => match p.kind() {
-            Prefix::DeviceNS(_) | Prefix::Verbatim(_) => true,
-            Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share) => {
-                share.eq_ignore_ascii_case("pipe") || share.eq_ignore_ascii_case("mailslot")
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-async fn request(
-    client: &reqwest::Client,
-    args: &Value,
-    data: Option<Vec<u8>>,
-) -> Result<Reply, String> {
+async fn request(host: &Host, args: &Value, data: Option<Vec<u8>>) -> Result<Reply, HostError> {
     let url = Url::parse(string(args, "url")?).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("http.request requires an HTTP(S) URL".into());
@@ -221,7 +76,7 @@ async fn request(
             .map_err(|e| format!("invalid HTTP method: {e}"))?,
         None => Method::GET,
     };
-    let mut request = client.request(method, url);
+    let mut request = host.client.request(method, url);
     if let Some(headers) = args.get("headers") {
         for (name, value) in headers.as_object().ok_or("headers must be an object")? {
             request = request.header(name, value.as_str().ok_or("header values must be strings")?);
@@ -230,23 +85,54 @@ async fn request(
     if let Some(duration) = timeout(args)? {
         request = request.timeout(duration);
     }
-    if let Some(data) = data {
+    let mut upload_closed = None;
+    if let Some(id) = args.get("upload") {
+        let (body, closed) = host.streams.upload(id, host.cancel.clone()).await?;
+        request = request.body(body);
+        upload_closed = Some(closed);
+    } else if let Some(data) = data {
         request = request.body(data);
     }
-    let network_error = |e: reqwest::Error| {
-        if e.is_timeout() {
-            "timeout: http.request".to_owned()
-        } else {
-            format!("http.request: {e}")
+    let slot = args["stream"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| host.streams.reserve())
+        .transpose()?;
+    let closed = async {
+        match upload_closed {
+            Some(closed) => closed.cancelled().await,
+            None => std::future::pending().await,
         }
     };
-    let mut response = request.send().await.map_err(network_error)?;
+    tokio::select! {
+        biased;
+        _ = closed => Err("upload stopped".into()),
+        reply = async {
+            let reply = request.send().await.map_err(network_error)?;
+            receive(reply, slot).await
+        } => reply,
+    }
+}
+
+fn network_error(e: reqwest::Error) -> String {
+    if e.is_timeout() {
+        "timeout: http.request".into()
+    } else {
+        format!("http.request: {e}")
+    }
+}
+
+async fn receive(
+    mut response: reqwest::Response,
+    slot: Option<Reservation<'_>>,
+) -> Result<Reply, HostError> {
     let too_large = || format!("http.request: response exceeds {BODY_LIMIT} bytes");
-    if response
-        .content_length()
-        .is_some_and(|n| n > BODY_LIMIT as u64)
+    if slot.is_none()
+        && response
+            .content_length()
+            .is_some_and(|n| n > BODY_LIMIT as u64)
     {
-        return Err(too_large());
+        return Err(too_large().into());
     }
     let mut headers = Map::new();
     for name in response.headers().keys() {
@@ -264,10 +150,17 @@ async fn request(
         headers.insert(name.as_str().to_owned(), value);
     }
     let status = response.status().as_u16();
+    if let Some(slot) = slot {
+        let reader = StreamReader::new(response.bytes_stream().map_err(io::Error::other));
+        let id = slot.insert(Resource::Reader(Box::pin(reader)));
+        return Ok(Reply::value(
+            json!({"status":status, "headers":headers, "body":id}),
+        ));
+    }
     let mut data = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(network_error)? {
         if chunk.len() > BODY_LIMIT - data.len() {
-            return Err(too_large());
+            return Err(too_large().into());
         }
         data.extend_from_slice(&chunk);
     }
@@ -277,29 +170,20 @@ async fn request(
     })
 }
 
-async fn command(
-    host: &Host,
-    op: &str,
-    args: &Value,
-    stdin: Option<Vec<u8>>,
-) -> Result<Value, String> {
-    let (program, argv) = if op == "bash" {
-        ("bash", vec!["-c".into(), string(args, "script")?.into()])
-    } else {
-        let argv = match args.get("args") {
-            None => Vec::new(),
-            Some(v) => v
-                .as_array()
-                .ok_or("args must be a string array")?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_owned)
-                        .ok_or("args must be a string array")
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        (string(args, "program")?, argv)
+async fn command(host: &Host, args: &Value, stdin: Option<Vec<u8>>) -> Result<Value, String> {
+    let program = string(args, "program")?;
+    let argv = match args.get("args") {
+        None => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or("args must be a string array")?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or("args must be a string array")
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     };
     if program.is_empty() || program.contains('\0') || argv.iter().any(|arg| arg.contains('\0')) {
         return Err("invalid program or argument".into());
@@ -325,15 +209,7 @@ async fn command(
     use super::process::execute;
     #[cfg(windows)]
     use super::windows::execute;
-    execute(program, &argv, args, stdin, host.cancel.clone())
-        .await
-        .map_err(|e| {
-            if op == "bash" && e.starts_with("program_not_found") {
-                format!("bash_unavailable: {e}")
-            } else {
-                e
-            }
-        })
+    execute(program, &argv, args, stdin, host.cancel.clone()).await
 }
 
 pub(super) async fn drain(

@@ -1,4 +1,4 @@
-use super::{Blocks, Host, Job, Outcome, Reply};
+use super::{Blocks, Host, HostError, Job, Outcome, Reply};
 use rquickjs::{
     AsyncContext, AsyncRuntime, Ctx, Error, Exception, Function, Object, Persistent, Promise,
     Result as JsResult, String as JsString, TypedArray, Value, context::EvalOptions,
@@ -104,7 +104,7 @@ impl Drop for Pool {
 }
 
 // The permit also bounds completed responses waiting for their turn on a JS worker.
-type HostResult = (Result<Reply, String>, Option<SemaphorePermit<'static>>);
+type HostResult = (Result<Reply, HostError>, Option<SemaphorePermit<'static>>);
 type Completed = Result<(Id, HostResult), JoinError>;
 type Callback = Persistent<Function<'static>>;
 type Resolvers = RefCell<HashMap<Id, (Callback, Callback)>>;
@@ -141,7 +141,7 @@ impl Scope {
         ctx: &Ctx<'js>,
         resolvers: &Weak<Resolvers>,
         permit: Option<SemaphorePermit<'static>>,
-        future: impl Future<Output = Result<Reply, String>> + Send + 'static,
+        future: impl Future<Output = Result<Reply, HostError>> + Send + 'static,
     ) -> JsResult<Promise<'js>> {
         // Reading JavaScript arguments may have reentered another host binding.
         self.admit(ctx)?;
@@ -159,14 +159,6 @@ impl Scope {
         );
         Ok(promise)
     }
-
-    fn append(&self, ctx: &Ctx<'_>, blocks: Blocks) -> JsResult<()> {
-        if self.stopped() {
-            return Err(Exception::throw_message(ctx, "codemode task stopped"));
-        }
-        let appended = self.output.borrow_mut().append(blocks);
-        appended.map_err(|e| Exception::throw_message(ctx, &e))
-    }
 }
 
 async fn run(job: Job, stop: CancellationToken) {
@@ -183,10 +175,9 @@ async fn run(job: Job, stop: CancellationToken) {
     // Never abort a host future. Managed commands finish process-group cleanup inside it.
     let mut jobs = scope.jobs.take();
     while jobs.join_next().await.is_some() {}
-    let _ = job.done.send(Outcome {
-        error,
-        output: scope.output.take(),
-    });
+    let output = scope.output.take();
+    drop(scope); // Release unread file and HTTP bodies before reporting completion.
+    let _ = job.done.send(Outcome { error, output });
 }
 
 async fn drive(scope: &Rc<Scope>, code: &str) -> Result<(), String> {
@@ -238,7 +229,7 @@ async fn drive(scope: &Rc<Scope>, code: &str) -> Result<(), String> {
                         scope.accepting.set(false);
                         let value = value?;
                         if !value.is_undefined() {
-                            scope.append(&ctx, blocks(&ctx, value)?)?;
+                            *scope.output.borrow_mut() = blocks(&ctx, value)?;
                         }
                         Ok(true)
                     };
@@ -291,7 +282,7 @@ async fn drive(scope: &Rc<Scope>, code: &str) -> Result<(), String> {
 fn settle<'js>(ctx: &Ctx<'js>, resolvers: &Resolvers, done: Completed) -> JsResult<()> {
     let (id, (reply, _permit)) = match done {
         Ok(done) => done,
-        Err(e) => (e.id(), (Err(format!("host task failed: {e}")), None)),
+        Err(e) => (e.id(), (Err(format!("host task failed: {e}").into()), None)),
     };
     let (yes, no) = resolvers
         .borrow_mut()
@@ -299,7 +290,13 @@ fn settle<'js>(ctx: &Ctx<'js>, resolvers: &Resolvers, done: Completed) -> JsResu
         .ok_or_else(|| Exception::throw_message(ctx, "unknown host completion"))?;
     let value = match reply {
         Ok(reply) => reply_value(ctx, reply),
-        Err(e) => Err(Exception::throw_message(ctx, &e)),
+        Err(e) => {
+            let error = Exception::from_message(ctx.clone(), &e.message)?;
+            if let Some(code) = e.code {
+                error.set("code", code)?;
+            }
+            Err(ctx.throw(error.into_value()))
+        }
     };
     match value {
         Ok(value) => yes.restore(ctx)?.call((value,)),
@@ -372,23 +369,30 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
             })
         })?
     };
-    let scope = scope.clone();
-    let append = Function::new(ctx.clone(), move |ctx: Ctx<'js>, value: Value<'js>| {
-        let blocks = blocks(&ctx, value)?;
-        scope.append(&ctx, blocks)
-    })?;
-    let decode = Function::new(ctx.clone(), |ctx: Ctx<'js>, data: TypedArray<'js, u8>| {
-        // SAFETY: decoding finishes before the next JS call.
-        let bytes = unsafe { data.as_bytes() }
-            .ok_or_else(|| Exception::throw_type(&ctx, "detached Uint8Array"))?;
-        if bytes.len() > IO_BYTES {
-            return Err(Exception::throw_range(&ctx, "response exceeds 8 MiB"));
-        }
-        let text = String::from_utf8_lossy(bytes).into_owned();
-        JsString::from_str(ctx, &text)
-    })?;
+    let streams = scope.host.streams.clone();
+    let close = Function::new(ctx.clone(), move |id: u32| streams.close(id))?;
+    let decode = Function::new(
+        ctx.clone(),
+        |ctx: Ctx<'js>, data: TypedArray<'js, u8>, fatal: bool| {
+            // SAFETY: decoding finishes before the next JS call.
+            let bytes = unsafe { data.as_bytes() }
+                .ok_or_else(|| Exception::throw_type(&ctx, "detached Uint8Array"))?;
+            if bytes.len() > IO_BYTES {
+                return Err(Exception::throw_range(&ctx, "response exceeds 8 MiB"));
+            }
+            if fatal {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| Exception::throw_type(&ctx, "invalid UTF-8"))?;
+                JsString::from_str(ctx, text)
+            } else {
+                JsString::from_str(ctx, &String::from_utf8_lossy(bytes))
+            }
+        },
+    )?;
+    let decoder: Function = ctx.eval(include_str!("decoder.js"))?;
+    decoder.call::<_, ()>((decode.clone(),))?;
     let init: Function = ctx.eval(include_str!("bootstrap.js"))?;
-    init.call((io, emit, append, decode))
+    init.call((io, emit, close, decode))
 }
 
 // QuickJS may encode an unpaired JS surrogate as WTF-8. Validate or decode lossily

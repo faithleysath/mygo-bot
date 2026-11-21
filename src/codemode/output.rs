@@ -31,16 +31,6 @@ impl Drop for Blocks {
 }
 
 impl Blocks {
-    pub fn append(&mut self, mut other: Self) -> Result<(), String> {
-        if self.parts.len() + other.parts.len() > 1024
-            || other.reserved > TASK_BYTES - self.reserved
-        {
-            return Err("task output budget exceeded".into());
-        }
-        self.reserved += std::mem::take(&mut other.reserved);
-        self.parts.append(&mut other.parts);
-        Ok(())
-    }
     fn reserve(&mut self, bytes: usize) -> Result<(), String> {
         let bytes = bytes.saturating_add(128);
         if self.parts.len() >= 1024 || bytes > TASK_BYTES - self.reserved {

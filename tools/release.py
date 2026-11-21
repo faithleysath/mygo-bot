@@ -26,6 +26,29 @@ def build(target):
     raise SystemExit("Cargo did not report the mygo-bot executable")
 
 
+def linux_requirements(executable, artifact):
+    # UPX rewrites ELF headers. Read the original target binary without executing it.
+    headers = subprocess.check_output(
+        [os.environ.get("OBJDUMP", "objdump"), "-p", executable],
+        text=True, env={**os.environ, "LC_ALL": "C"},
+    )
+    libraries = [fields[1] for fields in map(str.split, headers.splitlines())
+                 if len(fields) == 2 and fields[0] == "NEEDED"]
+    requirements = {
+        "artifact": artifact.name,
+        "tls_backend": "OpenSSL (native-tls)",
+        "needed_shared_libraries": libraries,
+        "trusted_ca": {
+            "source": "system trust store (ca-certificates)",
+            "bundle_env": "SSL_CERT_FILE",
+            "directory_env": "SSL_CERT_DIR",
+        },
+    }
+    path = artifact.with_name(artifact.name + ".requirements.json")
+    path.write_text(json.dumps(requirements, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def release(target, host):
     mac = target.endswith("-apple-darwin")
     if not (mac or "-linux-" in target or "-windows-" in target):
@@ -46,6 +69,8 @@ def release(target, host):
         subprocess.run(["upx", "--best", *options, "-o", packed, executable], check=True)
         subprocess.run(["upx", "-t", packed], check=True)
         artifacts = [packed]
+        if "-linux-" in target:
+            artifacts.append(linux_requirements(executable, packed))
         runnable = packed
         if mac:
             # Current macOS can run the original signed Mach-O directly from a compressed image.
