@@ -6,6 +6,7 @@ mod codemode;
 mod daemon;
 mod docs;
 mod events;
+mod mcp;
 mod media;
 mod model;
 mod pricing;
@@ -115,9 +116,18 @@ fn main() -> ExitCode {
             .unwrap_or_else(|e| clap::Error::from(e).exit());
         return ExitCode::SUCCESS;
     }
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_writer(io::stderr)
+    use tracing_subscriber::{filter::Targets, prelude::*};
+    // The SDK logs peer-supplied payloads and session IDs. Only emit MyGo's MCP summaries.
+    let targets = Targets::new()
+        .with_default(tracing::Level::INFO)
+        .with_target("rmcp", tracing::level_filters::LevelFilter::OFF);
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(io::stderr),
+        )
+        .with(targets)
         .init();
     match daemon::start(options) {
         Ok(()) => ExitCode::SUCCESS,
@@ -181,6 +191,8 @@ async fn serve(
         stopping: CancellationToken::new(),
         workers: TaskTracker::new(),
     };
+    app.workers
+        .spawn(mcp::reap_idle(app.db.clone(), app.stopping.clone()));
     let (routes, openapi) = api::routes(app.clone());
     let docs = listen
         .ip()

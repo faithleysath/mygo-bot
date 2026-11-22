@@ -37,6 +37,7 @@ pub async fn execute(
         _ = host.cancel.cancelled() => Err("cancelled".into()),
         result = async {
             match op {
+                "mcp.servers" | "mcp.tools" | "mcp.call" => crate::mcp::execute(&host.app, host.sid, host.origin, op, args).await.map(Reply::value).map_err(Into::into),
                 "http.request" => request(host, &args, data).await,
                 "upload.open" | "stream.next" | "stream.write" | "stream.finish" => host.streams.execute(op, &args["id"], data).await,
                 "sleep" => {

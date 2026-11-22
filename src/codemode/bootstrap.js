@@ -144,6 +144,11 @@
                 return response;
             },
         },
+        mcp: {
+            async servers() { return call('mcp.servers', {}); },
+            async tools(server, { query, cursor } = {}) { return call('mcp.tools', { server, query, cursor }); },
+            async call(server, tool, args = {}) { return call('mcp.call', { server, tool, args }); },
+        },
         proc: {
             async exec(program, args = [], { cwd, env, stdin, timeout_ms } = {}) {
                 return call('proc.exec', { program, args, cwd, env, timeout_ms }, stdin);

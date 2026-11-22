@@ -52,6 +52,7 @@ pub struct Store {
     pub conn: Connection,
     pub active: HashMap<i64, Control>,
     pub tasks: HashMap<i64, crate::codemode::Task>,
+    pub mcp: crate::mcp::Connections,
     channels: HashMap<i64, broadcast::WeakSender<Notice>>,
     wake_sequences: HashMap<i64, watch::Sender<u64>>,
     pub closing: bool,
@@ -79,6 +80,7 @@ impl Db {
             tx.execute_batch(include_str!("../schema.sql"))?;
         } else if !tx.column_exists(None, "sessions", "input_queue_cursor")?
             || !tx.column_exists(None, "items", "codemode_call_item_id")?
+            || !tx.table_exists(None, "mcp_servers")?
         {
             return Err(Error::internal(
                 "incompatible database schema; select a new database directory",
@@ -98,6 +100,7 @@ impl Db {
                     conn,
                     active: HashMap::new(),
                     tasks: HashMap::new(),
+                    mcp: Default::default(),
                     channels: HashMap::new(),
                     wake_sequences: HashMap::new(),
                     closing: false,

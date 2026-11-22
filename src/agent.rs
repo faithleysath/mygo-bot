@@ -248,7 +248,7 @@ impl App {
                 tracing::warn!("shutdown deadline reached with unfinished work");
             }
         }
-        Ok(())
+        crate::mcp::close(&self.db).await
     }
 
     async fn run(self, sid: i64, control: Control, channel: broadcast::Sender<Notice>) {

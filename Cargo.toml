@@ -16,6 +16,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = { version = "0.4", features = ["std"] }
 mime = "0.3.18"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
+rmcp = { version = "3.11.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
 rquickjs = { version = "0.14.0", features = ["futures"] }
 rusqlite = { version = "0.43", features = ["serde_json"] }
 serde = { version = "1", features = ["derive"] }

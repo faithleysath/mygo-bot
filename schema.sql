@@ -21,6 +21,16 @@ CREATE VIEW model_catalog AS
 SELECT m.*, p.archived_at AS provider_archived_at,
        (m.archived_at IS NULL AND p.archived_at IS NULL) AS available
 FROM llm_models m JOIN llm_providers p ON p.id=m.provider_id;
+CREATE TABLE mcp_servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
+    transport TEXT NOT NULL CHECK (transport='streamable-http'),
+    config_json TEXT NOT NULL CHECK (json_type(config_json)='object'),
+    timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1 AND 86400000),
+    revision INTEGER NOT NULL CHECK (revision > 0)
+);
 CREATE TABLE config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     default_model_id INTEGER REFERENCES llm_models,
