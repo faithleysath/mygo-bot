@@ -122,23 +122,28 @@ pub fn starting_sibling(conn: &Connection, sid: i64, call: i64) -> Result<bool> 
     )?.query_row((sid, call), |r| r.get(0))?)
 }
 
-pub fn task_status(conn: &Connection, sid: i64, origin: i64) -> Result<Value> {
+pub fn task_status(conn: &Connection, sid: i64, origin: i64, fold_queued: bool) -> Result<Value> {
     let id = format!("cm_{origin}");
-    let row: Option<(Option<Value>, Option<Value>)> = conn.prepare_cached(
-        "SELECT r.payload,e.payload FROM items c
-         LEFT JOIN items r ON r.kind='function_call_output' AND r.target_id=c.id AND r.codemode_call_item_id IS NULL
-         LEFT JOIN items e ON e.kind='codemode_event' AND e.codemode_call_item_id=c.id AND json_extract(e.payload,'$.event')='completed'
-         WHERE c.session_id=? AND c.id=? AND c.kind='function_call' AND json_extract(c.payload,'$.name')='codemode'",
-    )?.query_row((sid, origin), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    let wire = match row {
-        None => {
-            return Ok(
-                json!({"id":id,"status":"not_found","error":"unknown codemode task in this session"}),
-            );
-        }
-        Some((None, None)) => return Ok(json!({"id":id,"state":"starting"})),
-        Some((Some(mut receipt), _)) => receipt["output"].take(),
-        Some((None, Some(mut event))) => event["content"].take(),
+    let row: Option<(Option<Value>, Option<Value>, bool)> = conn.prepare_cached(
+        "WITH result AS (
+           SELECT r.payload AS receipt, e.payload AS event,
+                  (?3 AND e.id>s.input_queue_cursor AND json_extract(e.payload,'$.notify')=1) AS queued
+           FROM items c JOIN sessions s ON s.id=c.session_id
+           LEFT JOIN items r ON r.kind='function_call_output' AND r.target_id=c.id AND r.codemode_call_item_id IS NULL
+           LEFT JOIN items e ON e.kind='codemode_event' AND e.codemode_call_item_id=c.id AND json_extract(e.payload,'$.event')='completed'
+           WHERE c.session_id=?1 AND c.id=?2 AND c.kind='function_call' AND json_extract(c.payload,'$.name')='codemode'
+         ) SELECT receipt, CASE WHEN queued THEN json_array(json_extract(event,'$.content[0]'))
+                                ELSE json_extract(event,'$.content') END, coalesce(queued,0) FROM result",
+    )?.query_row((sid, origin, fold_queued), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let Some((receipt, content, queued)) = row else {
+        return Ok(
+            json!({"id":id,"status":"not_found","error":"unknown codemode task in this session"}),
+        );
+    };
+    let wire = match (receipt, content) {
+        (Some(mut receipt), _) => receipt["output"].take(),
+        (None, Some(content)) => content,
+        (None, None) => return Ok(json!({"id":id,"state":"starting"})),
     };
     let parts = wire.as_array().map(Vec::as_slice).unwrap_or_default();
     let header = wire
@@ -150,6 +155,15 @@ pub fn task_status(conn: &Connection, sid: i64, origin: i64) -> Result<Value> {
     let mut info = json!({"id":id,"state":"completed","status":match summary["status"].as_str() {
         Some("error") | None => "failed", Some(status) => status,
     }});
+    if queued {
+        if let Some(error) = summary["error"].as_str() {
+            info["error"] = json!(&error[..error.floor_char_boundary(512)]);
+        }
+        info["delivery"] = json!("queued");
+        info["message"] =
+            json!("Completion event is already queued and will be delivered in the next step.");
+        return Ok(info);
+    }
     if let Some(error) = summary.get("error") {
         info["error"] = error.clone();
     }

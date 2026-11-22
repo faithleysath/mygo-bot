@@ -45,12 +45,14 @@ pub fn definitions() -> Value {
                 "Return text, JSON-serializable values, or one or more content blocks. Wrap binary data in a media block. Console output (latest 256 KiB) accompanies the result. ",
                 "await emitEvent(textOrBlocks) queues a separate event in this session (rate-limited, nonempty). ",
                 "Blocks: {type:'text',text} (nonempty) or {type:'image'|'audio'|'video',mime_type,data:Uint8Array} (up to 50 MiB, when supported by the session model). ",
-                "Long listeners should use background:true. After 90s a running task goes to background automatically. ",
+                "await task.list() lists active tasks in this session; await task.status(id) returns the full live snapshot or final summary. ",
+                "Default foreground mode waits up to 90s, then continues the same task in the background without losing work. ",
+                "Keep background false unless you have independent work to do immediately or are starting a persistent listener or service. ",
                 "Do independent work while tasks run. Use codemode_task_wait when you need a result, then finish your turn once the work is complete."
             ),
             json!({
                 "code": {"type":"string", "description":"Async JavaScript function body (nonempty, up to 256 KiB)."},
-                "background": {"type":"boolean", "description":"Detach immediately and deliver completion via session events."},
+                "background": {"type":"boolean", "description":"Default false waits up to 90s then automatically detaches without losing work. Set true only for immediate independent work or a persistent listener/service."},
                 "label": {"type":"string", "description":"Optional short name shown in task lists and lease warnings (up to 256 bytes)."}
             }),
             &["code"]
@@ -63,13 +65,22 @@ pub fn definitions() -> Value {
         ),
         definition(
             "codemode_task_wait",
-            "Wait within this step for a codemode event or user message without polling. Requires pending input or an active codemode task in this session. Returns on pending input, session pause, all tasks finishing, or timeout.",
-            json!({"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"default":300}}),
+            concat!(
+                "Wait in the current step for session events or user messages without polling. Without trigger_code, pending input or an active codemode task is required. ",
+                "Returns on pending input, session pause, all active tasks finishing, or an internal time limit. ",
+                "With trigger_code, race an async codemode script (even with no active tasks) against those events. A return or reaching the end wakes immediately with reason 'trigger', the return value and console output. ",
+                "Pending input, pause, or all active tasks draining after a wait that began with tasks cancels the script and discards its output."
+            ),
+            json!({"trigger_code":{"type":"string", "description":concat!(
+                "Optional nonempty async JS body up to 256 KiB. Same runtime as codemode, including await task.status(id), await task.list(), fs, http, proc, mcp and await sleep(ms); emitEvent is unavailable. ",
+                "Use side-effect-free checks only: events can interrupt the script at any time, and it is never recovered or replayed. Avoid file writes or other side effects. ",
+                "Example: while (true) { const s = await task.status('cm_1'); if (s.running_commands?.some(c => /ERR/.test(c.stderr))) return s; await sleep(500); }"
+            )}}),
             &[]
         ),
         definition(
             "codemode_task_status",
-            "Inspect one task's current or final state. Live snapshots include console output and running proc.exec stdout/stderr. Use for progress checks or diagnosing a stuck command. To wait for completion use codemode_task_wait instead of polling.",
+            "Inspect one task's current or final state. Live snapshots include console output and running proc.exec stdout/stderr. A live task with unchanged output and state omits repeat text and returns unchanged_since_last_status: true. A completion event already queued for the next step is reported with delivery: queued. Use codemode_task_wait (optionally with trigger_code) to wait for progress or matching output instead of polling.",
             json!({"id":id}),
             &["id"]
         ),
@@ -109,12 +120,7 @@ struct Target {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Wait {
-    #[serde(default = "default_wait")]
-    timeout_seconds: u32,
-}
-
-fn default_wait() -> u32 {
-    300
+    trigger_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,20 +144,21 @@ enum Action {
     Run(Script),
     List,
     Status(i64),
-    Wait(u32),
+    Wait(Option<String>),
     Kill(i64),
     Renew(i64, u32),
+}
+
+pub(crate) fn task_id(id: &str) -> std::result::Result<i64, String> {
+    id.strip_prefix("cm_")
+        .and_then(|n| n.parse::<i64>().ok())
+        .filter(|n| *n > 0 && format!("cm_{n}") == id)
+        .ok_or_else(|| "expected a cm_ task ID".to_owned())
 }
 
 fn action(name: &str, arguments: &str) -> std::result::Result<Action, String> {
     fn parse<T: serde::de::DeserializeOwned>(s: &str) -> std::result::Result<T, String> {
         serde_json::from_str(s).map_err(|e| e.to_string())
-    }
-    fn target(id: &str) -> std::result::Result<i64, String> {
-        id.strip_prefix("cm_")
-            .and_then(|n| n.parse::<i64>().ok())
-            .filter(|n| *n > 0 && format!("cm_{n}") == id)
-            .ok_or_else(|| "expected a cm_ task ID".to_owned())
     }
     match name {
         "codemode" => {
@@ -170,21 +177,24 @@ fn action(name: &str, arguments: &str) -> std::result::Result<Action, String> {
             let _: Empty = parse(arguments)?;
             Ok(Action::List)
         }
-        "codemode_task_status" => Ok(Action::Status(target(&parse::<Target>(arguments)?.id)?)),
+        "codemode_task_status" => Ok(Action::Status(task_id(&parse::<Target>(arguments)?.id)?)),
         "codemode_task_wait" => {
-            let seconds = parse::<Wait>(arguments)?.timeout_seconds;
-            if !(1..=3600).contains(&seconds) {
-                return Err("timeout_seconds must be between 1 and 3600".into());
+            let code = parse::<Wait>(arguments)?.trigger_code;
+            if code
+                .as_ref()
+                .is_some_and(|code| code.trim().is_empty() || code.len() > 256 * 1024)
+            {
+                return Err("expected nonempty trigger_code up to 256 KiB".into());
             }
-            Ok(Action::Wait(seconds))
+            Ok(Action::Wait(code))
         }
-        "codemode_task_kill" => Ok(Action::Kill(target(&parse::<Target>(arguments)?.id)?)),
+        "codemode_task_kill" => Ok(Action::Kill(task_id(&parse::<Target>(arguments)?.id)?)),
         "codemode_task_renew" => {
             let r: Renewal = parse(arguments)?;
             if !(1..=86400).contains(&r.duration_seconds) {
                 return Err("duration_seconds must be between 1 and 86400".into());
             }
-            Ok(Action::Renew(target(&r.id)?, r.duration_seconds))
+            Ok(Action::Renew(task_id(&r.id)?, r.duration_seconds))
         }
         _ => Err(format!("unknown tool {name}")),
     }
@@ -203,7 +213,7 @@ pub async fn execute(
     match action(name, arguments) {
         Ok(Action::Run(script)) => codemode::run(app, call, script, hard).await,
         Ok(Action::Status(id)) => codemode::status(app, call, id, hard).await,
-        Ok(Action::Wait(seconds)) => codemode::wait(app, call, seconds, hard).await,
+        Ok(Action::Wait(code)) => codemode::wait(app, call, code, hard).await,
         Ok(Action::List) => codemode::list(app, call).await,
         Ok(Action::Kill(id)) => codemode::kill(app, call, id, hard).await,
         Ok(Action::Renew(id, seconds)) => codemode::renew(app, call, id, seconds, hard).await,

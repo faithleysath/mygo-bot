@@ -17,12 +17,13 @@ use crate::{
     tools::Script,
 };
 use chrono::{DateTime, Utc};
-use live::LiveState;
+use live::{LiveState, ProgressFingerprint};
 pub(crate) use output::TASK_BYTES;
 pub use output::{Blocks, Part};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -31,9 +32,10 @@ use tokio::{
     sync::{Notify, oneshot, watch},
     time::Instant,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::task_tracker::TaskTrackerToken};
 
 const FRONT_WAIT: Duration = Duration::from_secs(90);
+const WAIT_LIMIT: Duration = Duration::from_secs(3600);
 const LEASE: Duration = Duration::from_secs(7200);
 const WARNINGS: [Duration; 2] = [Duration::from_secs(3600), Duration::from_secs(900)];
 const KILL_WAIT: Duration = Duration::from_secs(3);
@@ -42,6 +44,7 @@ const MAX_SESSION_TASKS: usize = 32;
 
 pub struct Engine {
     pool: vm::Pool,
+    vm_counts: Mutex<HashMap<i64, usize>>,
     client: reqwest::Client,
 }
 impl Engine {
@@ -54,6 +57,7 @@ impl Engine {
             .map_err(|e| Error::internal(e.to_string()))?;
         Ok(Self {
             pool: vm::Pool::new(threads)?,
+            vm_counts: Mutex::default(),
             client,
         })
     }
@@ -125,7 +129,50 @@ pub struct Outcome {
     pub error: Option<String>,
     pub output: Blocks,
 }
+impl Outcome {
+    fn failed(error: String) -> Self {
+        Self {
+            error: Some(error),
+            output: Blocks::default(),
+        }
+    }
+}
+// A trigger has no Task entry. Count the VM until the worker finishes cleaning up,
+// even if a hard pause has already released the step that submitted it.
+struct VmSlot {
+    engine: Arc<Engine>,
+    sid: i64,
+    _worker: TaskTrackerToken,
+}
+impl VmSlot {
+    fn reserve(app: &App, sid: i64) -> std::result::Result<Self, String> {
+        let mut counts = app.codemode.vm_counts.lock().unwrap();
+        if counts.values().sum::<usize>() >= MAX_TASKS
+            || counts.get(&sid).copied().unwrap_or(0) >= MAX_SESSION_TASKS
+        {
+            return Err("task capacity reached".into());
+        }
+        *counts.entry(sid).or_default() += 1;
+        Ok(Self {
+            engine: app.codemode.clone(),
+            sid,
+            _worker: app.workers.token(),
+        })
+    }
+}
+impl Drop for VmSlot {
+    fn drop(&mut self) {
+        let mut counts = self.engine.vm_counts.lock().unwrap();
+        let count = counts.get_mut(&self.sid).expect("reserved VM slot");
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&self.sid);
+        }
+    }
+}
+
 pub struct Job {
+    _slot: VmSlot,
     pub code: String,
     pub cancel: CancellationToken,
     pub host: Host,
@@ -138,6 +185,8 @@ pub struct Host {
     app: App,
     sid: i64,
     origin: i64,
+    trigger: bool,
+    last_task_query: Arc<tokio::sync::Mutex<Option<Instant>>>,
     deadline: watch::Receiver<Instant>,
     pub client: reqwest::Client,
     pub cancel: CancellationToken,
@@ -145,6 +194,27 @@ pub struct Host {
     streams: Arc<streams::Streams>,
 }
 impl Host {
+    fn new(
+        app: &App,
+        call: &Call,
+        deadline: watch::Receiver<Instant>,
+        cancel: CancellationToken,
+        trigger: bool,
+    ) -> Self {
+        Self {
+            live: Arc::default(),
+            app: app.clone(),
+            client: app.codemode.client.clone(),
+            sid: call.sid,
+            origin: call.id,
+            trigger,
+            last_task_query: Arc::default(),
+            cancel,
+            deadline,
+            executor: Handle::current(),
+            streams: Arc::default(),
+        }
+    }
     pub async fn io(
         &self,
         op: String,
@@ -157,6 +227,9 @@ impl Host {
         io::execute(self, &op, args, data).await
     }
     pub async fn emit(&self, blocks: Blocks) -> std::result::Result<i64, String> {
+        if self.trigger {
+            return Err("emitEvent is not available in trigger_code; return from trigger_code to finish waiting".into());
+        }
         let sid = self.sid;
         let origin = self.origin;
         let app = self.app.clone();
@@ -231,6 +304,7 @@ struct KillWait {
     until: Instant,
 }
 pub struct Task {
+    last_status_fingerprint: Option<ProgressFingerprint>,
     live: Arc<Mutex<LiveState>>,
     origin: Call,
     label: String,
@@ -333,19 +407,26 @@ pub fn shutdown_tasks(s: &mut Store, hard: bool) -> Result<()> {
     Ok(())
 }
 
+fn task_list(s: &Store, sid: i64) -> Value {
+    let mut tasks: Vec<_> = s.tasks.values().filter(|t| t.origin.sid == sid).collect();
+    tasks.sort_unstable_by_key(|t| t.origin.id);
+    json!({"tasks": tasks.into_iter().map(Task::info).collect::<Vec<_>>()})
+}
+
 pub async fn list(app: App, call: Call) -> Result<()> {
     app.db
-        .call(move |s| {
-            let mut tasks: Vec<_> = s
-                .tasks
-                .values()
-                .filter(|t| t.origin.sid == call.sid)
-                .collect();
-            tasks.sort_unstable_by_key(|t| t.origin.id);
-            let tasks: Vec<_> = tasks.into_iter().map(Task::info).collect();
-            call.reply(s, json!({"tasks":tasks}))
-        })
+        .call(move |s| call.reply(s, task_list(s, call.sid)))
         .await
+}
+
+fn full_status(s: &Store, sid: i64, id: i64) -> Result<Value> {
+    if let Some(task) = owned(s, sid, id) {
+        let mut info = task.info();
+        task.live.lock().unwrap().snapshot(&mut info, true);
+        Ok(info)
+    } else {
+        ledger::task_status(&s.conn, sid, id, false)
+    }
 }
 
 fn owned(s: &Store, sid: i64, id: i64) -> Option<&Task> {
@@ -361,65 +442,222 @@ pub async fn status(app: App, call: Call, id: i64, hard: CancellationToken) -> R
             if hard.is_cancelled() {
                 return Ok(());
             }
-            let body = if let Some(task) = owned(s, call.sid, id) {
-                let mut info = task.info();
-                task.live.lock().unwrap().snapshot(&mut info);
-                info
-            } else {
-                ledger::task_status(&s.conn, call.sid, id)?
+            let Some(task) = s.tasks.get(&id).filter(|t| t.origin.sid == call.sid) else {
+                let body = ledger::task_status(&s.conn, call.sid, id, true)?;
+                return call.reply(s, body);
             };
-            call.reply(s, body)
+            let mut info = task.info();
+            let mut live = task.live.lock().unwrap();
+            let fingerprint = live.fingerprint(task.reason.is_some(), task.background, *task.deadline.borrow());
+            let unchanged = task.last_status_fingerprint.as_ref() == Some(&fingerprint);
+            live.snapshot(&mut info, !unchanged);
+            drop(live);
+            if unchanged {
+                info["unchanged_since_last_status"] = json!(true);
+                info["message"] = json!("No new output or state change since the last status check. Use codemode_task_wait (optionally with trigger_code) instead of polling codemode_task_status.");
+            }
+            call.reply(s, info)?;
+            s.tasks.get_mut(&id).unwrap().last_status_fingerprint = Some(fingerprint);
+            Ok(())
         })
         .await
 }
 
-pub async fn wait(app: App, call: Call, seconds: u32, hard: CancellationToken) -> Result<()> {
-    let start = Instant::now();
-    let deadline = start + Duration::from_secs(seconds.into());
-    let mut first = true;
-    loop {
-        let call = call.clone();
-        let hard_check = hard.clone();
-        let waiting = app.db.call(move |s| {
-            if hard_check.is_cancelled() {
-                return Ok(None);
-            }
-            let sid = call.sid;
-            let waited_ms = start.elapsed().as_millis();
-            let Some(control) = s.active.get(&sid).filter(|c| !s.closing && !c.soft.is_cancelled()) else {
-                call.reply(s, json!({"status":"interrupted", "reason":"session pausing", "waited_ms":waited_ms}))?;
-                return Ok(None);
-            };
-            let reply = if has_pending(&s.conn, sid)? {
-                json!({"status":"woke", "reason":"pending_input", "waited_ms":waited_ms})
+struct Wait {
+    call: Call,
+    start: Instant,
+    has_trigger: bool,
+    hard: CancellationToken,
+}
+
+enum WaitPoll {
+    Done,
+    Cancel(Value),
+    Listen {
+        wake: watch::Receiver<u64>,
+        soft: CancellationToken,
+        had_tasks: bool,
+    },
+}
+
+impl Wait {
+    // The queue check, subscription and any winning result all use the SQLite thread.
+    fn poll(
+        &self,
+        s: &mut Store,
+        had_tasks: Option<bool>,
+        running: bool,
+        outcome: Option<Outcome>,
+    ) -> Result<WaitPoll> {
+        if self.hard.is_cancelled() {
+            return Ok(WaitPoll::Done);
+        }
+        let sid = self.call.sid;
+        let waited_ms = self.start.elapsed().as_millis();
+        let control = s
+            .active
+            .get(&sid)
+            .filter(|c| !s.closing && !c.soft.is_cancelled());
+        let reply = if let Some(control) = control {
+            if has_pending(&s.conn, sid)? {
+                json!({"status":"woke", "reason":"pending_input", "waited_ms":if had_tasks.is_none() {0} else {waited_ms}})
             } else {
-                let active = s.tasks.values().filter(|task| task.origin.sid == sid).count();
-                if !first && Instant::now() >= deadline {
-                    json!({"status":"timeout", "waited_ms":waited_ms, "active_tasks":active})
-                } else if active > 0 || ledger::starting_sibling(&s.conn, sid, call.id)? {
-                    // The queue check and subscription share the SQLite thread.
-                    let soft = control.soft.clone();
-                    return Ok(Some((s.subscribe_wait(sid), soft)));
-                } else if first {
-                    json!({"status":"error", "error":"no active codemode tasks in this session"})
-                } else {
+                let active = s.tasks.values().filter(|t| t.origin.sid == sid).count();
+                let has_tasks = active > 0 || ledger::starting_sibling(&s.conn, sid, self.call.id)?;
+                if !has_tasks && had_tasks == Some(true) {
                     json!({"status":"woke", "reason":"no_active_tasks", "waited_ms":waited_ms})
+                } else if !has_tasks && !self.has_trigger {
+                    json!({"status":"error", "error":"no active codemode tasks in this session"})
+                } else if self.start.elapsed() >= WAIT_LIMIT {
+                    json!({"status":"timeout", "waited_ms":waited_ms, "active_tasks":active})
+                } else if let Some(outcome) = outcome {
+                    self.save_trigger(s, outcome)?;
+                    return Ok(WaitPoll::Done);
+                } else {
+                    let soft = control.soft.clone();
+                    return Ok(WaitPoll::Listen {
+                        wake: s.subscribe_wait(sid),
+                        soft,
+                        had_tasks: had_tasks.unwrap_or(has_tasks),
+                    });
                 }
-            };
-            call.reply(s, reply)?;
-            Ok(None)
-        }).await?;
-        let Some((mut rx, soft)) = waiting else {
-            return Ok(());
+            }
+        } else {
+            json!({"status":"interrupted", "reason":"session pausing", "waited_ms":waited_ms})
         };
+        if running {
+            return Ok(WaitPoll::Cancel(reply));
+        }
+        self.call.reply(s, reply)?;
+        Ok(WaitPoll::Done)
+    }
+
+    fn save_trigger(&self, s: &mut Store, outcome: Outcome) -> Result<()> {
+        let sid = self.call.sid;
+        let tx = s.conn.transaction()?;
+        let (parts, error) = match ledger::materialize(&tx, sid, &outcome.output) {
+            Ok(Value::Array(parts)) => (parts, outcome.error),
+            Ok(_) => return Err(Error::internal("expected codemode result blocks")),
+            Err(e) if e.0.is_client_error() => (Vec::new(), Some(e.1)),
+            Err(e) => return Err(e),
+        };
+        let waited_ms = self.start.elapsed().as_millis();
+        let summary = match error {
+            Some(error) => {
+                json!({"status":"error", "reason":"trigger_failed", "waited_ms":waited_ms, "error":error})
+            }
+            None => json!({"status":"woke", "reason":"trigger", "waited_ms":waited_ms}),
+        };
+        let (content, text) = pack_output(summary, parts, true);
+        let id = self
+            .call
+            .save(&tx, text.as_ref().unwrap_or(&content), false)?;
+        tx.commit()?;
+        notice(s, sid, id);
+        Ok(())
+    }
+
+    fn submit_trigger(
+        &self,
+        app: &App,
+        code: String,
+        cancel: CancellationToken,
+    ) -> std::result::Result<oneshot::Receiver<Outcome>, String> {
+        let (_, lease) = watch::channel(self.start + WAIT_LIMIT);
+        let slot = VmSlot::reserve(app, self.call.sid)?;
+        let host = Host::new(app, &self.call, lease, cancel.clone(), true);
+        let (done, finish) = oneshot::channel();
+        app.codemode.pool.submit(Job {
+            _slot: slot,
+            code,
+            host,
+            cancel,
+            done,
+        })?;
+        Ok(finish)
+    }
+}
+
+pub async fn wait(
+    app: App,
+    call: Call,
+    mut code: Option<String>,
+    hard: CancellationToken,
+) -> Result<()> {
+    let wait = Arc::new(Wait {
+        call,
+        start: Instant::now(),
+        has_trigger: code.is_some(),
+        hard: hard.clone(),
+    });
+    let deadline = wait.start + WAIT_LIMIT;
+    let cancel = hard.child_token();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let mut had_tasks = None;
+    let mut finish = None;
+    let mut outcome = None;
+    loop {
+        let check = wait.clone();
+        let running = finish.is_some();
+        let result = outcome.take();
+        let poll = app
+            .db
+            .call(move |s| check.poll(s, had_tasks, running, result))
+            .await?;
+        let (mut wake, soft) = match poll {
+            WaitPoll::Done => return Ok(()),
+            WaitPoll::Cancel(reply) => {
+                cancel.cancel();
+                tokio::select! {
+                    biased;
+                    _ = hard.cancelled() => return Ok(()),
+                    _ = finish.take().expect("trigger running") => (),
+                }
+                return app
+                    .db
+                    .call(move |s| {
+                        if hard.is_cancelled() {
+                            Ok(())
+                        } else {
+                            wait.call.reply(s, reply)
+                        }
+                    })
+                    .await;
+            }
+            WaitPoll::Listen {
+                wake,
+                soft,
+                had_tasks: initial,
+            } => {
+                had_tasks = Some(initial);
+                (wake, soft)
+            }
+        };
+        if let Some(code) = code.take() {
+            match wait.submit_trigger(&app, code, cancel.clone()) {
+                Ok(rx) => finish = Some(rx),
+                Err(error) => {
+                    outcome = Some(Outcome::failed(error));
+                    continue;
+                }
+            }
+        }
         tokio::select! {
             biased;
             _ = hard.cancelled() => return Ok(()),
             _ = soft.cancelled() => (),
             _ = tokio::time::sleep_until(deadline) => (),
-            _ = rx.changed() => (),
+            result = async {
+                match &mut finish {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                finish = None;
+                outcome = Some(result.unwrap_or_else(|_| Outcome::failed("JS worker exited before delivering outcome".into())));
+            }
+            _ = wake.changed() => (),
         }
-        first = false;
     }
 }
 
@@ -515,9 +753,14 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
         let id = call.id;
         let sid = call.sid;
         let changed = Arc::new(Notify::new());
-        let live = Arc::new(Mutex::new(LiveState::default()));
+        let slot = match VmSlot::reserve(&app, sid) {
+            Ok(slot) => slot,
+            Err(error) => return call.reply(s, json!({"status":"error","error":error})),
+        };
+        let host = Host::new(&app, &call, lease, cancel.clone(), false);
         let mut task = Task {
-            live: live.clone(),
+            last_status_fingerprint: None,
+            live: host.live.clone(),
             origin: call,
             label: script.label,
             created: now,
@@ -540,20 +783,10 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             task.delivered();
         }
         let (done, finish) = oneshot::channel();
-        let host = Host {
-            live,
-            app: app.clone(),
-            client: app.codemode.client.clone(),
-            sid,
-            origin: id,
-            cancel: cancel.clone(),
-            deadline: lease,
-            executor: Handle::current(),
-            streams: Arc::default(),
-        };
         s.tasks.insert(id, task);
         s.wake_waiters(sid);
         let submitted = app.codemode.pool.submit(Job {
+            _slot: slot,
             code: script.code,
             cancel,
             host,
@@ -624,10 +857,7 @@ async fn supervise(
     submitted: std::result::Result<(), String>,
 ) {
     let outcome = match submitted {
-        Err(error) => Outcome {
-            error: Some(error),
-            output: Blocks::default(),
-        },
+        Err(error) => Outcome::failed(error),
         Ok(()) => loop {
             let worker = app.clone();
             let timer = match app.db.call(move |s| tick(s, &worker, id)).await {
@@ -645,10 +875,7 @@ async fn supervise(
             };
             tokio::select! {
                 biased;
-                outcome = &mut finish => break outcome.unwrap_or_else(|_| Outcome {
-                    error: Some("JS worker exited before delivering outcome".into()),
-                    output: Blocks::default(),
-                }),
+                outcome = &mut finish => break outcome.unwrap_or_else(|_| Outcome::failed("JS worker exited before delivering outcome".into())),
                 _ = changed.notified() => (),
                 _ = alarm => (),
             }
@@ -675,6 +902,26 @@ async fn supervise(
     }
 }
 
+fn pack_output(
+    mut summary: Value,
+    mut parts: Vec<Value>,
+    for_tool: bool,
+) -> (Value, Option<Value>) {
+    let header = json!({"type":"text", "text":summary.to_string()});
+    let text = (for_tool && parts.iter().all(|p| p["type"] == "text")).then(|| {
+        summary["output"] = Value::String(
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        Value::String(summary.to_string())
+    });
+    parts.insert(0, header);
+    (Value::Array(parts), text)
+}
+
 fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
     let task = &s.tasks[&id];
     let sid = task.origin.sid;
@@ -699,7 +946,7 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
     } else {
         Ok(Value::Array(Vec::new()))
     };
-    let mut parts = match materialized {
+    let parts = match materialized {
         Ok(Value::Array(parts)) => parts,
         Ok(_) => return Err(Error::internal("expected codemode result blocks")),
         Err(e) if e.0.is_client_error() => {
@@ -712,19 +959,8 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
         Err(e) => return Err(e),
     };
     let mut saved = Vec::with_capacity(2);
-    let header = json!({"type":"text", "text":summary.to_string()});
-    let mut text_output = None;
-    if (original_pending || task.kill.is_some()) && parts.iter().all(|p| p["type"] == "text") {
-        let text = parts
-            .iter()
-            .filter_map(|p| p["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        summary["output"] = Value::String(text);
-        text_output = Some(Value::String(summary.to_string()));
-    }
-    parts.insert(0, header);
-    let content = Value::Array(parts);
+    let (content, text_output) =
+        pack_output(summary, parts, original_pending || task.kill.is_some());
     let wire = text_output.as_ref().unwrap_or(&content);
     ledger::invalidate(&tx, sid, id)?;
     if task.background {

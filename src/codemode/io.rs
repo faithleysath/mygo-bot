@@ -43,6 +43,23 @@ pub async fn execute(
                         call.set_phase(phase);
                     }).await.map_err(Into::into)
                 }
+                "task.list" | "task.status" => {
+                    let id = match op {
+                        "task.status" => Some(crate::tools::task_id(string(&args, "id")?)?),
+                        _ => None,
+                    };
+                    let mut last = host.last_task_query.lock().await;
+                    if let Some(at) = *last {
+                        tokio::time::sleep_until(at + Duration::from_millis(100)).await;
+                    }
+                    *last = Some(tokio::time::Instant::now());
+                    let sid = host.sid;
+                    let value = host.app.db.call(move |s| match id {
+                        Some(id) => super::full_status(s, sid, id),
+                        None => Ok(super::task_list(s, sid)),
+                    }).await.map_err(|e| e.to_string())?;
+                    Ok(Reply::value(value))
+                }
                 "http.request" => request(host, &args, data).await,
                 "upload.open" | "stream.next" | "stream.write" | "stream.finish" => host.streams.execute(op, &args["id"], data).await,
                 "sleep" => {

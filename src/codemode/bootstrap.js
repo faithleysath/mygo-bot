@@ -162,6 +162,10 @@
                 return response;
             },
         },
+        task: {
+            async list() { return call('task.list', {}); },
+            async status(id) { return call('task.status', { id }); },
+        },
         mcp: {
             async servers() { return call('mcp.servers', {}); },
             async tools(server, { query, cursor } = {}) { return call('mcp.tools', { server, query, cursor }); },

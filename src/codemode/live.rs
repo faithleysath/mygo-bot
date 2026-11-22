@@ -44,8 +44,22 @@ impl<const LIMIT: usize> Tail<LIMIT> {
     }
 }
 
+#[derive(PartialEq, Eq)]
+pub(super) struct ProgressFingerprint {
+    stopping: bool,
+    background: bool,
+    deadline: Instant,
+    console_epoch: u64,
+    console_bytes: u64,
+    completed_commands: u64,
+    commands: Vec<(u64, u64, u64)>,
+    last_mcp_id: u64,
+    mcp_calls: Vec<(u64, &'static str)>,
+}
+
 #[derive(Default)]
 pub(super) struct LiveState {
+    console_epoch: u64,
     console: Tail<{ 256 * 1024 }>,
     has_line: bool,
     commands: BTreeMap<u64, Command>,
@@ -64,6 +78,7 @@ impl LiveState {
             self.console.append(line);
             self.has_line = true;
         } else {
+            self.console_epoch += u64::from(self.has_line);
             self.console = Tail::default();
             self.has_line = false;
         }
@@ -81,19 +96,57 @@ impl LiveState {
         })
     }
 
-    pub fn snapshot(&mut self, info: &mut Value) {
-        info["console"] = json!({"output": self.console.text(), "total_bytes": self.console.total, "truncated": self.console.truncated()});
+    pub fn fingerprint(
+        &self,
+        stopping: bool,
+        background: bool,
+        deadline: Instant,
+    ) -> ProgressFingerprint {
+        ProgressFingerprint {
+            stopping,
+            background,
+            deadline,
+            console_epoch: self.console_epoch,
+            console_bytes: self.console.total,
+            completed_commands: self.completed_commands,
+            commands: self
+                .commands
+                .iter()
+                .map(|(&id, c)| (id, c.stdout.total, c.stderr.total))
+                .collect(),
+            last_mcp_id: self.next_mcp_call,
+            mcp_calls: self
+                .mcp_calls
+                .iter()
+                .map(|(&id, c)| (id, c.phase))
+                .collect(),
+        }
+    }
+
+    pub fn snapshot(&mut self, info: &mut Value, include_output: bool) {
+        info["console"] =
+            json!({"total_bytes": self.console.total, "truncated": self.console.truncated()});
+        if include_output {
+            info["console"]["output"] = json!(self.console.text());
+        }
         info["running_mcp_calls"] = Value::Array(self.mcp_calls.iter().map(|(id, call)| json!({
             "id": id, "server": call.server, "operation": call.operation, "tool": call.tool,
             "phase": call.phase, "elapsed_ms": call.started.elapsed().as_millis(),
         })).collect());
         info["completed_commands"] = json!(self.completed_commands);
-        info["running_commands"] = Value::Array(self.commands.iter_mut().map(|(id, c)| json!({
-            "id": id, "program": c.program, "args": c.args, "args_truncated": c.args_truncated, "cwd": c.cwd,
-            "started_at": c.started_at.to_rfc3339(), "elapsed_ms": c.started.elapsed().as_millis(),
-            "stdout": c.stdout.text(), "stdout_bytes": c.stdout.total, "stdout_truncated": c.stdout.truncated(),
-            "stderr": c.stderr.text(), "stderr_bytes": c.stderr.total, "stderr_truncated": c.stderr.truncated(),
-        })).collect());
+        info["running_commands"] = Value::Array(self.commands.iter_mut().map(|(id, c)| {
+            let mut command = json!({
+                "id": id, "program": c.program, "args": c.args, "args_truncated": c.args_truncated, "cwd": c.cwd,
+                "started_at": c.started_at.to_rfc3339(), "elapsed_ms": c.started.elapsed().as_millis(),
+                "stdout_bytes": c.stdout.total, "stdout_truncated": c.stdout.truncated(),
+                "stderr_bytes": c.stderr.total, "stderr_truncated": c.stderr.truncated(),
+            });
+            if include_output {
+                command["stdout"] = json!(c.stdout.text());
+                command["stderr"] = json!(c.stderr.text());
+            }
+            command
+        }).collect());
     }
 }
 
