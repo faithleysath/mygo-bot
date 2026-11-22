@@ -14,6 +14,28 @@
 
 这里最容易漏掉的是外部子进程。如果脚本通过 `proc.exec` 拉起 shell 或生出一串孙子进程，超时或取消时光杀最外层的领头进程没用，孙子进程还会留在后台野跑、死死占住输出管道不撒手。所以 `proc.exec` 做成了**受管命令**：Unix 下把每次命令放进独立进程组（`process_group(0)`），Windows 下放进带自动清场标志的 `JobObject`；不管是正常退出、超时还是取消，领头进程一停就把整组连根清掉，管道最多再给 250 毫秒排空宽限期就果断截断。虚拟机退出前也绝不直接腰斩宿主的异步任务，而是先拉取消闸门，等所有在途宿主调用把进程组收拾干净才交差——省掉这一层，取消脚本就会留下一地孤儿进程。
 
+## 脚本怎么找到并调用远端工具？
+
+拿一次实际的联网搜索来说。用户只问了 SQLite 3.50.0 的发布日期和两个新函数的名字。模型手里仍是前面那六个工具，它先调 `codemode`，在脚本里问 `await mcp.servers()`。宿主从 SQLite 的 `mcp_servers` 表读出已启用服务的名字和用途，这一步不用联网。模型看到 `exa` 能搜网页，才用 `await mcp.tools('exa')` 看它有哪些工具、每个工具要填什么参数。目录大时可以传 `{query: 'search'}` 筛选，或者把上页的 `nextCursor` 作为 `cursor` 传回来继续翻。
+
+Exa 的 `web_search_exa` 要求脚本用 `query` 写想找什么，用 `objective` 写希望从结果里核实什么。知道工具和参数后，脚本就可以直接调用。下面把这次搜索写成一段可以复用的脚本。
+
+```js
+const result = await mcp.call('exa', 'web_search_exa', {
+    query: 'SQLite 3.50.0 official release notes Unicode escape functions',
+    objective: 'Find the release date and both new SQL function names in the official notes.',
+    numResults: 5,
+})
+if (result.isError) throw new Error(result.content.map(block => block.text).join('\n'))
+return result.structuredContent ?? result.content
+```
+
+这次 Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 **2025 年 5 月 29 日**、`unistr()` 和 `unistr_quote()`。搜索结果先回到脚本，脚本可以挑出需要的部分再 `return`。会话流水账沿用外层 `codemode` 的调用和结果。一次脚本里即使查了多个远端工具，也由这次 `codemode` 一起交账。[SQLite 官方发布说明](https://sqlite.org/releaselog/3_50_0.html)
+
+**配置可以共用，连接按会话建立。** 通过 `POST /mcp/servers` 登记服务地址、说明和可选的静态请求头，重启后配置还在。第一次查工具或调用时，Rust 宿主才通过 Streamable HTTP 连过去。同一会话里，新脚本可以复用这条连接，另一个会话会另建连接。修改配置后，新调用用新配置，已经发出去的请求按原配置收尾。禁用服务后，即使脚本记得工具全名，也发不起新调用。
+
+**工具报错和断线要分开处理。** 服务明确回了失败结果，脚本能从 `isError` 和 `content` 读到原因。调用默认有 60 秒超时，硬暂停也会取消本地正在等的请求。如果写请求已经发出去，随后断线或超时，MyGo 只能记“结果未知”。比如远端可能已经建好了工单，只是回信丢了。MyGo 不会自动重发。要再试，先去远端核对这张工单。
+
 ## 快活当场结清，慢活打欠条转后台
 
 车间跑稳了，再看它怎么跟 `step` 对账。模型发起一次 `codemode`，照例先记成一笔 `function_call` 的 `item`（假设行号是 `42`，任务编号就叫 **`cm_42`**；全进程最多同时跑 256 个任务，单会话最多 32 个）。接下来在**怎么交还 `function_call_output`** 这一步一分为二：
