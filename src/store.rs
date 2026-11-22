@@ -4,7 +4,7 @@ use axum::body::Bytes;
 use reqwest::Body;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::{Error, Result, agent::Control, events::Notice};
 
@@ -53,6 +53,7 @@ pub struct Store {
     pub active: HashMap<i64, Control>,
     pub tasks: HashMap<i64, crate::codemode::Task>,
     channels: HashMap<i64, broadcast::WeakSender<Notice>>,
+    wake_sequences: HashMap<i64, watch::Sender<u64>>,
     pub closing: bool,
 }
 
@@ -98,6 +99,7 @@ impl Db {
                     active: HashMap::new(),
                     tasks: HashMap::new(),
                     channels: HashMap::new(),
+                    wake_sequences: HashMap::new(),
                     closing: false,
                 };
                 let mut next = None;
@@ -144,6 +146,7 @@ impl Db {
             move |conn| Enqueue { sid, content, key }.insert(conn),
             move |store, saved| {
                 if let Enqueued::Created(id) = saved {
+                    store.wake_waiters(sid);
                     store.item_saved(sid, id)?;
                 }
                 Ok(saved)
@@ -284,6 +287,29 @@ impl Store {
         for reply in replies {
             reply(self, &committed);
         }
+    }
+
+    pub fn wake_waiters(&mut self, sid: i64) {
+        if let std::collections::hash_map::Entry::Occupied(entry) = self.wake_sequences.entry(sid) {
+            if entry.get().receiver_count() > 0 {
+                entry.get().send_modify(|sequence| *sequence += 1);
+            } else {
+                entry.remove();
+            }
+        }
+    }
+
+    pub fn subscribe_wait(&mut self, sid: i64) -> watch::Receiver<u64> {
+        if let Some(sender) = self.wake_sequences.get(&sid) {
+            let mut rx = sender.subscribe();
+            rx.borrow_and_update();
+            return rx;
+        }
+        self.wake_sequences.retain(|_, s| s.receiver_count() > 0);
+        let (tx, mut rx) = watch::channel(0);
+        rx.borrow_and_update();
+        self.wake_sequences.insert(sid, tx);
+        rx
     }
 
     pub fn channel(&mut self, sid: i64) -> broadcast::Sender<Notice> {

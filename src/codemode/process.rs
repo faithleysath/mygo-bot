@@ -21,7 +21,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::io::drain;
+use super::{
+    io::drain,
+    live::{CommandGuard, Stream},
+};
 
 pub(super) async fn execute(
     program: &str,
@@ -29,6 +32,7 @@ pub(super) async fn execute(
     opts: &Value,
     stdin: Option<Vec<u8>>,
     cancel: CancellationToken,
+    command_preview: &CommandGuard<'_>,
 ) -> Result<Value, String> {
     let deadline = super::io::timeout(opts)?.map(|d| Instant::now() + d);
     let mut command = Command::new(program);
@@ -114,8 +118,8 @@ pub(super) async fn execute(
     let (status, input, stdout, stderr) = tokio::join!(
         monitor,
         write,
-        drain(stdout, &finished),
-        drain(stderr, &finished)
+        drain(stdout, &finished, Some((command_preview, Stream::Stdout))),
+        drain(stderr, &finished, Some((command_preview, Stream::Stderr)))
     );
     let status = status?;
     let pipe_error = |e| format!("pipe_failed: {e}");

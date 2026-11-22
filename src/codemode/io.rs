@@ -8,6 +8,7 @@ use tokio_util::{io::StreamReader, sync::CancellationToken};
 
 use super::{
     Host, HostError, Reply, files,
+    live::{CommandGuard, Stream},
     streams::{Reservation, Resource},
 };
 
@@ -209,12 +210,14 @@ async fn command(host: &Host, args: &Value, stdin: Option<Vec<u8>>) -> Result<Va
     use super::process::execute;
     #[cfg(windows)]
     use super::windows::execute;
-    execute(program, &argv, args, stdin, host.cancel.clone()).await
+    let preview = CommandGuard::start(&host.live, program, &argv, args["cwd"].as_str());
+    execute(program, &argv, args, stdin, host.cancel.clone(), &preview).await
 }
 
 pub(super) async fn drain(
     mut reader: impl AsyncRead + Unpin,
     finished: &CancellationToken,
+    preview: Option<(&CommandGuard<'_>, Stream)>,
 ) -> io::Result<(String, bool)> {
     let deadline = async {
         finished.cancelled().await;
@@ -232,6 +235,9 @@ pub(super) async fn drain(
         };
         if n == 0 {
             break;
+        }
+        if let Some((command, stream)) = &preview {
+            command.append(stream, &chunk[..n]);
         }
         let keep = n.min(OUTPUT_LIMIT - bytes.len());
         bytes.extend_from_slice(&chunk[..keep]);

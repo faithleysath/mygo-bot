@@ -33,11 +33,11 @@ pub fn definitions() -> Value {
                 "Use new TextDecoder().decode(chunk,{stream:true}) with the same decoder for each chunk, then decoder.decode() to flush. ",
                 "await proc.exec(program,args,{cwd,env,stdin,timeout_ms}) runs an executable directly (no shell; text/Uint8Array stdin; ",
                 "Windows .bat/.cmd require cmd.exe), kills its process group on exit, and returns {exit_code,signal,stdout,stderr,truncated} (256 KiB cap per stream). ",
-                "Return text or an array of blocks as the final output (blank return text yields empty output; console attaches only on error). ",
+                "Return text, JSON-serializable values, or one or more content blocks. Wrap binary data in a media block. Console output (latest 256 KiB) accompanies the result. ",
                 "await emitEvent(textOrBlocks) queues a separate event in this session (rate-limited, nonempty). ",
                 "Blocks: {type:'text',text} (nonempty) or {type:'image'|'audio'|'video',mime_type,data:Uint8Array} (up to 50 MiB, when supported by the session model). ",
                 "Long listeners should use background:true. After 90s a running task goes to background automatically. ",
-                "Results and lease reminders wake the session. End your turn if there is nothing else to do."
+                "Do independent work while tasks run. Use codemode_task_wait when you need a result, then finish your turn once the work is complete."
             ),
             json!({
                 "code": {"type":"string", "description":"Async JavaScript function body (nonempty, up to 256 KiB)."},
@@ -51,6 +51,18 @@ pub fn definitions() -> Value {
             "List active codemode tasks in this session, including tasks stopping.",
             json!({}),
             &[]
+        ),
+        definition(
+            "codemode_task_wait",
+            "Wait within this step for a codemode event or user message without polling. Requires pending input or an active codemode task in this session. Returns on pending input, session pause, all tasks finishing, or timeout.",
+            json!({"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"default":300}}),
+            &[]
+        ),
+        definition(
+            "codemode_task_status",
+            "Inspect one task's current or final state. Live snapshots include console output and running proc.exec stdout/stderr. Use for progress checks or diagnosing a stuck command. To wait for completion use codemode_task_wait instead of polling.",
+            json!({"id":id}),
+            &["id"]
         ),
         definition(
             "codemode_task_kill",
@@ -87,6 +99,17 @@ struct Target {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Wait {
+    #[serde(default = "default_wait")]
+    timeout_seconds: u32,
+}
+
+fn default_wait() -> u32 {
+    300
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Renewal {
     id: String,
     duration_seconds: u32,
@@ -105,6 +128,8 @@ pub struct Script {
 enum Action {
     Run(Script),
     List,
+    Status(i64),
+    Wait(u32),
     Kill(i64),
     Renew(i64, u32),
 }
@@ -136,6 +161,14 @@ fn action(name: &str, arguments: &str) -> std::result::Result<Action, String> {
             let _: Empty = parse(arguments)?;
             Ok(Action::List)
         }
+        "codemode_task_status" => Ok(Action::Status(target(&parse::<Target>(arguments)?.id)?)),
+        "codemode_task_wait" => {
+            let seconds = parse::<Wait>(arguments)?.timeout_seconds;
+            if !(1..=3600).contains(&seconds) {
+                return Err("timeout_seconds must be between 1 and 3600".into());
+            }
+            Ok(Action::Wait(seconds))
+        }
         "codemode_task_kill" => Ok(Action::Kill(target(&parse::<Target>(arguments)?.id)?)),
         "codemode_task_renew" => {
             let r: Renewal = parse(arguments)?;
@@ -160,6 +193,8 @@ pub async fn execute(
     }
     match action(name, arguments) {
         Ok(Action::Run(script)) => codemode::run(app, call, script, hard).await,
+        Ok(Action::Status(id)) => codemode::status(app, call, id, hard).await,
+        Ok(Action::Wait(seconds)) => codemode::wait(app, call, seconds, hard).await,
         Ok(Action::List) => codemode::list(app, call).await,
         Ok(Action::Kill(id)) => codemode::kill(app, call, id, hard).await,
         Ok(Action::Renew(id, seconds)) => codemode::renew(app, call, id, seconds, hard).await,

@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default)]
 pub struct Control {
-    soft: CancellationToken,
+    pub soft: CancellationToken,
     pub hard: CancellationToken,
 }
 
@@ -210,6 +210,7 @@ fn request_pause(s: &mut Store, sid: i64, hard: bool, reason: &str) -> Result<()
     } else {
         s.status(sid, "paused", reason)?;
     }
+    s.wake_waiters(sid);
     Ok(())
 }
 

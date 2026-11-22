@@ -5,7 +5,7 @@ use rquickjs::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     future::{Future, poll_fn},
     io,
     rc::{Rc, Weak},
@@ -28,9 +28,6 @@ const IO_BYTES: usize = 8 * MIB;
 const METADATA_BYTES: usize = 256 * 1024;
 const HOST_CALLS: usize = 16;
 const JOBS_PER_TURN: usize = 64;
-const LOG_LINES: usize = 32;
-const LOG_LINE_BYTES: usize = 1024;
-const LOG_TOTAL_BYTES: usize = 4096;
 static IO_SLOTS: Semaphore = Semaphore::const_new(32);
 
 struct Worker {
@@ -112,47 +109,6 @@ type Completed = Result<(Id, HostResult), JoinError>;
 type Callback = Persistent<Function<'static>>;
 type Resolvers = RefCell<HashMap<Id, (Callback, Callback)>>;
 
-#[derive(Default)]
-struct Logs {
-    lines: VecDeque<String>,
-    bytes: usize,
-}
-
-impl Logs {
-    fn clear(&mut self) {
-        self.lines.clear();
-        self.bytes = 0;
-    }
-
-    fn push(&mut self, raw: &[u8]) {
-        let head = &raw[..raw.len().min(LOG_LINE_BYTES + 4)];
-        let mut line = String::from_utf8_lossy(head).into_owned();
-        if line.len() > LOG_LINE_BYTES || raw.len() > head.len() {
-            line.truncate(line.floor_char_boundary(LOG_LINE_BYTES));
-            line.push('…');
-        }
-        while !self.lines.is_empty()
-            && (self.lines.len() >= LOG_LINES || self.bytes + line.len() > LOG_TOTAL_BYTES)
-        {
-            if let Some(old) = self.lines.pop_front() {
-                self.bytes -= old.len();
-            }
-        }
-        self.bytes += line.len();
-        self.lines.push_back(line);
-    }
-
-    fn finish(&self) -> Option<String> {
-        (!self.lines.is_empty()).then(|| {
-            self.lines
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-    }
-}
-
 struct Scope {
     host: Host,
     cancel: CancellationToken,
@@ -160,7 +116,6 @@ struct Scope {
     accepting: Cell<bool>,
     jobs: RefCell<JoinSet<HostResult>>,
     output: RefCell<Blocks>,
-    logs: RefCell<Logs>,
 }
 
 impl Scope {
@@ -214,20 +169,28 @@ async fn run(job: Job, stop: CancellationToken) {
         accepting: Cell::new(true),
         jobs: RefCell::default(),
         output: RefCell::default(),
-        logs: RefCell::default(),
     });
     let mut error = drive(&scope, &job.code).await.err();
     scope.cancel.cancel();
     // Never abort a host future. Managed commands finish process-group cleanup inside it.
     let mut jobs = scope.jobs.take();
     while jobs.join_next().await.is_some() {}
-    if let Some(err) = &mut error
-        && let Some(logs) = scope.logs.borrow().finish()
-    {
-        err.push_str("\n\nConsole output:\n");
-        err.push_str(&logs);
+    let mut output = scope.output.take();
+    let console = scope
+        .host
+        .live
+        .lock()
+        .unwrap()
+        .console_output(error.is_some());
+    if let Some(logs) = console {
+        if let Some(err) = &mut error {
+            err.push_str("\n\nConsole output:\n");
+            err.push_str(&logs);
+        } else if let Err(e) = output.append_console(logs) {
+            output = Blocks::default();
+            error = Some(e);
+        }
     }
-    let output = scope.output.take();
     drop(scope); // Release unread file and HTTP bodies before reporting completion.
     let _ = job.done.send(Outcome { error, output });
 }
@@ -430,10 +393,15 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
             match line {
                 Some(line) => {
                     if let Ok(raw) = line.to_cstring() {
-                        scope.logs.borrow_mut().push(string_bytes(&raw));
+                        scope
+                            .host
+                            .live
+                            .lock()
+                            .unwrap()
+                            .log(Some(string_bytes(&raw)));
                     }
                 }
-                None => scope.logs.borrow_mut().clear(),
+                None => scope.host.live.lock().unwrap().log(None),
             }
         })?
     };
@@ -524,67 +492,163 @@ fn input_bytes(ctx: &Ctx<'_>, value: Value<'_>) -> JsResult<Option<Vec<u8>>> {
     copy(bytes)
 }
 
-fn blocks<'js>(ctx: &Ctx<'js>, value: Value<'js>, allow_empty: bool) -> JsResult<Blocks> {
+fn raw_binary(value: &Value<'_>) -> bool {
+    use rquickjs::qjs;
+    let raw = value.as_raw();
+    // SAFETY: these predicates only inspect the class of a live JS value.
+    unsafe {
+        qjs::JS_IsArrayBuffer(raw) || qjs::JS_GetTypedArrayType(raw) >= 0 || qjs::JS_IsDataView(raw)
+    }
+}
+
+const BINARY_HINT: &str =
+    "raw binary data must be wrapped in an image, audio or video block or decoded with TextDecoder";
+
+fn block_candidate(value: &Value<'_>) -> JsResult<bool> {
+    let Some(object) = value.as_object() else {
+        return Ok(false);
+    };
+    if value.is_array() || value.is_function() || raw_binary(value) {
+        return Ok(false);
+    }
+    let kind: Value = object.get("type")?;
+    if let Some(kind) = kind.as_string()
+        && matches!(
+            kind.to_string()?.as_str(),
+            "text" | "audio" | "image" | "video"
+        )
+    {
+        return Ok(true);
+    }
+    Ok(object.contains_key("attachment_id")?
+        || (object.contains_key("mime_type")? && object.get::<_, Value>("data")?.is_object()))
+}
+
+fn blocks<'js>(ctx: &Ctx<'js>, value: Value<'js>, returning: bool) -> JsResult<Blocks> {
     let mut blocks = Blocks::default();
-    let push = |r: Result<(), String>| r.map_err(|e| Exception::throw_message(ctx, &e));
-    if let Some(text) = value.as_string() {
-        let text = text.to_string()?;
-        if allow_empty && text.trim().is_empty() {
-            return Ok(blocks);
+    let text_block = |text: String| {
+        let mut blocks = Blocks::default();
+        if !returning || !text.trim().is_empty() {
+            blocks
+                .push_text(text)
+                .map_err(|e| Exception::throw_message(ctx, &e))?;
         }
-        push(blocks.push_text(text))?;
+        Ok(blocks)
+    };
+    if let Some(text) = value.as_string() {
+        return text_block(text.to_string()?);
+    }
+    if raw_binary(&value) {
+        return Err(Exception::throw_type(ctx, BINARY_HINT));
+    }
+    let strict_part = |blocks: &mut Blocks, value: Value<'js>| {
+        if raw_binary(&value) {
+            return Err(Exception::throw_type(ctx, BINARY_HINT));
+        }
+        let part = value
+            .as_object()
+            .ok_or_else(|| Exception::throw_type(ctx, "expected a content block"))?;
+        push_part(ctx, blocks, part).map_err(|e| {
+            if e.is_from_js() {
+                Exception::throw_type(ctx, &e.to_string())
+            } else {
+                e
+            }
+        })
+    };
+    if returning && block_candidate(&value)? {
+        strict_part(&mut blocks, value)?;
         return Ok(blocks);
     }
-    let array = value
-        .into_array()
-        .ok_or_else(|| Exception::throw_type(ctx, "expected text or a content block array"))?;
-    // Array::len() assumes a small integer. Sparse JS arrays can legally exceed it.
-    let len: f64 = array.as_object().get("length")?;
-    if !(1.0..=1024.0).contains(&len) {
-        return Err(Exception::throw_range(
-            ctx,
-            "expected 1 to 1024 content blocks",
-        ));
-    }
-    for index in 0..len as usize {
-        let part: Object = array.get(index)?;
-        let kind: String = part.get("type")?;
-        let result = match kind.as_str() {
-            "text" => {
-                fields(&part, &["type", "text"])?;
-                blocks.push_text(part.get("text")?)
-            }
-            "image" | "audio" | "video" => {
-                let id: Option<f64> = part.get("attachment_id")?;
-                if let Some(id) = id {
-                    fields(&part, &["type", "attachment_id"])?;
-                    if id.fract() != 0.0 || !(1.0..=9_007_199_254_740_991.0).contains(&id) {
-                        return Err(Exception::throw_type(
-                            ctx,
-                            "expected a positive attachment_id or media data",
-                        ));
-                    }
-                    blocks.push_attachment(kind, id as i64)
-                } else {
-                    fields(&part, &["type", "mime_type", "data"])?;
-                    let mime = part.get("mime_type")?;
-                    let data: TypedArray<u8> = part.get("data")?;
-                    // SAFETY: push_bytes reserves its budget and copies without calling JS.
-                    let bytes = unsafe { data.as_bytes() }
-                        .ok_or_else(|| Exception::throw_type(ctx, "detached Uint8Array"))?;
-                    blocks.push_bytes(kind, mime, bytes)
+    if let Some(array) = value.as_array() {
+        // Array::len assumes a small integer; QuickJS also permits huge sparse arrays.
+        let len: f64 = array.as_object().get("length")?;
+        if len > (super::output::TASK_BYTES / 2) as f64 {
+            return Err(Exception::throw_range(
+                ctx,
+                "array exceeds task output budget",
+            ));
+        }
+        let len = len as usize;
+        let mut strict = !returning;
+        if returning {
+            for index in 0..len.min(1025) {
+                let item: Value = array.get(index)?;
+                if raw_binary(&item) || block_candidate(&item)? {
+                    strict = true;
+                    break;
                 }
             }
-            _ => {
-                return Err(Exception::throw_type(
+        }
+        if strict {
+            if !(1..=1024).contains(&len) {
+                return Err(Exception::throw_range(
                     ctx,
-                    "expected a text, image, audio or video block",
+                    "expected 1 to 1024 content blocks",
                 ));
             }
-        };
-        push(result)?;
+            for index in 0..len {
+                strict_part(&mut blocks, array.get(index)?)?;
+            }
+            return Ok(blocks);
+        }
+    } else if !returning {
+        return Err(Exception::throw_type(
+            ctx,
+            "expected text or a content block array",
+        ));
     }
-    Ok(blocks)
+    let replacer = Function::new(
+        ctx.clone(),
+        |ctx: Ctx<'js>, _key: Value<'js>, item: Value<'js>| {
+            if raw_binary(&item) {
+                return Err(Exception::throw_type(&ctx, BINARY_HINT));
+            }
+            Ok(item)
+        },
+    )?;
+    let json = ctx
+        .json_stringify_replacer(value, replacer)?
+        .ok_or_else(|| Exception::throw_type(ctx, "return value cannot be serialized as JSON"))?;
+    text_block(json.to_string()?)
+}
+
+fn push_part<'js>(ctx: &Ctx<'js>, blocks: &mut Blocks, part: &Object<'js>) -> JsResult<()> {
+    let kind: String = part.get("type")?;
+    let result = match kind.as_str() {
+        "text" => {
+            fields(part, &["type", "text"])?;
+            blocks.push_text(part.get("text")?)
+        }
+        "image" | "audio" | "video" => {
+            let id: Option<f64> = part.get("attachment_id")?;
+            if let Some(id) = id {
+                fields(part, &["type", "attachment_id"])?;
+                if id.fract() != 0.0 || !(1.0..=9_007_199_254_740_991.0).contains(&id) {
+                    return Err(Exception::throw_type(
+                        ctx,
+                        "expected a positive attachment_id or media data",
+                    ));
+                }
+                blocks.push_attachment(kind, id as i64)
+            } else {
+                fields(part, &["type", "mime_type", "data"])?;
+                let mime = part.get("mime_type")?;
+                let data: TypedArray<u8> = part.get("data")?;
+                // SAFETY: push_bytes reserves its budget and copies without calling JS.
+                let bytes = unsafe { data.as_bytes() }
+                    .ok_or_else(|| Exception::throw_type(ctx, "detached Uint8Array"))?;
+                blocks.push_bytes(kind, mime, bytes)
+            }
+        }
+        _ => {
+            return Err(Exception::throw_type(
+                ctx,
+                "expected a text, image, audio or video block",
+            ));
+        }
+    };
+    result.map_err(|e| Exception::throw_type(ctx, &e))
 }
 
 fn fields(part: &Object<'_>, expected: &[&str]) -> JsResult<()> {

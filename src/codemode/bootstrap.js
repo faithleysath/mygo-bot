@@ -7,16 +7,16 @@
     const chunkSize = 64 * 1024;
 
     function formatValue(value) {
-        if (typeof value === 'string') return value.length > 1024 ? `${value.slice(0, 1024)}…` : value;
+        if (typeof value === 'string') return value;
         if (value === null || typeof value !== 'object') return String(value);
         try {
             if (value instanceof Error) {
-                const text = value.stack || `${value.name || 'Error'}: ${value.message || ''}`;
-                return text.length > 1024 ? `${text.slice(0, 1024)}…` : text;
+                return value.stack || `${value.name || 'Error'}: ${value.message || ''}`;
             }
-            if (isView(value)) return `${value[Symbol.toStringTag] || 'DataView'}(${value.byteLength})`;
-            const json = stringify(value);
-            if (json !== undefined) return json.length > 1024 ? `${json.slice(0, 1024)}…` : json;
+            const binaryLabel = v => `${v[Symbol.toStringTag] || 'DataView'}(${v.byteLength})`;
+            if (isView(value)) return binaryLabel(value);
+            const json = stringify(value, (_, v) => isView(v) ? binaryLabel(v) : v);
+            if (json !== undefined) return json;
             return objectTag.call(value);
         } catch {
             try { return objectTag.call(value); } catch { return '[object]'; }
@@ -24,12 +24,7 @@
     }
 
     function writeLog(prefix, args) {
-        const parts = [];
-        const limit = Math.min(args.length, 32);
-        for (let i = 0; i < limit; i++) parts.push(formatValue(args[i]));
-        if (args.length > limit) parts.push('…');
-        const line = prefix ? `${prefix}${parts.join(' ')}` : parts.join(' ');
-        log(line.length > 1024 ? `${line.slice(0, 1024)}…` : line);
+        log(prefix + args.map(formatValue).join(' '));
     }
 
     function reader(id) {

@@ -1,6 +1,7 @@
 mod files;
 mod io;
 pub mod ledger;
+mod live;
 mod output;
 mod process;
 mod streams;
@@ -10,14 +11,18 @@ mod windows;
 
 use crate::{
     App, Error, Result,
-    store::{SessionStatus, Store, session},
+    store::{SessionStatus, Store, has_pending, session},
     tools::Script,
 };
 use chrono::{DateTime, Utc};
+use live::LiveState;
 pub use output::{Blocks, Part};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     runtime::Handle,
     sync::{Notify, oneshot, watch},
@@ -126,6 +131,7 @@ pub struct Job {
 
 #[derive(Clone)]
 pub struct Host {
+    live: Arc<Mutex<LiveState>>,
     app: App,
     sid: i64,
     origin: i64,
@@ -204,6 +210,7 @@ impl Call {
     }
 }
 fn notice(s: &mut Store, sid: i64, id: i64) {
+    s.wake_waiters(sid);
     if let Err(e) = s.item_saved(sid, id) {
         tracing::warn!(sid,id,error=%e,"item notification failed after commit");
     }
@@ -221,6 +228,7 @@ struct KillWait {
     until: Instant,
 }
 pub struct Task {
+    live: Arc<Mutex<LiveState>>,
     origin: Call,
     label: String,
     created: Instant,
@@ -271,7 +279,7 @@ impl Task {
         body["delivery"] = json!("background");
         body["status"] = json!("background");
         body["message"] = json!(
-            "Completion and lease reminders will arrive automatically. End your turn if there is nothing else to do."
+            "Do independent work while this task runs. Use codemode_task_wait when you need its events or result. Finish your turn once the work is complete."
         );
         Value::String(body.to_string())
     }
@@ -342,6 +350,74 @@ fn owned(s: &Store, sid: i64, id: i64) -> Option<&Task> {
 }
 fn inactive(call: &Call, s: &mut Store, id: i64) -> Result<()> {
     call.reply(s, json!({"id":format!("cm_{id}"),"status":"not_active"}))
+}
+
+pub async fn status(app: App, call: Call, id: i64, hard: CancellationToken) -> Result<()> {
+    app.db
+        .call(move |s| {
+            if hard.is_cancelled() {
+                return Ok(());
+            }
+            let body = if let Some(task) = owned(s, call.sid, id) {
+                let mut info = task.info();
+                task.live.lock().unwrap().snapshot(&mut info);
+                info
+            } else {
+                ledger::task_status(&s.conn, call.sid, id)?
+            };
+            call.reply(s, body)
+        })
+        .await
+}
+
+pub async fn wait(app: App, call: Call, seconds: u32, hard: CancellationToken) -> Result<()> {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(seconds.into());
+    let mut first = true;
+    loop {
+        let call = call.clone();
+        let hard_check = hard.clone();
+        let waiting = app.db.call(move |s| {
+            if hard_check.is_cancelled() {
+                return Ok(None);
+            }
+            let sid = call.sid;
+            let waited_ms = start.elapsed().as_millis();
+            let Some(control) = s.active.get(&sid).filter(|c| !s.closing && !c.soft.is_cancelled()) else {
+                call.reply(s, json!({"status":"interrupted", "reason":"session pausing", "waited_ms":waited_ms}))?;
+                return Ok(None);
+            };
+            let reply = if has_pending(&s.conn, sid)? {
+                json!({"status":"woke", "reason":"pending_input", "waited_ms":waited_ms})
+            } else {
+                let active = s.tasks.values().filter(|task| task.origin.sid == sid).count();
+                if !first && Instant::now() >= deadline {
+                    json!({"status":"timeout", "waited_ms":waited_ms, "active_tasks":active})
+                } else if active > 0 || ledger::starting_sibling(&s.conn, sid, call.id)? {
+                    // The queue check and subscription share the SQLite thread.
+                    let soft = control.soft.clone();
+                    return Ok(Some((s.subscribe_wait(sid), soft)));
+                } else if first {
+                    json!({"status":"error", "error":"no active codemode tasks in this session"})
+                } else {
+                    json!({"status":"woke", "reason":"no_active_tasks", "waited_ms":waited_ms})
+                }
+            };
+            call.reply(s, reply)?;
+            Ok(None)
+        }).await?;
+        let Some((mut rx, soft)) = waiting else {
+            return Ok(());
+        };
+        tokio::select! {
+            biased;
+            _ = hard.cancelled() => return Ok(()),
+            _ = soft.cancelled() => (),
+            _ = tokio::time::sleep_until(deadline) => (),
+            _ = rx.changed() => (),
+        }
+        first = false;
+    }
 }
 
 pub async fn renew(
@@ -436,7 +512,9 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
         let id = call.id;
         let sid = call.sid;
         let changed = Arc::new(Notify::new());
+        let live = Arc::new(Mutex::new(LiveState::default()));
         let mut task = Task {
+            live: live.clone(),
             origin: call,
             label: script.label,
             created: now,
@@ -460,6 +538,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
         }
         let (done, finish) = oneshot::channel();
         let host = Host {
+            live,
             app: app.clone(),
             client: app.codemode.client.clone(),
             sid,
@@ -470,6 +549,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             streams: Arc::default(),
         };
         s.tasks.insert(id, task);
+        s.wake_waiters(sid);
         let submitted = app.codemode.pool.submit(Job {
             code: script.code,
             cancel,
@@ -656,6 +736,7 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
     }
     tx.commit()?;
     let mut task = s.tasks.remove(&id).unwrap();
+    s.wake_waiters(sid);
     task.delivered();
     if let Some(k) = task.kill {
         let _ = k.committed.send(());

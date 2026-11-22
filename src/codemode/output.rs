@@ -1,7 +1,7 @@
 use tokio::sync::Semaphore;
 
 const MIB: usize = 1024 * 1024;
-const TASK_BYTES: usize = 52 * MIB;
+pub(super) const TASK_BYTES: usize = 52 * MIB;
 const GLOBAL_BYTES: usize = 192 * MIB;
 static OUTPUT_BUDGET: Semaphore = Semaphore::const_new(GLOBAL_BYTES);
 
@@ -33,7 +33,8 @@ impl Drop for Blocks {
 impl Blocks {
     fn reserve(&mut self, bytes: usize) -> Result<(), String> {
         let bytes = bytes.saturating_add(128);
-        if self.parts.len() >= 1024 || bytes > TASK_BYTES - self.reserved {
+        // The VM checks the script's block count before appending its console output.
+        if bytes > TASK_BYTES - self.reserved {
             return Err("task output budget exceeded".into());
         }
         OUTPUT_BUDGET
@@ -48,6 +49,22 @@ impl Blocks {
             return Err("expected nonempty text".into());
         }
         self.reserve(text.len())?;
+        self.parts.push(Part::Text(text));
+        Ok(())
+    }
+    pub fn append_console(&mut self, logs: String) -> Result<(), String> {
+        let prefix = if self.parts.is_empty() {
+            ""
+        } else {
+            "Console output:\n"
+        };
+        self.reserve(prefix.len() + logs.len())
+            .map_err(|e| format!("{e}\n\nConsole output:\n{logs}"))?;
+        let text = if prefix.is_empty() {
+            logs
+        } else {
+            format!("{prefix}{logs}")
+        };
         self.parts.push(Part::Text(text));
         Ok(())
     }

@@ -38,7 +38,10 @@ use windows_sys::Win32::{
     },
 };
 
-use super::io::drain;
+use super::{
+    io::drain,
+    live::{CommandGuard, Stream},
+};
 
 fn checked(ok: i32) -> io::Result<()> {
     if ok == 0 {
@@ -445,6 +448,7 @@ pub async fn execute(
     opts: &Value,
     stdin: Option<Vec<u8>>,
     cancel: CancellationToken,
+    command_preview: &CommandGuard<'_>,
 ) -> Result<Value, String> {
     let deadline = super::io::timeout(opts)?.map(|d| Instant::now() + d);
     if cancel.is_cancelled() {
@@ -506,8 +510,8 @@ pub async fn execute(
     let (status, written, out, err) = tokio::join!(
         monitor,
         writer,
-        drain(stdout, &finished),
-        drain(stderr, &finished)
+        drain(stdout, &finished, Some((command_preview, Stream::Stdout))),
+        drain(stderr, &finished, Some((command_preview, Stream::Stderr)))
     );
     let status = status?;
     written.map_err(pipe_error)?;

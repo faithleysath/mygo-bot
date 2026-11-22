@@ -113,6 +113,72 @@ pub fn event(
     Ok(id)
 }
 
+pub fn starting_sibling(conn: &Connection, sid: i64, call: i64) -> Result<bool> {
+    Ok(conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM items c WHERE c.session_id=?1 AND c.id!=?2
+         AND c.llm_call_id=(SELECT llm_call_id FROM items WHERE id=?2)
+         AND c.kind='function_call' AND json_extract(c.payload,'$.name')='codemode'
+         AND NOT EXISTS(SELECT 1 FROM items r WHERE r.kind='function_call_output' AND r.target_id=c.id))",
+    )?.query_row((sid, call), |r| r.get(0))?)
+}
+
+pub fn task_status(conn: &Connection, sid: i64, origin: i64) -> Result<Value> {
+    let id = format!("cm_{origin}");
+    let row: Option<(Option<Value>, Option<Value>)> = conn.prepare_cached(
+        "SELECT r.payload,e.payload FROM items c
+         LEFT JOIN items r ON r.kind='function_call_output' AND r.target_id=c.id AND r.codemode_call_item_id IS NULL
+         LEFT JOIN items e ON e.kind='codemode_event' AND e.codemode_call_item_id=c.id AND json_extract(e.payload,'$.event')='completed'
+         WHERE c.session_id=? AND c.id=? AND c.kind='function_call' AND json_extract(c.payload,'$.name')='codemode'",
+    )?.query_row((sid, origin), |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let wire = match row {
+        None => {
+            return Ok(
+                json!({"id":id,"status":"not_found","error":"unknown codemode task in this session"}),
+            );
+        }
+        Some((None, None)) => return Ok(json!({"id":id,"state":"starting"})),
+        Some((Some(mut receipt), _)) => receipt["output"].take(),
+        Some((None, Some(mut event))) => event["content"].take(),
+    };
+    let parts = wire.as_array().map(Vec::as_slice).unwrap_or_default();
+    let header = wire
+        .as_str()
+        .or_else(|| parts.first()?["text"].as_str())
+        .unwrap_or_default();
+    let summary: Value = serde_json::from_str(header)
+        .unwrap_or_else(|_| json!({"status":"interrupted","error":header}));
+    let mut info = json!({"id":id,"state":"completed","status":match summary["status"].as_str() {
+        Some("error") | None => "failed", Some(status) => status,
+    }});
+    if let Some(error) = summary.get("error") {
+        info["error"] = error.clone();
+    }
+    let mut preview = String::new();
+    let content = parts.get(1..).unwrap_or_default();
+    let attachments = content.iter().filter(|part| part["type"] != "text").count();
+    let mut truncated = false;
+    let texts = summary["output"]
+        .as_str()
+        .into_iter()
+        .chain(content.iter().filter_map(|part| part["text"].as_str()));
+    for text in texts {
+        const LIMIT: usize = 64 * 1024;
+        if !preview.is_empty() && preview.len() < LIMIT {
+            preview.push('\n');
+        }
+        let keep = text.floor_char_boundary(LIMIT - preview.len());
+        preview.push_str(&text[..keep]);
+        if keep < text.len() {
+            truncated = true;
+            break;
+        }
+    }
+    info["output"] = Value::String(preview);
+    info["output_truncated"] = json!(truncated);
+    info["attachment_count"] = json!(attachments);
+    Ok(info)
+}
+
 pub fn pending_messages(conn: &Connection, sid: i64) -> Result<usize> {
     let count: i64 = conn
         .prepare_cached(
