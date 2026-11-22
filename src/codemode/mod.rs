@@ -4,6 +4,8 @@ pub mod ledger;
 mod live;
 mod output;
 mod process;
+#[cfg(unix)]
+pub(crate) use process::{observe_exit, reap_group};
 mod streams;
 mod vm;
 #[cfg(windows)]
@@ -16,6 +18,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use live::LiveState;
+pub(crate) use output::TASK_BYTES;
 pub use output::{Blocks, Part};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -114,7 +117,7 @@ pub struct Reply {
     pub data: Option<Vec<u8>>,
 }
 impl Reply {
-    fn value(value: Value) -> Self {
+    pub(crate) fn value(value: Value) -> Self {
         Self { value, data: None }
     }
 }

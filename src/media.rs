@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{App, Error, Result};
 
-const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 
 pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
     use utoipa_axum::{router::OpenApiRouter, routes};

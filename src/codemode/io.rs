@@ -8,7 +8,7 @@ use tokio_util::{io::StreamReader, sync::CancellationToken};
 
 use super::{
     Host, HostError, Reply, files,
-    live::{CommandGuard, Stream},
+    live::{CommandGuard, McpGuard, Stream},
     streams::{Reservation, Resource},
 };
 
@@ -37,7 +37,12 @@ pub async fn execute(
         _ = host.cancel.cancelled() => Err("cancelled".into()),
         result = async {
             match op {
-                "mcp.servers" | "mcp.tools" | "mcp.call" => crate::mcp::execute(&host.app, host.sid, host.origin, op, args).await.map(Reply::value).map_err(Into::into),
+                op if op.starts_with("mcp.") => {
+                    let call = McpGuard::start(&host.live, op, &args);
+                    crate::mcp::execute(&host.app, host.sid, host.origin, op, args, |phase| {
+                        call.set_phase(phase);
+                    }).await.map_err(Into::into)
+                }
                 "http.request" => request(host, &args, data).await,
                 "upload.open" | "stream.next" | "stream.write" | "stream.finish" => host.streams.execute(op, &args["id"], data).await,
                 "sleep" => {

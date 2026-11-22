@@ -641,6 +641,12 @@ fn push_part<'js>(ctx: &Ctx<'js>, blocks: &mut Blocks, part: &Object<'js>) -> Js
                 blocks.push_bytes(kind, mime, bytes)
             }
         }
+        "blob" => {
+            return Err(Exception::throw_type(
+                ctx,
+                "MCP resource blob cannot be sent as model content; use block.data in the script or save it with fs.write",
+            ));
+        }
         _ => {
             return Err(Exception::throw_type(
                 ctx,

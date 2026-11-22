@@ -150,7 +150,10 @@ fn pipes(child: &mut Child) -> io::Result<(Option<ChildStdin>, ChildStdout, Chil
     ))
 }
 
-async fn observe_exit(pid: Pid, exits: &mut tokio::signal::unix::Signal) -> io::Result<()> {
+pub(crate) async fn observe_exit(
+    pid: Pid,
+    exits: &mut tokio::signal::unix::Signal,
+) -> io::Result<()> {
     let flags = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
     loop {
         match waitid(WaitId::Pid(pid), flags) {
@@ -167,21 +170,31 @@ async fn observe_exit(pid: Pid, exits: &mut tokio::signal::unix::Signal) -> io::
     }
 }
 
-async fn clean_group(mut child: Child, pgid: Pid) -> Result<ExitStatus, String> {
-    // The group leader is still waitable, so the OS cannot recycle its ID
-    // between observing its exit and signalling any surviving descendants.
-    let killed = kill_process_group(pgid, Signal::KILL);
-    let status = tokio::task::spawn_blocking(move || child.wait())
+async fn clean_group(child: Child, pgid: Pid) -> Result<ExitStatus, String> {
+    reap_group(child, pgid)
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| format!("wait_failed: {e}"))?;
-    // Darwin reports EPERM for a group containing only a zombie. After
-    // reaping our leader, probe with signal 0 to confirm the group is gone.
-    if let Err(e) = killed
-        && e != Errno::SRCH
-        && !(e == Errno::PERM && test_kill_process_group(pgid) == Err(Errno::SRCH))
-    {
-        return Err(format!("group_cleanup_failed: {e}"));
-    }
-    Ok(status)
+        .map_err(|e| e.to_string())
+}
+
+// Signal while the leader is still waitable. Dropping the JoinHandle leaves its reap running.
+pub(crate) fn reap_group(
+    mut child: Child,
+    pgid: Pid,
+) -> tokio::task::JoinHandle<io::Result<ExitStatus>> {
+    let killed = kill_process_group(pgid, Signal::KILL);
+    tokio::task::spawn_blocking(move || {
+        let status = child
+            .wait()
+            .map_err(|e| io::Error::other(format!("wait_failed: {e}")))?;
+        // Darwin reports EPERM for a group containing only a zombie. After reaping our
+        // leader, probe with signal 0 to confirm the group is gone.
+        if let Err(e) = killed
+            && e != Errno::SRCH
+            && !(e == Errno::PERM && test_kill_process_group(pgid) == Err(Errno::SRCH))
+        {
+            return Err(io::Error::other(format!("group_cleanup_failed: {e}")));
+        }
+        Ok(status)
+    })
 }

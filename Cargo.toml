@@ -7,20 +7,26 @@ publish = false
 
 [dependencies]
 async-stream = "0.3"
+async-trait = "0.1.92"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.23.1"
 bigdecimal = "0.4.11"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6", features = ["derive"] }
+form_urlencoded = "1.2.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = { version = "0.4", features = ["std"] }
 mime = "0.3.18"
+oauth2 = { version = "5.0.0", default-features = false }
+regex-lite = "0.1.9"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "stream"] }
-rmcp = { version = "3.11.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
+rmcp = { version = "3.11.0", default-features = false, features = ["client", "auth", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
 rquickjs = { version = "0.14.0", features = ["futures"] }
 rusqlite = { version = "0.43", features = ["serde_json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+# rmcp 3.11 exposes sse-stream 0.2 types in StreamableHttpClient.
+sse-stream = "0.2.6"
 subtle = "2.6"
 tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "net", "time", "fs", "process", "io-util"] }
 tokio-util = { version = "0.7", features = ["io", "codec", "rt"] }
@@ -33,6 +39,7 @@ utoipa-axum = "0.3.0"
 rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10.0.1", features = ["tokio1"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 # Generate SQLite bindings and leave the choice of Windows import library to build.rs.
 libsqlite3-sys = { version = "0.40", features = ["in_gecko"] }

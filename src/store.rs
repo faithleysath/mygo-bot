@@ -80,7 +80,8 @@ impl Db {
             tx.execute_batch(include_str!("../schema.sql"))?;
         } else if !tx.column_exists(None, "sessions", "input_queue_cursor")?
             || !tx.column_exists(None, "items", "codemode_call_item_id")?
-            || !tx.table_exists(None, "mcp_servers")?
+            || !tx.table_exists(None, "mcp_oauth")?
+            || !tx.column_exists(None, "mcp_servers", "session_ids")?
         {
             return Err(Error::internal(
                 "incompatible database schema; select a new database directory",

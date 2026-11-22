@@ -108,6 +108,24 @@
         }
     }
 
+    // Rust packs the decoded media in one binary reply. Only content slots carry
+    // ranges into it; structuredContent and resource links are ordinary JSON.
+    async function mcpResult(op, args) {
+        const result = await call(op, args);
+        if (!Object.hasOwn(result, 'body')) return result;
+        const bytes = result.body;
+        delete result.body;
+        const blocks = result.content ?? (result.contents ?? result.messages).map(entry => entry.content);
+        for (const outer of blocks) {
+            const block = outer.type === 'resource' ? outer.resource.content : outer;
+            if (block.type === 'image' || block.type === 'audio' || block.type === 'video' || block.type === 'blob') {
+                const [start, end] = block.data;
+                block.data = bytes.subarray(start, end);
+            }
+        }
+        return result;
+    }
+
     Object.assign(globalThis, {
         fs: {
             async read(path, { encoding, stream = false } = {}) {
@@ -147,7 +165,12 @@
         mcp: {
             async servers() { return call('mcp.servers', {}); },
             async tools(server, { query, cursor } = {}) { return call('mcp.tools', { server, query, cursor }); },
-            async call(server, tool, args = {}) { return call('mcp.call', { server, tool, args }); },
+            async call(server, tool, args = {}) { return mcpResult('mcp.call', { server, tool, args }); },
+            async resources(server, { cursor } = {}) { return call('mcp.resources', { server, cursor }); },
+            async resourceTemplates(server, { cursor } = {}) { return call('mcp.resourceTemplates', { server, cursor }); },
+            async readResource(server, uri) { return mcpResult('mcp.readResource', { server, uri }); },
+            async prompts(server, { cursor } = {}) { return call('mcp.prompts', { server, cursor }); },
+            async getPrompt(server, name, args) { return mcpResult('mcp.getPrompt', { server, name, args }); },
         },
         proc: {
             async exec(program, args = [], { cwd, env, stdin, timeout_ms } = {}) {

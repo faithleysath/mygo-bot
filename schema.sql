@@ -26,11 +26,25 @@ CREATE TABLE mcp_servers (
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL,
     enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
-    transport TEXT NOT NULL CHECK (transport='streamable-http'),
+    transport TEXT NOT NULL CHECK (transport IN ('streamable-http','stdio')),
+    session_ids TEXT CHECK (session_ids IS NULL OR json_type(session_ids)='array'),
+    allowed_tools TEXT CHECK (allowed_tools IS NULL OR json_type(allowed_tools)='array'),
     config_json TEXT NOT NULL CHECK (json_type(config_json)='object'),
     timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1 AND 86400000),
     revision INTEGER NOT NULL CHECK (revision > 0)
 );
+CREATE TABLE mcp_oauth (
+    server_id INTEGER PRIMARY KEY REFERENCES mcp_servers(id) ON DELETE CASCADE,
+    generation TEXT NOT NULL,
+    binding TEXT,
+    pending TEXT,
+    credentials TEXT,
+    rejected INTEGER NOT NULL DEFAULT 0 CHECK (rejected IN (0,1))
+);
+-- Credentials belong to a particular endpoint, authentication settings and HTTP headers.
+CREATE TRIGGER invalidate_mcp_oauth AFTER UPDATE ON mcp_servers
+WHEN NEW.transport != OLD.transport OR NEW.config_json != OLD.config_json
+BEGIN DELETE FROM mcp_oauth WHERE server_id=NEW.id; END;
 CREATE TABLE config (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     default_model_id INTEGER REFERENCES llm_models,

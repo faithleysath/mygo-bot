@@ -71,6 +71,7 @@ pub fn routes(app: App) -> (Router, utoipa::openapi::OpenApi) {
         .routes(routes!(events::subscribe))
         .merge(crate::catalog::routes())
         .merge(crate::mcp::routes())
+        .merge(crate::mcp::diagnostics::routes())
         .merge(crate::media::routes())
         .merge(crate::calls::routes())
         .with_state(app)

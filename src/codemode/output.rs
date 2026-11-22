@@ -1,7 +1,7 @@
 use tokio::sync::Semaphore;
 
 const MIB: usize = 1024 * 1024;
-pub(super) const TASK_BYTES: usize = 52 * MIB;
+pub(crate) const TASK_BYTES: usize = 52 * MIB;
 const GLOBAL_BYTES: usize = 192 * MIB;
 static OUTPUT_BUDGET: Semaphore = Semaphore::const_new(GLOBAL_BYTES);
 
@@ -78,7 +78,7 @@ impl Blocks {
     }
     pub fn push_bytes(&mut self, kind: String, mime: String, bytes: &[u8]) -> Result<(), String> {
         if bytes.is_empty()
-            || bytes.len() > 50 * MIB
+            || bytes.len() > crate::media::MAX_ATTACHMENT_BYTES
             || !matches!(kind.as_str(), "image" | "audio" | "video")
             || !mime
                 .parse::<mime::Mime>()

@@ -1,25 +1,26 @@
+mod capabilities;
 mod config;
+mod content;
+pub(crate) mod diagnostics;
+mod errors;
+mod oauth;
+mod stdio;
 pub use config::routes;
 
-use crate::{App, Error, Result, store::Db};
+use crate::{App, Error, Result, codemode::Reply, store::Db};
+use capabilities::AttemptError;
 use rmcp::{
     RoleClient,
-    model::{
-        CallToolRequestParams, CallToolResult, ContentBlock, PaginatedRequestParams,
-        ProtocolVersion, Tool,
-    },
-    service::{
-        ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, RunningService, ServiceError,
-    },
+    model::{PaginatedRequestParams, ProtocolVersion},
+    service::{ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, RunningService},
     transport::{
-        StreamableHttpClientTransport,
-        streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -32,7 +33,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+// Media travels separately from the JSON returned to QuickJS. Base64 counts against the wire budget.
 const BYTE_LIMIT: usize = 2 * 1024 * 1024;
+const WIRE_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 type Client = RunningService<RoleClient, ()>;
@@ -41,8 +44,28 @@ type Client = RunningService<RoleClient, ()>;
 struct Slot {
     client: OnceCell<Client>,
     retired: AtomicBool,
+    // Only echo error field names already public in this session's tool schemas.
+    public_fields: std::sync::Mutex<HashSet<String>>,
 }
 impl Slot {
+    fn remember_fields(&self, schema: &serde_json::Map<String, Value>) {
+        if let Some(fields) = schema.get("properties").and_then(Value::as_object) {
+            let mut public = self.public_fields.lock().unwrap();
+            for name in fields.keys().filter(|n| n.len() <= 64) {
+                if public.len() >= 512 {
+                    break;
+                }
+                public.insert(name.clone());
+            }
+        }
+    }
+    fn can_report_field(&self, name: &str) -> bool {
+        // These conventional parameter names also give a usable hint on a direct first call.
+        matches!(
+            name,
+            "query" | "name" | "uri" | "id" | "path" | "cursor" | "limit" | "arguments"
+        ) || self.public_fields.lock().unwrap().contains(name)
+    }
     fn available(&self) -> bool {
         !self.retired.load(Ordering::Acquire) && self.client.get().is_none_or(|c| !c.is_closed())
     }
@@ -61,33 +84,39 @@ impl Slot {
 // Owned by the database worker: admission and committed configuration changes are ordered.
 // An in-flight operation retains its Arc while a replacement can open a fresh connection.
 #[derive(Default)]
-pub struct Connections(HashMap<(i64, i64), (Arc<Slot>, Instant)>);
+pub struct Connections {
+    slots: HashMap<(i64, i64), (Arc<Slot>, Instant)>,
+    oauth: oauth::Runtime,
+}
 impl Connections {
+    fn oauth(&mut self) -> &mut oauth::Runtime {
+        &mut self.oauth
+    }
     fn acquire(&mut self, sid: i64, id: i64) -> Result<Arc<Slot>> {
         let key = (sid, id);
         let now = Instant::now();
-        if let Some((slot, touched)) = self.0.get_mut(&key)
+        if let Some((slot, touched)) = self.slots.get_mut(&key)
             && slot.available()
         {
             *touched = now;
             return Ok(slot.clone());
         }
-        if self.0.len() >= MAX_CONNECTIONS && !self.0.contains_key(&key) {
+        if self.slots.len() >= MAX_CONNECTIONS && !self.slots.contains_key(&key) {
             let idle = self
-                .0
+                .slots
                 .iter()
                 .filter(|(_, (slot, _))| Arc::strong_count(slot) == 1)
                 .min_by_key(|(_, (_, last))| *last)
                 .map(|(key, _)| *key)
                 .ok_or_else(|| Error::conflict("MCP connection limit reached"))?;
-            self.0.remove(&idle);
+            self.slots.remove(&idle);
         }
         let slot = Arc::new(Slot::default());
-        self.0.insert(key, (slot.clone(), now));
+        self.slots.insert(key, (slot.clone(), now));
         Ok(slot)
     }
     fn forget(&mut self, id: i64) {
-        self.0.retain(|(_, server), (slot, _)| {
+        self.slots.retain(|(_, server), (slot, _)| {
             if *server == id {
                 slot.retire();
                 return false;
@@ -98,7 +127,7 @@ impl Connections {
 }
 
 pub async fn close(db: &Db) -> Result<()> {
-    let slots = db.call(|s| Ok(std::mem::take(&mut s.mcp.0))).await?;
+    let slots = db.call(|s| Ok(std::mem::take(&mut s.mcp.slots))).await?;
     futures_util::future::join_all(slots.into_values().map(|(slot, _)| async move {
         slot.retire();
         match Arc::try_unwrap(slot) {
@@ -126,7 +155,7 @@ pub async fn reap_idle(db: Db, stop: CancellationToken) {
         }
         if db
             .call(|s| {
-                s.mcp.0.retain(|_, (slot, last)| {
+                s.mcp.slots.retain(|_, (slot, last)| {
                     if Arc::strong_count(slot) > 1 {
                         *last = Instant::now();
                     }
@@ -142,49 +171,62 @@ pub async fn reap_idle(db: Db, stop: CancellationToken) {
     }
 }
 
-async fn connect(
-    client: reqwest::Client,
-    endpoint: config::Endpoint,
-) -> std::result::Result<Client, String> {
-    let mut config = StreamableHttpClientTransportConfig::with_uri(endpoint.url)
-        .reinit_on_expired_session(false);
-    config.custom_headers = endpoint.headers;
-    config.max_json_response_size = BYTE_LIMIT;
-    config.max_sse_event_size = BYTE_LIMIT;
-    config.max_error_response_size = 1024;
-    let transport = StreamableHttpClientTransport::with_client(client, config);
-    let client = ()
-        .serve_with_lifecycle(
-            transport,
-            ClientLifecycleMode::Auto {
-                preferred_versions: ProtocolVersion::KNOWN_VERSIONS
-                    .iter()
-                    .rev()
-                    .cloned()
-                    .collect(),
-                legacy_version: Some(ProtocolVersion::LATEST_WITH_INITIALIZE),
-            },
-        )
-        .await
-        .map_err(|e| {
-            if e.is_authorization_required() {
-                "MCP authentication failed; check configured headers"
-            } else {
-                "MCP handshake failed; check endpoint, transport and credentials"
-            }
-        })?;
-    // Modern dynamic catalogs require a separate subscription for invalidations.
-    // Read those directly. On legacy connections rmcp invalidates cached pages on notification.
-    let dynamic = client.peer_info().is_some_and(|info| {
-        !info.protocol_version.has_initialize()
-            && info
-                .capabilities
-                .tools
-                .as_ref()
-                .and_then(|tools| tools.list_changed)
-                == Some(true)
+async fn connect(app: &App, endpoint: config::Endpoint) -> std::result::Result<Client, String> {
+    let lifecycle = ClientLifecycleMode::Auto {
+        preferred_versions: ProtocolVersion::KNOWN_VERSIONS
+            .iter()
+            .rev()
+            .cloned()
+            .collect(),
+        legacy_version: Some(ProtocolVersion::LATEST_WITH_INITIALIZE),
+    };
+    let client = match endpoint.transport {
+        config::Transport::Http {
+            url,
+            headers,
+            oauth,
+        } => {
+            let mut transport =
+                StreamableHttpClientTransportConfig::with_uri(url).reinit_on_expired_session(false);
+            transport.custom_headers = headers;
+            transport.max_json_response_size = WIRE_LIMIT;
+            transport.max_sse_event_size = WIRE_LIMIT;
+            transport.max_error_response_size = 1024;
+            let http = oauth::HttpClient::new(
+                app.client.clone(),
+                app.db.clone(),
+                endpoint.id,
+                endpoint.revision,
+                oauth,
+                endpoint.allow_disabled,
+            )
+            .await?;
+            ().serve_with_lifecycle(
+                StreamableHttpClientTransport::with_client(http, transport),
+                lifecycle,
+            )
+            .await
+        }
+        config::Transport::Stdio(config) => {
+            // PATH and cwd can be on a slow filesystem. Starting the child must not stall the
+            // daemon's single I/O thread. Its RAII guard also owns cleanup if this wait is cancelled.
+            let transport = tokio::task::spawn_blocking(move || stdio::spawn(config))
+                .await
+                .map_err(|_| "MCP stdio launch worker stopped")?
+                .map_err(|e| format!("MCP stdio launch failed ({})", e.kind()))?;
+            ().serve_with_lifecycle(transport, lifecycle).await
+        }
+    }
+    .map_err(errors::handshake)?;
+    // Do not cache binary reads or dynamic catalogs without a change subscription.
+    let volatile = client.peer_info().is_some_and(|info| {
+        let caps = &info.capabilities;
+        caps.resources.is_some()
+            || !info.protocol_version.has_initialize()
+                && (caps.tools.as_ref().and_then(|t| t.list_changed) == Some(true)
+                    || caps.prompts.as_ref().and_then(|p| p.list_changed) == Some(true))
     });
-    let cache = if dynamic {
+    let cache = if volatile {
         ClientCacheConfig::disabled()
     } else {
         ClientCacheConfig::default()
@@ -203,27 +245,14 @@ struct Discovery {
     query: String,
     cursor: Option<String>,
 }
-#[derive(Deserialize)]
-struct Invocation {
-    tool: String,
-    args: Map<String, Value>,
-}
-enum Request {
-    List(Discovery),
-    Call(Invocation),
-}
-
-// The SDK manages per-peer tool-page caching, TTLs and list-change invalidation.
-// Bound scanning even if the server keeps returning empty pages or repeating cursors.
 async fn discover(
     client: &Client,
     slot: &Slot,
-    request: &Request,
-) -> std::result::Result<Option<Value>, String> {
-    let (query, mut cursor) = match request {
-        Request::List(d) => (d.query.to_lowercase(), d.cursor.clone()),
-        Request::Call(_) => (String::new(), None),
-    };
+    query: Discovery,
+    allowed: Option<&BTreeSet<String>>,
+) -> std::result::Result<Reply, AttemptError> {
+    let filter = query.query.to_lowercase();
+    let mut cursor = query.cursor;
     let mut seen = HashSet::new();
     let mut count = 0;
     for _ in 0..64 {
@@ -231,105 +260,39 @@ async fn discover(
         seen.insert(cursor.clone());
         let page = client
             .list_tools(cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c))))
-            .await
-            .map_err(|e| request_error(e, slot, false))?;
+            .await?;
+        if page.tools.len() > 4096 {
+            return Err("MCP server returned more than 4096 tools in one page"
+                .to_owned()
+                .into());
+        }
         count += page.tools.len();
-        if count > 4096 {
-            return Err("MCP tool list exceeds 4096 tools".into());
-        }
-        cursor = page.next_cursor;
+        cursor = capabilities::checked_cursor(page.next_cursor)?;
         if cursor.is_some() && seen.contains(&cursor) {
-            return Err("MCP tool list repeated a cursor".into());
+            return Err("MCP tool list repeated a cursor".to_string().into());
         }
-        match request {
-            Request::Call(invocation) => {
-                if page.tools.iter().any(|tool| tool.name == invocation.tool) {
-                    return Ok(None);
-                }
-                if cursor.is_none() {
-                    return Err("unknown MCP tool".into());
-                }
-            }
-            Request::List(_) => {
-                let tools: Vec<_> = page.tools.into_iter()
-                    .filter(|tool| matches_query(tool, &query))
-                    .map(|tool| {
-                        json!({"name":tool.name, "description":tool.description, "inputSchema":tool.input_schema})
-                    })
-                    .collect();
-                if !tools.is_empty() || cursor.is_none() {
-                    return Ok(Some(json!({"tools":tools,"nextCursor":cursor})));
-                }
-            }
+        let tools: Vec<_> = page
+            .tools
+            .into_iter()
+            .filter(|t| allowed.is_none_or(|names| names.contains(t.name.as_ref())))
+            .filter(|t| {
+                filter.is_empty()
+                    || t.name.to_lowercase().contains(&filter)
+                    || t.description
+                        .as_ref()
+                        .is_some_and(|s| s.to_lowercase().contains(&filter))
+            })
+            .map(|t| {
+                slot.remember_fields(&t.input_schema);
+                json!({"name":t.name,"description":t.description,"inputSchema":t.input_schema})
+            })
+            .collect();
+        if !tools.is_empty() || cursor.is_none() || count >= 4096 {
+            return Ok(Reply::value(json!({"tools":tools,"nextCursor":cursor})));
         }
     }
-    Err("MCP tool scan exceeds 64 pages".into())
-}
-fn matches_query(tool: &Tool, query: &str) -> bool {
-    query.is_empty()
-        || tool.name.to_lowercase().contains(query)
-        || tool
-            .description
-            .as_ref()
-            .is_some_and(|s| s.to_lowercase().contains(query))
-}
-
-fn request_error(e: ServiceError, slot: &Slot, sent: bool) -> String {
-    if let ServiceError::McpError(error) = e {
-        return format!("MCP protocol error ({})", error.code.0);
-    }
-    if matches!(
-        e,
-        ServiceError::TransportClosed | ServiceError::TransportSend(_)
-    ) {
-        slot.retire();
-    }
-    if e.is_authorization_required() {
-        return "MCP authentication failed; check configured headers".into();
-    }
-    let mut cause = std::error::Error::source(&e);
-    while let Some(err) = cause {
-        if let Some(StreamableHttpError::ResponseBodyTooLarge { max_size }) =
-            err.downcast_ref::<StreamableHttpError<reqwest::Error>>()
-        {
-            let outcome = if sent {
-                "; result unknown; request was not replayed"
-            } else {
-                ""
-            };
-            return format!("MCP response exceeds {max_size} bytes{outcome}");
-        }
-        cause = err.source();
-    }
-    if sent {
-        "MCP call interrupted or response unreadable; result unknown; request was not replayed"
-            .into()
-    } else {
-        "MCP discovery failed; check connection and server capabilities".into()
-    }
-}
-
-fn script_result(result: CallToolResult) -> Value {
-    let content: Vec<_> = result
-        .content
-        .into_iter()
-        .map(|block| {
-            let kind = match block {
-                ContentBlock::Text(t) => return json!({"type":"text","text":t.text}),
-                ContentBlock::Image(_) => "image",
-                ContentBlock::Audio(_) => "audio",
-                ContentBlock::Resource(_) => "resource",
-                ContentBlock::ResourceLink(_) => "resource_link",
-                _ => "unknown",
-            };
-            json!({"type":"text","text":format!("Unsupported MCP content block: {kind}")})
-        })
-        .collect();
-    let mut value = json!({"content":content,"isError":result.is_error.unwrap_or(false)});
-    if let Some(structured) = result.structured_content {
-        value["structuredContent"] = structured;
-    }
-    value
+    // A sparse name filter can span more pages than one scan. The caller can continue from here.
+    Ok(Reply::value(json!({"tools":[],"nextCursor":cursor})))
 }
 
 pub async fn execute(
@@ -338,86 +301,97 @@ pub async fn execute(
     origin: i64,
     op: &str,
     args: Value,
-) -> std::result::Result<Value, String> {
+    stage: impl Fn(&'static str) + Send + Sync,
+) -> std::result::Result<Reply, String> {
     if op == "mcp.servers" {
         return app
             .db
-            .call(|s| config::enabled_servers(&s.conn))
+            .call(move |s| config::enabled_servers(&s.conn, sid))
             .await
+            .map(Reply::value)
             .map_err(|e| e.to_string());
     }
     let server = args["server"]
         .as_str()
-        .ok_or("expected an MCP server name")?
-        .to_owned();
-    let request = match op {
-        "mcp.tools" => Request::List(
-            serde_json::from_value(args).map_err(|_| "expected string query and cursor")?,
-        ),
-        "mcp.call" => Request::Call(
-            serde_json::from_value(args)
-                .map_err(|_| "expected an MCP tool name and an arguments object")?,
-        ),
-        _ => return Err("unknown MCP operation".into()),
+        .ok_or("expected an MCP server name")?;
+    let tool = if op == "mcp.call" {
+        Some(
+            args["tool"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("expected a nonempty MCP tool name")?,
+        )
+    } else {
+        None
     };
-    let lookup = server.clone();
-    let (slot, endpoint) = app
+    let name = server.to_owned();
+    let tool_name = tool.map(str::to_owned);
+    let (slot, mut endpoint) = app
         .db
         .call(move |s| {
-            let endpoint = config::endpoint(&s.conn, &lookup)?;
+            let endpoint = config::endpoint(&s.conn, sid, &name)?;
+            if let (Some(allowed), Some(tool)) = (&endpoint.allowed_tools, tool_name)
+                && !allowed.contains(&tool)
+            {
+                return Err(Error::bad("MCP tool is not allowed for this service"));
+            }
             Ok((s.mcp.acquire(sid, endpoint.id)?, endpoint))
         })
         .await
         .map_err(|e| e.to_string())?;
+    let allowed = endpoint.allowed_tools.take();
     let duration = Duration::from_millis(endpoint.timeout_ms.into());
-    let start = Instant::now();
-    let tool = match &request {
-        Request::List(_) => "",
-        Request::Call(i) => &i.tool,
-    };
+    let started = Instant::now();
     let mut sent = false;
     let result = timeout(duration, async {
+        stage("connecting");
         slot.check()?;
         let client = slot
             .client
-            .get_or_try_init(|| connect(app.client.clone(), endpoint))
+            .get_or_try_init(|| connect(app, endpoint))
             .await?;
-        if let Some(page) = discover(client, &slot, &request).await? {
-            return Ok(page);
-        }
-        let Request::Call(call) = &request else {
-            unreachable!()
-        };
         slot.check()?;
-        sent = true;
-        // Call the peer's single-round API. Later attempts always require a new script call.
-        let params =
-            CallToolRequestParams::new(call.tool.clone()).with_arguments(call.args.clone());
-        client
-            .peer()
-            .call_tool(params)
-            .await
-            .map(script_result)
-            .map_err(|e| request_error(e, &slot, true))
+        let attempt = match op {
+            "mcp.tools" => {
+                stage("discovering");
+                let query = serde_json::from_value(args.clone())
+                    .map_err(|_| "expected string query and cursor")?;
+                discover(client, &slot, query, allowed.as_ref()).await
+            }
+            _ => {
+                stage(match op {
+                    "mcp.resources" | "mcp.resourceTemplates" | "mcp.prompts" => "discovering",
+                    _ => "requesting",
+                });
+                sent = op == "mcp.call";
+                capabilities::attempt(client, op, &args).await
+            }
+        };
+        let reply = attempt.map_err(|e| match e {
+            AttemptError::Local(reason) => reason,
+            AttemptError::Service(err) => errors::request(err, &slot, op, sent),
+        })?;
+        if reply.value.to_string().len() > BYTE_LIMIT {
+            return Err(if sent {
+                "MCP tool replied but its JSON exceeds the byte limit; do not replay a write"
+            } else {
+                "MCP response JSON exceeds the byte limit"
+            }
+            .to_owned());
+        }
+        Ok(reply)
     })
     .await
     .unwrap_or_else(|_| {
         Err(if sent {
             "MCP call timed out; result unknown; request was not replayed"
         } else {
-            "MCP connection or discovery timed out"
+            "MCP connection or request timed out"
         }
         .into())
-    })
-    .and_then(|value| {
-        if value.to_string().len() <= BYTE_LIMIT {
-            Ok(value)
-        } else {
-            Err("MCP result exceeds byte limit".into())
-        }
     });
     let status = match &result {
-        Ok(v) if v["isError"] == true => "tool_error",
+        Ok(v) if v.value["isError"] == true => "tool_error",
         Ok(_) => "ok",
         Err(_) => "error",
     };
@@ -425,9 +399,10 @@ pub async fn execute(
         sid,
         origin,
         server,
-        tool,
+        tool = tool.unwrap_or(""),
+        op,
         status,
-        elapsed_ms = start.elapsed().as_millis(),
+        elapsed_ms = started.elapsed().as_millis(),
         "MCP operation"
     );
     result

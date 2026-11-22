@@ -76,6 +76,7 @@ struct App {
     db: Db,
     codemode: Arc<codemode::Engine>,
     client: reqwest::Client,
+    mcp_probes: Arc<tokio::sync::Semaphore>,
     stopping: CancellationToken,
     workers: TaskTracker,
 }
@@ -181,6 +182,7 @@ async fn serve(
     );
     let app = App {
         codemode: Arc::new(codemode::Engine::new(threads)?),
+        mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
         db: Db::open(Path::new("mygo-bot.sqlite3"))?,
         client: reqwest::Client::builder()
             // Each retry gets its own llm_calls row in the worker loop.
