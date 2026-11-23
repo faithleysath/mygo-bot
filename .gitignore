@@ -1,3 +1,4 @@
-/mygo-bot.sqlite
-/mygo-bot.sqlite3*
+/mygo.sqlite
+/mygo.sqlite3*
+/mygo.log
 /target/

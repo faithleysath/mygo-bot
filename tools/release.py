@@ -30,7 +30,7 @@ def build(target):
         else:
             env[target_var] = flag
     command = [
-        "cargo", "build", "--locked", "--release", "--bin", "mygo-bot",
+        "cargo", "build", "--locked", "--release", "--bin", "mygo",
         "--target", target, "--message-format=json-render-diagnostics",
     ]
     output = subprocess.check_output(command, text=True, encoding="utf-8", env=env)
@@ -38,9 +38,9 @@ def build(target):
         event = json.loads(line)
         if event["reason"] != "compiler-artifact" or not event["executable"]:
             continue
-        if event["target"]["name"] == "mygo-bot":
+        if event["target"]["name"] == "mygo":
             return Path(event["executable"])
-    raise SystemExit("Cargo did not report the mygo-bot executable")
+    raise SystemExit("Cargo did not report the mygo executable")
 
 
 def linux_requirements(executable, artifact):
@@ -80,7 +80,7 @@ def release(target, host):
     dist.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".pack-", dir=dist) as tmp:
         stage = Path(tmp)
-        name = f"mygo-bot-{target}"
+        name = f"mygo-{target}"
         packed = stage / (name + (".upx" if mac else executable.suffix))
         options = ["--force-macos"] if mac else []
         subprocess.run(["upx", "--best", *options, "-o", packed, executable], check=True)
@@ -93,7 +93,7 @@ def release(target, host):
             # Current macOS can run the original signed Mach-O directly from a compressed image.
             volume = stage / "volume"
             volume.mkdir()
-            runnable = volume / "mygo-bot"
+            runnable = volume / "mygo"
             subprocess.run(["upx", "-d", "-o", runnable, packed], check=True)
             if not filecmp.cmp(executable, runnable, shallow=False):
                 raise SystemExit("UPX did not restore the original Mach-O byte for byte")

@@ -7,8 +7,8 @@ use std::{
     process::{self, Command, Stdio},
 };
 
-const CHILD_ENV: &str = "MYGO_BOT_DAEMON_CHILD";
-const LOG: &str = "mygo-bot.log";
+const CHILD_ENV: &str = "MYGO_DAEMON_CHILD";
+const LOG: &str = "mygo.log";
 
 #[derive(Serialize, Deserialize)]
 pub struct Ready {
@@ -47,7 +47,7 @@ fn reply(out: io::Stdout, result: Result<&Ready, String>) -> io::Result<()> {
     out.flush()
 }
 
-pub fn start(options: super::Options) -> Result<(), Box<dyn std::error::Error>> {
+pub fn start(options: super::DaemonOptions) -> Result<(), Box<dyn std::error::Error>> {
     if options.foreground {
         return super::run(options, &mut None);
     }
@@ -67,7 +67,7 @@ pub fn start(options: super::Options) -> Result<(), Box<dyn std::error::Error>> 
     result
 }
 
-fn open_log() -> io::Result<File> {
+pub(crate) fn open_log(path: &std::path::Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -78,7 +78,7 @@ fn open_log() -> io::Result<File> {
             .mode(0o600)
             .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32);
     }
-    let file = options.open(LOG)?;
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::other("expected a regular log file"));
@@ -86,7 +86,7 @@ fn open_log() -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o777 != 0o600 {
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
     }
@@ -94,7 +94,8 @@ fn open_log() -> io::Result<File> {
 }
 
 fn launch() -> io::Result<()> {
-    let log = open_log().map_err(|e| io::Error::new(e.kind(), format!("open {LOG}: {e}")))?;
+    let log =
+        open_log(LOG.as_ref()).map_err(|e| io::Error::new(e.kind(), format!("open {LOG}: {e}")))?;
     let mut command = Command::new(env::current_exe()?);
     #[cfg(windows)]
     {

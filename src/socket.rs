@@ -14,7 +14,7 @@ fn runtime_dir(uid: u32) -> io::Result<PathBuf> {
     if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
-    let dir = env::temp_dir().join(format!("mygo-bot-{uid}"));
+    let dir = env::temp_dir().join(format!("mygo-{uid}"));
     match fs::DirBuilder::new().mode(0o700).create(&dir) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
         result => result?,
@@ -35,7 +35,7 @@ fn default_path() -> io::Result<PathBuf> {
             ),
         ));
     }
-    Ok(dir.join("mygo-bot.sock"))
+    Ok(dir.join("mygo.sock"))
 }
 
 pub struct SocketFile {

@@ -6,10 +6,14 @@ mod codemode;
 mod daemon;
 mod docs;
 mod events;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod install;
 mod mcp;
 mod media;
 mod model;
 mod pricing;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod service;
 #[cfg(unix)]
 mod socket;
 mod store;
@@ -21,20 +25,25 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::{
     ffi::{OsStr, OsString},
     fmt, io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     path::Path,
     process::ExitCode,
     sync::Arc,
     time::Duration,
 };
-#[cfg(unix)]
-use std::path::PathBuf;
 use store::Db;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+pub const BIN_NAME: &str = "mygo";
+pub const VERSION: &str = env!("MYGO_VERSION");
+const DEFAULT_PORT: u16 = 26946;
+const DEFAULT_PORT_ATTEMPTS: u16 = 100;
 
 type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Debug)]
@@ -93,38 +102,48 @@ struct App {
 
 #[cfg(unix)]
 const HELP_SOCKET_OPTIONS: &str = concat!(
-    "      --unix-socket <PATH>  Local socket (no token). Defaults to ",
+    "  --unix-socket <PATH>  Local socket (no token). Defaults to ",
     cfg_select! {
         target_os = "macos" => { "" }
-        _ => { "$XDG_RUNTIME_DIR/mygo-bot.sock or " }
+        _ => { "$XDG_RUNTIME_DIR/mygo.sock or " }
     },
-    "mygo-bot-<uid>/mygo-bot.sock under the system temp directory\n",
-    "      --no-unix-socket      Disable the local Unix socket and serve only TCP\n",
+    "mygo-<uid>/mygo.sock under the system temp directory\n",
+    "  --no-unix-socket      Disable the local Unix socket and serve only TCP\n",
 );
 #[cfg(not(unix))]
 const HELP_SOCKET_OPTIONS: &str = "";
 
-fn print_help() {
+const HELP: &str = concat!(
+    "Usage: mygo <COMMAND> [OPTIONS]\n\nCommands:\n  daemon     Run the HTTP and SSE API\n",
+    cfg_select! {
+        any(target_os = "macos", target_os = "linux") => {
+            "  install    Install the executable\n  uninstall  Remove the executable\n  service    Manage the system service\n"
+        }
+        _ => { "" }
+    },
+    "\n  -h, --help     Print help\n  -V, --version  Print version"
+);
+
+fn daemon_help() {
     print!(
-        "Run the MyGo-Bot HTTP and SSE API\n\n\
-Usage: mygo-bot [OPTIONS]\n\n\
-Options:\n\
-      --daemon              Start the server in the background and append logs to ./mygo-bot.log\n\
-      --foreground          With --daemon, keep the server attached to this terminal and log to stderr\n\
-      --js-threads <COUNT>  Fixed number of JavaScript worker threads (defaults to at most four logical CPUs)\n\
-      --listen <IP:PORT>    TCP bind address. Port 0 lets the OS choose a free port [default: 127.0.0.1:0]\n\
-      --token <TOKEN>       TCP Bearer token. Omit to generate a token and print it once at startup\n\
-{HELP_SOCKET_OPTIONS}\
-  -h, --help                Print help\n\
-  -V, --version             Print version\n"
+        "Usage: mygo daemon [OPTIONS]
+
+By default, start in the background and log to ./mygo.log.
+
+Options:
+  --foreground          Run attached to this terminal and log to stderr
+  --js-threads <COUNT>  JavaScript workers (default: up to four logical CPUs)
+  --listen <IP:PORT>    Bind this address once (0 selects a free port). Default: 127.0.0.1:{DEFAULT_PORT}, then the next free port ({DEFAULT_PORT_ATTEMPTS} attempts)
+  --token <TOKEN>       TCP Bearer token (default: generate and print once)
+{HELP_SOCKET_OPTIONS}  -h, --help            Print help
+"
     );
 }
 
-struct Options {
-    daemon: bool,
+struct DaemonOptions {
     foreground: bool,
     js_threads: Option<NonZeroUsize>,
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
     token: Option<String>,
     #[cfg(unix)]
     unix_socket: Option<PathBuf>,
@@ -133,7 +152,9 @@ struct Options {
 }
 
 enum Cli {
-    Run(Options),
+    Run(DaemonOptions),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Manage(install::Scope, service::Action),
     Exit(ExitCode),
 }
 
@@ -197,19 +218,33 @@ fn take_str_value(
         .map_err(|_| format!("invalid UTF-8 value for '{flag}'"))
 }
 
-impl Options {
-    fn parse() -> Cli {
-        match Self::parse_inner() {
-            Ok(cli) => cli,
-            Err(reason) => {
-                eprintln!("error: {reason}\n\nUsage: mygo-bot [OPTIONS]");
-                Cli::Exit(ExitCode::from(2))
+fn parse() -> std::result::Result<Cli, String> {
+    let mut args = std::env::args_os().skip(1);
+    let Some(command) = args.next() else {
+        println!("{HELP}");
+        return Ok(Cli::Exit(ExitCode::SUCCESS));
+    };
+    match command.to_str() {
+        Some("-h" | "--help") => println!("{HELP}"),
+        Some("-V" | "--version") => println!("{BIN_NAME} {VERSION}"),
+        Some("daemon") => return DaemonOptions::parse(args),
+        Some(name @ ("install" | "uninstall" | "service")) => {
+            cfg_select! {
+                any(target_os = "macos", target_os = "linux") => { return service::parse(name, args); }
+                windows => { return Err(format!("{name} is not supported on Windows yet")); }
+                _ => { return Err(format!("{name} is not supported on this platform")); }
             }
         }
+        _ => return Err(format!("unknown command {command:?}")),
     }
+    if let Some(extra) = args.next() {
+        return Err(format!("unexpected argument {extra:?}"));
+    }
+    Ok(Cli::Exit(ExitCode::SUCCESS))
+}
 
-    fn parse_inner() -> std::result::Result<Cli, String> {
-        let mut daemon = false;
+impl DaemonOptions {
+    fn parse(mut args: impl Iterator<Item = OsString>) -> std::result::Result<Cli, String> {
         let mut foreground = false;
         let mut js_threads: Option<NonZeroUsize> = None;
         let mut listen: Option<SocketAddr> = None;
@@ -219,7 +254,6 @@ impl Options {
         #[cfg(unix)]
         let mut no_unix_socket = false;
 
-        let mut args = std::env::args_os().skip(1);
         while let Some(arg) = args.next() {
             let (flag, inline) = match split_long_eq(&arg) {
                 Some((key, val)) => (key.to_owned(), Some(val)),
@@ -230,23 +264,13 @@ impl Options {
             };
             match flag.as_str() {
                 "-h" | "--help" if inline.is_none() => {
-                    print_help();
+                    daemon_help();
                     return Ok(Cli::Exit(ExitCode::SUCCESS));
-                }
-                "-V" | "--version" if inline.is_none() => {
-                    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                    return Ok(Cli::Exit(ExitCode::SUCCESS));
-                }
-                "--daemon" if inline.is_none() => {
-                    if daemon {
-                        return Err("the argument '--daemon' cannot be used multiple times".into());
-                    }
-                    daemon = true;
                 }
                 "--foreground" if inline.is_none() => {
                     if foreground {
                         return Err(
-                            "the argument '--foreground' cannot be used multiple times".into(),
+                            "the argument '--foreground' cannot be used multiple times".into()
                         );
                     }
                     foreground = true;
@@ -259,10 +283,10 @@ impl Options {
                         );
                     }
                     let val = take_str_value(inline, &mut args, "--js-threads")?;
-                    js_threads = Some(
-                        val.parse::<NonZeroUsize>()
-                            .map_err(|e| format!("invalid value '{val}' for '--js-threads': {e}"))?,
-                    );
+                    js_threads =
+                        Some(val.parse::<NonZeroUsize>().map_err(|e| {
+                            format!("invalid value '{val}' for '--js-threads': {e}")
+                        })?);
                 }
                 "--listen" => {
                     if listen.is_some() {
@@ -320,19 +344,15 @@ impl Options {
                     }
                     no_unix_socket = true;
                 }
-                other if other.starts_with('-') => {
-                    return Err(format!("unexpected argument '{other}' found"));
-                }
                 other => {
                     return Err(format!("unexpected argument '{other}' found"));
                 }
             }
         }
-        Ok(Cli::Run(Options {
-            daemon,
+        Ok(Cli::Run(Self {
             foreground,
             js_threads,
-            listen: listen.unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            listen,
             token,
             #[cfg(unix)]
             unix_socket,
@@ -343,14 +363,29 @@ impl Options {
 }
 
 fn main() -> ExitCode {
-    let options = match Options::parse() {
-        Cli::Run(options) => options,
-        Cli::Exit(code) => return code,
+    let options = match parse() {
+        Ok(Cli::Run(options)) => options,
+        Ok(Cli::Exit(code)) => return code,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        Ok(Cli::Manage(scope, action)) => {
+            let system_query = scope == install::Scope::System
+                && matches!(
+                    action,
+                    service::Action::Status | service::Action::Logs { .. }
+                );
+            return service::run(scope, action).unwrap_or_else(|err| {
+                eprintln!("error: {err}");
+                if system_query && err.kind() == io::ErrorKind::PermissionDenied {
+                    eprintln!("try this query with sudo");
+                }
+                ExitCode::FAILURE
+            });
+        }
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            return ExitCode::from(2);
+        }
     };
-    if !options.daemon {
-        print_help();
-        return ExitCode::SUCCESS;
-    }
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
@@ -366,7 +401,7 @@ fn main() -> ExitCode {
 }
 
 fn run(
-    options: Options,
+    options: DaemonOptions,
     parent: &mut Option<io::Stdout>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -378,8 +413,33 @@ fn run(
     result
 }
 
+async fn bind_tcp(listen: Option<SocketAddr>) -> io::Result<tokio::net::TcpListener> {
+    if let Some(addr) = listen {
+        return tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("bind TCP {addr}: {e}")));
+    }
+    for offset in 0..DEFAULT_PORT_ATTEMPTS {
+        let Some(port) = DEFAULT_PORT.checked_add(offset) else {
+            break;
+        };
+        let addr = (Ipv4Addr::LOCALHOST, port);
+        match tokio::net::TcpListener::bind(addr).await {
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => continue,
+            result => return result,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "all loopback ports {DEFAULT_PORT}..={} are in use",
+            DEFAULT_PORT.saturating_add(DEFAULT_PORT_ATTEMPTS - 1)
+        ),
+    ))
+}
+
 async fn serve(
-    options: Options,
+    options: DaemonOptions,
     parent: &mut Option<io::Stdout>,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let generated = options.token.is_none();
@@ -394,9 +454,7 @@ async fn serve(
             bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
     };
-    let listener = tokio::net::TcpListener::bind(options.listen)
-        .await
-        .map_err(|e| io::Error::new(e.kind(), format!("bind TCP {}: {e}", options.listen)))?;
+    let listener = bind_tcp(options.listen).await?;
     let listen = listener.local_addr()?;
     #[cfg(unix)]
     let unix = (!options.no_unix_socket)
@@ -428,7 +486,7 @@ async fn serve(
         App {
             codemode: Arc::new(codemode::Engine::new(threads, make_client()?)?),
             mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
-            db: Db::open(Path::new("mygo-bot.sqlite3"))?,
+            db: Db::open(Path::new("mygo.sqlite3"))?,
             client: make_client()?,
             stopping: CancellationToken::new(),
             workers: TaskTracker::new(),

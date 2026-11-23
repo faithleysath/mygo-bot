@@ -95,9 +95,9 @@ class MyGo(BaseInstalledAgent):
         # the private symlink for its WAL too. Never replace a task-owned file.
         start = f"""set -eu
 mkdir -p {logs}
-test ! -e mygo-bot.sqlite3 && test ! -L mygo-bot.sqlite3 || exit 1
-ln -s {s}/state.db mygo-bot.sqlite3
-nohup {s}/lib/ld-linux-x86-64.so.2 --library-path {s}/lib {s}/mygo-bot --daemon --foreground --unix-socket {s}/api.sock --token "$MYGO_LOCAL_TOKEN" > {logs}/daemon.log 2>&1 </dev/null &
+test ! -e mygo.sqlite3 && test ! -L mygo.sqlite3 || exit 1
+ln -s {s}/state.db mygo.sqlite3
+nohup {s}/lib/ld-linux-x86-64.so.2 --library-path {s}/lib {s}/mygo daemon --foreground --listen 127.0.0.1:0 --unix-socket {s}/api.sock --token "$MYGO_LOCAL_TOKEN" > {logs}/daemon.log 2>&1 </dev/null &
 echo $! > {s}/pid
 for i in $(seq 100); do test ! -S {s}/api.sock || exit 0; kill -0 $! || exit 1; sleep 0.1; done
 exit 1"""
@@ -155,7 +155,7 @@ exit 1"""
     sleep 0.1
   done
 fi
-if test "$(readlink mygo-bot.sqlite3)" = {s}/state.db; then rm -f mygo-bot.sqlite3; fi
+if test "$(readlink mygo.sqlite3)" = {s}/state.db; then rm -f mygo.sqlite3; fi
 rm -rf {s}""",
                 )
 

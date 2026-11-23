@@ -838,7 +838,7 @@ fn client_meta(protocol_version: &str) -> Value {
         "io.modelcontextprotocol/protocolVersion": protocol_version,
         "io.modelcontextprotocol/clientInfo": {
             "name": "mygo-bot",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::VERSION,
         },
         "io.modelcontextprotocol/clientCapabilities": {},
     })
@@ -986,7 +986,7 @@ impl Client {
                     "capabilities": {},
                     "clientInfo": {
                         "name": "mygo-bot",
-                        "version": env!("CARGO_PKG_VERSION"),
+                        "version": crate::VERSION,
                     }
                 });
                 let result = client.raw_request("initialize", init_params).await?;

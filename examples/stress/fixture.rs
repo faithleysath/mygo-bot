@@ -41,10 +41,17 @@ impl Agent {
         getrandom::fill(&mut bytes)?;
         let token = format!("{:032x}", u128::from_ne_bytes(bytes));
         let mut command = Command::new(bin);
+        command.args([
+            "daemon",
+            "--foreground",
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            &token,
+        ]);
         #[cfg(unix)]
         command.args(["--unix-socket", "agent.sock"]);
         let child = command
-            .args(["--daemon", "--foreground", "--token", &token])
             .current_dir(dir)
             .env("NO_PROXY", "*")
             .env("no_proxy", "*")
@@ -160,11 +167,11 @@ where
 }
 
 pub fn audit(dir: &Path, case: &str, users: u64, answers: u64) -> Result<Value> {
-    let path = dir.join("mygo-bot.sqlite3");
+    let path = dir.join("mygo.sqlite3");
     // The last connection may leave committed pages in WAL across process exit.
     let main_bytes = fs::metadata(&path)?.len();
     let sidecar_bytes = |suffix: &str| -> std::io::Result<u64> {
-        match fs::metadata(dir.join(format!("mygo-bot.sqlite3-{suffix}"))) {
+        match fs::metadata(dir.join(format!("mygo.sqlite3-{suffix}"))) {
             Ok(meta) => Ok(meta.len()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(err) => Err(err),

@@ -4,6 +4,6 @@ set -eu
 cd "$(dirname "$0")/.."
 case "${1:-}" in
   --help|--list|-h) ;;
-  *) cargo build --locked --release --bin mygo-bot ;;
+  *) cargo build --locked --release --bin mygo ;;
 esac
 exec cargo run --locked --release --example stress -- "$@"

@@ -187,7 +187,7 @@ async fn suite(opts: &Options) -> Result<()> {
         .parent()
         .and_then(Path::parent)
         .ok_or("missing release directory")?
-        .join("mygo-bot");
+        .join("mygo");
     let size = fs::metadata(&bin)
         .map_err(|e| format!("{}: {e}; run via mise run stress", bin.display()))?
         .len();
