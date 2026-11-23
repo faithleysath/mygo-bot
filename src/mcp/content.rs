@@ -118,31 +118,70 @@ impl BinaryData {
     }
 }
 
+fn check_complete_result(result: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    let obj = result
+        .as_object()
+        .ok_or_else(|| "invalid MCP response".to_owned())?;
+    if let Some(kind) = obj.get("resultType") {
+        match kind.as_str() {
+            Some("complete") => {}
+            Some("input_required") => {
+                return Err(
+                    "MCP operation requires additional input, which is not supported".into(),
+                );
+            }
+            Some("task") => {
+                return Err("MCP background task results are not supported".into());
+            }
+            _ => return Err("unsupported MCP result type".into()),
+        }
+    }
+    if obj.contains_key("inputRequests") || obj.contains_key("requestState") {
+        return Err("MCP operation requires additional input, which is not supported".into());
+    }
+    Ok(obj)
+}
+
 pub(super) fn tool(result: Value) -> Result<Reply, String> {
-    let mut media = BinaryData::default();
-    let is_error = result
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let items = match result.get("content") {
-        None | Some(Value::Null) => &[][..],
+    let obj = check_complete_result(&result)?;
+    if obj.contains_key("task")
+        || (obj.contains_key("taskId")
+            && !obj.contains_key("content")
+            && !obj.contains_key("structuredContent"))
+    {
+        return Err("MCP background task results are not supported".into());
+    }
+    let is_error = match obj.get("isError") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err("invalid MCP tool result".into()),
+    };
+    let items = match obj.get("content") {
         Some(Value::Array(arr)) => arr.as_slice(),
+        None if obj
+            .keys()
+            .all(|k| matches!(k.as_str(), "resultType" | "structuredContent" | "isError" | "_meta")) =>
+        {
+            &[][..]
+        }
         _ => return Err("invalid MCP tool content".into()),
     };
+    let mut media = BinaryData::default();
     let mut content = Vec::with_capacity(items.len());
     for item in items {
         content.push(media.block(item)?);
     }
     let mut value = json!({"isError":is_error,"content":content});
-    if let Some(structured) = result.get("structuredContent").filter(|v| !v.is_null()) {
+    if let Some(structured) = obj.get("structuredContent").filter(|v| !v.is_null()) {
         value["structuredContent"] = structured.clone();
     }
     Ok(media.reply(value))
 }
 
 pub(super) fn resource(result: Value) -> Result<Reply, String> {
+    let obj = check_complete_result(&result)?;
     let mut media = BinaryData::default();
-    let items = result
+    let items = obj
         .get("contents")
         .and_then(Value::as_array)
         .ok_or_else(|| "invalid MCP resource response".to_owned())?;
@@ -154,8 +193,9 @@ pub(super) fn resource(result: Value) -> Result<Reply, String> {
 }
 
 pub(super) fn prompt(result: Value) -> Result<Reply, String> {
+    let obj = check_complete_result(&result)?;
     let mut media = BinaryData::default();
-    let items = result
+    let items = obj
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| "invalid MCP prompt response".to_owned())?;
@@ -172,7 +212,7 @@ pub(super) fn prompt(result: Value) -> Result<Reply, String> {
         messages.push(json!({"role":role,"content":media.block(block)?}));
     }
     let mut value = json!({"messages":messages});
-    if let Some(desc) = result.get("description").and_then(Value::as_str) {
+    if let Some(desc) = obj.get("description").and_then(Value::as_str) {
         value["description"] = Value::String(desc.to_owned());
     }
     Ok(media.reply(value))

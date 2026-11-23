@@ -14,7 +14,7 @@ use std::{
 use tokio::{
     io::AsyncWriteExt,
     process::{ChildStdin, ChildStdout, Command},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::{
@@ -83,8 +83,13 @@ pub(super) fn spawn(config: StdioConfig) -> io::Result<SpawnedChild> {
 
 type PendingMap = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value, McpError>>>>>;
 
+struct WriteFrame {
+    bytes: Vec<u8>,
+    ack: Option<oneshot::Sender<Result<(), ()>>>,
+}
+
 pub(super) struct StdioTransport {
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    writer_tx: mpsc::Sender<WriteFrame>,
     pending: PendingMap,
     closed: Arc<AtomicBool>,
     shutdown: CancellationToken,
@@ -94,6 +99,9 @@ pub(super) struct StdioTransport {
 struct PendingGuard {
     id: u64,
     pending: PendingMap,
+    writer_tx: mpsc::Sender<WriteFrame>,
+    closed: Arc<AtomicBool>,
+    notify_cancel: bool,
     disarmed: bool,
 }
 
@@ -101,18 +109,48 @@ impl Drop for PendingGuard {
     fn drop(&mut self) {
         if !self.disarmed {
             self.pending.lock().unwrap().remove(&self.id);
+            if self.notify_cancel && !self.closed.load(Ordering::Acquire) {
+                let notice = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {
+                        "requestId": self.id,
+                        "reason": "request cancelled",
+                    }
+                });
+                if let Ok(mut bytes) = serde_json::to_vec(&notice) {
+                    bytes.push(b'\n');
+                    let _ = self.writer_tx.try_send(WriteFrame { bytes, ack: None });
+                }
+            }
         }
     }
 }
 
+fn framed_line(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(payload.len() + 1);
+    bytes.extend_from_slice(payload);
+    bytes.push(b'\n');
+    bytes
+}
+
 impl StdioTransport {
     pub(super) fn start(spawned: SpawnedChild, cache_epoch: Arc<AtomicU64>) -> Self {
-        let stdin = Arc::new(Mutex::new(Some(spawned.stdin)));
+        let (writer_tx, writer_rx) = mpsc::channel::<WriteFrame>(128);
         let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let shutdown = CancellationToken::new();
 
-        let task_stdin = stdin.clone();
+        let writer_closed = closed.clone();
+        let writer_shutdown = shutdown.clone();
+        let writer_handle = tokio::spawn(run_writer(
+            spawned.stdin,
+            writer_rx,
+            writer_closed,
+            writer_shutdown,
+        ));
+
+        let task_writer_tx = writer_tx.clone();
         let task_pending = pending.clone();
         let task_closed = closed.clone();
         let task_shutdown = shutdown.clone();
@@ -120,7 +158,8 @@ impl StdioTransport {
             run_reader(
                 spawned.child,
                 spawned.stdout,
-                task_stdin,
+                writer_handle,
+                task_writer_tx,
                 task_pending,
                 task_closed,
                 task_shutdown,
@@ -130,7 +169,7 @@ impl StdioTransport {
         });
 
         Self {
-            stdin,
+            writer_tx,
             pending,
             closed,
             shutdown,
@@ -151,9 +190,18 @@ impl StdioTransport {
         if self.is_closed() {
             return Err(McpError::TransportClosed);
         }
-        write_line(&self.stdin, payload)
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteFrame {
+                bytes: framed_line(payload),
+                ack: Some(ack_tx),
+            })
             .await
-            .map_err(|_| McpError::TransportClosed)
+            .map_err(|_| McpError::TransportClosed)?;
+        match ack_rx.await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(McpError::TransportClosed),
+        }
     }
 
     pub(super) async fn request(&self, id: u64, payload: &[u8]) -> Result<Value, McpError> {
@@ -165,10 +213,31 @@ impl StdioTransport {
         let mut guard = PendingGuard {
             id,
             pending: self.pending.clone(),
+            writer_tx: self.writer_tx.clone(),
+            closed: self.closed.clone(),
+            notify_cancel: false,
             disarmed: false,
         };
-        if let Err(()) = write_line(&self.stdin, payload).await {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .writer_tx
+            .send(WriteFrame {
+                bytes: framed_line(payload),
+                ack: Some(ack_tx),
+            })
+            .await
+            .is_err()
+        {
             return Err(McpError::TransportClosed);
+        }
+        // The writer task now owns writing the entire frame ahead of any queued cancellation.
+        guard.notify_cancel = true;
+        match ack_rx.await {
+            Ok(Ok(())) => {}
+            _ => {
+                guard.notify_cancel = false;
+                return Err(McpError::TransportClosed);
+            }
         }
         let result = rx.await.unwrap_or(Err(McpError::TransportClosed));
         guard.disarmed = true;
@@ -189,19 +258,47 @@ impl Drop for StdioTransport {
     }
 }
 
-async fn write_line(stdin: &Mutex<Option<ChildStdin>>, payload: &[u8]) -> Result<(), ()> {
-    let mut guard = stdin.lock().await;
-    let pipe = guard.as_mut().ok_or(())?;
-    pipe.write_all(payload).await.map_err(|_| ())?;
-    pipe.write_all(b"\n").await.map_err(|_| ())?;
-    pipe.flush().await.map_err(|_| ())?;
-    Ok(())
+async fn run_writer<W: tokio::io::AsyncWrite + Unpin>(
+    mut stdin: W,
+    mut rx: mpsc::Receiver<WriteFrame>,
+    closed: Arc<AtomicBool>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            frame = rx.recv() => match frame {
+                Some(frame) => frame,
+                None => break,
+            },
+        };
+        let write_res = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Err(()),
+            res = async {
+                stdin.write_all(&frame.bytes).await.map_err(|_| ())?;
+                stdin.flush().await.map_err(|_| ())
+            } => res,
+        };
+        let failed = write_res.is_err();
+        if let Some(ack) = frame.ack {
+            let _ = ack.send(write_res);
+        }
+        if failed {
+            closed.store(true, Ordering::Release);
+            shutdown.cancel();
+            break;
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_reader(
     mut child: platform::Child,
     stdout: ChildStdout,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    writer_handle: JoinHandle<()>,
+    writer_tx: mpsc::Sender<WriteFrame>,
     pending: PendingMap,
     closed: Arc<AtomicBool>,
     shutdown: CancellationToken,
@@ -240,8 +337,9 @@ async fn run_reader(
                 } else {
                     json!({"jsonrpc":"2.0","id":req_id,"error":{"code":-32601,"message":"method not found"}})
                 };
-                if let Ok(bytes) = serde_json::to_vec(&reply) {
-                    let _ = write_line(&stdin, &bytes).await;
+                if let Ok(mut bytes) = serde_json::to_vec(&reply) {
+                    bytes.push(b'\n');
+                    let _ = writer_tx.try_send(WriteFrame { bytes, ack: None });
                 }
             } else if matches!(
                 method,
@@ -262,9 +360,8 @@ async fn run_reader(
     }
 
     closed.store(true, Ordering::Release);
-    if let Ok(mut guard) = tokio::time::timeout(Duration::from_millis(150), stdin.lock()).await {
-        *guard = None;
-    }
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_millis(150), writer_handle).await;
     let _ = tokio::time::timeout(Duration::from_millis(150), child.leader_exit()).await;
     let _ = child.finish().await;
 
@@ -339,18 +436,27 @@ mod platform {
 mod platform {
     use super::*;
     use std::{
-        mem::size_of_val,
+        mem::{offset_of, size_of, size_of_val, zeroed},
         os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
         ptr::{null, null_mut},
     };
-    use windows_sys::Win32::System::{
-        JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    use windows_sys::Win32::{
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+                Thread32Next,
+            },
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            },
+            Threading::{
+                CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+            },
         },
-        Threading::CREATE_NO_WINDOW,
     };
 
     fn checked(ok: i32) -> io::Result<()> {
@@ -359,6 +465,44 @@ mod platform {
         } else {
             Ok(())
         }
+    }
+
+    fn resume_process_threads(pid: u32) -> io::Result<()> {
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let snap = unsafe { OwnedHandle::from_raw_handle(snap) };
+        let mut entry: THREADENTRY32 = unsafe { zeroed() };
+        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+        checked(unsafe { Thread32First(snap.as_raw_handle(), &mut entry) })?;
+        let min_size = (offset_of!(THREADENTRY32, th32OwnerProcessID) + size_of::<u32>()) as u32;
+        let mut resumed = 0usize;
+        loop {
+            if entry.dwSize >= min_size && entry.th32OwnerProcessID == pid {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+                if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                resumed += 1;
+            }
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            if unsafe { Thread32Next(snap.as_raw_handle(), &mut entry) } == 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+        if resumed == 0 {
+            return Err(io::Error::other("stdio process has no initial thread"));
+        }
+        Ok(())
     }
 
     pub(super) struct Child {
@@ -383,14 +527,24 @@ mod platform {
                 size_of_val(&limits) as u32,
             )
         })?;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        // Assign the suspended child to the job before user code can spawn grandchildren.
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let mut inner = cmd.spawn()?;
         let Some(proc_handle) = inner.raw_handle() else {
             let _ = inner.start_kill();
             return Err(io::Error::other("stdio process handle unavailable"));
         };
+        let Some(pid) = inner.id() else {
+            let _ = inner.start_kill();
+            return Err(io::Error::other("stdio process id unavailable"));
+        };
         if let Err(err) = checked(unsafe { AssignProcessToJobObject(job.as_raw_handle(), proc_handle) })
         {
+            let _ = inner.start_kill();
+            return Err(err);
+        }
+        if let Err(err) = resume_process_threads(pid) {
+            let _ = unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
             let _ = inner.start_kill();
             return Err(err);
         }

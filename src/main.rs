@@ -148,6 +148,23 @@ fn split_long_eq(arg: &OsStr) -> Option<(&str, OsString)> {
     }
 }
 
+fn starts_with_hyphen(value: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_bytes().starts_with(b"-")
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().next() == Some(b'-' as u16)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        value.to_str().is_some_and(|s| s.starts_with('-'))
+    }
+}
+
 fn take_os_value(
     inline: Option<OsString>,
     args: &mut impl Iterator<Item = OsString>,
@@ -155,9 +172,12 @@ fn take_os_value(
 ) -> std::result::Result<OsString, String> {
     match inline {
         Some(value) => Ok(value),
-        None => args
-            .next()
-            .ok_or_else(|| format!("a value is required for '{flag}' but none was supplied")),
+        None => match args.next() {
+            Some(value) if !starts_with_hyphen(&value) => Ok(value),
+            _ => Err(format!(
+                "a value is required for '{flag}' but none was supplied"
+            )),
+        },
     }
 }
 

@@ -203,7 +203,7 @@ pub(super) fn handshake(error: McpError) -> String {
 }
 
 pub(super) fn request(error: McpError, slot: &Slot, operation: &str, sent: bool) -> String {
-    if let McpError::Protocol { code, message } = error {
+    if let McpError::Protocol { code, message, .. } = error {
         return protocol(slot, operation, code, &message);
     }
     if error.should_retire() {

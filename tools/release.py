@@ -13,7 +13,7 @@ import tempfile
 
 def build(target):
     env = os.environ.copy()
-    if not target.endswith("-windows-msvc"):
+    if target.endswith("-apple-darwin") or "-linux-" in target:
         flag = "-C force-unwind-tables=no"
         target_var = f"CARGO_TARGET_{target.upper().replace('-', '_')}_RUSTFLAGS"
         if "CARGO_ENCODED_RUSTFLAGS" in env:
