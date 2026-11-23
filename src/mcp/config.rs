@@ -62,8 +62,6 @@ struct McpServerConfig {
     #[schema(write_only)]
     env: BTreeMap<String, String>,
     cwd: Option<String>,
-    /// null 表示所有会话，空数组表示所有会话都不可访问。
-    session_ids: Option<BTreeSet<i64>>,
     /// 精确工具原名，null 表示全部，空数组禁止工具调用。
     allowed_tools: Option<BTreeSet<String>>,
     #[serde(default = "timeout_ms")]
@@ -95,7 +93,6 @@ struct McpServerInfo {
     arg_count: usize,
     has_env: bool,
     cwd: Option<String>,
-    session_ids: Option<BTreeSet<i64>>,
     allowed_tools: Option<BTreeSet<String>>,
     timeout_ms: u32,
     revision: i64,
@@ -151,9 +148,7 @@ struct Stored {
     revision: i64,
     cfg: McpServerConfig,
 }
-const SELECT: &str = "SELECT id,name,description,enabled,transport,config_json,session_ids,allowed_tools,timeout_ms,revision FROM mcp_servers";
-// Resolve the caller's session in the host, never from the script's arguments.
-const VISIBLE: &str = "enabled AND (session_ids IS NULL OR EXISTS (SELECT 1 FROM json_each(session_ids) WHERE value=?1))";
+const SELECT: &str = "SELECT id,name,description,enabled,transport,config_json,allowed_tools,timeout_ms,revision FROM mcp_servers";
 fn stored(r: &Row) -> rusqlite::Result<Stored> {
     let mut value: Value = r.get(5)?;
     let obj = value.as_object_mut().ok_or(rusqlite::Error::InvalidQuery)?;
@@ -162,18 +157,14 @@ fn stored(r: &Row) -> rusqlite::Result<Stored> {
     obj.insert("enabled".into(), json!(r.get::<_, bool>(3)?));
     obj.insert("transport".into(), json!(r.get::<_, String>(4)?));
     obj.insert(
-        "session_ids".into(),
+        "allowed_tools".into(),
         r.get::<_, Option<Value>>(6)?.unwrap_or(Value::Null),
     );
-    obj.insert(
-        "allowed_tools".into(),
-        r.get::<_, Option<Value>>(7)?.unwrap_or(Value::Null),
-    );
-    obj.insert("timeout_ms".into(), json!(r.get::<_, u32>(8)?));
+    obj.insert("timeout_ms".into(), json!(r.get::<_, u32>(7)?));
     let cfg = serde_json::from_value(value).map_err(|_| rusqlite::Error::InvalidQuery)?;
     Ok(Stored {
         id: r.get(0)?,
-        revision: r.get(9)?,
+        revision: r.get(8)?,
         cfg,
     })
 }
@@ -203,7 +194,6 @@ impl Stored {
             arg_count: c.args.len(),
             has_env: !c.env.is_empty(),
             cwd: c.cwd,
-            session_ids: c.session_ids,
             allowed_tools: c.allowed_tools,
             timeout_ms: c.timeout_ms,
         }
@@ -248,22 +238,19 @@ fn by_id(conn: &Connection, id: i64) -> Result<McpServerInfo> {
 pub(super) fn endpoint_by_id(conn: &Connection, id: i64) -> Result<Endpoint> {
     load(conn, id)?.endpoint(true)
 }
-pub(super) fn endpoint(conn: &Connection, sid: i64, name: &str) -> Result<Endpoint> {
-    conn.prepare_cached(&format!("{SELECT} WHERE {VISIBLE} AND name=?2"))?
-        .query_row((sid, name), stored)
+pub(super) fn endpoint(conn: &Connection, name: &str) -> Result<Endpoint> {
+    conn.prepare_cached(&format!("{SELECT} WHERE enabled AND name=?1"))?
+        .query_row([name], stored)
         .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                Error::bad("MCP server is unknown or disabled for this session")
-            }
+            rusqlite::Error::QueryReturnedNoRows => Error::bad("MCP server is unknown or disabled"),
             other => other.into(),
         })?
         .endpoint(false)
 }
-pub(super) fn enabled_servers(conn: &Connection, sid: i64) -> Result<Value> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT name,description FROM mcp_servers WHERE {VISIBLE} ORDER BY name"
-    ))?;
-    let mut rows = stmt.query([sid])?;
+pub(super) fn enabled_servers(conn: &Connection) -> Result<Value> {
+    let mut stmt =
+        conn.prepare_cached("SELECT name,description FROM mcp_servers WHERE enabled ORDER BY name")?;
+    let mut rows = stmt.query([])?;
     let mut servers = Vec::new();
     let mut bytes = 2;
     while let Some(row) = rows.next()? {
@@ -282,7 +269,7 @@ fn connection_document(c: &McpServerConfig) -> Value {
         McpTransport::Stdio => json!({"command":c.command,"args":c.args,"env":c.env,"cwd":c.cwd}),
     }
 }
-fn validate(conn: &Connection, c: &mut McpServerConfig) -> Result<()> {
+fn validate(c: &mut McpServerConfig) -> Result<()> {
     if c.name.trim().is_empty()
         || c.name.trim() != c.name
         || c.name.len() > 128
@@ -299,14 +286,6 @@ fn validate(conn: &Connection, c: &mut McpServerConfig) -> Result<()> {
         return Err(Error::bad(
             "expected nonempty exact MCP tool names up to 256 bytes",
         ));
-    }
-    if let Some(ids) = &c.session_ids {
-        let sql = "SELECT EXISTS(SELECT 1 FROM json_each(?1) scope
-                   WHERE NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id=scope.value))";
-        let missing: bool = conn.query_row(sql, [json!(ids)], |row| row.get(0))?;
-        if missing {
-            return Err(Error::bad("unknown session in session_ids"));
-        }
     }
     match c.transport {
         McpTransport::StreamableHttp => {
@@ -396,14 +375,14 @@ fn save(conn: &Connection, id: Option<i64>, fields: Fields) -> Result<(McpServer
     doc.as_object_mut().unwrap().extend(fields.0);
     let mut c: McpServerConfig = serde_json::from_value(doc)
         .map_err(|_| Error::bad("invalid MCP configuration fields or types"))?;
-    validate(conn, &mut c)?;
+    validate(&mut c)?;
     let connection = connection_document(&c);
     let auth_changed = old.as_ref().is_some_and(|s| {
         s.cfg.transport != c.transport || connection_document(&s.cfg) != connection
     });
-    let sql = "INSERT INTO mcp_servers(id,name,description,enabled,transport,config_json,session_ids,allowed_tools,timeout_ms,revision)
-        VALUES(?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET description=excluded.description,enabled=excluded.enabled,
-        transport=excluded.transport,config_json=excluded.config_json,session_ids=excluded.session_ids,allowed_tools=excluded.allowed_tools,
+    let sql = "INSERT INTO mcp_servers(id,name,description,enabled,transport,config_json,allowed_tools,timeout_ms,revision)
+        VALUES(?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET description=excluded.description,enabled=excluded.enabled,
+        transport=excluded.transport,config_json=excluded.config_json,allowed_tools=excluded.allowed_tools,
         timeout_ms=excluded.timeout_ms,revision=mcp_servers.revision+1 RETURNING id";
     let transport = match c.transport {
         McpTransport::StreamableHttp => "streamable-http",
@@ -419,7 +398,6 @@ fn save(conn: &Connection, id: Option<i64>, fields: Fields) -> Result<(McpServer
                 c.enabled,
                 transport,
                 connection,
-                c.session_ids.as_ref().map(|ids| json!(ids)),
                 c.allowed_tools.as_ref().map(|names| json!(names)),
                 c.timeout_ms
             ],

@@ -306,7 +306,7 @@ pub async fn execute(
     if op == "mcp.servers" {
         return app
             .db
-            .call(move |s| config::enabled_servers(&s.conn, sid))
+            .call(|s| config::enabled_servers(&s.conn))
             .await
             .map(Reply::value)
             .map_err(|e| e.to_string());
@@ -329,7 +329,7 @@ pub async fn execute(
     let (slot, mut endpoint) = app
         .db
         .call(move |s| {
-            let endpoint = config::endpoint(&s.conn, sid, &name)?;
+            let endpoint = config::endpoint(&s.conn, &name)?;
             if let (Some(allowed), Some(tool)) = (&endpoint.allowed_tools, tool_name)
                 && !allowed.contains(&tool)
             {

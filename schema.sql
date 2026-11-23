@@ -27,7 +27,6 @@ CREATE TABLE mcp_servers (
     description TEXT NOT NULL,
     enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
     transport TEXT NOT NULL CHECK (transport IN ('streamable-http','stdio')),
-    session_ids TEXT CHECK (session_ids IS NULL OR json_type(session_ids)='array'),
     allowed_tools TEXT CHECK (allowed_tools IS NULL OR json_type(allowed_tools)='array'),
     config_json TEXT NOT NULL CHECK (json_type(config_json)='object'),
     timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1 AND 86400000),
