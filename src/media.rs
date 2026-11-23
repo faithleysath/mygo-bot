@@ -1,9 +1,10 @@
 use axum::{
-    Json,
+    Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use rusqlite::{Connection, OptionalExtension, types::ValueRef};
@@ -13,30 +14,26 @@ use crate::{App, Error, Result};
 
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 
-pub fn routes(documented: bool) -> crate::docs::RouteRegistry {
-    crate::docs::RouteRegistry::new(documented)
-        .register(crate::docs::register!(upload))
+pub fn routes() -> Router<App> {
+    Router::new()
+        .route("/attachments", post(upload))
         .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES))
-        .register(crate::docs::register!(download))
+        .route("/attachments/{id}", get(download))
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize)]
 struct Attachment {
     id: i64,
     mime_type: String,
 }
 
-#[derive(utoipa::ToSchema)]
-#[schema(value_type = String, format = Binary)]
-struct AttachmentBytes(());
-
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TextKind {
     Text,
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
     Image,
@@ -55,47 +52,21 @@ impl MediaKind {
 }
 
 /// 消息内容块。媒体引用通过附件上传接口取得的 ID。
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ContentBlock<'a> {
-    #[schema(max_properties = 2)]
     Text {
         #[serde(rename = "type")]
         kind: TextKind,
-        #[schema(min_length = 1)]
         text: &'a str,
     },
-    #[schema(max_properties = 2)]
     Media {
         #[serde(rename = "type")]
         kind: MediaKind,
-        #[schema(minimum = 1)]
         attachment_id: i64,
     },
 }
 
-/// 上传附件
-///
-/// 直接发送非空的原始文件字节，指定具体的 image、audio 或 video MIME 类型，最大 50 MiB。
-///
-/// ```sh
-/// curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: image/png' --data-binary @photo.png "$BASE/attachments"
-/// ```
-#[utoipa::path(
-    post,
-    path = "/attachments",
-    tag = "附件",
-    request_body(content(
-        (AttachmentBytes = "image/png"), (AttachmentBytes = "audio/wav"), (AttachmentBytes = "video/mp4"),
-        (AttachmentBytes = "image/*"), (AttachmentBytes = "audio/*"), (AttachmentBytes = "video/*")
-    )),
-    responses(
-        (status = 201, description = "创建成功", body = Attachment),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 413, description = "附件超过 50 MiB", body = String, content_type = "text/plain"),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn upload(
     State(app): State<App>,
     headers: HeaderMap,
@@ -143,21 +114,6 @@ pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Res
     Ok(conn.last_insert_rowid())
 }
 
-/// 下载附件
-///
-/// 返回原始文件字节，Content-Type 为上传时保存的 MIME 类型。
-#[utoipa::path(
-    get,
-    path = "/attachments/{id}",
-    tag = "附件",
-    params(("id" = i64, Path, description = "附件 ID")),
-    responses(
-        (status = 200, description = "原始附件", content((crate::media::AttachmentBytes = "image/*"), (crate::media::AttachmentBytes = "audio/*"), (crate::media::AttachmentBytes = "video/*"))),
-        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn download(State(app): State<App>, Path(id): Path<i64>) -> Result<Response> {
     let (mime, data) = app
         .db

@@ -1,7 +1,8 @@
 use crate::{App, Error, Result, media, model::Input, pricing};
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, Query, State},
+    routing::get,
 };
 use chrono::Utc;
 use rusqlite::{Connection, Row, params};
@@ -75,52 +76,31 @@ impl Report {
     }
 }
 
-pub fn routes(documented: bool) -> crate::docs::RouteRegistry {
-    crate::docs::RouteRegistry::new(documented)
-        .register(crate::docs::register!(list))
-        .register(crate::docs::register!(one))
+pub fn routes() -> Router<App> {
+    Router::new()
+        .route("/calls", get(list))
+        .route("/calls/{id}", get(one))
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct Call {
     id: i64,
-    #[schema(required)]
     session_id: Option<i64>,
     model_id: i64,
-    #[schema(required)]
     reasoning_effort: Option<String>,
-    #[schema(required)]
     input_end_position: Option<i64>,
-    /// 调用开始时的 Unix 毫秒时间戳。
     started_at: i64,
-    /// 调用结束时的 Unix 毫秒时间戳。
-    #[schema(required)]
     finished_at: Option<i64>,
-    /// in_flight、succeeded、failed、cancelled 或 interrupted。
-    #[schema(pattern = "^(in_flight|succeeded|failed|cancelled|interrupted)$")]
     status: String,
-    #[schema(required)]
     upstream_response_id: Option<String>,
-    #[schema(required)]
     http_status: Option<i64>,
-    #[schema(required)]
     error_summary: Option<String>,
-    /// 供应商返回的原始 usage 对象。
-    #[schema(required, value_type = Option<Object>)]
     raw_usage: Option<Value>,
-    #[schema(required)]
     input_uncached_tokens: Option<i64>,
-    #[schema(required)]
     cache_read_tokens: Option<i64>,
-    #[schema(required)]
     cache_write_tokens: Option<i64>,
-    #[schema(required)]
     output_tokens: Option<i64>,
-    /// 记录调用时选用的 UTC 价目表版本、时段和阶梯。
-    #[schema(required, value_type = Option<pricing::PricingSnapshot>)]
     pricing_snapshot: Option<Value>,
-    /// 费用，单位为十亿分之一美元。无法结算时为 null。
-    #[schema(required)]
     cost_nano_usd: Option<i64>,
 }
 
@@ -147,33 +127,16 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Call> {
     })
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[into_params(parameter_in = Query)]
 struct Filter {
     session_id: Option<i64>,
     model_id: Option<i64>,
     #[serde(default)]
-    #[param(minimum = 0, default = 0)]
     after: i64,
-    #[param(minimum = 1, maximum = 200, default = 50)]
     limit: Option<i64>,
 }
 
-/// 查询模型调用记录
-///
-/// 按调用 ID 升序分页，可按会话或模型筛选。
-#[utoipa::path(
-    get,
-    path = "/calls",
-    tag = "调用记录",
-    params(Filter),
-    responses(
-        (status = 200, description = "查询模型调用记录", body = Vec<Call>),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn list(State(app): State<App>, Query(q): Query<Filter>) -> Result<Json<Vec<Call>>> {
     let limit = q.limit.unwrap_or(50);
     if q.after < 0 || !(1..=200).contains(&limit) {
@@ -185,19 +148,6 @@ async fn list(State(app): State<App>, Query(q): Query<Filter>) -> Result<Json<Ve
     }).await
 }
 
-/// 读取模型调用详情
-#[utoipa::path(
-    get,
-    path = "/calls/{id}",
-    tag = "调用记录",
-    params(("id" = i64, Path, description = "调用 ID")),
-    responses(
-        (status = 200, description = "读取模型调用详情", body = Call),
-        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn one(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Call>> {
     app.db
         .call(move |s| {

@@ -363,28 +363,13 @@ impl Store {
     }
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize)]
 pub struct HistoryItem {
     id: i64,
     kind: String,
-    /// 由 kind 决定的内容对象。
-    #[schema(value_type = Object)]
     payload: Value,
-    #[schema(required)]
     target_id: Option<i64>,
-    #[schema(required)]
     llm_call_id: Option<i64>,
-}
-
-/// 按 position 排序的上下文记录，由 SQLite 直接流式输出。
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub struct ContextItem {
-    position: i64,
-    item_id: i64,
-    #[schema(required)]
-    llm_call_id: Option<i64>,
-    #[schema(value_type = Object)]
-    payload: Value,
 }
 
 fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
@@ -404,23 +389,16 @@ pub fn session(conn: &Connection, sid: i64) -> Result<Session> {
     Ok(stmt.query_row([sid], session_row)?)
 }
 
-#[derive(serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize)]
 pub struct Session {
-    /// 会话 ID。
     id: i64,
-    /// 当前运行状态。
     pub status: SessionStatus,
-    /// 推理强度。未指定时为 null。
-    #[schema(required)]
     reasoning_effort: Option<String>,
-    /// 最近的错误或暂停原因。无记录时为空字符串。
     pub last_error: String,
-    /// 选中的模型 ID。未选择时为 null。
-    #[schema(required)]
     pub model_id: Option<i64>,
 }
 
-#[derive(PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+#[derive(PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     Idle,

@@ -1,4 +1,5 @@
 mod capabilities;
+mod client;
 mod config;
 mod content;
 pub(crate) mod diagnostics;
@@ -9,14 +10,7 @@ pub use config::routes;
 
 use crate::{App, Error, Result, codemode::Reply, store::Db};
 use capabilities::AttemptError;
-use rmcp::{
-    RoleClient,
-    model::{PaginatedRequestParams, ProtocolVersion},
-    service::{ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, RunningService},
-    transport::{
-        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
-    },
-};
+use client::{Client, McpError};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -38,7 +32,6 @@ const BYTE_LIMIT: usize = 2 * 1024 * 1024;
 const WIRE_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-type Client = RunningService<RoleClient, ()>;
 
 #[derive(Default)]
 struct Slot {
@@ -132,13 +125,13 @@ pub async fn close(db: &Db) -> Result<()> {
         slot.retire();
         match Arc::try_unwrap(slot) {
             Ok(slot) => {
-                if let Some(mut client) = slot.client.into_inner() {
-                    let _ = client.close_with_timeout(Duration::from_secs(1)).await;
+                if let Some(client) = slot.client.into_inner() {
+                    client.close(Duration::from_secs(1)).await;
                 }
             }
             Err(slot) => {
                 if let Some(client) = slot.client.get() {
-                    client.cancellation_token().cancel();
+                    client.cancel();
                 }
             }
         }
@@ -172,26 +165,12 @@ pub async fn reap_idle(db: Db, stop: CancellationToken) {
 }
 
 async fn connect(app: &App, endpoint: config::Endpoint) -> std::result::Result<Client, String> {
-    let lifecycle = ClientLifecycleMode::Auto {
-        preferred_versions: ProtocolVersion::KNOWN_VERSIONS
-            .iter()
-            .rev()
-            .cloned()
-            .collect(),
-        legacy_version: Some(ProtocolVersion::LATEST_WITH_INITIALIZE),
-    };
     let client = match endpoint.transport {
         config::Transport::Http {
             url,
             headers,
             oauth,
         } => {
-            let mut transport =
-                StreamableHttpClientTransportConfig::with_uri(url).reinit_on_expired_session(false);
-            transport.custom_headers = headers;
-            transport.max_json_response_size = WIRE_LIMIT;
-            transport.max_sse_event_size = WIRE_LIMIT;
-            transport.max_error_response_size = 1024;
             let http = oauth::HttpClient::new(
                 app.client.clone(),
                 app.db.clone(),
@@ -201,41 +180,19 @@ async fn connect(app: &App, endpoint: config::Endpoint) -> std::result::Result<C
                 endpoint.allow_disabled,
             )
             .await?;
-            ().serve_with_lifecycle(
-                StreamableHttpClientTransport::with_client(http, transport),
-                lifecycle,
-            )
-            .await
+            Client::connect_http(http, url, headers).await
         }
         config::Transport::Stdio(config) => {
             // PATH and cwd can be on a slow filesystem. Starting the child must not stall the
             // daemon's single I/O thread. Its RAII guard also owns cleanup if this wait is cancelled.
-            let transport = tokio::task::spawn_blocking(move || stdio::spawn(config))
+            let spawned = tokio::task::spawn_blocking(move || stdio::spawn(config))
                 .await
                 .map_err(|_| "MCP stdio launch worker stopped")?
                 .map_err(|e| format!("MCP stdio launch failed ({})", e.kind()))?;
-            ().serve_with_lifecycle(transport, lifecycle).await
+            Client::connect_stdio(spawned).await
         }
     }
     .map_err(errors::handshake)?;
-    // Do not cache binary reads or dynamic catalogs without a change subscription.
-    let volatile = client.peer_info().is_some_and(|info| {
-        let caps = &info.capabilities;
-        caps.resources.is_some()
-            || !info.protocol_version.has_initialize()
-                && (caps.tools.as_ref().and_then(|t| t.list_changed) == Some(true)
-                    || caps.prompts.as_ref().and_then(|p| p.list_changed) == Some(true))
-    });
-    let cache = if volatile {
-        ClientCacheConfig::disabled()
-    } else {
-        ClientCacheConfig::default()
-            .with_default_ttl(Duration::from_secs(5))
-            .with_max_ttl(Duration::from_secs(30))
-            .with_max_entries(4)
-            .with_serve_stale_on_error(false)
-    };
-    client.set_response_cache_config(cache).await;
     Ok(client)
 }
 
@@ -258,35 +215,43 @@ async fn discover(
     for _ in 0..64 {
         slot.check()?;
         seen.insert(cursor.clone());
-        let page = client
-            .list_tools(cursor.map(|c| PaginatedRequestParams::default().with_cursor(Some(c))))
-            .await?;
-        if page.tools.len() > 4096 {
+        let mut page = client.list_tools(cursor).await?;
+        let raw_tools = page
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .ok_or(McpError::InvalidResponse)?;
+        if raw_tools.len() > 4096 {
             return Err("MCP server returned more than 4096 tools in one page"
                 .to_owned()
                 .into());
         }
-        count += page.tools.len();
-        cursor = capabilities::checked_cursor(page.next_cursor)?;
+        count += raw_tools.len();
+        cursor = capabilities::next_cursor(&page)?;
         if cursor.is_some() && seen.contains(&cursor) {
             return Err("MCP tool list repeated a cursor".to_string().into());
         }
-        let tools: Vec<_> = page
-            .tools
-            .into_iter()
-            .filter(|t| allowed.is_none_or(|names| names.contains(t.name.as_ref())))
-            .filter(|t| {
-                filter.is_empty()
-                    || t.name.to_lowercase().contains(&filter)
-                    || t.description
-                        .as_ref()
-                        .is_some_and(|s| s.to_lowercase().contains(&filter))
-            })
-            .map(|t| {
-                slot.remember_fields(&t.input_schema);
-                json!({"name":t.name,"description":t.description,"inputSchema":t.input_schema})
-            })
-            .collect();
+        let mut tools = Vec::new();
+        for tool in raw_tools {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                return Err(McpError::InvalidResponse.into());
+            };
+            if !allowed.is_none_or(|names| names.contains(name)) {
+                continue;
+            }
+            let description = tool.get("description").and_then(Value::as_str);
+            if !(filter.is_empty()
+                || name.to_lowercase().contains(&filter)
+                || description.is_some_and(|s| s.to_lowercase().contains(&filter)))
+            {
+                continue;
+            }
+            let Some(schema) = tool.get("inputSchema").and_then(Value::as_object) else {
+                return Err(McpError::InvalidResponse.into());
+            };
+            slot.remember_fields(schema);
+            tools.push(json!({"name":name,"description":description,"inputSchema":schema}));
+        }
         if !tools.is_empty() || cursor.is_none() || count >= 4096 {
             return Ok(Reply::value(json!({"tools":tools,"nextCursor":cursor})));
         }

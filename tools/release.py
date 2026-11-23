@@ -12,11 +12,27 @@ import tempfile
 
 
 def build(target):
+    env = os.environ.copy()
+    flag = "-C force-unwind-tables=no"
+    target_var = f"CARGO_TARGET_{target.upper().replace('-', '_')}_RUSTFLAGS"
+    if "CARGO_ENCODED_RUSTFLAGS" in env:
+        items = [x for x in env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f") if x]
+        if "-Cforce-unwind-tables=no" not in items and "force-unwind-tables=no" not in items:
+            items.extend(["-C", "force-unwind-tables=no"])
+        env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(items)
+    elif target_var in env:
+        if "force-unwind-tables=" not in env[target_var]:
+            env[target_var] = f"{env[target_var]} {flag}".strip()
+    elif "RUSTFLAGS" in env:
+        if "force-unwind-tables=" not in env["RUSTFLAGS"]:
+            env["RUSTFLAGS"] = f"{env['RUSTFLAGS']} {flag}".strip()
+    else:
+        env[target_var] = flag
     command = [
         "cargo", "build", "--locked", "--release", "--bin", "mygo-bot",
         "--target", target, "--message-format=json-render-diagnostics",
     ]
-    output = subprocess.check_output(command, text=True, encoding="utf-8")
+    output = subprocess.check_output(command, text=True, encoding="utf-8", env=env)
     for line in output.splitlines():
         event = json.loads(line)
         if event["reason"] != "compiler-artifact" or not event["executable"]:

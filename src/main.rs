@@ -20,9 +20,19 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use clap::{CommandFactory, Parser};
 use serde::Serialize;
-use std::{fmt, io, net::SocketAddr, path::Path, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
+    path::Path,
+    process::ExitCode,
+    sync::Arc,
+    time::Duration,
+};
+#[cfg(unix)]
+use std::path::PathBuf;
 use store::Db;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -60,7 +70,7 @@ impl From<std::io::Error> for Error {
         Self::internal(e.to_string())
     }
 }
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct ErrorBody {
     error: String,
 }
@@ -81,54 +91,244 @@ struct App {
     workers: TaskTracker,
 }
 
-#[derive(Parser)]
-#[command(version, about = "Run the MyGo-Bot HTTP and SSE API")]
+#[cfg(unix)]
+const HELP_SOCKET_OPTIONS: &str = "\
+      --unix-socket <PATH>  Local socket (no token). Defaults to $XDG_RUNTIME_DIR/mygo-bot.sock or a private mygo-bot-<uid> directory under the system temp directory\n\
+      --no-unix-socket      Disable the local Unix socket and serve only TCP\n";
+#[cfg(not(unix))]
+const HELP_SOCKET_OPTIONS: &str = "";
+
+fn print_help() {
+    print!(
+        "Run the MyGo-Bot HTTP and SSE API\n\n\
+Usage: mygo-bot [OPTIONS]\n\n\
+Options:\n\
+      --daemon              Start the server in the background and append logs to ./mygo-bot.log\n\
+      --foreground          With --daemon, keep the server attached to this terminal and log to stderr\n\
+      --js-threads <COUNT>  Fixed number of JavaScript worker threads (defaults to at most four logical CPUs)\n\
+      --listen <IP:PORT>    TCP bind address. Port 0 lets the OS choose a free port [default: 127.0.0.1:0]\n\
+      --token <TOKEN>       TCP Bearer token. Omit to generate a token and print it once at startup\n\
+{HELP_SOCKET_OPTIONS}\
+  -h, --help                Print help\n\
+  -V, --version             Print version\n"
+    );
+}
+
 struct Options {
-    /// Start the server in the background and append logs to ./mygo-bot.log.
-    #[arg(long)]
     daemon: bool,
-    /// With --daemon, keep the server attached to this terminal and log to stderr.
-    #[arg(long)]
     foreground: bool,
-    /// Fixed number of JavaScript worker threads (defaults to at most four logical CPUs).
-    #[arg(long, value_name = "COUNT")]
-    js_threads: Option<std::num::NonZeroUsize>,
-    /// TCP bind address. Port 0 lets the OS choose a free port.
-    #[arg(long, default_value = "127.0.0.1:0", value_name = "IP:PORT")]
+    js_threads: Option<NonZeroUsize>,
     listen: SocketAddr,
-    /// TCP Bearer token. Omit to generate a token and print it once at startup.
-    #[arg(long, value_name = "TOKEN")]
     token: Option<String>,
-    /// Local socket (no token). Defaults to $XDG_RUNTIME_DIR/mygo-bot.sock or a private mygo-bot-<uid> directory under the system temp directory.
     #[cfg(unix)]
-    #[arg(long, value_name = "PATH")]
-    unix_socket: Option<std::path::PathBuf>,
-    /// Disable the local Unix socket and serve only TCP.
+    unix_socket: Option<PathBuf>,
     #[cfg(unix)]
-    #[arg(long, conflicts_with = "unix_socket")]
     no_unix_socket: bool,
 }
 
+enum Cli {
+    Run(Options),
+    Exit(ExitCode),
+}
+
+fn split_long_eq(arg: &OsStr) -> Option<(&str, OsString)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = arg.as_bytes();
+        let eq = bytes.iter().position(|&b| b == b'=')?;
+        let key = std::str::from_utf8(&bytes[..eq]).ok()?;
+        Some((key, OsString::from_vec(bytes[eq + 1..].to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        let text = arg.to_str()?;
+        let (key, val) = text.split_once('=')?;
+        Some((key, OsString::from(val)))
+    }
+}
+
+fn take_os_value(
+    inline: Option<OsString>,
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> std::result::Result<OsString, String> {
+    match inline {
+        Some(value) => Ok(value),
+        None => args
+            .next()
+            .ok_or_else(|| format!("a value is required for '{flag}' but none was supplied")),
+    }
+}
+
+fn take_str_value(
+    inline: Option<OsString>,
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> std::result::Result<String, String> {
+    take_os_value(inline, args, flag)?
+        .into_string()
+        .map_err(|_| format!("invalid UTF-8 value for '{flag}'"))
+}
+
+impl Options {
+    fn parse() -> Cli {
+        match Self::parse_inner() {
+            Ok(cli) => cli,
+            Err(reason) => {
+                eprintln!("error: {reason}\n\nUsage: mygo-bot [OPTIONS]");
+                Cli::Exit(ExitCode::from(2))
+            }
+        }
+    }
+
+    fn parse_inner() -> std::result::Result<Cli, String> {
+        let mut daemon = false;
+        let mut foreground = false;
+        let mut js_threads: Option<NonZeroUsize> = None;
+        let mut listen: Option<SocketAddr> = None;
+        let mut token: Option<String> = None;
+        #[cfg(unix)]
+        let mut unix_socket: Option<PathBuf> = None;
+        #[cfg(unix)]
+        let mut no_unix_socket = false;
+
+        let mut args = std::env::args_os().skip(1);
+        while let Some(arg) = args.next() {
+            let (flag, inline) = match split_long_eq(&arg) {
+                Some((key, val)) => (key.to_owned(), Some(val)),
+                None => match arg.into_string() {
+                    Ok(s) => (s, None),
+                    Err(_) => return Err("unexpected non-UTF-8 argument".into()),
+                },
+            };
+            match flag.as_str() {
+                "-h" | "--help" if inline.is_none() => {
+                    print_help();
+                    return Ok(Cli::Exit(ExitCode::SUCCESS));
+                }
+                "-V" | "--version" if inline.is_none() => {
+                    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                    return Ok(Cli::Exit(ExitCode::SUCCESS));
+                }
+                "--daemon" if inline.is_none() => {
+                    if daemon {
+                        return Err("the argument '--daemon' cannot be used multiple times".into());
+                    }
+                    daemon = true;
+                }
+                "--foreground" if inline.is_none() => {
+                    if foreground {
+                        return Err(
+                            "the argument '--foreground' cannot be used multiple times".into(),
+                        );
+                    }
+                    foreground = true;
+                }
+                "--js-threads" => {
+                    if js_threads.is_some() {
+                        return Err(
+                            "the argument '--js-threads <COUNT>' cannot be used multiple times"
+                                .into(),
+                        );
+                    }
+                    let val = take_str_value(inline, &mut args, "--js-threads")?;
+                    js_threads = Some(
+                        val.parse::<NonZeroUsize>()
+                            .map_err(|e| format!("invalid value '{val}' for '--js-threads': {e}"))?,
+                    );
+                }
+                "--listen" => {
+                    if listen.is_some() {
+                        return Err(
+                            "the argument '--listen <IP:PORT>' cannot be used multiple times"
+                                .into(),
+                        );
+                    }
+                    let val = take_str_value(inline, &mut args, "--listen")?;
+                    listen = Some(
+                        val.parse::<SocketAddr>()
+                            .map_err(|e| format!("invalid value '{val}' for '--listen': {e}"))?,
+                    );
+                }
+                "--token" => {
+                    if token.is_some() {
+                        return Err(
+                            "the argument '--token <TOKEN>' cannot be used multiple times".into(),
+                        );
+                    }
+                    token = Some(take_str_value(inline, &mut args, "--token")?);
+                }
+                #[cfg(unix)]
+                "--unix-socket" => {
+                    if unix_socket.is_some() {
+                        return Err(
+                            "the argument '--unix-socket <PATH>' cannot be used multiple times"
+                                .into(),
+                        );
+                    }
+                    if no_unix_socket {
+                        return Err(
+                            "the argument '--unix-socket <PATH>' cannot be used with '--no-unix-socket'"
+                                .into(),
+                        );
+                    }
+                    unix_socket = Some(PathBuf::from(take_os_value(
+                        inline,
+                        &mut args,
+                        "--unix-socket",
+                    )?));
+                }
+                #[cfg(unix)]
+                "--no-unix-socket" if inline.is_none() => {
+                    if no_unix_socket {
+                        return Err(
+                            "the argument '--no-unix-socket' cannot be used multiple times".into(),
+                        );
+                    }
+                    if unix_socket.is_some() {
+                        return Err(
+                            "the argument '--no-unix-socket' cannot be used with '--unix-socket <PATH>'"
+                                .into(),
+                        );
+                    }
+                    no_unix_socket = true;
+                }
+                other if other.starts_with('-') => {
+                    return Err(format!("unexpected argument '{other}' found"));
+                }
+                other => {
+                    return Err(format!("unexpected argument '{other}' found"));
+                }
+            }
+        }
+        Ok(Cli::Run(Options {
+            daemon,
+            foreground,
+            js_threads,
+            listen: listen.unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            token,
+            #[cfg(unix)]
+            unix_socket,
+            #[cfg(unix)]
+            no_unix_socket,
+        }))
+    }
+}
+
 fn main() -> ExitCode {
-    let options = Options::parse();
+    let options = match Options::parse() {
+        Cli::Run(options) => options,
+        Cli::Exit(code) => return code,
+    };
     if !options.daemon {
-        Options::command()
-            .print_help()
-            .unwrap_or_else(|e| clap::Error::from(e).exit());
+        print_help();
         return ExitCode::SUCCESS;
     }
-    use tracing_subscriber::{filter::Targets, prelude::*};
-    // The SDK logs peer-supplied payloads and session IDs. Only emit MyGo's MCP summaries.
-    let targets = Targets::new()
-        .with_default(tracing::Level::INFO)
-        .with_target("rmcp", tracing::level_filters::LevelFilter::OFF);
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_writer(io::stderr),
-        )
-        .with(targets)
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .with_writer(io::stderr)
         .init();
     match daemon::start(options) {
         Ok(()) => ExitCode::SUCCESS,

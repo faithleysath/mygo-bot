@@ -7,6 +7,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
+    routing::{delete, get, post, put},
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -46,63 +47,34 @@ pub async fn authorize_tcp(
     }
 }
 
-#[derive(utoipa::OpenApi)]
-#[openapi(
-    components(schemas(Selection)),
-    info(
-        title = "MyGo-Bot API",
-        description = "输入服务的 Bearer token，即可在本页试调接口。"
-    )
-)]
-struct ApiDoc;
-
 pub fn routes(app: App) -> Router {
-    let (router, _) = registry(crate::docs::RouteRegistry::Bare(Router::new()), false).into_parts();
-    router.with_state(app)
+    Router::new()
+        .route("/config", get(get_config).patch(patch_config))
+        .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{sid}", get(get_session).patch(patch_session))
+        .route("/sessions/{sid}/messages", post(enqueue).get(messages))
+        .route("/sessions/{sid}/messages/{mid}", delete(withdraw))
+        .route("/sessions/{sid}/run", put(agent::start).delete(agent::pause))
+        .route("/sessions/{sid}/history", get(history))
+        .route("/sessions/{sid}/context", get(context))
+        .route("/sessions/{sid}/events", get(events::subscribe))
+        .merge(crate::catalog::routes())
+        .merge(crate::mcp::routes())
+        .merge(crate::mcp::diagnostics::routes())
+        .merge(crate::media::routes())
+        .merge(crate::calls::routes())
+        .with_state(app)
 }
 
-pub(crate) fn openapi() -> utoipa::openapi::OpenApi {
-    use utoipa::OpenApi;
-    let documented = crate::docs::RouteRegistry::Documented(Box::new(
-        utoipa_axum::router::OpenApiRouter::with_openapi(ApiDoc::openapi()),
-    ));
-    registry(documented, true)
-        .into_parts()
-        .1
-        .expect("documented routes")
-}
-
-fn registry(registry: crate::docs::RouteRegistry, documented: bool) -> crate::docs::RouteRegistry {
-    registry
-        .register(crate::docs::register!(get_config, patch_config))
-        .register(crate::docs::register!(list_sessions, create_session))
-        .register(crate::docs::register!(get_session, patch_session))
-        .register(crate::docs::register!(enqueue, messages))
-        .register(crate::docs::register!(withdraw))
-        .register(crate::docs::register!(agent::start, agent::pause))
-        .register(crate::docs::register!(history))
-        .register(crate::docs::register!(context))
-        .register(crate::docs::register!(events::subscribe))
-        .merge(crate::catalog::routes(documented))
-        .merge(crate::mcp::routes(documented))
-        .merge(crate::mcp::diagnostics::routes(documented))
-        .merge(crate::media::routes(documented))
-        .merge(crate::calls::routes(documented))
-}
-
-type ConfigPatch = crate::docs::Patch<Config>;
-type SelectionPatch = crate::docs::Patch<Selection>;
 type Document = Json<Map<String, Value>>;
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
-    #[schema(required)]
     default_model_id: Option<i64>,
-    #[schema(required)]
     default_reasoning_effort: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
     model_id: Option<i64>,
@@ -164,38 +136,12 @@ impl Selection {
     }
 }
 
-/// 读取默认模型设置
-#[utoipa::path(
-    get,
-    path = "/config",
-    tag = "配置",
-    responses(
-        (status = 200, description = "读取默认模型设置", body = Config),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn get_config(State(app): State<App>) -> Result<Json<Config>> {
     app.db
         .call(|s| Ok(Json(Selection::defaults(&s.conn)?.config())))
         .await
 }
-/// 更新默认模型设置
-///
-/// 至少传一个字段。省略的字段沿用当前值。default_model_id 为 null 时清除默认模型，同时清除原推理强度。
-#[utoipa::path(
-    patch,
-    path = "/config",
-    tag = "配置",
-    request_body = ConfigPatch,
-    responses(
-        (status = 200, description = "更新默认模型设置", body = Config),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
-        crate::docs::ServiceErrors,
-        crate::docs::JsonBodyErrors
-    )
-)]
+
 async fn patch_config(State(app): State<App>, Json(fields): Document) -> Result<Json<Config>> {
     let mut selection = Map::new();
     for (key, value) in fields {
@@ -222,23 +168,6 @@ async fn patch_config(State(app): State<App>, Json(fields): Document) -> Result<
         .await
 }
 
-/// 创建会话
-///
-/// 可发送空对象以使用默认配置，也可用 model_id 和 reasoning_effort 覆盖默认值。
-#[utoipa::path(
-    post,
-    path = "/sessions",
-    tag = "会话",
-    request_body(content = ref("#/components/schemas/Selection"), content_type = "application/json", example = json!({})),
-    responses(
-        (status = 201, description = "创建成功", body = Session),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
-        crate::docs::ServiceErrors,
-        crate::docs::JsonBodyErrors
-    )
-)]
 async fn create_session(
     State(app): State<App>,
     body: Option<Document>,
@@ -261,40 +190,11 @@ async fn create_session(
         .await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
-/// 读取会话
-#[utoipa::path(
-    get,
-    path = "/sessions/{sid}",
-    tag = "会话",
-    params(("sid" = i64, Path, description = "会话 ID")),
-    responses(
-        (status = 200, description = "读取会话", body = Session),
-        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
+
 async fn get_session(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Session>> {
     app.db.call(move |s| Ok(Json(session(&s.conn, sid)?))).await
 }
-/// 更新会话模型设置
-///
-/// 省略字段表示保留。传 model_id: null 可清空空会话的模型，也会清除原推理强度。
-#[utoipa::path(
-    patch,
-    path = "/sessions/{sid}",
-    tag = "会话",
-    params(("sid" = i64, Path, description = "会话 ID")),
-    request_body = SelectionPatch,
-    responses(
-        (status = 200, description = "更新会话模型设置", body = Session),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
-        crate::docs::ServiceErrors,
-        crate::docs::JsonBodyErrors
-    )
-)]
+
 async fn patch_session(
     State(app): State<App>,
     Path(sid): Path<i64>,
@@ -341,17 +241,12 @@ async fn patch_session(
         .await
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[into_params(parameter_in = Query)]
 struct Page {
-    /// 上一页末项的游标，默认从 0 开始。
     #[serde(default)]
-    #[param(minimum = 0, default = 0)]
     after: i64,
-    /// 最多返回的记录数。
     #[serde(default = "default_limit")]
-    #[param(minimum = 1, maximum = 200, default = default_limit)]
     limit: i64,
 }
 fn default_limit() -> i64 {
@@ -366,16 +261,7 @@ impl Page {
         }
     }
 }
-/// 查询会话列表
-///
-/// 按 ID 升序返回会话。下一页使用本页最后一个会话的 ID 作为 `after`。
-#[utoipa::path(get, path = "/sessions", tag = "会话", params(Page), responses(
-    (status = 200, description = "当前页的会话", body = Vec<Session>,
-        example = json!([{"id": 1, "status": "idle", "model_id": null, "reasoning_effort": null, "last_error": ""}])),
-    (status = 400, description = "分页参数越界（JSON）或无法解析查询参数（纯文本）",
-        content((ErrorBody = "application/json"), (String = "text/plain"))),
-    crate::docs::ServiceErrors
-))]
+
 async fn list_sessions(
     State(app): State<App>,
     Query(page): Query<Page>,
@@ -394,46 +280,23 @@ async fn list_sessions(
         .await
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Message {
-    #[schema(value_type = Vec<crate::media::ContentBlock>, min_items = 1)]
     content: Value,
 }
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct MessageId {
     id: i64,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct QueuedMessage {
     id: i64,
-    #[schema(value_type = Vec<crate::media::ContentBlock>)]
     content: Value,
-    /// queued、included 或 withdrawn。
-    #[schema(pattern = "^(queued|included|withdrawn)$")]
     status: String,
 }
 
-/// 提交用户消息
-///
-/// content 是非空内容块数组。相同的幂等键和内容重试返回已有消息，不同内容返回 409。
-#[utoipa::path(
-    post,
-    path = "/sessions/{sid}/messages",
-    tag = "消息",
-    params(("sid" = i64, Path, description = "会话 ID"), ("Idempotency-Key" = Option<String>, Header, description = "可选，去除首尾空白后为 1 到 256 字节。")),
-    request_body(content = Message, example = json!({"content":[{"type":"text","text":"你好"}]})),
-    responses(
-        (status = 201, description = "创建成功", body = MessageId),
-        (status = 200, description = "命中已提交的幂等消息", body = MessageId),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
-        crate::docs::ServiceErrors,
-        crate::docs::JsonBodyErrors
-    )
-)]
 async fn enqueue(
     State(app): State<App>,
     Path(sid): Path<i64>,
@@ -459,36 +322,17 @@ async fn enqueue(
     };
     Ok((status, Json(MessageId { id })))
 }
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[into_params(parameter_in = Query)]
 struct Filter {
     id: Option<i64>,
-    /// queued、included 或 withdrawn。
-    #[param(pattern = "^(queued|included|withdrawn)$")]
     status: Option<String>,
     #[serde(default)]
-    #[param(minimum = 0, default = 0)]
     after: i64,
     #[serde(default = "default_limit")]
-    #[param(minimum = 1, maximum = 200, default = default_limit)]
     limit: i64,
 }
-/// 查询会话消息
-///
-/// 按消息 ID 升序分页，支持按消息 ID 和状态筛选。
-#[utoipa::path(
-    get,
-    path = "/sessions/{sid}/messages",
-    tag = "消息",
-    params(("sid" = i64, Path, description = "会话 ID"), Filter),
-    responses(
-        (status = 200, description = "查询会话消息", body = Vec<QueuedMessage>),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
+
 async fn messages(
     State(app): State<App>,
     Path(sid): Path<i64>,
@@ -540,22 +384,6 @@ async fn messages(
         })
         .await
 }
-/// 撤回排队的消息
-///
-/// 重复撤回返回 204。已进入上下文的消息无法撤回。
-#[utoipa::path(
-    delete,
-    path = "/sessions/{sid}/messages/{mid}",
-    tag = "消息",
-    params(("sid" = i64, Path, description = "会话 ID"), ("mid" = i64, Path, description = "消息 ID")),
-    responses(
-        (status = 204, description = "操作成功，无响应体", ),
-        (status = 400, description = "参数无法解析", body = String, content_type = "text/plain"),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn withdraw(
     State(app): State<App>,
     Path((sid, mid)): Path<(i64, i64)>,
@@ -598,21 +426,6 @@ async fn record_page(app: App, sid: i64, page: Page, rows: store::JsonRows) -> R
         .into_response())
 }
 
-/// 读取历史记录
-///
-/// 按历史记录 ID 升序分页，after 填上页末项的 id。
-#[utoipa::path(
-    get,
-    path = "/sessions/{sid}/history",
-    tag = "会话",
-    params(("sid" = i64, Path, description = "会话 ID"), Page),
-    responses(
-        (status = 200, description = "读取历史记录", body = Vec<store::HistoryItem>),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn history(
     State(app): State<App>,
     Path(sid): Path<i64>,
@@ -621,21 +434,6 @@ async fn history(
     record_page(app, sid, page, store::JsonRows::History).await
 }
 
-/// 读取模型上下文
-///
-/// 按上下文位置升序分页，after 填上页末项的 position。
-#[utoipa::path(
-    get,
-    path = "/sessions/{sid}/context",
-    tag = "会话",
-    params(("sid" = i64, Path, description = "会话 ID"), Page),
-    responses(
-        (status = 200, description = "读取模型上下文", body = Vec<store::ContextItem>),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
 async fn context(
     State(app): State<App>,
     Path(sid): Path<i64>,

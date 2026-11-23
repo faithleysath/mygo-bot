@@ -29,20 +29,6 @@ enum StartEffect {
 /// 启动或恢复会话
 ///
 /// 会话需要可用模型；没有待处理工作时返回当前会话。
-#[utoipa::path(
-    put,
-    path = "/sessions/{sid}/run",
-    tag = "运行",
-    params(("sid" = i64, Path, description = "会话 ID")),
-    responses(
-        (status = 200, description = "启动或恢复会话", body = Session),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        (status = 409, description = "当前状态与操作冲突", body = crate::ErrorBody),
-        (status = 503, description = "服务正在关闭", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
 pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Session>> {
     app.start_worker(sid, false).await
 }
@@ -151,35 +137,19 @@ impl App {
             .await
     }
 }
-#[derive(Deserialize, Default, utoipa::ToSchema)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 enum PauseMode {
     #[default]
     Soft,
     Hard,
 }
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[into_params(parameter_in = Query)]
 pub struct Pause {
     #[serde(default)]
-    /// soft 等待当前工作结束，hard 取消当前工作。默认 soft。
-    #[param(inline)]
     mode: PauseMode,
 }
-/// 暂停会话
-#[utoipa::path(
-    delete,
-    path = "/sessions/{sid}/run",
-    tag = "运行",
-    params(("sid" = i64, Path, description = "会话 ID"), Pause),
-    responses(
-        (status = 200, description = "暂停会话", body = Session),
-        (status = 400, description = "无效的参数或请求", content((crate::ErrorBody = "application/json"), (String = "text/plain"))),
-        (status = 404, description = "记录不存在", body = crate::ErrorBody),
-        crate::docs::ServiceErrors
-    )
-)]
 pub async fn pause(
     State(app): State<App>,
     Path(sid): Path<i64>,

@@ -1,25 +1,21 @@
 use std::collections::HashSet;
 
-use bigdecimal::{BigDecimal, RoundingMode, ToPrimitive};
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{Error, Result};
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PriceBook {
-    /// 只接受 UTC。
-    #[schema(pattern = "^UTC$", example = "UTC")]
     timezone: String,
-    #[schema(min_items = 1)]
     versions: Vec<Version>,
     #[serde(flatten)]
     calendar: Calendar,
 }
 
-#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 enum EffectiveFrom {
     UnixMillis(i64),
@@ -37,12 +33,10 @@ impl PriceBook {
     }
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Version {
-    /// 生效时刻，RFC3339 字符串或 Unix 毫秒时间戳。
     effective_from: EffectiveFrom,
-    #[schema(min_items = 1)]
     default_tiers: Vec<Tier>,
     #[serde(default)]
     periods: Vec<Period>,
@@ -50,39 +44,31 @@ struct Version {
     calendar: Calendar,
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize)]
 struct Calendar {
     holiday_dates: Option<Vec<String>>,
     covered_years: Option<Vec<i32>>,
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Period {
-    /// ISO 星期，星期一为 1，星期日为 7。
-    #[schema(min_items = 1)]
     weekdays: Vec<u8>,
-    /// 起始分钟（含）。
-    #[schema(maximum = 1439)]
     start_minute: u16,
-    /// 结束分钟（不含），必须大于起始分钟。
-    #[schema(minimum = 1, maximum = 1440)]
     end_minute: u16,
     #[serde(default)]
     exclude_holidays: bool,
     tiers: Vec<Tier>,
 }
 
-#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Tier {
-    /// 输入 token 数的闭区间上限。末档为 null，表示无上限。
     up_to_input_tokens: Option<i64>,
-    /// 每百万 token 的美元单价，使用非负十进制字符串。
     rates: Rates,
 }
 
-#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Rates {
     input: Option<String>,
@@ -129,14 +115,55 @@ impl Calendar {
     }
 }
 
-fn decimal(text: &str) -> Option<BigDecimal> {
+fn parse_decimal(text: &str) -> Option<(&str, &str)> {
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
     let (whole, fraction) = text.split_once('.').unwrap_or((text, "0"));
-    if digits(whole) && digits(fraction) {
-        text.parse().ok()
-    } else {
-        None
+    (digits(whole) && digits(fraction)).then_some((whole, fraction))
+}
+
+fn is_positive_decimal(text: &str) -> bool {
+    parse_decimal(text)
+        .is_some_and(|(whole, fraction)| whole.bytes().chain(fraction.bytes()).any(|b| b != b'0'))
+}
+
+fn add_scaled_cost(
+    rate: &str,
+    quantity: i64,
+    sum_int: &mut u128,
+    sum_frac: &mut Vec<u8>,
+) -> Option<()> {
+    let (whole, fraction) = parse_decimal(rate)?;
+    let qty = u128::try_from(quantity).ok()?;
+    // USD per million tokens to nano-USD per token is a factor of 1000.
+    let take = fraction.len().min(3);
+    let pad = 3 - take;
+    let mut int_val = 0u128;
+    for b in whole
+        .bytes()
+        .chain(fraction.as_bytes()[..take].iter().copied())
+        .chain(std::iter::repeat_n(b'0', pad))
+    {
+        int_val = int_val
+            .checked_mul(10)?
+            .checked_add(u128::from(b - b'0'))?;
     }
+    *sum_int = sum_int.checked_add(int_val.checked_mul(qty)?)?;
+
+    let rem_len = fraction[take..].trim_end_matches('0').len();
+    if rem_len > 0 {
+        if sum_frac.len() < rem_len {
+            sum_frac.resize(rem_len, 0);
+        }
+        let rem = &fraction.as_bytes()[take..take + rem_len];
+        let mut carry = 0u128;
+        for (slot, &digit) in sum_frac[..rem_len].iter_mut().zip(rem).rev() {
+            let prod = u128::from(digit - b'0') * qty + u128::from(*slot) + carry;
+            *slot = (prod % 10) as u8;
+            carry = prod / 10;
+        }
+        *sum_int = sum_int.checked_add(carry)?;
+    }
+    Some(())
 }
 
 fn validate_tiers(tiers: &[Tier]) -> Result<()> {
@@ -166,7 +193,7 @@ fn validate_tiers(tiers: &[Tier]) -> Result<()> {
         .into_iter()
         .flatten()
         {
-            if decimal(rate).is_none() {
+            if parse_decimal(rate).is_none() {
                 return Err(Error::bad(
                     "pricing rates must be nonnegative decimal strings",
                 ));
@@ -227,7 +254,7 @@ pub fn validate(pricing: &Value) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct PeriodRule<'a> {
     weekdays: &'a [u8],
     start_minute: u16,
@@ -235,16 +262,13 @@ struct PeriodRule<'a> {
     exclude_holidays: bool,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 pub struct PricingSnapshot<'a> {
     timezone: &'a str,
     effective_from: &'a EffectiveFrom,
-    #[schema(required)]
     period_index: Option<usize>,
-    #[schema(required)]
     period: Option<PeriodRule<'a>>,
     tiers: &'a [Tier],
-    #[schema(required)]
     matched_tier_index: Option<usize>,
 }
 
@@ -316,7 +340,8 @@ fn count(value: &Value) -> Option<i64> {
 
 impl Settlement {
     fn cost(&self, rates: &Rates) -> Option<i64> {
-        let mut total = BigDecimal::from(0);
+        let mut sum_int = 0u128;
+        let mut sum_frac = Vec::new();
         for (rate, quantity) in [
             (&rates.input, self.input_uncached_tokens?),
             (&rates.cache_read, self.cache_read_tokens?),
@@ -324,13 +349,13 @@ impl Settlement {
             (&rates.output, self.output_tokens?),
         ] {
             if quantity > 0 {
-                total += decimal(rate.as_deref()?)? * BigDecimal::from(quantity);
+                add_scaled_cost(rate.as_deref()?, quantity, &mut sum_int, &mut sum_frac)?;
             }
         }
-        // USD per million tokens to nano-USD per token is a factor of 1000.
-        (total * BigDecimal::from(1000))
-            .with_scale_round(0, RoundingMode::HalfUp)
-            .to_i64()
+        if sum_frac.first().is_some_and(|&digit| digit >= 5) {
+            sum_int = sum_int.checked_add(1)?;
+        }
+        i64::try_from(sum_int).ok()
     }
 }
 
@@ -360,8 +385,7 @@ pub fn settle(snapshot: Option<Value>, usage: Option<&Value>) -> Settlement {
     let separate_write_charge = rates
         .as_ref()
         .and_then(|r| r.cache_write.as_deref())
-        .and_then(decimal)
-        .is_some_and(|rate| rate > 0);
+        .is_some_and(is_positive_decimal);
     let details = &usage["input_tokens_details"];
     result.cache_read_tokens = count(&details["cached_tokens"]);
     if input == Some(0) && details.is_null() {
@@ -384,3 +408,4 @@ pub fn settle(snapshot: Option<Value>, usage: Option<&Value>) -> Settlement {
     result.cost_nano_usd = rates.as_ref().and_then(|rates| result.cost(rates));
     result
 }
+

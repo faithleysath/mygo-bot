@@ -1,22 +1,15 @@
-use super::{Client, content};
+use super::{Client, client::McpError, content};
 use crate::codemode::Reply;
-use rmcp::{
-    model::{
-        CallToolRequestParams, GetPromptRequestParams, PaginatedRequestParams,
-        ReadResourceRequestParams,
-    },
-    service::ServiceError,
-};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug)]
 pub(super) enum AttemptError {
-    Service(ServiceError),
+    Service(McpError),
     Local(String),
 }
 
-impl From<ServiceError> for AttemptError {
-    fn from(error: ServiceError) -> Self {
+impl From<McpError> for AttemptError {
+    fn from(error: McpError) -> Self {
         Self::Service(error)
     }
 }
@@ -50,66 +43,82 @@ pub(super) fn checked_cursor(cursor: Option<String>) -> Result<Option<String>, S
     Ok(cursor)
 }
 
-fn page(args: &Value) -> Result<Option<PaginatedRequestParams>, String> {
+pub(super) fn next_cursor(page: &Value) -> Result<Option<String>, AttemptError> {
+    let cursor = match page.get("nextCursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => return Err(McpError::InvalidResponse.into()),
+    };
+    Ok(checked_cursor(cursor)?)
+}
+
+fn page_cursor(args: &Value) -> Result<Option<String>, String> {
     match &args["cursor"] {
         Value::Null => Ok(None),
-        Value::String(cursor) => Ok(Some(
-            PaginatedRequestParams::default().with_cursor(Some(cursor.clone())),
-        )),
+        Value::String(cursor) => Ok(Some(cursor.clone())),
         _ => Err("expected a string MCP cursor".into()),
     }
 }
 
-/// Exactly one peer operation. These methods cancel an outstanding request on drop.
+/// Exactly one peer operation. Dropping the future cancels any stdio waiter.
 pub(super) async fn attempt(
     client: &Client,
     op: &str,
     args: &Value,
 ) -> Result<Reply, AttemptError> {
-    let peer = client.peer();
     let reply = match op {
         "mcp.call" => {
-            let params = CallToolRequestParams::new(string(args, "tool")?.to_owned())
-                .with_arguments(arguments(args)?);
-            let response = peer.call_tool(params).await?;
-            content::tool(response).map_err(|reason| format!(
-                "MCP tool replied, but its result could not be read: {reason}; check remote state before repeating a write"
-            ))?
+            let response = client.call_tool(string(args, "tool")?, arguments(args)?).await?;
+            content::tool(response).map_err(|reason| {
+                format!(
+                    "MCP tool replied, but its result could not be read: {reason}; check remote state before repeating a write"
+                )
+            })?
         }
         "mcp.resources" => {
-            let page = peer.list_resources(page(args)?).await?;
-            Reply::value(
-                json!({"resources":page.resources,"nextCursor":checked_cursor(page.next_cursor)?}),
-            )
+            let mut page = client.list_resources(page_cursor(args)?).await?;
+            let next = next_cursor(&page)?;
+            let resources = page
+                .get_mut("resources")
+                .filter(|v| v.is_array())
+                .map(Value::take)
+                .ok_or(McpError::InvalidResponse)?;
+            Reply::value(json!({"resources":resources,"nextCursor":next}))
         }
         "mcp.resourceTemplates" => {
-            let page = peer.list_resource_templates(page(args)?).await?;
-            Reply::value(
-                json!({"resourceTemplates":page.resource_templates,"nextCursor":checked_cursor(page.next_cursor)?}),
-            )
+            let mut page = client.list_resource_templates(page_cursor(args)?).await?;
+            let next = next_cursor(&page)?;
+            let templates = page
+                .get_mut("resourceTemplates")
+                .filter(|v| v.is_array())
+                .map(Value::take)
+                .ok_or(McpError::InvalidResponse)?;
+            Reply::value(json!({"resourceTemplates":templates,"nextCursor":next}))
         }
-        "mcp.readResource" => {
-            let params = ReadResourceRequestParams::new(string(args, "uri")?);
-            content::resource(peer.read_resource(params).await?)?
-        }
+        "mcp.readResource" => content::resource(client.read_resource(string(args, "uri")?).await?)?,
         "mcp.prompts" => {
-            let page = peer.list_prompts(page(args)?).await?;
-            Reply::value(
-                json!({"prompts":page.prompts,"nextCursor":checked_cursor(page.next_cursor)?}),
-            )
+            let mut page = client.list_prompts(page_cursor(args)?).await?;
+            let next = next_cursor(&page)?;
+            let prompts = page
+                .get_mut("prompts")
+                .filter(|v| v.is_array())
+                .map(Value::take)
+                .ok_or(McpError::InvalidResponse)?;
+            Reply::value(json!({"prompts":prompts,"nextCursor":next}))
         }
         "mcp.getPrompt" => {
-            let mut params = GetPromptRequestParams::new(string(args, "name")?);
-            if args.get("args").is_some() {
-                let args = arguments(args)?;
-                if args.values().any(|v| !v.is_string()) {
+            let prompt_args = if args.get("args").is_some() {
+                let parsed = arguments(args)?;
+                if parsed.values().any(|v| !v.is_string()) {
                     return Err(AttemptError::Local(
                         "MCP prompt argument values must be strings".into(),
                     ));
                 }
-                params = params.with_arguments(args);
-            }
-            content::prompt(peer.get_prompt(params).await?)?
+                Some(parsed)
+            } else {
+                None
+            };
+            content::prompt(client.get_prompt(string(args, "name")?, prompt_args).await?)?
         }
         _ => return Err(AttemptError::Local("unknown MCP operation".into())),
     };

@@ -1,9 +1,10 @@
 use super::{oauth, stdio};
 use crate::{App, Error, Result};
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
+    routing::get,
 };
 use reqwest::{
     Url,
@@ -14,18 +15,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-pub fn routes(documented: bool) -> crate::docs::RouteRegistry {
-    crate::docs::RouteRegistry::new(documented)
-        .register(crate::docs::register!(list_servers, create_server))
-        .register(crate::docs::register!(
-            get_server,
-            patch_server,
-            delete_server
-        ))
-        .merge(oauth::routes(documented))
+pub fn routes() -> Router<App> {
+    Router::new()
+        .route("/mcp/servers", get(list_servers).post(create_server))
+        .route(
+            "/mcp/servers/{id}",
+            get(get_server).patch(patch_server).delete(delete_server),
+        )
+        .merge(oauth::routes())
 }
 
-#[derive(Clone, Copy, Default, Deserialize, Serialize, utoipa::ToSchema, PartialEq)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 enum McpTransport {
     #[default]
@@ -33,10 +33,9 @@ enum McpTransport {
     Stdio,
 }
 
-#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct McpServerConfig {
-    /// 稳定的服务名，创建后不可改名。
     name: String,
     #[serde(default)]
     description: String,
@@ -44,28 +43,18 @@ struct McpServerConfig {
     enabled: bool,
     #[serde(default)]
     transport: McpTransport,
-    /// HTTP(S) 服务地址。查询参数只写。
     url: Option<String>,
-    /// 静态 HTTP 请求头。PATCH 省略时保留，空对象清除。
     #[serde(default)]
-    #[schema(write_only)]
     headers: BTreeMap<String, String>,
-    /// OAuth 客户端设置。传对象整体替换，null 关闭。
-    #[schema(write_only)]
     oauth: Option<oauth::Config>,
-    /// stdio 可执行文件，直接按 argv 启动。
     command: Option<String>,
     #[serde(default)]
-    #[schema(write_only)]
     args: Vec<String>,
     #[serde(default)]
-    #[schema(write_only)]
     env: BTreeMap<String, String>,
     cwd: Option<String>,
-    /// 精确工具原名，null 表示全部，空数组禁止工具调用。
     allowed_tools: Option<BTreeSet<String>>,
     #[serde(default = "timeout_ms")]
-    #[schema(minimum = 1, maximum = 86400000, default = 60000)]
     timeout_ms: u32,
 }
 fn enabled() -> bool {
@@ -74,10 +63,9 @@ fn enabled() -> bool {
 fn timeout_ms() -> u32 {
     60_000
 }
-type McpServerPatch = crate::docs::Patch<McpServerConfig>;
 type Fields = Json<Map<String, Value>>;
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct McpServerInfo {
     id: i64,
     name: String,
@@ -412,8 +400,6 @@ fn save(conn: &Connection, id: Option<i64>, fields: Fields) -> Result<(McpServer
     Ok((by_id(conn, id)?, auth_changed))
 }
 
-/// 列出 MCP 服务配置。只显示是否设置了请求头。
-#[utoipa::path(get, path="/mcp/servers", tag="MCP", responses((status=200,body=Vec<McpServerInfo>), crate::docs::ServiceErrors))]
 async fn list_servers(State(app): State<App>) -> Result<Json<Vec<McpServerInfo>>> {
     app.db
         .call(|s| {
@@ -426,13 +412,11 @@ async fn list_servers(State(app): State<App>) -> Result<Json<Vec<McpServerInfo>>
         })
         .await
 }
-/// 读取 MCP 服务配置。
-#[utoipa::path(get, path="/mcp/servers/{id}", tag="MCP", params(("id"=i64, Path)), responses((status=200,body=McpServerInfo),(status=404,body=crate::ErrorBody),crate::docs::ServiceErrors))]
+
 async fn get_server(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<McpServerInfo>> {
     app.db.call(move |s| by_id(&s.conn, id).map(Json)).await
 }
-/// 创建 Streamable HTTP 或 stdio 服务。默认启用，超时 60 秒。
-#[utoipa::path(post, path="/mcp/servers", tag="MCP", request_body=McpServerConfig, responses((status=201,body=McpServerInfo),(status=400,body=crate::ErrorBody),(status=409,body=crate::ErrorBody),crate::docs::ServiceErrors,crate::docs::JsonBodyErrors))]
+
 async fn create_server(
     State(app): State<App>,
     fields: Fields,
@@ -444,8 +428,7 @@ async fn create_server(
         )
         .await
 }
-/// 更新服务。已发出的调用可收尾，后续调用使用新配置。
-#[utoipa::path(patch, path="/mcp/servers/{id}", tag="MCP", params(("id"=i64, Path)),request_body=McpServerPatch, responses((status=200,body=McpServerInfo),(status=400,body=crate::ErrorBody),(status=404,body=crate::ErrorBody),crate::docs::ServiceErrors,crate::docs::JsonBodyErrors))]
+
 async fn patch_server(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -464,8 +447,7 @@ async fn patch_server(
         )
         .await
 }
-/// 删除服务及其配置。
-#[utoipa::path(delete, path="/mcp/servers/{id}", tag="MCP", params(("id"=i64, Path)), responses((status=204,description="已删除"),(status=404,body=crate::ErrorBody),crate::docs::ServiceErrors))]
+
 async fn delete_server(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
     app.db
         .write(

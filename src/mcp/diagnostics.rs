@@ -1,102 +1,101 @@
-use super::{Client, config, connect};
+use super::{
+    Client,
+    client::{KNOWN_VERSIONS, McpError},
+    config, connect,
+};
 use crate::{App, Result};
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, State},
-};
-use rmcp::{
-    model::{ErrorCode, ProtocolVersion},
-    service::ServiceError,
+    routing::post,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::time::Duration;
 use tokio::time::{Instant, timeout};
 
-pub(crate) fn routes(documented: bool) -> crate::docs::RouteRegistry {
-    crate::docs::RouteRegistry::new(documented).register(crate::docs::register!(test_server))
+pub(crate) fn routes() -> Router<App> {
+    Router::new().route("/mcp/servers/{id}/test", post(test_server))
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct ListSummary {
     operation: &'static str,
-    /// 首页条目数。
     count: usize,
     has_more: bool,
 }
 
-#[derive(Serialize, utoipa::ToSchema)]
+#[derive(Serialize)]
 struct Probe {
     id: i64,
     revision: i64,
     ok: bool,
-    /// 成功时为 complete，失败时为出错的握手或目录阶段。
     stage: &'static str,
-    /// 从开始握手到结束目录检查的耗时。
     elapsed_ms: u64,
     protocol_version: Option<String>,
-    /// 已成功读取的目录首页。服务未实现可选的资源模板目录时省略该项。
     lists: Vec<ListSummary>,
     error: Option<String>,
 }
 
 impl Probe {
-    fn page(&mut self, count: usize, has_more: bool) {
+    fn record_page(&mut self, page: &Value, field: &str) -> std::result::Result<(), String> {
+        let count = page
+            .get(field)
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .ok_or_else(|| list_error(McpError::InvalidResponse))?;
+        let has_more = page
+            .get("nextCursor")
+            .is_some_and(|v| !v.is_null());
         self.lists.push(ListSummary {
             operation: self.stage,
             count,
             has_more,
         });
+        Ok(())
     }
 
     async fn list(&mut self, client: &Client) -> std::result::Result<(), String> {
-        let info = client
-            .peer_info()
-            .ok_or("MCP handshake did not return server capabilities")?;
-        self.protocol_version = ProtocolVersion::KNOWN_VERSIONS
-            .contains(&info.protocol_version)
-            .then(|| info.protocol_version.to_string());
+        let info = client.peer_info();
+        self.protocol_version = KNOWN_VERSIONS
+            .contains(&info.protocol_version.as_str())
+            .then(|| info.protocol_version.clone());
         if info.capabilities.tools.is_some() {
             self.stage = "tools/list";
             let page = client.list_tools(None).await.map_err(list_error)?;
-            self.page(page.tools.len(), page.next_cursor.is_some());
+            self.record_page(&page, "tools")?;
         }
-        if info.capabilities.resources.is_some() {
+        if info.capabilities.resources {
             self.stage = "resources/list";
             let page = client.list_resources(None).await.map_err(list_error)?;
-            self.page(page.resources.len(), page.next_cursor.is_some());
+            self.record_page(&page, "resources")?;
             self.stage = "resources/templates/list";
             match client.list_resource_templates(None).await {
-                Ok(page) => self.page(page.resource_templates.len(), page.next_cursor.is_some()),
+                Ok(page) => self.record_page(&page, "resourceTemplates")?,
                 // MCP has no separate capability flag for template discovery.
-                Err(ServiceError::McpError(e)) if e.code == ErrorCode::METHOD_NOT_FOUND => (),
+                Err(McpError::Protocol { code: -32601, .. }) => (),
                 Err(e) => return Err(list_error(e)),
             }
         }
         if info.capabilities.prompts.is_some() {
             self.stage = "prompts/list";
             let page = client.list_prompts(None).await.map_err(list_error)?;
-            self.page(page.prompts.len(), page.next_cursor.is_some());
+            self.record_page(&page, "prompts")?;
         }
         Ok(())
     }
 }
 
-fn list_error(error: ServiceError) -> String {
-    if error.is_authorization_required() {
+fn list_error(error: McpError) -> String {
+    if error.is_auth_required() {
         return "MCP authentication required".into();
     }
-    if let ServiceError::McpError(error) = error {
-        return format!("MCP protocol error ({})", error.code.0);
+    if let McpError::Protocol { code, .. } = error {
+        return format!("MCP protocol error ({code})");
     }
     "MCP catalog request failed; check the connection and server capabilities".into()
 }
 
-/// 试连接 MCP 服务，可测试已停用的配置。握手后按能力读取目录首页，只返回条数和有无下一页。
-#[utoipa::path(post, path="/mcp/servers/{id}/test", tag="MCP", params(("id"=i64, Path)), responses(
-    (status=200, description="试连结果，ok 表示握手和目录读取是否成功", body=Probe),
-    (status=400, description="服务 ID 无效", body=String, content_type="text/plain"),
-    (status=404, body=crate::ErrorBody), (status=429,description="试连接并发已满",body=crate::ErrorBody), crate::docs::ServiceErrors
-))]
 async fn test_server(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Probe>> {
     let endpoint = app
         .db
@@ -137,8 +136,8 @@ async fn test_server(State(app): State<App>, Path(id): Path<i64>) -> Result<Json
         }
         Err(error) => probe.error = Some(error),
     }
-    if let Some(mut client) = client {
-        let _ = client.close_with_timeout(Duration::from_secs(1)).await;
+    if let Some(client) = client {
+        client.close(Duration::from_secs(1)).await;
     }
     Ok(Json(probe))
 }

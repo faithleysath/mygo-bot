@@ -1,29 +1,18 @@
+use super::client::OAuthHttp;
 use super::*;
-use futures_util::stream::BoxStream;
-use reqwest::header::{HeaderName, HeaderValue};
-use rmcp::{
-    model::ClientJsonRpcMessage,
-    transport::streamable_http_client::{
-        StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
-        StreamableHttpResponseLimits,
-    },
-};
-use sse_stream::{Error as SseError, Sse};
-
-type HttpResult<T> = std::result::Result<T, StreamableHttpError<reqwest::Error>>;
-type Headers = HashMap<HeaderName, HeaderValue>;
-type Events = BoxStream<'static, std::result::Result<Sse, SseError>>;
+use crate::mcp::client::McpError;
 
 struct Authorization {
     endpoint: String,
-    manager: AuthorizationManager,
+    oauth_http: OAuthHttp,
+    binding: Binding,
     account: Account,
     gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
 pub(in crate::mcp) struct HttpClient {
-    http: reqwest::Client,
+    pub(in crate::mcp) http: reqwest::Client,
     authorization: Option<Arc<Authorization>>,
 }
 
@@ -67,13 +56,12 @@ impl HttpClient {
                 revision,
                 generation,
             };
-            let manager = binding
-                .manager(&endpoint, &account)
-                .await
-                .map_err(|e| e.to_string())?;
+            let base = flow::discovery_base(&endpoint).map_err(|e| e.to_string())?;
+            let oauth_http = OAuthHttp::new(&base)?;
             Some(Arc::new(Authorization {
                 endpoint,
-                manager,
+                oauth_http,
+                binding,
                 account,
                 gate,
             }))
@@ -86,12 +74,15 @@ impl HttpClient {
         })
     }
 
-    async fn token(&self, uri: &str, supplied: Option<String>) -> HttpResult<Option<String>> {
+    pub(in crate::mcp) async fn acquire_token(
+        &self,
+        uri: &str,
+    ) -> std::result::Result<Option<String>, McpError> {
         let Some(auth) = &self.authorization else {
-            return Ok(supplied);
+            return Ok(None);
         };
-        if auth.endpoint != uri || supplied.is_some() {
-            return Err(AuthError::AuthorizationRequired.into());
+        if auth.endpoint != uri {
+            return Err(McpError::AuthRequired);
         }
         // Queued requests recheck expiry after the previous refresh commits. Once token
         // acquisition starts, finish a possible refresh even if this MCP operation times out:
@@ -100,140 +91,35 @@ impl HttpClient {
         let auth = auth.clone();
         let token = tokio::spawn(async move {
             let _guard = guard;
-            // rmcp's HTTP timeout is 30s. Bound all SDK/store work as well, with
-            // time left to commit a response received near that network deadline.
-            tokio::time::timeout(Duration::from_secs(45), auth.manager.get_access_token())
-                .await
-                .map_err(|_| {
-                    AuthError::TokenRefreshFailed("MCP OAuth token acquisition timed out".into())
-                })?
+            tokio::time::timeout(
+                Duration::from_secs(45),
+                storage::acquire_valid_token(&auth.oauth_http, &auth.binding, &auth.account),
+            )
+            .await
+            .map_err(|_| false)?
         })
-        .await??;
+        .await
+        .map_err(|_| McpError::TransportClosed)?
+        .map_err(|reauth| {
+            if reauth {
+                McpError::AuthRequired
+            } else {
+                McpError::TransportClosed
+            }
+        })?;
         Ok(Some(token))
     }
 
-    async fn record<T>(&self, token: Option<String>, response: HttpResult<T>) -> HttpResult<T> {
-        let rejected = match &response {
-            Err(StreamableHttpError::AuthRequired(_)) => true,
-            Err(StreamableHttpError::Client(e)) => e.status() == Some(StatusCode::UNAUTHORIZED),
-            Err(StreamableHttpError::HttpStatus(e)) => e.status == 401,
-            // rmcp 3.11 preserves an unchallenged POST status as this prefix.
-            Err(StreamableHttpError::UnexpectedServerResponse(raw)) => raw.starts_with("HTTP 401 "),
-            _ => false,
-        };
-        if rejected && let (Some(auth), Some(token)) = (&self.authorization, token) {
+    pub(in crate::mcp) fn attach_bearer(
+        headers: &mut reqwest::header::HeaderMap,
+        token: &str,
+    ) -> std::result::Result<(), McpError> {
+        client::attach_bearer(headers, token).map_err(|()| McpError::InvalidResponse)
+    }
+
+    pub(in crate::mcp) async fn on_unauthorized(&self, token: Option<String>) {
+        if let (Some(auth), Some(token)) = (&self.authorization, token) {
             auth.account.reject(token).await;
         }
-        response
-    }
-}
-
-// rmcp's AuthClient retries a rejected POST. Here a 401 only invalidates the bearer for the
-// next request. Each method forwards a message exactly once and keeps the SDK's response limits.
-impl StreamableHttpClient for HttpClient {
-    type Error = reqwest::Error;
-
-    async fn post_message(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session: Option<Arc<str>>,
-        token: Option<String>,
-        headers: Headers,
-    ) -> HttpResult<StreamableHttpPostResponse> {
-        self.post_message_with_response_limits(
-            uri,
-            message,
-            session,
-            token,
-            headers,
-            Default::default(),
-        )
-        .await
-    }
-    async fn post_message_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session: Option<Arc<str>>,
-        token: Option<String>,
-        headers: Headers,
-        max: usize,
-    ) -> HttpResult<StreamableHttpPostResponse> {
-        let mut limits = StreamableHttpResponseLimits::default();
-        limits.max_sse_event_size = max;
-        self.post_message_with_response_limits(uri, message, session, token, headers, limits)
-            .await
-    }
-    async fn post_message_with_response_limits(
-        &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session: Option<Arc<str>>,
-        token: Option<String>,
-        headers: Headers,
-        limits: StreamableHttpResponseLimits,
-    ) -> HttpResult<StreamableHttpPostResponse> {
-        let token = self.token(&uri, token).await?;
-        let response = self
-            .http
-            .post_message_with_response_limits(
-                uri,
-                message,
-                session,
-                token.clone(),
-                headers,
-                limits,
-            )
-            .await;
-        self.record(token, response).await
-    }
-    async fn get_stream(
-        &self,
-        uri: Arc<str>,
-        session: Option<Arc<str>>,
-        last_id: Option<String>,
-        token: Option<String>,
-        headers: Headers,
-    ) -> HttpResult<Events> {
-        self.get_stream_with_max_sse_event_size(
-            uri,
-            session,
-            last_id,
-            token,
-            headers,
-            StreamableHttpResponseLimits::default().max_sse_event_size,
-        )
-        .await
-    }
-    async fn get_stream_with_max_sse_event_size(
-        &self,
-        uri: Arc<str>,
-        session: Option<Arc<str>>,
-        last_id: Option<String>,
-        token: Option<String>,
-        headers: Headers,
-        max: usize,
-    ) -> HttpResult<Events> {
-        let token = self.token(&uri, token).await?;
-        let response = self
-            .http
-            .get_stream_with_max_sse_event_size(uri, session, last_id, token.clone(), headers, max)
-            .await;
-        self.record(token, response).await
-    }
-    async fn delete_session(
-        &self,
-        uri: Arc<str>,
-        session: Arc<str>,
-        token: Option<String>,
-        headers: Headers,
-    ) -> HttpResult<()> {
-        let token = self.token(&uri, token).await?;
-        let response = self
-            .http
-            .delete_session(uri, session, token.clone(), headers)
-            .await;
-        self.record(token, response).await
     }
 }

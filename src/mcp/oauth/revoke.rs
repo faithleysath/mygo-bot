@@ -1,10 +1,8 @@
-use super::{Binding, decode, validate_endpoint};
+use super::{Binding, client::StoredCredentials, decode, validate_endpoint};
 use crate::{App, Error, Result};
 use axum::http::StatusCode;
 use form_urlencoded::{Serializer, byte_serialize};
-use oauth2::TokenResponse;
 use reqwest::{Client, Url, header::CONTENT_TYPE};
-use rmcp::transport::auth::StoredCredentials;
 use rusqlite::Connection;
 use std::time::Duration;
 
@@ -151,14 +149,18 @@ impl Revocation<'_> {
 }
 
 pub(super) async fn logout(app: &App, id: i64) -> Result<()> {
-    let (generation, gate, timeout) = app.db.call(move |s| {
-        let (generation, ms): (Option<String>, u32) = s.conn.query_row(
-            "SELECT generation,timeout_ms FROM mcp_servers LEFT JOIN mcp_oauth ON server_id=id WHERE id=?",
-            [id], |r| Ok((r.get(0)?,r.get(1)?)),
-        )?;
-        let gate = generation.as_ref().map(|g| s.mcp.oauth().refresh_lock(g));
-        Ok((generation, gate, Duration::from_millis(ms.min(5_000).into())))
-    }).await?;
+    let (generation, gate, timeout) = app
+        .db
+        .call(move |s| {
+            let (generation, ms): (Option<String>, u32) = s.conn.query_row(
+                "SELECT generation,timeout_ms FROM mcp_servers LEFT JOIN mcp_oauth ON server_id=id WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let gate = generation.as_ref().map(|g| s.mcp.oauth().refresh_lock(g));
+            Ok((generation, gate, Duration::from_millis(ms.min(5_000).into())))
+        })
+        .await?;
     // A refresh that already sent its request may rotate both tokens. Wait outside
     // SQLite for its save. On timeout the generation-guarded DELETE still wins.
     let guard = match gate {
@@ -208,18 +210,17 @@ async fn remote(http: &Client, grant: Grant, refresh_in_flight: bool) -> Result<
             auth: ClientAuth::select(&binding)?,
             timeout: grant.timeout,
         };
-        let access = revocation.send(tokens.access_token().secret(), "access_token");
-        if let Some(refresh) = tokens.refresh_token() {
+        let access = revocation.send(&tokens.access_token, "access_token");
+        if let Some(refresh) = tokens.refresh_token.as_deref() {
             // RFC 7009 accepts already-revoked tokens. Attempt both even if one fails.
-            let (refresh, access) =
-                tokio::join!(revocation.send(refresh.secret(), "refresh_token"), access);
+            let (refresh, access) = tokio::join!(revocation.send(refresh, "refresh_token"), access);
             refresh?;
             access?;
         } else {
             access.await?;
         }
     }
-    if refresh_in_flight && tokens.refresh_token().is_some() {
+    if refresh_in_flight && tokens.refresh_token.is_some() {
         return Err(incomplete(
             "A concurrent token request may have rotated the refresh token",
         ));
