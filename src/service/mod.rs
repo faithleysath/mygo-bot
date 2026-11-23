@@ -11,7 +11,7 @@ use rustix::fs::RenameFlags;
 use std::{
     env,
     ffi::OsString,
-    io,
+    fs, io,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
@@ -169,26 +169,56 @@ fn terminal(command: &mut Command) -> io::Result<ExitCode> {
 }
 
 impl Service {
+    fn remove_definition(&self) -> io::Result<bool> {
+        match fs::remove_file(&self.config) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn ensure_binary(&self) -> io::Result<()> {
-        if !self.binary.try_exists()? {
-            // An explicit install may win the race between the probe and publication.
-            match install::copy_binary(self.scope, RenameFlags::NOREPLACE) {
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-                result => return result,
+        let entry = match fs::symlink_metadata(&self.binary) {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                match install::copy_binary(self.scope, RenameFlags::NOREPLACE) {
+                    // Inspect whatever appeared during the copy just like an existing entry.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        fs::symlink_metadata(&self.binary)?
+                    }
+                    result => return result,
+                }
             }
+            Err(e) => return Err(e),
+        };
+        let path = self.binary.display();
+        let reinstall = self.scope.command("install");
+        if entry.is_symlink() && !self.binary.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{path} is a dangling symlink. Run `{reinstall}` to replace it"),
+            ));
         }
-        if !install::same_file(&env::current_exe()?, &self.binary)? {
-            let output = Command::new(&self.binary).arg("--version").output()?;
-            let installed = String::from_utf8_lossy(&output.stdout);
-            if !output.status.success() || installed.trim() != format!("mygo {VERSION}") {
-                eprintln!(
-                    "warning: keeping installed executable {} ({:?}); current build is mygo {VERSION}. To update, run `{}`",
-                    self.binary.display(),
-                    installed.trim(),
-                    self.scope.command("install")
-                );
+        if install::same_file(&env::current_exe()?, &self.binary)? {
+            return Ok(());
+        }
+        let reason = match Command::new(&self.binary).arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                let installed = String::from_utf8_lossy(&output.stdout);
+                if installed.trim() == format!("mygo {VERSION}") {
+                    return Ok(());
+                }
+                format!(
+                    "reported {:?}, current build is mygo {VERSION}",
+                    installed.trim()
+                )
             }
-        }
+            Ok(output) => format!("--version returned {}", output.status),
+            Err(e) => format!("could not run --version: {e}"),
+        };
+        eprintln!(
+            "warning: keeping installed executable {path} ({reason}). To replace it, run `{reinstall}`"
+        );
         Ok(())
     }
 }
@@ -216,14 +246,20 @@ pub fn run(scope: Scope, action: Action) -> io::Result<ExitCode> {
                 );
             }
         }
-        Action::Start | Action::Restart if !svc.config.try_exists()? => {
-            return Err(io::Error::other(format!(
-                "service is not installed; run `{}`",
-                scope.command("service install")
-            )));
+        Action::Start | Action::Restart => {
+            if !svc.config.try_exists()? {
+                return Err(io::Error::other(format!(
+                    "service is not installed; run `{}`",
+                    scope.command("service install")
+                )));
+            }
+            install::private_dir(&svc.data)?;
+            if matches!(action, Action::Start) {
+                svc.start()?;
+            } else {
+                svc.restart()?;
+            }
         }
-        Action::Start => svc.start()?,
-        Action::Restart => svc.restart()?,
         Action::Status if !svc.config.try_exists()? => {
             println!("service is not installed ({})", svc.config.display());
             return Ok(ExitCode::from(3));
@@ -240,7 +276,13 @@ pub fn run(scope: Scope, action: Action) -> io::Result<ExitCode> {
         }
         Action::Logs { lines, follow } => return svc.logs(lines, follow),
         Action::Stop => svc.stop()?,
-        Action::Uninstall => svc.unregister()?,
+        Action::Uninstall => {
+            if svc.unregister()? {
+                println!("uninstalled service definition at {}", svc.config.display());
+            } else {
+                println!("service is not installed ({})", svc.config.display());
+            }
+        }
         Action::InstallBinary | Action::UninstallBinary => unreachable!(),
     }
     Ok(ExitCode::SUCCESS)

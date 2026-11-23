@@ -225,8 +225,16 @@ fn parse() -> std::result::Result<Cli, String> {
         return Ok(Cli::Exit(ExitCode::SUCCESS));
     };
     match command.to_str() {
-        Some("-h" | "--help") => println!("{HELP}"),
-        Some("-V" | "--version") => println!("{BIN_NAME} {VERSION}"),
+        Some("-h" | "--help" | "-V" | "--version") => {
+            if let Some(extra) = args.next() {
+                return Err(format!("unexpected argument {extra:?}"));
+            }
+            if command == "-V" || command == "--version" {
+                println!("{BIN_NAME} {VERSION}");
+            } else {
+                println!("{HELP}");
+            }
+        }
         Some("daemon") => return DaemonOptions::parse(args),
         Some(name @ ("install" | "uninstall" | "service")) => {
             cfg_select! {
@@ -236,9 +244,6 @@ fn parse() -> std::result::Result<Cli, String> {
             }
         }
         _ => return Err(format!("unknown command {command:?}")),
-    }
-    if let Some(extra) = args.next() {
-        return Err(format!("unexpected argument {extra:?}"));
     }
     Ok(Cli::Exit(ExitCode::SUCCESS))
 }
@@ -423,10 +428,11 @@ async fn bind_tcp(listen: Option<SocketAddr>) -> io::Result<tokio::net::TcpListe
         let Some(port) = DEFAULT_PORT.checked_add(offset) else {
             break;
         };
-        let addr = (Ipv4Addr::LOCALHOST, port);
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         match tokio::net::TcpListener::bind(addr).await {
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => continue,
-            result => return result,
+            Err(e) => return Err(io::Error::new(e.kind(), format!("bind TCP {addr}: {e}"))),
+            Ok(listener) => return Ok(listener),
         }
     }
     Err(io::Error::new(

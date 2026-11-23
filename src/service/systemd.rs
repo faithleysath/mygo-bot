@@ -2,7 +2,7 @@ use super::{Scope, Service, checked, path_text, terminal};
 use crate::install::{atomic_write, home};
 use rustix::{fs::RenameFlags, process::geteuid};
 use std::{
-    env, fs,
+    env,
     io::{self, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -99,7 +99,7 @@ Description=MyGo-Bot Daemon
 {network}
 [Service]
 Type=simple
-ExecStart=\"{prefix}{binary}\" daemon --foreground
+ExecStart={prefix}\"{binary}\" daemon --foreground
 WorkingDirectory={data}
 Restart=on-failure
 RestartSec=3
@@ -163,16 +163,18 @@ WantedBy={wanted}
         }
         terminal(&mut cmd)
     }
-    pub(super) fn unregister(&self) -> io::Result<()> {
-        if self.config.try_exists()? {
+    pub(super) fn unregister(&self) -> io::Result<bool> {
+        let removed = if self.config.try_exists()? {
+            self.systemctl(&["daemon-reload"])?;
             self.systemctl(&["disable", "--now", UNIT])?;
-            match fs::remove_file(&self.config) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                result => result?,
+            self.remove_definition()?
+        } else {
+            if self.property("LoadState")? != "not-found" {
+                self.stop()?;
             }
-        } else if self.property("LoadState")? != "not-found" {
-            self.stop()?;
-        }
-        self.systemctl(&["daemon-reload"])
+            false
+        };
+        self.systemctl(&["daemon-reload"])?;
+        Ok(removed)
     }
 }

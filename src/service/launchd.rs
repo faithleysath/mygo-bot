@@ -5,7 +5,6 @@ use crate::{
 };
 use rustix::{fs::RenameFlags, process::geteuid};
 use std::{
-    fs,
     io::{self, Write},
     num::NonZeroUsize,
     path::PathBuf,
@@ -15,6 +14,7 @@ use std::{
 };
 
 const LABEL: &str = "io.mygo.daemon";
+const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn launchctl() -> Command {
     Command::new("/bin/launchctl")
@@ -148,13 +148,15 @@ impl Service {
   <key>ProgramArguments</key><array><string>{binary}</string><string>daemon</string><string>--foreground</string></array>
   <key>WorkingDirectory</key><string>{data}</string>
   <key>RunAtLoad</key><true/>
+  <key>ExitTimeOut</key><integer>{exit_timeout}</integer>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict>
 </dict>
 </plist>
-"#
+"#,
+                exit_timeout = EXIT_TIMEOUT.as_secs(),
             )
         })?;
         checked(launchctl().arg("enable").arg(self.target()))
@@ -184,7 +186,7 @@ impl Service {
         if !result.status.success() && !missing(&result) {
             return Err(failure(result));
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + EXIT_TIMEOUT;
         while self.job()?.is_some() {
             if Instant::now() >= deadline {
                 return Err(io::Error::other("timed out waiting for launchctl bootout"));
@@ -235,11 +237,8 @@ impl Service {
         }
         terminal(cmd.arg("--").arg(&self.log))
     }
-    pub(super) fn unregister(&self) -> io::Result<()> {
+    pub(super) fn unregister(&self) -> io::Result<bool> {
         self.bootout()?;
-        match fs::remove_file(&self.config) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            result => result,
-        }
+        self.remove_definition()
     }
 }
