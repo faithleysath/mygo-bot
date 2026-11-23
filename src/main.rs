@@ -210,12 +210,8 @@ async fn serve(
     };
     app.workers
         .spawn(mcp::reap_idle(app.db.clone(), app.stopping.clone()));
-    let (routes, openapi) = api::routes(app.clone());
-    let docs = listen
-        .ip()
-        .is_loopback()
-        .then(|| docs::routes(openapi))
-        .transpose()?;
+    let routes = api::routes(app.clone());
+    let docs = listen.ip().is_loopback().then(docs::routes);
     let signal = shutdown_signal()?;
     daemon::Ready {
         listen,

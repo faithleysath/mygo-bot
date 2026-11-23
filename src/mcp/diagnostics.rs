@@ -11,10 +11,9 @@ use rmcp::{
 use serde::Serialize;
 use std::time::Duration;
 use tokio::time::{Instant, timeout};
-use utoipa_axum::{router::OpenApiRouter, routes};
 
-pub(crate) fn routes() -> OpenApiRouter<App> {
-    OpenApiRouter::new().routes(routes!(test_server))
+pub(crate) fn routes(documented: bool) -> crate::docs::RouteRegistry {
+    crate::docs::RouteRegistry::new(documented).register(crate::docs::register!(test_server))
 }
 
 #[derive(Serialize, utoipa::ToSchema)]

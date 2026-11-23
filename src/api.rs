@@ -56,26 +56,38 @@ pub async fn authorize_tcp(
 )]
 struct ApiDoc;
 
-pub fn routes(app: App) -> (Router, utoipa::openapi::OpenApi) {
+pub fn routes(app: App) -> Router {
+    let (router, _) = registry(crate::docs::RouteRegistry::Bare(Router::new()), false).into_parts();
+    router.with_state(app)
+}
+
+pub(crate) fn openapi() -> utoipa::openapi::OpenApi {
     use utoipa::OpenApi;
-    use utoipa_axum::{router::OpenApiRouter, routes};
-    OpenApiRouter::with_openapi(ApiDoc::openapi())
-        .routes(routes!(get_config, patch_config))
-        .routes(routes!(list_sessions, create_session))
-        .routes(routes!(get_session, patch_session))
-        .routes(routes!(enqueue, messages))
-        .routes(routes!(withdraw))
-        .routes(routes!(agent::start, agent::pause))
-        .routes(routes!(history))
-        .routes(routes!(context))
-        .routes(routes!(events::subscribe))
-        .merge(crate::catalog::routes())
-        .merge(crate::mcp::routes())
-        .merge(crate::mcp::diagnostics::routes())
-        .merge(crate::media::routes())
-        .merge(crate::calls::routes())
-        .with_state(app)
-        .split_for_parts()
+    let documented = crate::docs::RouteRegistry::Documented(Box::new(
+        utoipa_axum::router::OpenApiRouter::with_openapi(ApiDoc::openapi()),
+    ));
+    registry(documented, true)
+        .into_parts()
+        .1
+        .expect("documented routes")
+}
+
+fn registry(registry: crate::docs::RouteRegistry, documented: bool) -> crate::docs::RouteRegistry {
+    registry
+        .register(crate::docs::register!(get_config, patch_config))
+        .register(crate::docs::register!(list_sessions, create_session))
+        .register(crate::docs::register!(get_session, patch_session))
+        .register(crate::docs::register!(enqueue, messages))
+        .register(crate::docs::register!(withdraw))
+        .register(crate::docs::register!(agent::start, agent::pause))
+        .register(crate::docs::register!(history))
+        .register(crate::docs::register!(context))
+        .register(crate::docs::register!(events::subscribe))
+        .merge(crate::catalog::routes(documented))
+        .merge(crate::mcp::routes(documented))
+        .merge(crate::mcp::diagnostics::routes(documented))
+        .merge(crate::media::routes(documented))
+        .merge(crate::calls::routes(documented))
 }
 
 type ConfigPatch = crate::docs::Patch<Config>;

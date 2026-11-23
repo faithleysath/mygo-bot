@@ -75,11 +75,10 @@ impl Report {
     }
 }
 
-pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
-    use utoipa_axum::{router::OpenApiRouter, routes};
-    OpenApiRouter::new()
-        .routes(routes!(list))
-        .routes(routes!(one))
+pub fn routes(documented: bool) -> crate::docs::RouteRegistry {
+    crate::docs::RouteRegistry::new(documented)
+        .register(crate::docs::register!(list))
+        .register(crate::docs::register!(one))
 }
 
 #[derive(Serialize, utoipa::ToSchema)]

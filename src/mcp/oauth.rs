@@ -182,12 +182,11 @@ impl Binding {
     }
 }
 
-pub(super) fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
-    use utoipa_axum::{router::OpenApiRouter, routes};
-    OpenApiRouter::new()
-        .routes(routes!(status, logout))
-        .routes(routes!(login))
-        .routes(routes!(callback))
+pub(super) fn routes(documented: bool) -> crate::docs::RouteRegistry {
+    crate::docs::RouteRegistry::new(documented)
+        .register(crate::docs::register!(status, logout))
+        .register(crate::docs::register!(login))
+        .register(crate::docs::register!(callback))
 }
 
 #[derive(Serialize, utoipa::ToSchema)]

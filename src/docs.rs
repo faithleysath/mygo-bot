@@ -105,7 +105,7 @@ const PAGE: &str = r#"<!doctype html>
 </body>
 </html>"#;
 
-pub fn routes(mut spec: OpenApi) -> serde_json::Result<Router> {
+fn json_bytes(mut spec: OpenApi) -> serde_json::Result<Bytes> {
     spec.components.get_or_insert_default().add_security_scheme(
         "bearerAuth",
         SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
@@ -114,11 +114,124 @@ pub fn routes(mut spec: OpenApi) -> serde_json::Result<Router> {
         "bearerAuth",
         [] as [&str; 0],
     )]);
-    let json = Bytes::from(serde_json::to_vec(&spec)?);
-    Ok(Router::new()
+    Ok(Bytes::from(serde_json::to_vec(&spec)?))
+}
+
+pub fn routes() -> Router {
+    use futures_util::FutureExt;
+
+    let openapi = std::sync::Arc::new(std::sync::OnceLock::new());
+    Router::new()
         .route("/docs", get(|| async { Html(PAGE) }))
         .route(
             "/openapi.json",
-            get(move || async move { ([(header::CONTENT_TYPE, "application/json")], json) }),
-        ))
+            get(move || async move {
+                // The shared future survives a client disconnect while the schema is built.
+                let json = openapi
+                    .get_or_init(|| {
+                        let task =
+                            tokio::task::spawn_blocking(|| json_bytes(crate::api::openapi()));
+                        async move {
+                            match task.await {
+                                Ok(Ok(json)) => Ok(json),
+                                Ok(Err(error)) => {
+                                    tracing::error!(%error, "could not serialize OpenAPI");
+                                    Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, "could not build OpenAPI");
+                                    Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                }
+                            }
+                        }
+                        .boxed()
+                        .shared()
+                    })
+                    .clone();
+                json.await
+                    .map(|body| ([(header::CONTENT_TYPE, "application/json")], body))
+            }),
+        )
 }
+
+pub(crate) enum RouteRegistry {
+    Documented(Box<utoipa_axum::router::OpenApiRouter<crate::App>>),
+    Bare(Router<crate::App>),
+}
+
+impl RouteRegistry {
+    pub(crate) fn new(documented: bool) -> Self {
+        if documented {
+            Self::Documented(Box::new(utoipa_axum::router::OpenApiRouter::new()))
+        } else {
+            Self::Bare(Router::new())
+        }
+    }
+
+    pub(crate) fn register(self, entry: impl FnOnce(Self) -> Self) -> Self {
+        entry(self)
+    }
+
+    pub(crate) fn routes(
+        self,
+        documented: impl FnOnce(
+            utoipa_axum::router::OpenApiRouter<crate::App>,
+        ) -> utoipa_axum::router::OpenApiRouter<crate::App>,
+        bare: impl FnOnce(Router<crate::App>) -> Router<crate::App>,
+    ) -> Self {
+        match self {
+            Self::Documented(router) => Self::Documented(Box::new(documented(*router))),
+            Self::Bare(router) => Self::Bare(bare(router)),
+        }
+    }
+
+    pub(crate) fn merge(self, inner: Self) -> Self {
+        match (self, inner) {
+            (Self::Documented(outer), Self::Documented(inner)) => {
+                Self::Documented(Box::new(outer.merge(*inner)))
+            }
+            (Self::Bare(outer), Self::Bare(inner)) => Self::Bare(outer.merge(inner)),
+            _ => unreachable!("a route registry must use one metadata mode"),
+        }
+    }
+
+    pub(crate) fn layer(self, body_limit: axum::extract::DefaultBodyLimit) -> Self {
+        match self {
+            Self::Documented(router) => Self::Documented(Box::new(router.layer(body_limit))),
+            Self::Bare(router) => Self::Bare(router.layer(body_limit)),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Router<crate::App>, Option<OpenApi>) {
+        match self {
+            Self::Documented(router) => {
+                let (router, schema) = router.split_for_parts();
+                (router, Some(schema))
+            }
+            Self::Bare(router) => (router, None),
+        }
+    }
+}
+
+// Utoipa's generated path and method accessors let both router modes use
+// the same handler declarations. Build operations and schemas only on demand.
+macro_rules! register {
+    ($($handler:ident $(::$part:ident)*),+ $(,)?) => {
+        |registry: $crate::docs::RouteRegistry| registry.routes(
+            |router| router.routes(utoipa_axum::routes!($($handler $(::$part)*),+)),
+            |mut router| {
+                use utoipa_axum::PathItemExt;
+                $(
+                    let path = utoipa_axum::routes!(@path [path()] of $handler $(::$part)*);
+                    let methods = utoipa_axum::routes!(@path [methods()] of $handler $(::$part)*);
+                    let method_router = methods.iter().fold(axum::routing::MethodRouter::new(), |router, method| {
+                        router.on(method.to_method_filter(), $handler $(::$part)*)
+                    });
+                    router = router.route(if path.is_empty() { "/" } else { path.as_str() }, method_router);
+                )+
+                router
+            },
+        )
+    };
+}
+pub(crate) use register;

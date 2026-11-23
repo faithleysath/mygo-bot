@@ -13,12 +13,11 @@ use crate::{App, Error, Result};
 
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 
-pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
-    use utoipa_axum::{router::OpenApiRouter, routes};
-    OpenApiRouter::new()
-        .routes(routes!(upload))
+pub fn routes(documented: bool) -> crate::docs::RouteRegistry {
+    crate::docs::RouteRegistry::new(documented)
+        .register(crate::docs::register!(upload))
         .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES))
-        .routes(routes!(download))
+        .register(crate::docs::register!(download))
 }
 
 #[derive(serde::Serialize, utoipa::ToSchema)]

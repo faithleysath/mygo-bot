@@ -14,12 +14,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
-    use utoipa_axum::{router::OpenApiRouter, routes};
-    OpenApiRouter::new()
-        .routes(routes!(list_servers, create_server))
-        .routes(routes!(get_server, patch_server, delete_server))
-        .merge(oauth::routes())
+pub fn routes(documented: bool) -> crate::docs::RouteRegistry {
+    crate::docs::RouteRegistry::new(documented)
+        .register(crate::docs::register!(list_servers, create_server))
+        .register(crate::docs::register!(
+            get_server,
+            patch_server,
+            delete_server
+        ))
+        .merge(oauth::routes(documented))
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, utoipa::ToSchema, PartialEq)]

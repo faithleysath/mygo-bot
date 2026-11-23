@@ -12,15 +12,22 @@ use std::collections::HashSet;
 type ProviderPatch = crate::docs::Patch<Provider>;
 type ModelPatch = crate::docs::Patch<Model>;
 type Document = Json<Map<String, Value>>;
-pub fn routes() -> utoipa_axum::router::OpenApiRouter<App> {
-    use utoipa_axum::{router::OpenApiRouter, routes};
-    OpenApiRouter::new()
-        .routes(routes!(list_providers, create_provider))
-        .routes(routes!(get_provider, patch_provider, archive_provider))
-        .routes(routes!(restore_provider))
-        .routes(routes!(list_models, create_model))
-        .routes(routes!(get_model, patch_model, archive_model))
-        .routes(routes!(restore_model))
+pub fn routes(documented: bool) -> crate::docs::RouteRegistry {
+    crate::docs::RouteRegistry::new(documented)
+        .register(crate::docs::register!(list_providers, create_provider))
+        .register(crate::docs::register!(
+            get_provider,
+            patch_provider,
+            archive_provider
+        ))
+        .register(crate::docs::register!(restore_provider))
+        .register(crate::docs::register!(list_models, create_model))
+        .register(crate::docs::register!(
+            get_model,
+            patch_model,
+            archive_model
+        ))
+        .register(crate::docs::register!(restore_model))
 }
 
 fn document<T: DeserializeOwned + Serialize>(old: Option<&T>, fields: Document) -> Result<T> {
