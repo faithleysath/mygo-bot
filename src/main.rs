@@ -92,9 +92,15 @@ struct App {
 }
 
 #[cfg(unix)]
-const HELP_SOCKET_OPTIONS: &str = "\
-      --unix-socket <PATH>  Local socket (no token). Defaults to $XDG_RUNTIME_DIR/mygo-bot.sock or a private mygo-bot-<uid> directory under the system temp directory\n\
-      --no-unix-socket      Disable the local Unix socket and serve only TCP\n";
+const HELP_SOCKET_OPTIONS: &str = concat!(
+    "      --unix-socket <PATH>  Local socket (no token). Defaults to ",
+    cfg_select! {
+        target_os = "macos" => { "" }
+        _ => { "$XDG_RUNTIME_DIR/mygo-bot.sock or " }
+    },
+    "mygo-bot-<uid>/mygo-bot.sock under the system temp directory\n",
+    "      --no-unix-socket      Disable the local Unix socket and serve only TCP\n",
+);
 #[cfg(not(unix))]
 const HELP_SOCKET_OPTIONS: &str = "";
 
@@ -439,8 +445,6 @@ async fn serve(
         socket: unix
             .as_ref()
             .map(|(_, file)| file.path.display().to_string()),
-        #[cfg(not(unix))]
-        socket: None,
         token: generated.then(|| token.clone()),
     }
     .announce(parent)?;

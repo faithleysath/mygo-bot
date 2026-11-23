@@ -49,18 +49,11 @@ pub(super) fn spawn(config: StdioConfig) -> io::Result<SpawnedChild> {
     let mut cmd = Command::new(config.command);
     // Keep executable lookup and OS runtime paths; never inherit the daemon's secret environment.
     cmd.env_clear();
-    for name in [
-        "PATH",
-        "HOME",
-        "USERPROFILE",
-        "SystemRoot",
-        "WINDIR",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "LANG",
-        "LC_ALL",
-    ] {
+    let inherited = cfg_select! {
+        windows => { ["PATH", "USERPROFILE", "SystemRoot", "WINDIR", "TMP", "TEMP"] }
+        unix => { ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"] }
+    };
+    for name in inherited {
         if let Some(value) = std::env::var_os(name) {
             cmd.env(name, value);
         }

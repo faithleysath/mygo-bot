@@ -31,8 +31,12 @@ pub fn definitions() -> Value {
                 "stream:true returns headers early and a single-use async byte iterable. Buffered reads and bodies are limited to 8 MiB. ",
                 "Use for await on streams; break closes them, or call await body.return() to discard an unread response. ",
                 "Use new TextDecoder().decode(chunk,{stream:true}) with the same decoder for each chunk, then decoder.decode() to flush. ",
-                "await proc.exec(program,args,{cwd,env,stdin,timeout_ms}) runs an executable directly (no shell; text/Uint8Array stdin; ",
-                "Windows .bat/.cmd require cmd.exe), kills its process group on exit, and returns {exit_code,signal,stdout,stderr,truncated} (256 KiB cap per stream). ",
+                "await proc.exec(program,args,{cwd,env,stdin,timeout_ms}) runs an executable directly (no shell; text/Uint8Array stdin",
+                cfg_select! {
+                    windows => { "; Windows .bat/.cmd require cmd.exe" }
+                    _ => { "" }
+                },
+                "), kills its process group on exit, and returns {exit_code,signal,stdout,stderr,truncated} (256 KiB cap per stream). ",
                 "await mcp.servers() lists enabled MCP servers by name and description. await mcp.tools(server,{query?,cursor?}) returns {tools,nextCursor} with names, descriptions and inputSchema; pass nextCursor as cursor to continue. ",
                 "await mcp.call(server,tool,args) calls by exact names with an object and returns {content,structuredContent?,isError}. Check isError for tool failures. ",
                 "mcp.resources(server,{cursor?}), mcp.resourceTemplates(server,{cursor?}) and mcp.prompts(server,{cursor?}) return one page under resources, resourceTemplates or prompts plus nextCursor. ",

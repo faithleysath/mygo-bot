@@ -6,11 +6,11 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
 };
 
+#[cfg(target_vendor = "apple")]
+use rustix::process::test_kill_process_group;
 use rustix::{
     io::Errno,
-    process::{
-        Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
-    },
+    process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -187,14 +187,12 @@ pub(crate) fn reap_group(
         let status = child
             .wait()
             .map_err(|e| io::Error::other(format!("wait_failed: {e}")))?;
-        // Darwin reports EPERM for a group containing only a zombie. After reaping our
-        // leader, probe with signal 0 to confirm the group is gone.
-        if let Err(e) = killed
-            && e != Errno::SRCH
-            && !(e == Errno::PERM && test_kill_process_group(pgid) == Err(Errno::SRCH))
-        {
-            return Err(io::Error::other(format!("group_cleanup_failed: {e}")));
+        match killed {
+            Ok(()) | Err(Errno::SRCH) => Ok(status),
+            // Darwin can report EPERM when only the zombie leader remains.
+            #[cfg(target_vendor = "apple")]
+            Err(Errno::PERM) if test_kill_process_group(pgid) == Err(Errno::SRCH) => Ok(status),
+            Err(e) => Err(io::Error::other(format!("group_cleanup_failed: {e}"))),
         }
-        Ok(status)
     })
 }

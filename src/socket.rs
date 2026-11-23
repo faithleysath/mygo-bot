@@ -9,19 +9,22 @@ use std::{
 };
 use tokio::net::UnixListener;
 
+fn runtime_dir(uid: u32) -> io::Result<PathBuf> {
+    #[cfg(not(target_os = "macos"))]
+    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    let dir = env::temp_dir().join(format!("mygo-bot-{uid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+        result => result?,
+    }
+    Ok(dir)
+}
+
 fn default_path() -> io::Result<PathBuf> {
     let uid = geteuid().as_raw();
-    let dir = match env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => {
-            let dir = env::temp_dir().join(format!("mygo-bot-{uid}"));
-            match fs::DirBuilder::new().mode(0o700).create(&dir) {
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-                result => result?,
-            }
-            dir
-        }
-    };
+    let dir = runtime_dir(uid)?;
     let meta = fs::symlink_metadata(&dir)?;
     if !dir.is_absolute() || !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
         return Err(io::Error::new(

@@ -13,6 +13,7 @@ const LOG: &str = "mygo-bot.log";
 #[derive(Serialize, Deserialize)]
 pub struct Ready {
     pub listen: SocketAddr,
+    #[cfg(unix)]
     pub socket: Option<String>,
     pub token: Option<String>,
 }
@@ -22,6 +23,7 @@ impl Ready {
         if let Some(token) = &self.token {
             tracing::info!(%token, "generated TCP Bearer token");
         }
+        #[cfg(unix)]
         if let Some(path) = &self.socket {
             tracing::info!(%path, "Unix socket ready");
         }
