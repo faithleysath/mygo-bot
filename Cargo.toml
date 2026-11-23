@@ -38,6 +38,9 @@ utoipa-axum = "0.3.0"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+native-tls = { version = "0.2.18", features = ["alpn"] }
+
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "10.0.1", features = ["tokio1"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }

@@ -48,13 +48,7 @@ pub struct Engine {
     client: reqwest::Client,
 }
 impl Engine {
-    pub fn new(threads: usize) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::internal(e.to_string()))?;
+    pub fn new(threads: usize, client: reqwest::Client) -> Result<Self> {
         Ok(Self {
             pool: vm::Pool::new(threads)?,
             vm_counts: Mutex::default(),

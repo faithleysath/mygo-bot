@@ -1018,6 +1018,7 @@ dependencies = [
  "getrandom 0.4.3",
  "libsqlite3-sys",
  "mime",
+ "native-tls",
  "oauth2",
  "process-wrap",
  "regex-lite",

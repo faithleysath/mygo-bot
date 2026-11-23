@@ -180,18 +180,33 @@ async fn serve(
         || std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
         |n| n.get(),
     );
-    let app = App {
-        codemode: Arc::new(codemode::Engine::new(threads)?),
-        mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
-        db: Db::open(Path::new("mygo-bot.sqlite3"))?,
-        client: reqwest::Client::builder()
-            // Each retry gets its own llm_calls row in the worker loop.
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
-        stopping: CancellationToken::new(),
-        workers: TaskTracker::new(),
+    let app = {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let tls = {
+            let mut builder = native_tls::TlsConnector::builder();
+            // Match the ALPN list of the enabled reqwest HTTP/1.1 features.
+            builder.request_alpns(&["http/1.1"]);
+            builder.build()?
+        };
+        let make_client = || {
+            let builder = reqwest::Client::builder()
+                // Each retry gets its own llm_calls row in the worker loop.
+                .retry(reqwest::retry::never())
+                .connect_timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none());
+            // Share the system trust store while building separate connection pools.
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            let builder = builder.tls_backend_preconfigured(tls.clone());
+            builder.build()
+        };
+        App {
+            codemode: Arc::new(codemode::Engine::new(threads, make_client()?)?),
+            mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
+            db: Db::open(Path::new("mygo-bot.sqlite3"))?,
+            client: make_client()?,
+            stopping: CancellationToken::new(),
+            workers: TaskTracker::new(),
+        }
     };
     app.workers
         .spawn(mcp::reap_idle(app.db.clone(), app.stopping.clone()));
