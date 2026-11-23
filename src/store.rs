@@ -53,13 +53,14 @@ pub struct Store {
     pub active: HashMap<i64, Control>,
     pub tasks: HashMap<i64, crate::codemode::Task>,
     pub mcp: crate::mcp::Connections,
-    channels: HashMap<i64, broadcast::WeakSender<Notice>>,
-    wake_sequences: HashMap<i64, watch::Sender<u64>>,
+    pub channels: HashMap<i64, broadcast::WeakSender<Notice>>,
+    pub wake_sequences: HashMap<i64, watch::Sender<u64>>,
+    pub global_events: broadcast::Sender<Notice>,
     pub closing: bool,
 }
 
 impl Db {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, global_events: broadcast::Sender<Notice>) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -79,6 +80,8 @@ impl Db {
         if !initialized {
             tx.execute_batch(include_str!("../schema.sql"))?;
         } else if !tx.column_exists(None, "sessions", "input_queue_cursor")?
+            || !tx.column_exists(None, "sessions", "title")?
+            || !tx.column_exists(None, "sessions", "updated_at")?
             || !tx.column_exists(None, "items", "codemode_call_item_id")?
             || !tx.table_exists(None, "mcp_oauth")?
             || !tx.column_exists(None, "mcp_servers", "allowed_tools")?
@@ -105,6 +108,7 @@ impl Db {
                     mcp: Default::default(),
                     channels: HashMap::new(),
                     wake_sequences: HashMap::new(),
+                    global_events,
                     closing: false,
                 };
                 let mut next = None;
@@ -246,7 +250,11 @@ impl Enqueue {
         let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
         crate::media::validate_message(conn, &self.content, &modalities)?;
         conn.prepare_cached("INSERT INTO items(session_id,kind,payload,idempotency_key) VALUES(?1,'user_message',json_object('content',json(?2),'role','user'),?3)")?.execute(params![self.sid, self.content, self.key])?;
-        Ok(Enqueued::Created(conn.last_insert_rowid()))
+        let id = conn.last_insert_rowid();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
+            .execute((self.sid, now))?;
+        Ok(Enqueued::Created(id))
     }
 }
 
@@ -343,23 +351,32 @@ impl Store {
         Ok(())
     }
 
+    pub fn publish_global(&self, name: &'static str, data: Value) {
+        Notice::publish(&self.global_events, name, data);
+    }
+
     pub fn status(&mut self, sid: i64, state: &str, reason: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
         self.conn.execute(
-            "UPDATE sessions SET status=?2,last_error=?3 WHERE id=?1",
-            (sid, state, reason),
+            "UPDATE sessions SET status=?2,last_error=?3,updated_at=?4 WHERE id=?1",
+            (sid, state, reason, now),
         )?;
-        self.notify_status(sid, state, reason);
+        self.notify_status(sid, state, reason, now);
         Ok(())
     }
 
-    pub fn notify_status(&self, sid: i64, state: &str, reason: &str) {
+    pub fn notify_status(&self, sid: i64, state: &str, reason: &str, updated_at: i64) {
         if let Some(channel) = self.channels.get(&sid).and_then(|w| w.upgrade()) {
             Notice::publish(
                 &channel,
                 "session.status",
-                json!({"status":state,"reason":reason}),
+                json!({"status":state,"reason":reason,"updated_at":updated_at}),
             );
         }
+        self.publish_global(
+            "session.status",
+            json!({"id":sid,"status":state,"reason":reason,"updated_at":updated_at}),
+        );
     }
 }
 
@@ -384,16 +401,19 @@ fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
 
 pub fn session(conn: &Connection, sid: i64) -> Result<Session> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id,status,reasoning_effort,last_error,model_id FROM sessions WHERE id=?",
+        "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id FROM sessions WHERE id=?",
     )?;
     Ok(stmt.query_row([sid], session_row)?)
 }
 
 #[derive(serde::Serialize)]
 pub struct Session {
-    id: i64,
+    pub id: i64,
+    pub title: String,
+    pub created_at: i64,
+    pub updated_at: i64,
     pub status: SessionStatus,
-    reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub last_error: String,
     pub model_id: Option<i64>,
 }
@@ -420,10 +440,13 @@ impl rusqlite::types::FromSql for SessionStatus {
 pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
-        status: row.get(1)?,
-        reasoning_effort: row.get(2)?,
-        last_error: row.get(3)?,
-        model_id: row.get(4)?,
+        title: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+        status: row.get(4)?,
+        reasoning_effort: row.get(5)?,
+        last_error: row.get(6)?,
+        model_id: row.get(7)?,
     })
 }
 
@@ -553,6 +576,45 @@ impl JsonRows {
             .prepare_cached(sql)?
             .query_row((sid, after, limit), |r| r.get(0))?;
         Ok(end.unwrap_or(after))
+    }
+
+    pub fn page_range(
+        self,
+        conn: &Connection,
+        sid: i64,
+        after: Option<i64>,
+        before: Option<i64>,
+        tail: bool,
+        limit: i64,
+    ) -> Result<(i64, i64)> {
+        if !tail && before.is_none() {
+            let start = after.unwrap_or(0);
+            return Ok((start, self.page_end(conn, sid, start, limit)?));
+        }
+        let (table, col) = match self {
+            Self::History => ("items", "id"),
+            Self::Context | Self::ModelInput => ("context_items", "position"),
+        };
+        let range = if tail {
+            let sql = format!(
+                "SELECT min(k) - 1, max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 ORDER BY {col} DESC LIMIT ?2)"
+            );
+            conn.prepare_cached(&sql)?.query_row((sid, limit), |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+            })?
+        } else {
+            let sql = format!(
+                "SELECT min(k) - 1, max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}<?2 ORDER BY {col} DESC LIMIT ?3)"
+            );
+            conn.prepare_cached(&sql)?
+                .query_row((sid, before.unwrap(), limit), |r| {
+                    Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+                })?
+        };
+        Ok(match range {
+            (Some(start), Some(end)) => (start, end),
+            _ => (0, 0),
+        })
     }
 
     fn batch(

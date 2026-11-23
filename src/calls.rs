@@ -79,6 +79,7 @@ impl Report {
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/calls", get(list))
+        .route("/calls/summary", get(summary))
         .route("/calls/{id}", get(one))
 }
 
@@ -156,6 +157,77 @@ async fn one(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Call>> 
                 [id],
                 row,
             )?))
+        })
+        .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SummaryFilter {
+    session_id: Option<i64>,
+    model_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct CallsSummary {
+    call_count: i64,
+    succeeded_count: i64,
+    failed_count: i64,
+    input_uncached_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    output_tokens: i64,
+    cost_nano_usd: i64,
+    unpriced_succeeded_count: i64,
+    last_input_tokens: Option<i64>,
+}
+
+async fn summary(
+    State(app): State<App>,
+    Query(q): Query<SummaryFilter>,
+) -> Result<Json<CallsSummary>> {
+    app.db
+        .call(move |s| {
+            let mut summary = s.conn.prepare_cached(
+                "SELECT
+                   count(*),
+                   coalesce(sum(CASE WHEN status='succeeded' THEN 1 ELSE 0 END), 0),
+                   coalesce(sum(CASE WHEN status IN ('failed','cancelled','interrupted') THEN 1 ELSE 0 END), 0),
+                   coalesce(sum(coalesce(input_uncached_tokens, 0)), 0),
+                   coalesce(sum(coalesce(cache_read_tokens, 0)), 0),
+                   coalesce(sum(coalesce(cache_write_tokens, 0)), 0),
+                   coalesce(sum(coalesce(output_tokens, 0)), 0),
+                   coalesce(sum(coalesce(cost_nano_usd, 0)), 0),
+                   coalesce(sum(CASE WHEN status='succeeded' AND cost_nano_usd IS NULL THEN 1 ELSE 0 END), 0)
+                 FROM llm_calls
+                 WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR model_id=?2)",
+            )?
+            .query_row((q.session_id, q.model_id), |r| {
+                Ok(CallsSummary {
+                    call_count: r.get(0)?,
+                    succeeded_count: r.get(1)?,
+                    failed_count: r.get(2)?,
+                    input_uncached_tokens: r.get(3)?,
+                    cache_read_tokens: r.get(4)?,
+                    cache_write_tokens: r.get(5)?,
+                    output_tokens: r.get(6)?,
+                    cost_nano_usd: r.get(7)?,
+                    unpriced_succeeded_count: r.get(8)?,
+                    last_input_tokens: None,
+                })
+            })?;
+            use rusqlite::OptionalExtension;
+            summary.last_input_tokens = s.conn.prepare_cached(
+                "SELECT coalesce(input_uncached_tokens, 0) + coalesce(cache_read_tokens, 0) + coalesce(cache_write_tokens, 0)
+                 FROM llm_calls
+                 WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR model_id=?2)
+                   AND status='succeeded'
+                   AND (input_uncached_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL)
+                 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row((q.session_id, q.model_id), |r| r.get(0))
+            .optional()?;
+            Ok(Json(summary))
         })
         .await
 }

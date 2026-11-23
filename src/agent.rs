@@ -22,8 +22,8 @@ pub struct Control {
 
 enum StartEffect {
     None,
-    Idle,
-    Worker(Vec<i64>),
+    Idle(i64),
+    Worker(Vec<i64>, i64),
 }
 
 /// 启动或恢复会话
@@ -87,13 +87,14 @@ impl App {
                         [sid],
                         |r| r.get(0),
                     )?;
+                    let now = chrono::Utc::now().timestamp_millis();
                     if !unfinished && !store::has_pending(conn, sid)? {
                         if current.status == SessionStatus::Paused {
                             conn.execute(
-                                "UPDATE sessions SET status='idle',last_error='' WHERE id=?",
-                                [sid],
+                                "UPDATE sessions SET status='idle',last_error='',updated_at=?2 WHERE id=?1",
+                                (sid, now),
                             )?;
-                            return Ok((session(conn, sid)?, StartEffect::Idle));
+                            return Ok((session(conn, sid)?, StartEffect::Idle(now)));
                         }
                         return Ok((current, StartEffect::None));
                     }
@@ -104,25 +105,21 @@ impl App {
                     };
                     store::take_pending(conn, sid)?;
                     conn.execute(
-                        "UPDATE sessions SET status='running',last_error='' WHERE id=?",
-                        [sid],
+                        "UPDATE sessions SET status='running',last_error='',updated_at=?2 WHERE id=?1",
+                        (sid, now),
                     )?;
-                    Ok((session(conn, sid)?, StartEffect::Worker(recovered)))
+                    Ok((session(conn, sid)?, StartEffect::Worker(recovered, now)))
                 },
                 move |s, (current, effect)| {
                     match effect {
                         StartEffect::None => (),
-                        StartEffect::Idle => s.notify_status(sid, "idle", ""),
-                        StartEffect::Worker(recovered) => {
+                        StartEffect::Idle(updated_at) => s.notify_status(sid, "idle", "", updated_at),
+                        StartEffect::Worker(recovered, updated_at) => {
                             let notices = recovered
                                 .into_iter()
                                 .try_for_each(|id| s.item_saved(sid, id));
                             let channel = s.channel(sid);
-                            Notice::publish(
-                                &channel,
-                                "session.status",
-                                json!({"status":"running","reason":""}),
-                            );
+                            s.notify_status(sid, "running", "", updated_at);
                             let control = Control::default();
                             s.active.insert(sid, control.clone());
                             let tracker = worker.workers.clone();
@@ -290,6 +287,7 @@ impl App {
             };
             attempt += 1;
             let call_id = input.call_id;
+            self.streams.start_call(sid, call_id);
             let mut output = model::Output::default();
             let streamed = tokio::select! {
                 biased;
@@ -319,11 +317,15 @@ impl App {
             // Tool writes outlive a transient upstream disconnect. Publish only once all finish.
             while let Some(result) = output.tasks.join_next().await {
                 if let Err(err) = result.unwrap_or_else(|e| Err(Error::internal(e.to_string()))) {
+                    self.streams.clear_call(sid, call_id, true);
                     output.tasks.shutdown().await;
                     return Err(err);
                 }
             }
             let interrupted = control.hard.is_cancelled() && output.final_item.is_none();
+            if streamed.is_err() || interrupted {
+                self.streams.clear_call(sid, call_id, true);
+            }
             // A call may have reached the store just as the stream was cancelled, before spawn.
             if interrupted || (output.tools && streamed.is_err()) {
                 self.db
@@ -358,6 +360,7 @@ impl App {
                 Err(Failure::Cancelled) => return Err(Error::conflict("paused")),
                 Err(Failure::Fatal(err)) => return Err(err),
                 Ok(()) if !output.answer && !output.tools => {
+                    self.streams.clear_call(sid, call_id, true);
                     return Err(Error::internal(
                         "model completed without an answer or tool call",
                     ));
@@ -366,6 +369,7 @@ impl App {
             }
             retries = 0;
             let tools = output.tools;
+            let final_output_index = output.final_output_index;
             let soft = control.soft.clone();
             let stopped = self
                 .db
@@ -395,29 +399,30 @@ impl App {
                         } else {
                             "idle"
                         };
+                        let now = chrono::Utc::now().timestamp_millis();
                         conn.execute(
-                            "UPDATE sessions SET needs_model=?2,status=?3 WHERE id=?1",
-                            (sid, tools, state),
+                            "UPDATE sessions SET needs_model=?2,status=?3,updated_at=?4 WHERE id=?1",
+                            (sid, tools, state, now),
                         )?;
-                        Ok((saved, state))
+                        Ok((saved, state, now))
                     },
-                    move |s, (saved, state)| {
+                    move |s, (saved, state, now)| {
                         if let Some(id) = saved {
                             s.item_saved(sid, id)?;
                         }
                         if state != "running" {
                             s.active.remove(&sid);
                             let info = session(&s.conn, sid)?;
-                            Notice::publish(
-                                &s.channel(sid),
-                                "session.status",
-                                json!({"status":state,"reason":info.last_error}),
-                            );
+                            s.notify_status(sid, state, &info.last_error, now);
                         }
                         Ok(state != "running")
                     },
                 )
                 .await?;
+            if let Some(idx) = final_output_index {
+                self.streams.finish_item(sid, call_id, idx);
+            }
+            self.streams.clear_call(sid, call_id, true);
             if stopped {
                 return Ok(());
             }

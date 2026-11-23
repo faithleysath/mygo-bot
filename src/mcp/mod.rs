@@ -117,6 +117,15 @@ impl Connections {
             true
         });
     }
+    pub fn forget_session(&mut self, sid: i64) {
+        self.slots.retain(|(session, _), (slot, _)| {
+            if *session == sid {
+                slot.retire();
+                return false;
+            }
+            true
+        });
+    }
 }
 
 pub async fn close(db: &Db) -> Result<()> {

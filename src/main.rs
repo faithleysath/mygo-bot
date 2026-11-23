@@ -96,6 +96,7 @@ struct App {
     codemode: Arc<codemode::Engine>,
     client: reqwest::Client,
     mcp_probes: Arc<tokio::sync::Semaphore>,
+    streams: events::Hub,
     stopping: CancellationToken,
     workers: TaskTracker,
 }
@@ -485,11 +486,13 @@ async fn serve(
             let builder = builder.tls_backend_preconfigured(tls.clone());
             builder.build()
         };
+        let streams = events::Hub::default();
         App {
             codemode: Arc::new(codemode::Engine::new(threads, make_client()?)?),
             mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
-            db: Db::open(Path::new("mygo.sqlite3"))?,
+            db: Db::open(Path::new("mygo.sqlite3"), streams.global_sender())?,
             client: make_client()?,
+            streams,
             stopping: CancellationToken::new(),
             workers: TaskTracker::new(),
         }

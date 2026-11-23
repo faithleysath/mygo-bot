@@ -1,6 +1,7 @@
 use crate::{
-    App, Error, ErrorBody, Result, agent, events,
-    store::{self, Session, session},
+    App, Error, ErrorBody, Result, agent, codemode, events,
+    events::Notice,
+    store::{self, Session, SessionStatus, session},
 };
 use axum::{
     Json, Router,
@@ -50,14 +51,20 @@ pub async fn authorize_tcp(
 pub fn routes(app: App) -> Router {
     Router::new()
         .route("/config", get(get_config).patch(patch_config))
+        .route("/events", get(events::subscribe_global))
         .route("/sessions", get(list_sessions).post(create_session))
-        .route("/sessions/{sid}", get(get_session).patch(patch_session))
+        .route(
+            "/sessions/{sid}",
+            get(get_session).patch(patch_session).delete(delete_session),
+        )
         .route("/sessions/{sid}/messages", post(enqueue).get(messages))
         .route("/sessions/{sid}/messages/{mid}", delete(withdraw))
         .route("/sessions/{sid}/run", put(agent::start).delete(agent::pause))
         .route("/sessions/{sid}/history", get(history))
         .route("/sessions/{sid}/context", get(context))
         .route("/sessions/{sid}/events", get(events::subscribe))
+        .route("/sessions/{sid}/tasks", get(list_tasks))
+        .route("/sessions/{sid}/tasks/{tid}", delete(kill_task))
         .merge(crate::catalog::routes())
         .merge(crate::mcp::routes())
         .merge(crate::mcp::diagnostics::routes())
@@ -172,24 +179,42 @@ async fn patch_config(State(app): State<App>, Json(fields): Document) -> Result<
         .await
 }
 
+fn extract_title(fields: &mut Map<String, Value>) -> Result<Option<String>> {
+    let Some(value) = fields.remove("title") else {
+        return Ok(None);
+    };
+    let title = value
+        .as_str()
+        .ok_or_else(|| Error::bad("title must be a string"))?;
+    if title.len() > 256 || title.contains('\0') {
+        return Err(Error::bad("title must be at most 256 bytes without NUL"));
+    }
+    Ok(Some(title.to_owned()))
+}
+
 async fn create_session(
     State(app): State<App>,
     body: Option<Document>,
 ) -> Result<(StatusCode, Json<Session>)> {
-    let fields = body.map(|x| x.0).unwrap_or_default();
+    let mut fields = body.map(|x| x.0).unwrap_or_default();
+    let title = extract_title(&mut fields)?.unwrap_or_default();
     let created = app
         .db
         .write(
             move |conn| {
                 let next = Selection::defaults(conn)?.apply(fields)?;
                 next.validate(conn)?;
+                let now = chrono::Utc::now().timestamp_millis();
                 conn.execute(
-                    "INSERT INTO sessions(model_id,reasoning_effort) VALUES(?,?)",
-                    params![next.model_id, next.reasoning_effort],
+                    "INSERT INTO sessions(title,created_at,updated_at,model_id,reasoning_effort) VALUES(?,?,?,?,?)",
+                    params![title, now, now, next.model_id, next.reasoning_effort],
                 )?;
                 session(conn, conn.last_insert_rowid())
             },
-            |_, created| Ok(created),
+            |s, created| {
+                s.publish_global("session.created", json!(created));
+                Ok(created)
+            },
         )
         .await?;
     Ok((StatusCode::CREATED, Json(created)))
@@ -202,11 +227,12 @@ async fn get_session(State(app): State<App>, Path(sid): Path<i64>) -> Result<Jso
 async fn patch_session(
     State(app): State<App>,
     Path(sid): Path<i64>,
-    Json(fields): Document,
+    Json(mut fields): Document,
 ) -> Result<Json<Session>> {
     if fields.is_empty() {
         return Err(Error::bad("expected session settings"));
     }
+    let title = extract_title(&mut fields)?;
     app.db
         .write(
             move |conn| {
@@ -234,15 +260,60 @@ async fn patch_session(
                         }
                     }
                 }
+                let now = chrono::Utc::now().timestamp_millis();
                 conn.execute(
-                    "UPDATE sessions SET model_id=?,reasoning_effort=? WHERE id=?",
-                    params![next.model_id, next.reasoning_effort, sid],
+                    "UPDATE sessions SET model_id=?,reasoning_effort=?,title=coalesce(?,title),updated_at=? WHERE id=?",
+                    params![next.model_id, next.reasoning_effort, title, now, sid],
                 )?;
                 session(conn, sid)
             },
-            |_, updated| Ok(Json(updated)),
+            move |s, updated| {
+                let data = json!(updated);
+                if let Some(channel) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
+                    Notice::publish(&channel, "session.updated", data.clone());
+                }
+                s.publish_global("session.updated", data);
+                Ok(Json(updated))
+            },
         )
         .await
+}
+
+async fn delete_session(State(app): State<App>, Path(sid): Path<i64>) -> Result<StatusCode> {
+    app.db
+        .call(move |s| {
+            let current = session(&s.conn, sid)?;
+            if s.active.contains_key(&sid)
+                || codemode::has_session_tasks(s, sid)
+                || matches!(current.status, SessionStatus::Running | SessionStatus::Pausing)
+            {
+                return Err(Error::conflict(
+                    "pause the session and stop active tasks before deleting",
+                ));
+            }
+            let tx = s.conn.transaction()?;
+            tx.execute("DELETE FROM context_items WHERE session_id=?", [sid])?;
+            tx.execute(
+                "DELETE FROM invalidated_warnings WHERE item_id IN (SELECT id FROM items WHERE session_id=?)",
+                [sid],
+            )?;
+            tx.execute(
+                "DELETE FROM items WHERE session_id=? AND (target_id IS NOT NULL OR codemode_call_item_id IS NOT NULL)",
+                [sid],
+            )?;
+            tx.execute("DELETE FROM items WHERE session_id=?", [sid])?;
+            tx.execute("UPDATE llm_calls SET session_id=NULL WHERE session_id=?", [sid])?;
+            tx.execute("DELETE FROM sessions WHERE id=?", [sid])?;
+            tx.commit()?;
+            s.mcp.forget_session(sid);
+            s.channels.remove(&sid);
+            s.wake_sequences.remove(&sid);
+            s.publish_global("session.deleted", json!({"id": sid}));
+            Ok(())
+        })
+        .await?;
+    app.streams.remove_session(sid);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -273,7 +344,7 @@ async fn list_sessions(
     page.check()?;
     app.db
         .call(move |s| {
-            let sql = "SELECT id,status,reasoning_effort,last_error,model_id FROM sessions
+            let sql = "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id FROM sessions
                    WHERE id>? ORDER BY id LIMIT ?";
             let mut stmt = s.conn.prepare_cached(sql)?;
             let rows = stmt
@@ -411,17 +482,53 @@ async fn withdraw(
         })
         .await
 }
-async fn record_page(app: App, sid: i64, page: Page, rows: store::JsonRows) -> Result<Response> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordPage {
+    after: Option<i64>,
+    before: Option<i64>,
+    #[serde(default)]
+    tail: bool,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+impl RecordPage {
+    fn check(&self) -> Result<()> {
+        let modes = usize::from(self.after.is_some())
+            + usize::from(self.before.is_some())
+            + usize::from(self.tail);
+        if modes > 1 {
+            return Err(Error::bad("specify at most one of after, before, or tail"));
+        }
+        if self.after.is_some_and(|v| v < 0)
+            || self.before.is_some_and(|v| v <= 0)
+            || !(1..=200).contains(&self.limit)
+        {
+            return Err(Error::bad(
+                "expected after >= 0, before > 0, and limit 1..200",
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn record_page(
+    app: App,
+    sid: i64,
+    page: RecordPage,
+    rows: store::JsonRows,
+) -> Result<Response> {
     page.check()?;
-    let end = app
+    let (start, end) = app
         .db
         .call(move |s| {
             session(&s.conn, sid)?;
-            rows.page_end(&s.conn, sid, page.after, page.limit)
+            rows.page_range(&s.conn, sid, page.after, page.before, page.tail, page.limit)
         })
         .await?;
     let body = rows
-        .body(app.db, sid, page.after, end, vec![b'['], b"]")
+        .body(app.db, sid, start, end, vec![b'['], b"]")
         .await?;
     Ok((
         [(header::CONTENT_TYPE, "application/json")],
@@ -433,7 +540,7 @@ async fn record_page(app: App, sid: i64, page: Page, rows: store::JsonRows) -> R
 async fn history(
     State(app): State<App>,
     Path(sid): Path<i64>,
-    Query(page): Query<Page>,
+    Query(page): Query<RecordPage>,
 ) -> Result<Response> {
     record_page(app, sid, page, store::JsonRows::History).await
 }
@@ -441,7 +548,31 @@ async fn history(
 async fn context(
     State(app): State<App>,
     Path(sid): Path<i64>,
-    Query(page): Query<Page>,
+    Query(page): Query<RecordPage>,
 ) -> Result<Response> {
     record_page(app, sid, page, store::JsonRows::Context).await
+}
+
+async fn list_tasks(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Value>> {
+    app.db
+        .call(move |s| {
+            session(&s.conn, sid)?;
+            Ok(Json(codemode::session_tasks_snapshot(s, sid)))
+        })
+        .await
+}
+
+async fn kill_task(
+    State(app): State<App>,
+    Path((sid, tid)): Path<(i64, String)>,
+) -> Result<Json<Value>> {
+    let id = crate::tools::task_id(&tid).map_err(Error::bad)?;
+    app.db
+        .call(move |s| {
+            session(&s.conn, sid)?;
+            codemode::stop_task(s, sid, id)
+                .map(Json)
+                .ok_or_else(|| Error(StatusCode::NOT_FOUND, "task is not active".into()))
+        })
+        .await
 }

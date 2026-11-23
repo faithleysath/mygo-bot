@@ -32,6 +32,7 @@ pub struct Output {
     pub report: Report,
     pub answer: bool,
     pub final_item: Option<Value>,
+    pub final_output_index: Option<u32>,
     pub tools: bool,
     pub tasks: JoinSet<Result<()>>,
 }
@@ -69,8 +70,60 @@ struct Frame {
     #[serde(rename = "type")]
     kind: String,
     item: Option<Value>,
+    output_index: Option<u32>,
+    delta: Option<String>,
     message: Option<String>,
     response: Option<ResponseMetadata>,
+}
+
+struct DeltaBatcher<'a> {
+    streams: &'a crate::events::Hub,
+    sid: i64,
+    call_id: i64,
+    key: Option<(u32, &'static str)>,
+    buf: String,
+    flush_at: Option<Instant>,
+}
+
+impl<'a> DeltaBatcher<'a> {
+    fn new(streams: &'a crate::events::Hub, sid: i64, call_id: i64) -> Self {
+        Self {
+            streams,
+            sid,
+            call_id,
+            key: None,
+            buf: String::new(),
+            flush_at: None,
+        }
+    }
+
+    fn push(&mut self, output_index: u32, field: &'static str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.key.is_some_and(|k| k != (output_index, field)) {
+            self.flush();
+        }
+        if self.key.is_none() {
+            self.key = Some((output_index, field));
+            self.flush_at = Some(Instant::now() + Duration::from_millis(30));
+        }
+        self.buf.push_str(delta);
+        if self.buf.len() >= 256 {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some((idx, field)) = self.key.take() {
+            self.flush_at = None;
+            if !self.buf.is_empty() {
+                let delta = std::mem::take(&mut self.buf);
+                self.streams
+                    .append_delta(self.sid, self.call_id, idx, field, &delta);
+            }
+        }
+    }
 }
 
 // Responses terminal events may repeat the whole model output. Deserialize only billing metadata.
@@ -178,12 +231,26 @@ impl App {
         );
         let mut data = String::new();
         let mut deadline = Instant::now() + IDLE;
+        let mut batcher = DeltaBatcher::new(&self.streams, sid, input.call_id);
         loop {
-            let line = timeout_at(deadline, lines.next())
-                .await
-                .map_err(|_| Failure::Transient("model stream idle timeout".into()))?
-                .ok_or_else(|| Failure::Transient("incomplete model stream".into()))?
-                .map_err(|e| Failure::Transient(e.to_string()))?;
+            let flush_at = batcher.flush_at;
+            let line = tokio::select! {
+                biased;
+                _ = async {
+                    match flush_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    batcher.flush();
+                    continue;
+                }
+                line = timeout_at(deadline, lines.next()) => {
+                    line.map_err(|_| Failure::Transient("model stream idle timeout".into()))?
+                        .ok_or_else(|| Failure::Transient("incomplete model stream".into()))?
+                        .map_err(|e| Failure::Transient(e.to_string()))?
+                }
+            };
             if line.starts_with(':') {
                 deadline = Instant::now() + IDLE;
                 continue;
@@ -206,8 +273,12 @@ impl App {
                 .map_err(|e| fatal(format!("invalid model event: {e}")))?;
             frame.observe(&mut out.report);
             match frame.kind.as_str() {
-                "response.completed" => return Ok(()),
+                "response.completed" => {
+                    batcher.flush();
+                    return Ok(());
+                }
                 "response.failed" | "response.incomplete" | "error" => {
+                    batcher.flush();
                     let detail = frame
                         .response
                         .as_ref()
@@ -218,7 +289,35 @@ impl App {
                         .unwrap_or("model request unsuccessful");
                     return Err(fatal(format!("{}: {detail}", frame.kind)));
                 }
+                "response.output_item.added" => {
+                    batcher.flush();
+                    if let Some(item) = frame.item {
+                        let idx = frame.output_index.unwrap_or(0);
+                        let kind = item["type"].as_str().unwrap_or("message").to_owned();
+                        let name = item["name"].as_str().map(str::to_owned);
+                        let call_id_str = item["call_id"].as_str().map(str::to_owned);
+                        self.streams
+                            .item_started(sid, input.call_id, idx, kind, name, call_id_str);
+                    }
+                }
+                "response.output_text.delta" | "response.refusal.delta" => {
+                    if let Some(delta) = frame.delta.as_deref() {
+                        batcher.push(frame.output_index.unwrap_or(0), "text", delta);
+                    }
+                }
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    if let Some(delta) = frame.delta.as_deref() {
+                        batcher.push(frame.output_index.unwrap_or(0), "reasoning", delta);
+                    }
+                }
+                "response.function_call_arguments.delta" => {
+                    if let Some(delta) = frame.delta.as_deref() {
+                        batcher.push(frame.output_index.unwrap_or(0), "arguments", delta);
+                    }
+                }
                 "response.output_item.done" => {
+                    batcher.flush();
+                    let idx = frame.output_index.unwrap_or(0);
                     let item = frame.item.ok_or_else(|| fatal("missing output item"))?;
                     if !out.tools
                         && has_answer(&item)
@@ -227,9 +326,11 @@ impl App {
                         terminal.observe(&mut out.report);
                         out.answer = true;
                         out.final_item = Some(item);
+                        out.final_output_index = Some(idx);
                         return Ok(());
                     }
-                    self.accept(sid, input.call_id, item, out, hard).await?
+                    self.accept(sid, input.call_id, item, out, hard).await?;
+                    self.streams.finish_item(sid, input.call_id, idx);
                 }
                 _ => (),
             }

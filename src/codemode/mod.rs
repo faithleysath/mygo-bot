@@ -382,6 +382,31 @@ pub fn stop_session(s: &mut Store, sid: i64) {
         t.stop("killed");
     }
 }
+
+pub fn has_session_tasks(s: &Store, sid: i64) -> bool {
+    s.tasks.values().any(|t| t.origin.sid == sid)
+}
+
+pub fn session_tasks_snapshot(s: &Store, sid: i64) -> Value {
+    let mut tasks: Vec<_> = s.tasks.values().filter(|t| t.origin.sid == sid).collect();
+    tasks.sort_unstable_by_key(|t| t.origin.id);
+    Value::Array(
+        tasks
+            .into_iter()
+            .map(|t| {
+                let mut info = t.info();
+                t.live.lock().unwrap().snapshot(&mut info, true);
+                info
+            })
+            .collect(),
+    )
+}
+
+pub fn stop_task(s: &mut Store, sid: i64, id: i64) -> Option<Value> {
+    let task = s.tasks.get_mut(&id).filter(|t| t.origin.sid == sid)?;
+    task.stop(if task.expired() { "expired" } else { "killed" });
+    Some(json!({"id": format!("cm_{id}"), "status": "stopping"}))
+}
 pub fn shutdown_tasks(s: &mut Store, hard: bool) -> Result<()> {
     let mut paused = std::collections::BTreeSet::new();
     for t in s.tasks.values_mut() {
