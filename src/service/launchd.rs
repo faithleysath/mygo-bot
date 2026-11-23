@@ -87,6 +87,12 @@ impl Service {
             log,
         })
     }
+    pub(super) fn socket_path(&self) -> PathBuf {
+        match self.scope {
+            Scope::User => self.data.join("mygo.sock"),
+            Scope::System => PathBuf::from("/var/run/mygo.sock"),
+        }
+    }
     fn domain(&self) -> String {
         match self.scope {
             Scope::User => format!("gui/{}", geteuid().as_raw()),
@@ -128,6 +134,7 @@ impl Service {
         self.prepare_log()?;
         let binary = xml(path_text(&self.binary)?)?;
         let data = xml(path_text(&self.data)?)?;
+        let socket = xml(path_text(&self.socket_path())?)?;
         let log = xml(path_text(&self.log)?)?;
         let path = match self.scope {
             Scope::User => format!(
@@ -146,7 +153,7 @@ impl Service {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{binary}</string><string>daemon</string><string>--foreground</string></array>
+  <key>ProgramArguments</key><array><string>{binary}</string><string>daemon</string><string>--foreground</string><string>--unix-socket</string><string>{socket}</string></array>
   <key>WorkingDirectory</key><string>{data}</string>
   <key>RunAtLoad</key><true/>
   <key>ExitTimeOut</key><integer>{exit_timeout}</integer>

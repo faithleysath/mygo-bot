@@ -10,6 +10,8 @@ use std::{
 };
 
 const UNIT: &str = "mygo.service";
+const RUNTIME_DIR: &str = "mygo";
+const SOCKET_NAME: &str = "mygo.sock";
 
 fn xdg(key: &str, default: &str) -> io::Result<PathBuf> {
     env::var_os(key)
@@ -45,6 +47,17 @@ impl Service {
             config: Self::config(scope)?,
             data,
         })
+    }
+    pub(super) fn socket_path(&self) -> PathBuf {
+        // systemd expands %t to the system or user manager's runtime directory.
+        let runtime = match self.scope {
+            Scope::System => PathBuf::from("/run"),
+            Scope::User => env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", geteuid().as_raw()))),
+        };
+        runtime.join(RUNTIME_DIR).join(SOCKET_NAME)
     }
     fn command(&self, name: &str) -> Command {
         let mut command = Command::new(name);
@@ -103,7 +116,9 @@ Description=MyGo-Bot Daemon
 {network}
 [Service]
 Type=simple
-ExecStart={prefix}\"{binary}\" daemon --foreground
+ExecStart={prefix}\"{binary}\" daemon --foreground --unix-socket \"%t/{RUNTIME_DIR}/{SOCKET_NAME}\"
+RuntimeDirectory={RUNTIME_DIR}
+RuntimeDirectoryMode=0700
 WorkingDirectory={data}
 Restart=on-failure
 RestartSec=3

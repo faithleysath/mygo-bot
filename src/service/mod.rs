@@ -33,7 +33,7 @@ const SERVICE_HELP: &str = "Usage: mygo service [--system] <ACTION> [OPTIONS]
   install    Register automatic startup
   start      Start the service
   stop       Stop the service
-  status     Show service state and paths
+  status     Show service state and paths, including the Unix socket
   restart    Reload the definition and restart
   logs       Show recent log lines
   uninstall  Remove the service definition
@@ -267,15 +267,20 @@ pub fn run(scope: Scope, action: Action) -> io::Result<ExitCode> {
             }
         }
         Action::Status if !svc.config.try_exists()? => {
-            println!("service is not installed ({})", svc.config.display());
+            println!(
+                "service is not installed ({})\nSocket: {}",
+                svc.config.display(),
+                svc.socket_path().display()
+            );
             return Ok(ExitCode::from(3));
         }
         Action::Status => {
             println!(
-                "Config: {}\nExecutable: {}\nData: {}\nLogs: {}",
+                "Config: {}\nExecutable: {}\nData: {}\nSocket: {}\nLogs: {}",
                 svc.config.display(),
                 svc.binary.display(),
                 svc.data.display(),
+                svc.socket_path().display(),
                 svc.log_source()
             );
             return svc.status();
