@@ -113,7 +113,7 @@ const HELP: &str = concat!(
     "Usage: mygo <COMMAND> [OPTIONS]\n\nCommands:\n  daemon     Run the HTTP and SSE API\n",
     cfg_select! {
         any(target_os = "macos", target_os = "linux") => {
-            "  install    Install the executable\n  uninstall  Remove the executable\n  service    Manage the system service\n"
+            "  install    Install the executable\n  uninstall  Unregister the service and remove the executable\n  service    Manage the system service\n"
         }
         _ => { "" }
     },

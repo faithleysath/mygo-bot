@@ -19,14 +19,13 @@ use std::{
 
 pub enum Action {
     InstallBinary,
-    UninstallBinary,
     Install,
     Start,
     Stop,
     Status,
     Restart,
     Logs { lines: NonZeroUsize, follow: bool },
-    Uninstall,
+    Uninstall { remove_binary: bool },
 }
 
 const SERVICE_HELP: &str = "Usage: mygo service [--system] <ACTION> [OPTIONS]
@@ -101,13 +100,17 @@ pub fn parse(name: &str, args: impl Iterator<Item = OsString>) -> Result<Cli, St
     }
     let action = match service_action.as_deref() {
         None if name == "install" => Action::InstallBinary,
-        None => Action::UninstallBinary,
+        None => Action::Uninstall {
+            remove_binary: true,
+        },
         Some("install") => Action::Install,
         Some("start") => Action::Start,
         Some("stop") => Action::Stop,
         Some("status") => Action::Status,
         Some("restart") => Action::Restart,
-        Some("uninstall") => Action::Uninstall,
+        Some("uninstall") => Action::Uninstall {
+            remove_binary: false,
+        },
         Some("logs") => Action::Logs {
             lines: lines.unwrap_or(NonZeroUsize::new(50).unwrap()),
             follow,
@@ -118,6 +121,10 @@ pub fn parse(name: &str, args: impl Iterator<Item = OsString>) -> Result<Cli, St
         if logs {
             println!(
                 "Usage: {usage} [--system] [-f|--follow] [-n|--lines <COUNT>]\n\nShow the last COUNT lines (default: 50). Use --follow to stream new entries."
+            );
+        } else if name == "uninstall" {
+            println!(
+                "Usage: {usage} [--system]\n\nStop and unregister the service, then remove the executable. Data and logs are kept.\nDefaults to the current user. Pass --system for system scope."
             );
         } else {
             println!(
@@ -226,7 +233,6 @@ impl Service {
 pub fn run(scope: Scope, action: Action) -> io::Result<ExitCode> {
     match action {
         Action::InstallBinary => return install::install(scope).map(|()| ExitCode::SUCCESS),
-        Action::UninstallBinary => return install::uninstall(scope).map(|()| ExitCode::SUCCESS),
         Action::Status | Action::Logs { .. } => (),
         _ => scope.check()?,
     }
@@ -276,14 +282,23 @@ pub fn run(scope: Scope, action: Action) -> io::Result<ExitCode> {
         }
         Action::Logs { lines, follow } => return svc.logs(lines, follow),
         Action::Stop => svc.stop()?,
-        Action::Uninstall => {
+        Action::Uninstall { remove_binary } => {
+            // A standalone executable can be installed on Linux without a systemd manager.
+            #[cfg(target_os = "linux")]
+            if remove_binary && !svc.config.try_exists()? && svc.check_manager().is_err() {
+                install::remove_binary(&svc.binary)?;
+                return Ok(ExitCode::SUCCESS);
+            }
             if svc.unregister()? {
                 println!("uninstalled service definition at {}", svc.config.display());
-            } else {
+            } else if !remove_binary {
                 println!("service is not installed ({})", svc.config.display());
             }
+            if remove_binary {
+                install::remove_binary(&svc.binary)?;
+            }
         }
-        Action::InstallBinary | Action::UninstallBinary => unreachable!(),
+        Action::InstallBinary => unreachable!(),
     }
     Ok(ExitCode::SUCCESS)
 }

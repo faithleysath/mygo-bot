@@ -152,23 +152,13 @@ pub fn copy_binary(scope: Scope, flags: RenameFlags) -> io::Result<()> {
     Ok(())
 }
 
-pub fn uninstall(scope: Scope) -> io::Result<()> {
-    scope.check()?;
-    let dest = scope.binary()?;
-    match fs::remove_file(&dest) {
+pub(super) fn remove_binary(dest: &Path) -> io::Result<()> {
+    match fs::remove_file(dest) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             println!("mygo is not installed at {}", dest.display())
         }
-        result => {
-            result?;
-            println!("uninstalled {}", dest.display());
-            if service::is_installed(scope)? {
-                eprintln!(
-                    "warning: service is still installed; run `{}`",
-                    scope.command("service uninstall")
-                );
-            }
-        }
+        Ok(()) => println!("uninstalled {}", dest.display()),
+        Err(err) => return Err(err),
     }
     Ok(())
 }

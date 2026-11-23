@@ -34,7 +34,8 @@ fn xml(value: &str) -> io::Result<String> {
 }
 
 fn missing(output: &Output) -> bool {
-    matches!(output.status.code(), Some(3 | 113))
+    // launchctl distinguishes an absent login domain (112) from an absent job (113).
+    matches!(output.status.code(), Some(3 | 112 | 113))
 }
 fn failure(output: Output) -> io::Error {
     let kind = match output.status.code() {

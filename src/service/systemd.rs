@@ -66,7 +66,11 @@ impl Service {
             .args(["show", UNIT, "-p", name, "--value"])
             .output()
             .map_err(|e| io::Error::new(e.kind(), format!("systemctl: {e}")))?;
-        if !out.status.success() {
+        // Some systemd versions return EXIT_UNKNOWN (4) along with the requested state.
+        let missing_unit = name == "LoadState"
+            && out.status.code() == Some(4)
+            && out.stdout.trim_ascii() == b"not-found";
+        if !out.status.success() && !missing_unit {
             return Err(io::Error::other(format!(
                 "systemctl show: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
@@ -169,9 +173,10 @@ WantedBy={wanted}
             self.systemctl(&["disable", "--now", UNIT])?;
             self.remove_definition()?
         } else {
-            if self.property("LoadState")? != "not-found" {
-                self.stop()?;
+            if self.property("LoadState")? == "not-found" {
+                return Ok(false);
             }
+            self.stop()?;
             false
         };
         self.systemctl(&["daemon-reload"])?;
