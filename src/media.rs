@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::prelude::{BASE64_STANDARD, Engine as _};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, types::ValueRef};
 use serde_json::{Value, json};
 
 use crate::{App, Error, Result};
@@ -251,15 +251,28 @@ impl<'a> ContentBlock<'a> {
                 attachment_id,
             } => (kind.as_str(), attachment_id),
         };
-        let (mime, data): (String, Vec<u8>) = conn
-            .prepare_cached("SELECT mime_type,data FROM attachments WHERE id=?")?
-            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?
+        let mut stmt = conn.prepare_cached("SELECT mime_type,data FROM attachments WHERE id=?")?;
+        let mut rows = stmt.query([id])?;
+        let row = rows
+            .next()?
             .ok_or_else(|| Error::bad(format!("attachment {id} does not exist")))?;
+        let mime: String = row.get(0)?;
+        let data = match row.get_ref(1)? {
+            ValueRef::Blob(data) => data,
+            value => {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    1,
+                    "data".into(),
+                    value.data_type(),
+                )
+                .into());
+            }
+        };
         check_mime(kind, id, &mime)?;
         let essence = mime.split(';').next().unwrap_or(&mime);
         let mut url = format!("data:{essence};base64,");
         BASE64_STANDARD.encode_string(data, &mut url);
+        drop(rows);
         if kind == "image" {
             return Ok(json!({"type":"input_image","image_url":url,"detail":"auto"}));
         }
