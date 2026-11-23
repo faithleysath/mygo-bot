@@ -100,7 +100,28 @@ enum Transport {
     Stdio(StdioTransport),
 }
 
-type ToolParamHeaders = HashMap<String, Vec<(Vec<String>, String)>>;
+type ParamHeaders = Vec<(Vec<String>, String)>;
+
+#[derive(Default)]
+struct ToolHeaderCache {
+    entries: HashMap<String, ParamHeaders>,
+    overflowed: bool,
+}
+
+impl ToolHeaderCache {
+    fn remember(&mut self, name: &str, headers: ParamHeaders) {
+        if headers.is_empty() && !self.overflowed {
+            self.entries.remove(name);
+            return;
+        }
+        if self.entries.len() >= 512 && !self.entries.contains_key(name) {
+            self.overflowed = true;
+            let victim = self.entries.keys().next().unwrap().clone();
+            self.entries.remove(&victim);
+        }
+        self.entries.insert(name.to_owned(), headers);
+    }
+}
 
 struct HttpInner {
     http: oauth::HttpClient,
@@ -108,7 +129,7 @@ struct HttpInner {
     headers: HashMap<HeaderName, HeaderValue>,
     session_id: std::sync::RwLock<Option<String>>,
     protocol_version: std::sync::RwLock<Option<String>>,
-    tool_param_headers: std::sync::RwLock<ToolParamHeaders>,
+    tool_param_headers: std::sync::RwLock<ToolHeaderCache>,
     closed: AtomicBool,
     delete_sent: AtomicBool,
     cache_epoch: Arc<AtomicU64>,
@@ -233,6 +254,15 @@ pub(super) fn parse_rpc_message(msg: &Value) -> Result<Value, McpError> {
         .ok_or(McpError::InvalidResponse)
 }
 
+fn check_rpc_error(body: &[u8]) -> Result<(), McpError> {
+    if let Ok(msg) = serde_json::from_slice::<Value>(body)
+        && msg.get("error").is_some()
+    {
+        parse_rpc_message(&msg)?;
+    }
+    Ok(())
+}
+
 fn classify_reqwest_error(err: reqwest::Error) -> McpError {
     if let Some(status) = err.status() {
         return McpError::HttpStatus(status.as_u16());
@@ -329,7 +359,7 @@ fn collect_prop_headers(
     }
 }
 
-fn collect_param_headers(schema: &Map<String, Value>) -> Vec<(Vec<String>, String)> {
+fn collect_param_headers(schema: &Map<String, Value>) -> ParamHeaders {
     if schema.contains_key("x-mcp-header") {
         return Vec::new();
     }
@@ -534,6 +564,7 @@ impl HttpTransport {
         method: Option<&str>,
         params: Option<&Value>,
         override_version: Option<&str>,
+        param_headers: &[(Vec<String>, String)],
     ) -> (HeaderMap, bool) {
         let mut headers = HeaderMap::new();
         for (name, value) in &self.inner.headers {
@@ -573,19 +604,9 @@ impl HttpTransport {
                     headers.insert("mcp-name", val);
                 }
                 if method == "tools/call"
-                    && let Some(tool_name) = params
-                        .and_then(|p| p.get("name"))
-                        .and_then(Value::as_str)
                     && let Some(arguments) = params.and_then(|p| p.get("arguments"))
-                    && let Some(entries) = self
-                        .inner
-                        .tool_param_headers
-                        .read()
-                        .unwrap()
-                        .get(tool_name)
-                        .cloned()
                 {
-                    for (path, header) in entries {
+                    for (path, header) in param_headers {
                         let Some(arg) = path.iter().try_fold(arguments, |v, k| v.get(k)) else {
                             continue;
                         };
@@ -618,12 +639,7 @@ impl HttpTransport {
             let Some(schema) = tool.get("inputSchema").and_then(Value::as_object) else {
                 continue;
             };
-            let collected = collect_param_headers(schema);
-            if collected.is_empty() {
-                cache.remove(name);
-            } else if cache.len() < 512 || cache.contains_key(name) {
-                cache.insert(name.to_owned(), collected);
-            }
+            cache.remember(name, collect_param_headers(schema));
         }
     }
 
@@ -634,7 +650,7 @@ impl HttpTransport {
         let Ok(token) = self.inner.http.acquire_token(&self.inner.url).await else {
             return;
         };
-        let (mut headers, _) = self.build_headers(None, None, override_version);
+        let (mut headers, _) = self.build_headers(None, None, override_version, &[]);
         if let Some(t) = token.as_deref()
             && super::oauth::HttpClient::attach_bearer(&mut headers, t).is_err()
         {
@@ -689,13 +705,14 @@ impl HttpTransport {
         method: Option<&str>,
         params: Option<&Value>,
         override_version: Option<&str>,
+        param_headers: &[(Vec<String>, String)],
     ) -> Result<Option<Value>, McpError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(McpError::TransportClosed);
         }
         let token = self.inner.http.acquire_token(&self.inner.url).await?;
         let (mut headers, session_was_attached) =
-            self.build_headers(method, params, override_version);
+            self.build_headers(method, params, override_version, param_headers);
         if let Some(t) = token.as_deref() {
             super::oauth::HttpClient::attach_bearer(&mut headers, t)?;
         }
@@ -729,21 +746,18 @@ impl HttpTransport {
         let is_sse = content_type_is(response.headers(), "text/event-stream");
 
         if !status.is_success() {
+            if method == Some("server/discover")
+                && matches!(status, reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::GATEWAY_TIMEOUT)
+            {
+                return Err(McpError::TimedOut);
+            }
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS
                 || status == reqwest::StatusCode::FORBIDDEN
                 || !is_json
             {
                 return Err(McpError::HttpStatus(status.as_u16()));
             }
-            let body = read_bounded(response).await?;
-            if let Ok(msg) = serde_json::from_slice::<Value>(&body)
-                && msg.get("error").is_some()
-            {
-                return match parse_rpc_message(&msg) {
-                    Err(err) => Err(err),
-                    Ok(_) => Err(McpError::InvalidResponse),
-                };
-            }
+            check_rpc_error(&read_bounded(response).await?)?;
             return Err(McpError::HttpStatus(status.as_u16()));
         }
 
@@ -768,6 +782,9 @@ impl HttpTransport {
         }
 
         let Some(expected_id) = expected_id else {
+            if is_json {
+                check_rpc_error(&read_bounded(response).await?)?;
+            }
             return Ok(None);
         };
 
@@ -846,7 +863,7 @@ impl Client {
                 headers,
                 session_id: std::sync::RwLock::new(None),
                 protocol_version: std::sync::RwLock::new(None),
-                tool_param_headers: std::sync::RwLock::new(HashMap::new()),
+                tool_param_headers: Default::default(),
                 closed: AtomicBool::new(false),
                 delete_sent: AtomicBool::new(false),
                 cache_epoch: cache_epoch.clone(),
@@ -871,7 +888,7 @@ impl Client {
             attempted.push(candidate);
             let params = json!({ "_meta": client_meta(candidate) });
             match self
-                .raw_request_with_version("server/discover", params, Some(candidate))
+                .send_request("server/discover", params, Some(candidate), &[])
                 .await
             {
                 Ok(disc) => {
@@ -957,14 +974,12 @@ impl Client {
             cache_epoch,
             send_meta: false,
         };
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(10), client.discover_startup()).await;
-        let (info, has_initialize, send_meta) = match outcome {
-            Ok(Ok(DiscoverOutcome::Modern(info))) => {
+        let (info, has_initialize, send_meta) = match client.discover_startup().await? {
+            DiscoverOutcome::Modern(info) => {
                 client.set_protocol_version(&info.protocol_version);
                 (info, false, true)
             }
-            Ok(Ok(DiscoverOutcome::Legacy)) | Err(_) => {
+            DiscoverOutcome::Legacy => {
                 client.reset_http_session();
                 let init_params = json!({
                     "protocolVersion": "2025-11-25",
@@ -984,7 +999,7 @@ impl Client {
                 }
                 let capabilities = ServerCapabilities::from_json(result.get("capabilities"));
                 client.set_protocol_version(ver);
-                let _ = client.raw_notify("notifications/initialized", None).await;
+                client.raw_notify("notifications/initialized", None).await?;
                 let has_initialize = ver < MODERN_PROTOCOL_VERSION;
                 (
                     ServerInfo {
@@ -995,7 +1010,6 @@ impl Client {
                     !has_initialize,
                 )
             }
-            Ok(Err(err)) => return Err(err),
         };
         // Only stdio receives pushed list_changed notifications; HTTP has no GET SSE stream.
         let receives_notifications =
@@ -1066,7 +1080,7 @@ impl Client {
         let payload = serde_json::to_vec(&msg).map_err(|_| McpError::InvalidResponse)?;
         match &self.transport {
             Transport::Http(http) => {
-                http.post(&payload, None, Some(method), params.as_ref(), None)
+                http.post(&payload, None, Some(method), params.as_ref(), None, &[])
                     .await?;
                 Ok(())
             }
@@ -1074,7 +1088,17 @@ impl Client {
         }
     }
 
-    async fn raw_request(&self, method: &str, mut params: Value) -> Result<Value, McpError> {
+    async fn raw_request(&self, method: &str, params: Value) -> Result<Value, McpError> {
+        self.send_request(method, params, None, &[]).await
+    }
+
+    async fn send_request(
+        &self,
+        method: &str,
+        mut params: Value,
+        override_version: Option<&str>,
+        param_headers: &[(Vec<String>, String)],
+    ) -> Result<Value, McpError> {
         if self.send_meta
             && let Some(obj) = params.as_object_mut()
             && !obj.contains_key("_meta")
@@ -1084,21 +1108,19 @@ impl Client {
                 client_meta(&self.info.protocol_version),
             );
         }
-        self.raw_request_with_version(method, params, None).await
-    }
-
-    async fn raw_request_with_version(
-        &self,
-        method: &str,
-        params: Value,
-        override_version: Option<&str>,
-    ) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": &params});
         let payload = serde_json::to_vec(&msg).map_err(|_| McpError::InvalidResponse)?;
         match &self.transport {
             Transport::Http(http) => http
-                .post(&payload, Some(id), Some(method), Some(&params), override_version)
+                .post(
+                    &payload,
+                    Some(id),
+                    Some(method),
+                    Some(&params),
+                    override_version,
+                    param_headers,
+                )
                 .await?
                 .ok_or(McpError::InvalidResponse),
             Transport::Stdio(stdio) => stdio.request(id, &payload).await,
@@ -1180,12 +1202,54 @@ impl Client {
         self.raw_request("prompts/get", params).await
     }
 
+    pub(super) async fn headers_for_tool(&self, name: &str) -> Result<ParamHeaders, McpError> {
+        let Transport::Http(http) = &self.transport else {
+            return Ok(Vec::new());
+        };
+        {
+            let cache = http.inner.tool_param_headers.read().unwrap();
+            if let Some(headers) = cache.entries.get(name) {
+                return Ok(headers.clone());
+            }
+            if !cache.overflowed {
+                return Ok(Vec::new());
+            }
+        }
+        // A cache miss after eviction is ambiguous. Resolve the schema before sending
+        // the call and keep its mapping local so concurrent discovery cannot evict it.
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        loop {
+            let page = self.list_cached("tools/list", cursor).await?;
+            let tools = page["tools"].as_array().ok_or(McpError::InvalidResponse)?;
+            if let Some(tool) = tools.iter().find(|tool| tool["name"].as_str() == Some(name)) {
+                let schema = tool["inputSchema"]
+                    .as_object()
+                    .ok_or(McpError::InvalidResponse)?;
+                let headers = collect_param_headers(schema);
+                http.inner.tool_param_headers.write().unwrap()
+                    .remember(name, headers.clone());
+                return Ok(headers);
+            }
+            let Some(next) = super::capabilities::next_cursor(&page)
+                .map_err(|_| McpError::InvalidResponse)?
+            else {
+                return Ok(Vec::new());
+            };
+            if !seen.insert(next.clone()) {
+                return Err(McpError::InvalidResponse);
+            }
+            cursor = Some(next);
+        }
+    }
+
     pub(super) async fn call_tool(
         &self,
         name: &str,
         args: Map<String, Value>,
+        headers: &[(Vec<String>, String)],
     ) -> Result<Value, McpError> {
-        self.raw_request("tools/call", json!({"name": name, "arguments": args}))
-            .await
+        let params = json!({"name": name, "arguments": args});
+        self.send_request("tools/call", params, None, headers).await
     }
 }

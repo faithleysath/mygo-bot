@@ -328,8 +328,12 @@ pub async fn execute(
                     "mcp.resources" | "mcp.resourceTemplates" | "mcp.prompts" => "discovering",
                     _ => "requesting",
                 });
-                sent = op == "mcp.call";
-                capabilities::attempt(client, op, &args).await
+                capabilities::attempt(client, op, &args, || {
+                    slot.check()?;
+                    sent = true;
+                    Ok(())
+                })
+                .await
             }
         };
         let reply = attempt.map_err(|e| match e {

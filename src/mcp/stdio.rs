@@ -96,33 +96,25 @@ pub(super) struct StdioTransport {
     reader: Mutex<Option<JoinHandle<()>>>,
 }
 
-struct PendingGuard {
+struct PendingGuard<'a> {
     id: u64,
-    pending: PendingMap,
-    writer_tx: mpsc::Sender<WriteFrame>,
-    closed: Arc<AtomicBool>,
-    notify_cancel: bool,
-    disarmed: bool,
+    pending: &'a PendingMap,
+    cancel_slot: Option<mpsc::Permit<'a, WriteFrame>>,
 }
 
-impl Drop for PendingGuard {
+impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
-        if !self.disarmed {
-            self.pending.lock().unwrap().remove(&self.id);
-            if self.notify_cancel && !self.closed.load(Ordering::Acquire) {
-                let notice = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/cancelled",
-                    "params": {
-                        "requestId": self.id,
-                        "reason": "request cancelled",
-                    }
-                });
-                if let Ok(mut bytes) = serde_json::to_vec(&notice) {
-                    bytes.push(b'\n');
-                    let _ = self.writer_tx.try_send(WriteFrame { bytes, ack: None });
-                }
-            }
+        if self.pending.lock().unwrap().remove(&self.id).is_some()
+            && let Some(slot) = self.cancel_slot.take()
+        {
+            let notice = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": self.id, "reason": "request cancelled"}
+            });
+            let mut bytes = notice.to_string().into_bytes();
+            bytes.push(b'\n');
+            slot.send(WriteFrame { bytes, ack: None });
         }
     }
 }
@@ -208,40 +200,30 @@ impl StdioTransport {
         if self.is_closed() {
             return Err(McpError::TransportClosed);
         }
+        // Admit the request and its possible cancellation together. Drop can then queue
+        // the notice synchronously, behind the request, even when the pipe is backed up.
+        let mut slots = self
+            .writer_tx
+            .reserve_many(2)
+            .await
+            .map_err(|_| McpError::TransportClosed)?;
+        let request_slot = slots.next().unwrap();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        let mut guard = PendingGuard {
+        let _guard = PendingGuard {
             id,
-            pending: self.pending.clone(),
-            writer_tx: self.writer_tx.clone(),
-            closed: self.closed.clone(),
-            notify_cancel: false,
-            disarmed: false,
+            pending: &self.pending,
+            cancel_slot: slots.next(),
         };
         let (ack_tx, ack_rx) = oneshot::channel();
-        if self
-            .writer_tx
-            .send(WriteFrame {
-                bytes: framed_line(payload),
-                ack: Some(ack_tx),
-            })
-            .await
-            .is_err()
-        {
+        request_slot.send(WriteFrame {
+            bytes: framed_line(payload),
+            ack: Some(ack_tx),
+        });
+        if !matches!(ack_rx.await, Ok(Ok(()))) {
             return Err(McpError::TransportClosed);
         }
-        // The writer task now owns writing the entire frame ahead of any queued cancellation.
-        guard.notify_cancel = true;
-        match ack_rx.await {
-            Ok(Ok(())) => {}
-            _ => {
-                guard.notify_cancel = false;
-                return Err(McpError::TransportClosed);
-            }
-        }
-        let result = rx.await.unwrap_or(Err(McpError::TransportClosed));
-        guard.disarmed = true;
-        result
+        rx.await.unwrap_or(Err(McpError::TransportClosed))
     }
 
     pub(super) async fn close(&self, timeout: Duration) {
@@ -339,7 +321,13 @@ async fn run_reader(
                 };
                 if let Ok(mut bytes) = serde_json::to_vec(&reply) {
                     bytes.push(b'\n');
-                    let _ = writer_tx.try_send(WriteFrame { bytes, ack: None });
+                    let frame = WriteFrame { bytes, ack: None };
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        _ = child.leader_exit() => break,
+                        sent = writer_tx.send(frame) => if sent.is_err() { break },
+                    }
                 }
             } else if matches!(
                 method,

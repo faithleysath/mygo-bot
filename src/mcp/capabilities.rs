@@ -60,15 +60,20 @@ fn page_cursor(args: &Value) -> Result<Option<String>, String> {
     }
 }
 
-/// Exactly one peer operation. Dropping the future cancels any stdio waiter.
+/// Run one requested operation. A tool call may first need to look up its parameter headers.
 pub(super) async fn attempt(
     client: &Client,
     op: &str,
     args: &Value,
+    before_tool_call: impl FnOnce() -> Result<(), String>,
 ) -> Result<Reply, AttemptError> {
     let reply = match op {
         "mcp.call" => {
-            let response = client.call_tool(string(args, "tool")?, arguments(args)?).await?;
+            let name = string(args, "tool")?;
+            let arguments = arguments(args)?;
+            let headers = client.headers_for_tool(name).await?;
+            before_tool_call()?;
+            let response = client.call_tool(name, arguments, &headers).await?;
             content::tool(response).map_err(|reason| {
                 format!(
                     "MCP tool replied, but its result could not be read: {reason}; check remote state before repeating a write"
