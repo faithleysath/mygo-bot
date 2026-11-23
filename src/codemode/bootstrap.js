@@ -1,4 +1,4 @@
-((io, emit, close, decode, log) => {
+((io, emit, close, decode, log, sessionId, taskId) => {
     const stringify = JSON.stringify;
     const parse = JSON.parse;
     const objectTag = Object.prototype.toString;
@@ -126,6 +126,19 @@
         return result;
     }
 
+    async function sendRequest(op, args, body, stream) {
+        const response = body?.[Symbol.asyncIterator]
+            ? await consume(body, () => call('upload.open', {}), upload => call(op, { ...args, upload }))
+            : await call(op, args, body);
+        if (stream) {
+            response.body = reader(response.body);
+        } else {
+            response.text = () => decode(response.body, false);
+            response.json = () => parse(response.text());
+        }
+        return response;
+    }
+
     Object.assign(globalThis, {
         fs: {
             async read(path, { encoding, stream = false } = {}) {
@@ -149,19 +162,34 @@
         http: {
             async request({ url, method, headers, body, timeout_ms, stream = false }) {
                 if (typeof stream !== 'boolean') throw new TypeError('stream must be a boolean');
-                const args = { url, method, headers, timeout_ms, stream };
-                const response = body?.[Symbol.asyncIterator]
-                    ? await consume(body, () => call('upload.open', {}), upload => call('http.request', { ...args, upload }))
-                    : await call('http.request', args, body);
-                if (stream) {
-                    response.body = reader(response.body);
-                } else {
-                    response.text = () => decode(response.body, false);
-                    response.json = () => parse(response.text());
-                }
-                return response;
+                return sendRequest('http.request', { url, method, headers, timeout_ms, stream }, body, stream);
             },
         },
+        mygo: Object.freeze({
+            sessionId,
+            taskId: taskId ?? null,
+            async request({ path, method, headers, body, timeout_ms, stream = false }) {
+                if (typeof stream !== 'boolean') throw new TypeError('stream must be a boolean');
+                let reqHeaders = headers;
+                let reqBody = body;
+                if (body !== undefined && body !== null && !body[Symbol.asyncIterator]
+                    && typeof body !== 'string' && !(body instanceof Uint8Array)) {
+                    if (isView(body) || body instanceof ArrayBuffer) {
+                        throw new TypeError('expected string, Uint8Array, async iterable, or JSON value');
+                    }
+                    const json = stringify(body);
+                    if (json === undefined) {
+                        throw new TypeError('request body cannot be serialized as JSON');
+                    }
+                    reqBody = json;
+                    if (headers === undefined || headers === null || (typeof headers === 'object' && !Array.isArray(headers))) {
+                        const hasType = headers && Object.keys(headers).some(k => k.toLowerCase() === 'content-type');
+                        if (!hasType) reqHeaders = { ...headers, 'content-type': 'application/json' };
+                    }
+                }
+                return sendRequest('mygo.request', { path, method, headers: reqHeaders, timeout_ms, stream }, reqBody, stream);
+            },
+        }),
         task: {
             async list() { return call('task.list', {}); },
             async status(id) { return call('task.status', { id }); },

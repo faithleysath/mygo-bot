@@ -440,8 +440,17 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
     })?;
     let decoder: Function = ctx.eval(include_str!("decoder.js"))?;
     decoder.call::<_, ()>((decode.clone(), encode))?;
+    let task_id = (!scope.host.trigger).then(|| format!("cm_{}", scope.host.origin));
     let init: Function = ctx.eval(include_str!("bootstrap.js"))?;
-    init.call((io, emit, close, decode, log))
+    init.call((
+        io,
+        emit,
+        close,
+        decode,
+        log,
+        scope.host.sid,
+        task_id,
+    ))
 }
 
 // QuickJS may encode an unpaired JS surrogate as WTF-8. Validate or decode lossily

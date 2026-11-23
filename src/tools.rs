@@ -50,6 +50,10 @@ pub fn definitions() -> Value {
                 "await emitEvent(textOrBlocks) queues a separate event in this session (rate-limited, nonempty). ",
                 "Blocks: {type:'text',text} (nonempty) or {type:'image'|'audio'|'video',mime_type,data:Uint8Array} (up to 50 MiB, when supported by the session model). ",
                 "await task.list() lists active tasks in this session; await task.status(id) returns the full live snapshot or final summary. ",
+                "mygo.sessionId and mygo.taskId identify the current session and task. await mygo.request({path,method,headers,body,timeout_ms,stream}) ",
+                "calls MyGo's own HTTP API in-process (no host or token needed; plain objects/JSON bodies serialize with application/json; ",
+                "stream:true is required for SSE endpoints such as /sessions/{sid}/events). Read /openapi.json via mygo.request for all routes and schemas ",
+                "(sessions, messages, run/pause, history, context, events, providers, models, config, mcp, calls, attachments). ",
                 "Default foreground mode waits up to 90s, then continues the same task in the background without losing work. ",
                 "Keep background false unless you have independent work to do immediately or are starting a persistent listener or service. ",
                 "Do independent work while tasks run. Use codemode_task_wait when you need a result, then finish your turn once the work is complete."
@@ -76,7 +80,7 @@ pub fn definitions() -> Value {
                 "Pending input, pause, or all active tasks draining after a wait that began with tasks cancels the script and discards its output."
             ),
             json!({"trigger_code":{"type":"string", "description":concat!(
-                "Optional nonempty async JS body up to 256 KiB. Same runtime as codemode, including await task.status(id), await task.list(), fs, http, proc, mcp and await sleep(ms); emitEvent is unavailable. ",
+                "Optional nonempty async JS body up to 256 KiB. Same runtime as codemode, including await task.status(id), await task.list(), fs, http, proc, mcp, mygo and await sleep(ms); emitEvent is unavailable. ",
                 "Use side-effect-free checks only: events can interrupt the script at any time, and it is never recovered or replayed. Avoid file writes or other side effects. ",
                 "Example: while (true) { const s = await task.status('cm_1'); if (s.running_commands?.some(c => /ERR/.test(c.stderr))) return s; await sleep(500); }"
             )}}),

@@ -66,6 +66,10 @@ pub fn routes(app: App) -> Router {
         .with_state(app)
 }
 
+pub fn internal_routes(app: App) -> Router {
+    routes(app).merge(crate::docs::openapi_route())
+}
+
 type Document = Json<Map<String, Value>>;
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]

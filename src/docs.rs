@@ -52,11 +52,15 @@ const PAGE: &str = r#"<!doctype html>
 </body>
 </html>"#;
 
+pub fn openapi_route() -> Router {
+    Router::new().route(
+        "/openapi.json",
+        get(|| async { ([(header::CONTENT_TYPE, "application/json")], OPENAPI) }),
+    )
+}
+
 pub fn routes() -> Router {
     Router::new()
         .route("/docs", get(|| async { Html(PAGE) }))
-        .route(
-            "/openapi.json",
-            get(|| async { ([(header::CONTENT_TYPE, "application/json")], OPENAPI) }),
-        )
+        .merge(openapi_route())
 }

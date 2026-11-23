@@ -718,6 +718,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "windows-sys",

@@ -193,11 +193,17 @@ impl Streams {
         }
     }
 
-    pub async fn upload(
+    pub async fn upload_stream(
         &self,
         id: &Value,
         cancel: CancellationToken,
-    ) -> Result<(reqwest::Body, CancellationToken), HostError> {
+    ) -> Result<
+        (
+            impl futures_util::Stream<Item = std::result::Result<Vec<u8>, io::Error>> + Send + 'static,
+            CancellationToken,
+        ),
+        HostError,
+    > {
         let entry = self.get(id)?;
         let mut receiver = match &mut *entry.resource.lock().await {
             Resource::Upload { receiver, .. } => {
@@ -206,7 +212,7 @@ impl Streams {
             _ => return Err("expected an upload stream".into()),
         };
         let closed = entry.closed.clone();
-        let body = async_stream::stream! {
+        let stream = async_stream::stream! {
             loop {
                 let part = tokio::select! {
                     biased;
@@ -224,7 +230,16 @@ impl Streams {
                 }
             }
         };
-        Ok((reqwest::Body::wrap_stream(body), closed))
+        Ok((stream, closed))
+    }
+
+    pub async fn upload(
+        &self,
+        id: &Value,
+        cancel: CancellationToken,
+    ) -> Result<(reqwest::Body, CancellationToken), HostError> {
+        let (stream, closed) = self.upload_stream(id, cancel).await?;
+        Ok((reqwest::Body::wrap_stream(stream), closed))
     }
 }
 
