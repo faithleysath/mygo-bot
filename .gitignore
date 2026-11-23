@@ -2,3 +2,4 @@
 /mygo.sqlite3*
 /mygo.log
 /target/
+/web/node_modules/

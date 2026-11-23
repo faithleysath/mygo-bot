@@ -1,0 +1,11 @@
+{
+  "name": "mygo-webui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run build.mjs"
+  },
+  "dependencies": {
+    "preact": "11.2.0"
+  }
+}

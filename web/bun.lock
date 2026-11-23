@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "mygo-webui",
+      "dependencies": {
+        "preact": "11.2.0",
+      },
+    },
+  },
+  "packages": {
+    "preact": ["preact@11.2.0", "https://registry.npmmirror.com/preact/-/preact-11.2.0.tgz", { "peerDependencies": { "preact-render-to-string": ">=6.7.0" }, "optionalPeers": ["preact-render-to-string"] }, "sha512-/HfHI/7N84e6GrWBJ3J280z3mLaRJiDcSvj/A+y/4AbLnND/1UlGHe1sR6oYuTGwId0nP7dqDU9OnLxMPZ7xBg=="],
+  }
+}

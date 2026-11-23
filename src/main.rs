@@ -18,6 +18,7 @@ mod service;
 mod socket;
 mod store;
 mod tools;
+mod webui;
 
 use axum::{
     Json,
@@ -500,6 +501,7 @@ async fn serve(
     app.workers
         .spawn(mcp::reap_idle(app.db.clone(), app.stopping.clone()));
     let routes = api::routes(app.clone());
+    let web = webui::routes();
     let docs = listen.ip().is_loopback().then(docs::routes);
     let signal = shutdown_signal()?;
     daemon::Ready {
@@ -511,10 +513,13 @@ async fn serve(
         token: generated.then(|| token.clone()),
     }
     .announce(parent)?;
-    let mut tcp_routes = routes.clone().layer(axum::middleware::from_fn_with_state(
-        Arc::<str>::from(token),
-        api::authorize_tcp,
-    ));
+    let mut tcp_routes = routes
+        .clone()
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::<str>::from(token),
+            api::authorize_tcp,
+        ))
+        .merge(web.clone());
     if let Some(docs) = docs {
         tcp_routes = tcp_routes.merge(docs);
     }
@@ -523,7 +528,7 @@ async fn serve(
     let server = async {
         #[cfg(unix)]
         if let Some((listener, _socket_file)) = unix {
-            let unix_server = axum::serve(listener, routes)
+            let unix_server = axum::serve(listener, routes.merge(web))
                 .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
             return tokio::try_join!(tcp_server.into_future(), unix_server.into_future())
                 .map(|_| ());
