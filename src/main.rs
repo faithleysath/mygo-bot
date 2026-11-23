@@ -103,10 +103,6 @@ struct App {
 #[cfg(unix)]
 const HELP_SOCKET_OPTIONS: &str = concat!(
     "  --unix-socket <PATH>  Local socket (no token). Defaults to ",
-    cfg_select! {
-        target_os = "macos" => { "" }
-        _ => { "$XDG_RUNTIME_DIR/mygo.sock or " }
-    },
     "mygo-<uid>/mygo.sock under the system temp directory\n",
     "  --no-unix-socket      Disable the local Unix socket and serve only TCP\n",
 );

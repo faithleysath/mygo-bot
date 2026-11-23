@@ -10,10 +10,6 @@ use std::{
 use tokio::net::UnixListener;
 
 fn runtime_dir(uid: u32) -> io::Result<PathBuf> {
-    #[cfg(not(target_os = "macos"))]
-    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
     let dir = env::temp_dir().join(format!("mygo-{uid}"));
     match fs::DirBuilder::new().mode(0o700).create(&dir) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
