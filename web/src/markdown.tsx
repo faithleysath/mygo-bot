@@ -44,27 +44,34 @@ function safeUrl(raw: string): string | null {
   return null;
 }
 
-function scanLinkEnd(text: string, start: number): number {
-  let depth = 0;
-  for (let i = start; i < text.length; i += 1) {
+function isSpace(ch: string): boolean {
+  return ch === " " || (ch >= "\t" && ch <= "\r") || (ch > "\x7f" && /\s/.test(ch));
+}
+
+function buildCloseParenMap(text: string): Map<number, number> {
+  const map = new Map<number, number>();
+  const stack: number[] = [];
+  for (let i = 0; i < text.length; i += 1) {
     const ch = text[i];
-    if (ch === "\n" || /\s/.test(ch)) return -1;
     if (ch === "(") {
-      depth += 1;
+      stack.push(i);
     } else if (ch === ")") {
-      if (depth === 0) return i > start ? i : -1;
-      depth -= 1;
+      const open = stack.pop();
+      if (open !== undefined && i > open + 1) map.set(open, i);
+    } else if (isSpace(ch)) {
+      stack.length = 0;
     }
   }
-  return -1;
+  return map;
 }
 
 function renderInline(text: string, keyPrefix: string): ComponentChildren[] {
   const nodes: ComponentChildren[] = [];
   const pattern =
-    /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(__[^_\n]+?__)|(~~[^~\n]+?~~)|(\*[^*\n]+?\*)|((?<![A-Za-z0-9_])_[^\s_](?:[^_\n]*[^\s_])?_(?![A-Za-z0-9_]))|(\[[^\]\n]+\]\()/g;
+    /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(__[^_\n]+?__)|(~~[^~\n]+?~~)|(\*[^*\n]+?\*)|((?<![A-Za-z0-9_])_[^\s_](?:[^_\n]*[^\s_])?_(?![A-Za-z0-9_]))|(\[[^\[\]\n]+\]\()/g;
   let last = 0;
   let idx = 0;
+  let closeParens: Map<number, number> | null = null;
   let m: RegExpExecArray | null;
   while ((m = pattern.exec(text)) !== null) {
     if (m.index > last) nodes.push(text.slice(last, m.index));
@@ -80,7 +87,8 @@ function renderInline(text: string, keyPrefix: string): ComponentChildren[] {
       nodes.push(<em key={k}>{renderInline(tok.slice(1, -1), k)}</em>);
     } else if (m[7]) {
       const label = tok.slice(1, -2);
-      const end = scanLinkEnd(text, pattern.lastIndex);
+      closeParens ??= buildCloseParenMap(text);
+      const end = closeParens.get(pattern.lastIndex - 1) ?? -1;
       if (end === -1) {
         nodes.push("[", ...renderInline(label, k), "](");
       } else {
