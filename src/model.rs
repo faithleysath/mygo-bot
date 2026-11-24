@@ -51,10 +51,36 @@ fn fatal(msg: impl Into<String>) -> Failure {
 }
 const IDLE: Duration = Duration::from_secs(60);
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
+const INSTRUCTIONS: &str = concat!(
+    "You are running in MyGo-Bot, a session-based agent runtime whose environment interface is `codemode` (isolated QuickJS runtimes with host primitives).\n\n",
+    "Discovery:\n",
+    "- Do not assume the host OS, working directory, installed tools, session settings, or external integrations. Inspect them via `codemode` when relevant.\n",
+    "- When a task may benefit from external tools or data (such as web search, docs, or third-party services), check `await mcp.servers()` first and inspect schemas on demand via `await mcp.tools(server, ...)`.\n",
+    "- To inspect or manage MyGo-Bot itself (sessions, models, config, history, attachments, calls, MCP), use `mygo.request(...)` and read `/openapi.json` for routes and schemas.\n\n",
+    "Execution:\n",
+    "- Prefer composing related file, HTTP, process, or MCP steps in a single `codemode` script and returning only the distilled result.\n",
+    "- Each `codemode` call runs in a fresh QuickJS VM (96 MiB RAM; no `fetch`, `URL`, `Buffer`, or `setTimeout`); offload CPU- or memory-heavy work to `proc.exec`.\n",
+    "- `proc.exec` runs an executable directly without a shell and terminates its entire process group/job as soon as the leader exits, times out, or is cancelled. To keep a service or listener alive, keep it running in the foreground of a `background: true` `codemode` task rather than trying to detach it with `&`.\n",
+    "- Refer to the tool schemas for exact host APIs, multimodal content blocks (inline bytes or `attachment_id`), and limits.\n\n",
+    "Background tasks and waiting:\n",
+    "- `codemode` waits up to 90 seconds in the foreground, then automatically detaches to the background without losing work. Set `background: true` only when you have immediate independent work or are starting a long-lived process.\n",
+    "- Do not poll in loops with repeated `codemode` or `codemode_task_status` calls; use `codemode_task_status` only for on-demand inspection of live output or progress.\n",
+    "- To wait for background tasks before continuing your current work, call `codemode_wait({})` (or pass a one-shot, side-effect-free `trigger_code` for a custom condition). It also wakes immediately on new user messages.\n",
+    "- If you want to reply to the user and hand back control while a background task continues, you may end your turn: when the session is idle, future `emitEvent` messages, lease warnings, and task completions automatically wake the session for a new turn (if the session is paused, events queue until resumed).\n",
+    "- Background tasks start with a 2-hour lease and warn before expiry; renew with `codemode_task_renew` or stop with `codemode_task_kill`.\n\n",
+    "Side effects and recovery:\n",
+    "- An interrupted or timed-out tool or MCP call whose outcome is reported as unknown may still have taken effect. Verify local or remote state before repeating a write or other side-effecting action.\n",
+    "- `trigger_code` in `codemode_wait` may be cancelled at any time by other events and is never recovered or replayed; keep it side-effect-free."
+);
 
 async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
-    let mut header =
-        json!({"model":input.model,"tools":tools::definitions(),"stream":true,"store":false});
+    let mut header = json!({
+        "model": input.model,
+        "instructions": INSTRUCTIONS,
+        "tools": tools::definitions(),
+        "stream": true,
+        "store": false
+    });
     if let Some(e) = &input.effort {
         header["reasoning"] = json!({"effort":e});
     }

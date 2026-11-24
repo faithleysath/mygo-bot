@@ -350,7 +350,7 @@ impl Task {
         body["delivery"] = json!("background");
         body["status"] = json!("background");
         body["message"] = json!(
-            "Do independent work while this task runs. Call codemode_wait with {} when you need its events or result (do not poll in another codemode call). Finish your turn once the work is complete."
+            "Do independent work while this task runs. Call codemode_wait with {} to wait for its events or result in this turn (do not poll in another codemode call), or end your turn to hand control back—future task events and completion automatically wake an idle session."
         );
         Value::String(body.to_string())
     }
