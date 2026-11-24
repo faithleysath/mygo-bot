@@ -96,6 +96,7 @@ const ZH = {
   "Pausing after current step…": "等待当前步骤完成后暂停…",
   "Upstream retry": "上游重试",
   "Latest": "回到底部",
+  "Conversation turns": "对话轮次导航",
   "Close preview": "关闭预览",
   "Click to enlarge": "点击放大",
   "Loading": "正在加载",
@@ -330,6 +331,29 @@ export function dateGroupLabelLoc(ms: number | null | undefined, locale: Locale)
   if (ms >= startOfToday) return locale === "zh" ? "今天" : "Today";
   if (ms >= startOfToday - 86400_000) return locale === "zh" ? "昨天" : "Yesterday";
   return locale === "zh" ? "近 7 天" : "Previous 7 days";
+}
+
+export function utf8ByteLength(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 export function formatBytes(bytes: number): string {

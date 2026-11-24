@@ -254,6 +254,23 @@ export function formatTokens(n: number | null | undefined): string {
   return String(n);
 }
 
+export interface TokenUsageFields {
+  input_uncached_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  output_tokens?: number | null;
+}
+
+export function totalInputTokens(u: TokenUsageFields | null | undefined): number {
+  if (!u) return 0;
+  return (u.input_uncached_tokens || 0) + (u.cache_read_tokens || 0) + (u.cache_write_tokens || 0);
+}
+
+export function totalCallTokens(u: TokenUsageFields | null | undefined): number {
+  if (!u) return 0;
+  return totalInputTokens(u) + (u.output_tokens || 0);
+}
+
 export function formatDuration(ms: number | null | undefined): string {
   if (ms == null || ms < 0) return "";
   if (ms < 1000) return `${Math.round(ms)}ms`;

@@ -162,7 +162,9 @@ async fn request(host: &Host, args: &Value, data: Option<Vec<u8>>) -> Result<Rep
             request = request.header(name, value.as_str().ok_or("header values must be strings")?);
         }
     }
-    if let Some(duration) = timeout(args)? {
+    let duration = timeout(args)?;
+    let stream_deadline = duration.map(|d| (tokio::time::Instant::now() + d, "timeout: http.request"));
+    if let Some(duration) = duration {
         request = request.timeout(duration);
     }
     let mut upload_closed = None;
@@ -188,7 +190,7 @@ async fn request(host: &Host, args: &Value, data: Option<Vec<u8>>) -> Result<Rep
         _ = closed => Err("upload stopped".into()),
         reply = async {
             let reply = request.send().await.map_err(network_error)?;
-            receive(reply, slot).await
+            receive(reply, slot, stream_deadline).await
         } => reply,
     }
 }
@@ -312,6 +314,7 @@ where
 async fn receive(
     response: reqwest::Response,
     slot: Option<Reservation<'_>>,
+    stream_deadline: Option<(tokio::time::Instant, &'static str)>,
 ) -> Result<Reply, HostError> {
     let status = response.status().as_u16();
     let headers = response.headers().clone();
@@ -323,7 +326,7 @@ async fn receive(
         content_length,
         Box::pin(response.bytes_stream()),
         slot,
-        None,
+        stream_deadline,
         network_error,
     )
     .await

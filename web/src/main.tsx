@@ -323,7 +323,14 @@ function App() {
   const sendingRef = useRef<Record<string, boolean>>({});
   sendingRef.current = sendingBySid;
   const globalSyncRef = useRef<GlobalSessionSync | null>(null);
-  const settledCallCursorRef = useRef("");
+  const itemsRef = useRef<HistoryItem[]>([]);
+  itemsRef.current = items;
+  const callsByIdRef = useRef<Map<string, LlmCallInfo>>(callsById);
+  callsByIdRef.current = callsById;
+  const inFlightCallIdsRef = useRef<Set<string>>(new Set());
+  const failedCallIdsRef = useRef<Set<string>>(new Set());
+  const sessionEpochRef = useRef(0);
+  const loadMoreSeqRef = useRef(0);
 
   const updateComposer = (sid: string, fn: (cur: ComposerDraft) => ComposerDraft) => {
     setComposers((prev) => {
@@ -525,49 +532,80 @@ function App() {
     }
   }, [activeId]);
 
-  const refreshSessionSidecars = async (sid: string): Promise<void> => {
-    const fetchNewCalls = async (): Promise<LlmCallInfo[]> => {
-      const collected: LlmCallInfo[] = [];
-      let after = settledCallCursorRef.current;
-      while (true) {
-        const q = after ? `&after=${encodeURIComponent(after)}` : "";
-        const page = await apiFetch<LlmCallInfo[]>(`/calls?session_id=${encodeURIComponent(sid)}${q}&limit=200`);
-        collected.push(...page);
-        if (page.length < 200) break;
-        after = page[page.length - 1].id;
-      }
-      return collected;
-    };
+  const syncVisibleCalls = async (
+    sid: string,
+    list: HistoryItem[],
+    retryFailed = false,
+    epoch = sessionEpochRef.current
+  ): Promise<void> => {
+    if (sessionEpochRef.current !== epoch || activeIdRef.current !== sid) return;
+    if (retryFailed) failedCallIdsRef.current.clear();
 
-    const [queued, sum, tlist, newCalls] = await Promise.all([
-      apiFetch<HistoryItem[]>(`/sessions/${sid}/messages?status=queued&limit=200`),
-      apiFetch<CallsSummary>(`/calls/summary?session_id=${sid}`),
-      apiFetch<ActiveTask[]>(`/sessions/${sid}/tasks`),
-      fetchNewCalls(),
-    ]);
-    if (activeIdRef.current !== sid) return;
-    setQueuedIds(new Set(queued.map((m) => m.id)));
-    setSummary(sum);
-    setTasks(tlist);
-    if (newCalls.length > 0) {
-      let nextCursor = settledCallCursorRef.current;
-      for (const c of newCalls) {
-        if (c.status === "in_flight") break;
-        if (c.id > nextCursor) nextCursor = c.id;
-      }
-      settledCallCursorRef.current = nextCursor;
-      setCallsById((prev) => {
-        const next = new Map(prev);
-        for (const c of newCalls) next.set(c.id, c);
-        return next;
-      });
+    const missing: string[] = [];
+    const seen = new Set<string>();
+    for (const item of list) {
+      if (item.kind !== "assistant_message" || item.llm_call_id == null) continue;
+      const callId = item.llm_call_id;
+      if (seen.has(callId)) continue;
+      seen.add(callId);
+      if (inFlightCallIdsRef.current.has(callId)) continue;
+      if (!retryFailed && failedCallIdsRef.current.has(callId)) continue;
+      const existing = callsByIdRef.current.get(callId);
+      if (existing && existing.status !== "in_flight") continue;
+      missing.push(callId);
     }
-    setContextRefreshNonce((n) => n + 1);
+    if (missing.length === 0) return;
+
+    for (const id of missing) inFlightCallIdsRef.current.add(id);
+    const fetched: LlmCallInfo[] = [];
+    let cursor = 0;
+    const workerCount = Math.min(6, missing.length);
+    try {
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          while (cursor < missing.length && sessionEpochRef.current === epoch && activeIdRef.current === sid) {
+            const callId = missing[cursor++];
+            try {
+              const call = await apiFetch<LlmCallInfo>(`/calls/${encodeURIComponent(callId)}`);
+              if (sessionEpochRef.current !== epoch || activeIdRef.current !== sid) return;
+              fetched.push(call);
+            } catch {
+              if (sessionEpochRef.current === epoch && activeIdRef.current === sid) {
+                failedCallIdsRef.current.add(callId);
+              }
+            }
+          }
+        })
+      );
+    } finally {
+      if (sessionEpochRef.current === epoch && activeIdRef.current === sid) {
+        for (const id of missing) inFlightCallIdsRef.current.delete(id);
+      }
+    }
+
+    if (sessionEpochRef.current !== epoch || activeIdRef.current !== sid || fetched.length === 0) return;
+    setCallsById((prev) => {
+      const next = new Map(prev);
+      for (const c of fetched) next.set(c.id, c);
+      callsByIdRef.current = next;
+      return next;
+    });
   };
 
   useEffect(() => {
-    settledCallCursorRef.current = "";
+    if (!authed || !activeId) return;
+    void syncVisibleCalls(activeId, items);
+  }, [authed, activeId, items]);
+
+  useEffect(() => {
+    const epoch = ++sessionEpochRef.current;
+    loadMoreSeqRef.current += 1;
+    setLoadingMore(false);
+    itemsRef.current = [];
+    callsByIdRef.current = new Map();
     setCallsById(new Map());
+    inFlightCallIdsRef.current.clear();
+    failedCallIdsRef.current.clear();
     if (!authed || !activeId) {
       setItems([]);
       setDraft(null);
@@ -584,6 +622,41 @@ function App() {
     setHasMore(false);
     setBannerErr("");
 
+    let disposed = false;
+    let sidecarInFlight = false;
+    let sidecarAgain = false;
+
+    const triggerSidecars = (): void => {
+      if (disposed || sessionEpochRef.current !== epoch) return;
+      if (sidecarInFlight) {
+        sidecarAgain = true;
+        return;
+      }
+      sidecarInFlight = true;
+      void (async () => {
+        try {
+          const [queued, sum, tlist] = await Promise.all([
+            apiFetch<HistoryItem[]>(`/sessions/${sid}/messages?status=queued&limit=200`),
+            apiFetch<CallsSummary>(`/calls/summary?session_id=${encodeURIComponent(sid)}`),
+            apiFetch<ActiveTask[]>(`/sessions/${sid}/tasks`),
+          ]);
+          if (disposed || sessionEpochRef.current !== epoch || activeIdRef.current !== sid) return;
+          setQueuedIds(new Set(queued.map((m) => m.id)));
+          setSummary(sum);
+          setTasks(tlist);
+          setContextRefreshNonce((n) => n + 1);
+          void syncVisibleCalls(sid, itemsRef.current, true, epoch);
+        } catch {
+        } finally {
+          sidecarInFlight = false;
+          if (sidecarAgain && !disposed && sessionEpochRef.current === epoch) {
+            sidecarAgain = false;
+            triggerSidecars();
+          }
+        }
+      })();
+    };
+
     const closedCalls = new Set<string>();
     const closedItems = new Set<string>();
 
@@ -596,23 +669,26 @@ function App() {
             : `/sessions/${sid}/history?limit=200`
         ),
       onItems: (page) => {
-        if (activeIdRef.current === sid) setItems((prev) => mergeItems(prev, page));
+        if (activeIdRef.current === sid && sessionEpochRef.current === epoch) {
+          setItems((prev) => mergeItems(prev, page));
+        }
       },
       onHasMore: (more) => {
-        if (activeIdRef.current === sid) setHasMore(more);
+        if (activeIdRef.current === sid && sessionEpochRef.current === epoch) setHasMore(more);
       },
-      onSidecars: () => refreshSessionSidecars(sid),
+      onSidecars: triggerSidecars,
       onError: (msg) => {
-        if (activeIdRef.current === sid) setBannerErr(msg);
+        if (activeIdRef.current === sid && sessionEpochRef.current === epoch) setBannerErr(msg);
       },
     });
+    sessionSync.start();
 
     const ctrl = new AbortController();
     connectSse(`/sessions/${sid}/events`, {
       signal: ctrl.signal,
       onStatus: setSseStatus,
       onEvent: (name, data) => {
-        if (activeIdRef.current !== sid) return;
+        if (activeIdRef.current !== sid || sessionEpochRef.current !== epoch) return;
         if (name === "ready") {
           const sess = data as SessionInfo;
           globalSyncRef.current?.touchSession(sid);
@@ -663,7 +739,7 @@ function App() {
               return next;
             });
           } else {
-            refreshSessionSidecars(sid).catch(() => {});
+            triggerSidecars();
           }
         } else if (name === "session.status") {
           const ev = data as SessionStatusEvent;
@@ -682,7 +758,7 @@ function App() {
                 : s
             )
           );
-          refreshSessionSidecars(sid).catch(() => {});
+          triggerSidecars();
         } else if (name === "session.updated") {
           const updated = data as SessionInfo;
           globalSyncRef.current?.touchSession(sid);
@@ -691,7 +767,7 @@ function App() {
           globalSyncRef.current?.touchSession(sid);
           apiFetch<SessionInfo>(`/sessions/${sid}`)
             .then((sess) => {
-              if (activeIdRef.current === sid) {
+              if (activeIdRef.current === sid && sessionEpochRef.current === epoch) {
                 globalSyncRef.current?.touchSession(sid);
                 setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
               }
@@ -703,6 +779,7 @@ function App() {
     });
 
     return () => {
+      disposed = true;
       sessionSync.dispose();
       ctrl.abort();
     };
@@ -779,17 +856,22 @@ function App() {
   const loadMore = async () => {
     if (!activeId || !items.length || loadingMore) return;
     const sid = activeId;
+    const mySeq = ++loadMoreSeqRef.current;
     const firstId = items[0].id;
     setLoadingMore(true);
     try {
       const older = await apiFetch<HistoryItem[]>(`/sessions/${sid}/history?before=${encodeURIComponent(firstId)}&limit=50`);
-      if (activeIdRef.current !== sid) return;
+      if (activeIdRef.current !== sid || loadMoreSeqRef.current !== mySeq) return;
       setItems((prev) => mergeItems(prev, older));
       setHasMore(older.length === 50);
     } catch (e) {
-      setBannerErr(errorMessage(e));
+      if (activeIdRef.current === sid && loadMoreSeqRef.current === mySeq) {
+        setBannerErr(errorMessage(e));
+      }
     } finally {
-      setLoadingMore(false);
+      if (activeIdRef.current === sid && loadMoreSeqRef.current === mySeq) {
+        setLoadingMore(false);
+      }
     }
   };
 

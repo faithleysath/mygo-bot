@@ -44,10 +44,25 @@ function safeUrl(raw: string): string | null {
   return null;
 }
 
+function scanLinkEnd(text: string, start: number): number {
+  let depth = 0;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "\n" || /\s/.test(ch)) return -1;
+    if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      if (depth === 0) return i > start ? i : -1;
+      depth -= 1;
+    }
+  }
+  return -1;
+}
+
 function renderInline(text: string, keyPrefix: string): ComponentChildren[] {
   const nodes: ComponentChildren[] = [];
   const pattern =
-    /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(__[^_\n]+?__)|(~~[^~\n]+?~~)|(\*[^*\n]+?\*)|((?<![A-Za-z0-9_])_[^\s_](?:[^_\n]*[^\s_])?_(?![A-Za-z0-9_]))|(\[[^\]\n]+\]\((?:[^()\s]+|\([^()\s]*\))+\))/g;
+    /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(__[^_\n]+?__)|(~~[^~\n]+?~~)|(\*[^*\n]+?\*)|((?<![A-Za-z0-9_])_[^\s_](?:[^_\n]*[^\s_])?_(?![A-Za-z0-9_]))|(\[[^\]\n]+\]\()/g;
   let last = 0;
   let idx = 0;
   let m: RegExpExecArray | null;
@@ -64,17 +79,22 @@ function renderInline(text: string, keyPrefix: string): ComponentChildren[] {
     } else if (m[5] || m[6]) {
       nodes.push(<em key={k}>{renderInline(tok.slice(1, -1), k)}</em>);
     } else if (m[7]) {
-      const split = tok.indexOf("](");
-      const label = tok.slice(1, split);
-      const href = safeUrl(tok.slice(split + 2, -1));
-      if (href) {
-        nodes.push(
-          <a key={k} href={href} target="_blank" rel="noopener noreferrer">
-            {renderInline(label, k)}
-          </a>
-        );
+      const label = tok.slice(1, -2);
+      const end = scanLinkEnd(text, pattern.lastIndex);
+      if (end === -1) {
+        nodes.push("[", ...renderInline(label, k), "](");
       } else {
-        nodes.push(tok);
+        const href = safeUrl(text.slice(pattern.lastIndex, end));
+        pattern.lastIndex = end + 1;
+        if (href) {
+          nodes.push(
+            <a key={k} href={href} target="_blank" rel="noopener noreferrer">
+              {renderInline(label, k)}
+            </a>
+          );
+        } else {
+          nodes.push(text.slice(m.index, end + 1));
+        }
       }
     }
     last = pattern.lastIndex;

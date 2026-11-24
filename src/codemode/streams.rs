@@ -1,10 +1,13 @@
 use super::{HostError, Reply};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{
     fs::{File, ReadDir},
@@ -16,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) const CHUNK: usize = 64 * 1024;
 const PER_TASK: usize = 16;
+const MAX_EXPIRED_REASONS: usize = 64;
 static HANDLES: Semaphore = Semaphore::const_new(128);
 
 pub(super) enum Resource {
@@ -31,25 +35,33 @@ pub(super) enum Resource {
 struct Entry {
     resource: AsyncMutex<Resource>,
     closed: CancellationToken,
+    timed_out: AtomicBool,
     deadline: Option<(Instant, &'static str)>,
     _permits: (OwnedSemaphorePermit, SemaphorePermit<'static>),
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        self.closed.cancel();
+    }
 }
 
 #[derive(Default)]
 struct Table {
     last_id: u32,
     entries: HashMap<u32, Arc<Entry>>,
+    expired: VecDeque<(u32, &'static str)>,
 }
 
 pub(super) struct Streams {
-    table: Mutex<Table>,
+    table: Arc<Mutex<Table>>,
     slots: Arc<Semaphore>,
 }
 
 impl Default for Streams {
     fn default() -> Self {
         Self {
-            table: Mutex::default(),
+            table: Arc::default(),
             slots: Arc::new(Semaphore::new(PER_TASK)),
         }
     }
@@ -71,18 +83,50 @@ impl Reservation<'_> {
         resource: Resource,
         deadline: Option<(Instant, &'static str)>,
     ) -> u64 {
-        let entry = Entry {
+        let entry = Arc::new(Entry {
             resource: AsyncMutex::new(resource),
             closed: CancellationToken::new(),
+            timed_out: AtomicBool::new(false),
             deadline,
             _permits: self.permits,
-        };
+        });
+        let entry_weak = Arc::downgrade(&entry);
+        let closed = entry.closed.clone();
         self.streams
             .table
             .lock()
             .unwrap()
             .entries
-            .insert(self.id, Arc::new(entry));
+            .insert(self.id, entry);
+        if let Some((at, message)) = deadline {
+            let table_weak = Arc::downgrade(&self.streams.table);
+            let id = self.id;
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = closed.cancelled() => return,
+                    _ = tokio::time::sleep_until(at) => {}
+                }
+                if let Some(entry) = entry_weak.upgrade() {
+                    entry.timed_out.store(true, Ordering::Release);
+                    entry.closed.cancel();
+                }
+                if let Some(table) = table_weak.upgrade() {
+                    let mut table = table.lock().unwrap();
+                    if table
+                        .entries
+                        .get(&id)
+                        .is_some_and(|cur| entry_weak.ptr_eq(&Arc::downgrade(cur)))
+                    {
+                        table.entries.remove(&id);
+                        if table.expired.len() >= MAX_EXPIRED_REASONS {
+                            table.expired.pop_front();
+                        }
+                        table.expired.push_back((id, message));
+                    }
+                }
+            });
+        }
         self.id.into()
     }
 }
@@ -116,17 +160,21 @@ impl Streams {
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .ok_or("invalid stream ID")?;
-        self.table
-            .lock()
-            .unwrap()
-            .entries
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| "stream closed".into())
+        let mut table = self.table.lock().unwrap();
+        if let Some(entry) = table.entries.get(&id) {
+            return Ok(entry.clone());
+        }
+        if let Some(pos) = table.expired.iter().position(|(eid, _)| *eid == id) {
+            let (_, message) = table.expired.remove(pos).unwrap();
+            return Err(message.into());
+        }
+        Err("stream closed".into())
     }
 
     pub fn close(&self, id: u32) {
-        if let Some(entry) = self.table.lock().unwrap().entries.remove(&id) {
+        let mut table = self.table.lock().unwrap();
+        table.expired.retain(|(eid, _)| *eid != id);
+        if let Some(entry) = table.entries.remove(&id) {
             entry.closed.cancel();
         }
     }
@@ -215,10 +263,16 @@ impl Streams {
         };
         tokio::select! {
             biased;
-            _ = entry.closed.cancelled() => Err("stream closed".into()),
             _ = deadline => {
                 self.close(stream_id);
                 Err(entry.deadline.unwrap().1.into())
+            }
+            _ = entry.closed.cancelled() => {
+                if entry.timed_out.load(Ordering::Acquire) {
+                    Err(entry.deadline.unwrap().1.into())
+                } else {
+                    Err("stream closed".into())
+                }
             }
             result = operation => result,
         }

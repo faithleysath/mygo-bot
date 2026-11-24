@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { copyText, errorMessage, fetchMediaUrl, formatDuration, formatTokens } from "./api.ts";
+import { copyText, errorMessage, fetchMediaUrl, formatDuration, formatTokens, totalCallTokens } from "./api.ts";
 import { HighlightedCode } from "./highlight.tsx";
 import { formatShortTimeLoc, statusText, useI18n } from "./i18n.ts";
 import { BrandMark, Icon } from "./Icons.tsx";
@@ -689,11 +689,7 @@ export function Timeline({
             if (item.kind === "assistant_message") {
               const msgText = extractMessageText(item.payload?.content);
               const call = item.llm_call_id != null ? callsById.get(item.llm_call_id) : undefined;
-              const callTokens = call
-                ? (call.input_uncached_tokens || 0) +
-                  (call.cache_read_tokens || 0) +
-                  (call.output_tokens || 0)
-                : 0;
+              const callTokens = call ? totalCallTokens(call) : 0;
               const callTime = call ? formatShortTimeLoc(call.finished_at || call.started_at, locale) : "";
               return (
                 <div key={item.id} data-turn-idx={tIdx} class="msg-row msg-assistant">
@@ -704,7 +700,7 @@ export function Timeline({
                       {call && (
                         <span
                           class="meta-chip"
-                          title={`#${call.id}: in ${call.input_uncached_tokens ?? 0} + cache ${call.cache_read_tokens ?? 0} → out ${call.output_tokens ?? 0}`}
+                          title={`#${call.id}: in ${call.input_uncached_tokens ?? 0} + cache_read ${call.cache_read_tokens ?? 0}${call.cache_write_tokens ? ` + cache_write ${call.cache_write_tokens}` : ""} → out ${call.output_tokens ?? 0}`}
                         >
                           <Icon n="database" s={12} />
                           <span>{t("Usage")} {formatTokens(callTokens)} tok</span>
@@ -798,13 +794,15 @@ export function Timeline({
       </div>
 
       {turns.length >= 2 && (
-        <div class="turn-rail" aria-hidden="true">
+        <nav class="turn-rail" aria-label={t("Conversation turns")}>
           {turns.map((turn, idx) => (
             <button
               key={turn.id}
               type="button"
               class={`turn-tick ${turn.role} ${activeTurn === idx ? "active" : ""}`}
               title={turn.label}
+              aria-label={turn.label}
+              aria-current={activeTurn === idx ? "location" : undefined}
               onClick={() => {
                 scrollRef.current
                   ?.querySelector(`[data-turn-idx="${idx}"]`)
@@ -812,7 +810,7 @@ export function Timeline({
               }}
             />
           ))}
-        </div>
+        </nav>
       )}
 
       {showJump && (

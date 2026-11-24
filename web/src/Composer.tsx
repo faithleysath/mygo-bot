@@ -1,6 +1,6 @@
 import type { TargetedClipboardEvent, TargetedDragEvent, TargetedKeyboardEvent } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { formatCost, formatTokens } from "./api.ts";
+import { formatCost, formatTokens, totalCallTokens, totalInputTokens } from "./api.ts";
 import { useI18n } from "./i18n.ts";
 import { Icon } from "./Icons.tsx";
 import type {
@@ -85,10 +85,8 @@ export function Composer({
   const lastIn = summary?.last_input_tokens;
   const ctxPct =
     lastIn != null && ctxLimit ? Math.min(100, Math.round((lastIn / ctxLimit) * 100)) : null;
-  const totalTokens = summary
-    ? summary.input_uncached_tokens + summary.cache_read_tokens + summary.output_tokens
-    : 0;
-  const totalInput = summary ? summary.input_uncached_tokens + summary.cache_read_tokens : 0;
+  const totalTokens = totalCallTokens(summary);
+  const totalInput = totalInputTokens(summary);
   const cachePct =
     totalInput > 0 && summary ? Math.round((summary.cache_read_tokens / totalInput) * 100) : null;
   const ringLevel = ctxPct == null ? "" : ctxPct >= 90 ? "danger" : ctxPct >= 75 ? "warn" : "";

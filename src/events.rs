@@ -87,6 +87,20 @@ struct ActiveDraft {
 struct SessionStream {
     tx: Option<broadcast::WeakSender<Notice>>,
     draft: Option<ActiveDraft>,
+    last_cleared: Option<CallId>,
+}
+
+enum DraftRecovery {
+    Snapshot(Value),
+    Clear(CallId),
+    None,
+}
+
+fn draft_snapshot(draft: &ActiveDraft) -> Value {
+    json!({
+        "llm_call_id": draft.llm_call_id,
+        "items": draft.items.values().collect::<Vec<_>>(),
+    })
 }
 
 struct HubInner {
@@ -141,13 +155,26 @@ impl Hub {
             .draft
             .as_ref()
             .filter(|d| !d.items.is_empty())
-            .map(|d| {
-                json!({
-                    "llm_call_id": d.llm_call_id,
-                    "items": d.items.values().collect::<Vec<_>>(),
-                })
-            });
+            .map(draft_snapshot);
         (tx, rx, snapshot, min_seq)
+    }
+
+    fn recovery(&self, sid: SessionId) -> (DraftRecovery, u64) {
+        let sessions = self.0.sessions.lock().unwrap();
+        let min_seq = NEXT_SEQ.load(Ordering::Acquire);
+        let recovery = match sessions.get(&sid) {
+            Some(entry) => {
+                if let Some(d) = &entry.draft {
+                    DraftRecovery::Snapshot(draft_snapshot(d))
+                } else if let Some(call_id) = entry.last_cleared {
+                    DraftRecovery::Clear(call_id)
+                } else {
+                    DraftRecovery::None
+                }
+            }
+            None => DraftRecovery::None,
+        };
+        (recovery, min_seq)
     }
 
     pub fn start_call(&self, sid: SessionId, llm_call_id: CallId) {
@@ -274,6 +301,7 @@ impl Hub {
                 .is_some_and(|d| d.llm_call_id == llm_call_id)
         {
             let old = entry.draft.take().unwrap();
+            entry.last_cleared = Some(llm_call_id);
             if emit_clear
                 && !old.items.is_empty()
                 && let Some(tx) = entry.tx.as_ref().and_then(|w| w.upgrade())
@@ -320,7 +348,7 @@ fn take_older_deltas(
     delta_open: &mut bool,
     min_seq: u64,
     before_seq: u64,
-) -> Vec<Notice> {
+) -> (Vec<Notice>, bool) {
     let mut ready = Vec::new();
     if let Some(b) = buffered_delta.as_ref()
         && b.seq < before_seq
@@ -335,12 +363,15 @@ fn take_older_deltas(
             Ok(m) if m.seq < min_seq => continue,
             Ok(m) if m.seq < before_seq => ready.push(m),
             Ok(m) => *buffered_delta = Some(m),
-            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Lagged(_)) => {
+                *buffered_delta = None;
+                return (Vec::new(), true);
+            }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Closed) => *delta_open = false,
         }
     }
-    ready
+    (ready, false)
 }
 
 pub async fn subscribe(
@@ -356,7 +387,7 @@ pub async fn subscribe(
             Ok((channel, rx, initial))
         })
         .await?;
-    let (delta_tx, mut delta_rx, snapshot, min_seq) = app.streams.subscribe_delta(sid);
+    let (delta_tx, mut delta_rx, snapshot, mut min_seq) = app.streams.subscribe_delta(sid);
     let stream = async_stream::stream! {
         let _channel = channel;
         let _delta = delta_tx;
@@ -366,20 +397,84 @@ pub async fn subscribe(
         }
         let mut buffered_delta: Option<Notice> = None;
         let mut delta_open = true;
+        let mut delta_lagged = false;
         loop {
+            while delta_lagged {
+                buffered_delta = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(d) => yield Ok(d.into_event()),
+                        Err(TryRecvError::Lagged(_)) => {
+                            yield Ok(Event::default().event("resync").data("{}"));
+                        }
+                        Err(TryRecvError::Closed) => return,
+                        Err(TryRecvError::Empty) => break,
+                    }
+                }
+                let (recovery, new_min_seq) = app.streams.recovery(sid);
+                min_seq = min_seq.max(new_min_seq);
+                let mut relagged = false;
+                while buffered_delta.is_none() && delta_open {
+                    match delta_rx.try_recv() {
+                        Ok(m) if m.seq < min_seq => continue,
+                        Ok(m) => buffered_delta = Some(m),
+                        Err(TryRecvError::Lagged(_)) => {
+                            relagged = true;
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => delta_open = false,
+                    }
+                }
+                if relagged {
+                    continue;
+                }
+                match rx.try_recv() {
+                    Ok(d) => {
+                        yield Ok(d.into_event());
+                        continue;
+                    }
+                    Err(TryRecvError::Lagged(_)) => {
+                        yield Ok(Event::default().event("resync").data("{}"));
+                        continue;
+                    }
+                    Err(TryRecvError::Closed) => return,
+                    Err(TryRecvError::Empty) => {}
+                }
+                delta_lagged = false;
+                match recovery {
+                    DraftRecovery::Snapshot(snap) => {
+                        yield Ok(Event::default().event("stream.snapshot").data(snap.to_string()));
+                    }
+                    DraftRecovery::Clear(call_id) => {
+                        yield Ok(
+                            Event::default()
+                                .event("stream.clear")
+                                .data(json!({"llm_call_id": call_id}).to_string()),
+                        );
+                    }
+                    DraftRecovery::None => {}
+                }
+            }
             while buffered_delta.is_some() {
                 match rx.try_recv() {
                     Ok(d) => {
-                        for m in take_older_deltas(
+                        let (older, lagged) = take_older_deltas(
                             &mut buffered_delta,
                             &mut delta_rx,
                             &mut delta_open,
                             min_seq,
                             d.seq,
-                        ) {
+                        );
+                        for m in older {
                             yield Ok(m.into_event());
                         }
                         yield Ok(d.into_event());
+                        if lagged {
+                            delta_lagged = true;
+                            buffered_delta = None;
+                            break;
+                        }
                     }
                     Err(TryRecvError::Lagged(_)) => {
                         buffered_delta = None;
@@ -401,6 +496,9 @@ pub async fn subscribe(
                     }
                 }
             }
+            if delta_lagged {
+                continue;
+            }
             enum Incoming {
                 Durable(std::result::Result<Notice, RecvError>),
                 Delta(std::result::Result<Notice, RecvError>),
@@ -413,16 +511,21 @@ pub async fn subscribe(
             };
             match received {
                 Incoming::Durable(Ok(d)) => {
-                    for m in take_older_deltas(
+                    let (older, lagged) = take_older_deltas(
                         &mut buffered_delta,
                         &mut delta_rx,
                         &mut delta_open,
                         min_seq,
                         d.seq,
-                    ) {
+                    );
+                    for m in older {
                         yield Ok(m.into_event());
                     }
                     yield Ok(d.into_event());
+                    if lagged {
+                        delta_lagged = true;
+                        buffered_delta = None;
+                    }
                 }
                 Incoming::Durable(Err(RecvError::Lagged(_))) => {
                     buffered_delta = None;
@@ -434,7 +537,10 @@ pub async fn subscribe(
                         buffered_delta = Some(m);
                     }
                 }
-                Incoming::Delta(Err(RecvError::Lagged(_))) => continue,
+                Incoming::Delta(Err(RecvError::Lagged(_))) => {
+                    delta_lagged = true;
+                    buffered_delta = None;
+                }
                 Incoming::Delta(Err(RecvError::Closed)) => delta_open = false,
             }
         }

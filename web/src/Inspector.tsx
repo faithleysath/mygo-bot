@@ -2,7 +2,7 @@ import type { ComponentChildren } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { apiFetch, errorMessage, formatTokens } from "./api.ts";
 import { HighlightedCode } from "./highlight.tsx";
-import { formatBytes, useI18n } from "./i18n.ts";
+import { formatBytes, useI18n, utf8ByteLength } from "./i18n.ts";
 import { Icon } from "./Icons.tsx";
 import { ContentBlocks, CopyBtn, extractMessageText, extractReasoningText } from "./Timeline.tsx";
 import type {
@@ -214,7 +214,7 @@ function InspectorShell({
                   {row.badges}
                   {preview && <span class="muted truncate">{preview}</span>}
                   <span class="card-spacer" />
-                  <span class="muted small mono">{formatBytes(json.length)}</span>
+                  <span class="muted small mono">{formatBytes(utf8ByteLength(json))}</span>
                 </summary>
                 <div class="card-body">
                   <div class="section-bar">
@@ -378,63 +378,90 @@ export function ContextView({
   const [err, setErr] = useState("");
   const sidRef = useRef(session.id);
   sidRef.current = session.id;
+  const refreshNonceRef = useRef(refreshNonce);
+  refreshNonceRef.current = refreshNonce;
   const lastPosRef = useRef(0);
   const loadedOnceRef = useRef(false);
+  const initSeqRef = useRef(0);
+  const loadMoreSeqRef = useRef(0);
+  const catchupSeqRef = useRef(0);
 
   const itemsById = useMemo(() => new Map(items.map((it) => [it.id, it])), [items]);
 
+  const fetchAfterCurrent = async (sid: string, initSeq: number) => {
+    const myCatchup = ++catchupSeqRef.current;
+    try {
+      while (
+        sidRef.current === sid &&
+        initSeqRef.current === initSeq &&
+        catchupSeqRef.current === myCatchup
+      ) {
+        const page = await apiFetch<ContextItem[]>(
+          `/sessions/${sid}/context?after=${lastPosRef.current}&limit=200`
+        );
+        if (
+          sidRef.current !== sid ||
+          initSeqRef.current !== initSeq ||
+          catchupSeqRef.current !== myCatchup
+        ) {
+          return;
+        }
+        if (page.length) {
+          setCtxItems((prev) => mergeContext(prev, page));
+          lastPosRef.current = Math.max(lastPosRef.current, page[page.length - 1].position);
+        }
+        if (page.length < 200) break;
+      }
+    } catch {}
+  };
+
   const loadInitial = async (sid: string) => {
+    const myInit = ++initSeqRef.current;
+    loadMoreSeqRef.current += 1;
+    catchupSeqRef.current += 1;
+    loadedOnceRef.current = false;
+    setLoadingMore(false);
     setLoading(true);
     setErr("");
+    const startNonce = refreshNonceRef.current;
     try {
       const page = await apiFetch<ContextItem[]>(`/sessions/${sid}/context?tail=true&limit=50`);
-      if (sidRef.current !== sid) return;
+      if (sidRef.current !== sid || initSeqRef.current !== myInit) return;
       setCtxItems(page);
       setHasMore(page.length === 50);
       lastPosRef.current = page.length ? page[page.length - 1].position : 0;
       loadedOnceRef.current = true;
+      if (refreshNonceRef.current !== startNonce) {
+        void fetchAfterCurrent(sid, myInit);
+      }
     } catch (e) {
-      if (sidRef.current === sid) setErr(errorMessage(e));
+      if (sidRef.current === sid && initSeqRef.current === myInit) setErr(errorMessage(e));
     } finally {
-      if (sidRef.current === sid) setLoading(false);
+      if (sidRef.current === sid && initSeqRef.current === myInit) setLoading(false);
     }
   };
 
   useEffect(() => {
-    loadedOnceRef.current = false;
     lastPosRef.current = 0;
     setCtxItems([]);
     setHasMore(false);
+    setLoadingMore(false);
     void loadInitial(session.id);
   }, [session.id]);
 
   useEffect(() => {
     if (!loadedOnceRef.current) return;
-    const sid = session.id;
-    let cancelled = false;
-    void (async () => {
-      try {
-        while (!cancelled && sidRef.current === sid) {
-          const page = await apiFetch<ContextItem[]>(
-            `/sessions/${sid}/context?after=${lastPosRef.current}&limit=200`
-          );
-          if (cancelled || sidRef.current !== sid) return;
-          if (page.length) {
-            setCtxItems((prev) => mergeContext(prev, page));
-            lastPosRef.current = Math.max(lastPosRef.current, page[page.length - 1].position);
-          }
-          if (page.length < 200) break;
-        }
-      } catch {}
-    })();
+    void fetchAfterCurrent(session.id, initSeqRef.current);
     return () => {
-      cancelled = true;
+      catchupSeqRef.current += 1;
     };
   }, [refreshNonce, session.id]);
 
   const loadEarlier = async () => {
     if (!ctxItems.length || loadingMore) return;
     const sid = session.id;
+    const myInit = initSeqRef.current;
+    const myMore = ++loadMoreSeqRef.current;
     const firstPos = ctxItems[0].position;
     setLoadingMore(true);
     setErr("");
@@ -442,13 +469,31 @@ export function ContextView({
       const older = await apiFetch<ContextItem[]>(
         `/sessions/${sid}/context?before=${firstPos}&limit=50`
       );
-      if (sidRef.current !== sid) return;
+      if (
+        sidRef.current !== sid ||
+        initSeqRef.current !== myInit ||
+        loadMoreSeqRef.current !== myMore
+      ) {
+        return;
+      }
       setCtxItems((prev) => mergeContext(prev, older));
       setHasMore(older.length === 50);
     } catch (e) {
-      if (sidRef.current === sid) setErr(errorMessage(e));
+      if (
+        sidRef.current === sid &&
+        initSeqRef.current === myInit &&
+        loadMoreSeqRef.current === myMore
+      ) {
+        setErr(errorMessage(e));
+      }
     } finally {
-      if (sidRef.current === sid) setLoadingMore(false);
+      if (
+        sidRef.current === sid &&
+        initSeqRef.current === myInit &&
+        loadMoreSeqRef.current === myMore
+      ) {
+        setLoadingMore(false);
+      }
     }
   };
 

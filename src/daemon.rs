@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, IsTerminal, Write},
     net::SocketAddr,
     process::{self, Command, Stdio},
 };
@@ -20,9 +20,6 @@ pub struct Ready {
 
 impl Ready {
     fn log(&self, pid: u32) {
-        if let Some(token) = &self.token {
-            tracing::info!(%token, "generated TCP Bearer token");
-        }
         #[cfg(unix)]
         if let Some(path) = &self.socket {
             tracing::info!(%path, "Unix socket ready");
@@ -30,11 +27,20 @@ impl Ready {
         tracing::info!(pid, listen = %self.listen, "TCP ready");
     }
 
+    fn print_token_to_terminal(&self) {
+        if let Some(token) = &self.token
+            && io::stderr().is_terminal()
+        {
+            let _ = writeln!(io::stderr(), "TCP Bearer token: {token}");
+        }
+    }
+
     pub fn announce(mut self, parent: &mut Option<io::Stdout>) -> io::Result<()> {
         if let Some(out) = parent.take() {
             reply(out, Ok(&self))?;
             self.token = None;
         }
+        self.print_token_to_terminal();
         self.log(process::id());
         Ok(())
     }
@@ -120,6 +126,7 @@ fn launch() -> io::Result<()> {
         });
     match result {
         Ok(Ok(ready)) => {
+            ready.print_token_to_terminal();
             ready.log(child.id());
             Ok(())
         }

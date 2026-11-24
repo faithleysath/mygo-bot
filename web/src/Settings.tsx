@@ -1,6 +1,6 @@
 import type { TargetedSubmitEvent } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { apiFetch, errorMessage, formatAbsTime, formatCost, formatDuration, formatTokens } from "./api.ts";
+import { apiFetch, errorMessage, formatAbsTime, formatCost, formatDuration, formatTokens, totalInputTokens } from "./api.ts";
 import { formatRelTimeLoc, statusText, useI18n } from "./i18n.ts";
 import type { LocalePref } from "./i18n.ts";
 import { Icon } from "./Icons.tsx";
@@ -878,7 +878,7 @@ function UsageTab({
     void load("", false, initialSessionId || "");
   }, []);
 
-  const totalInput = summary ? summary.input_uncached_tokens + summary.cache_read_tokens : 0;
+  const totalInput = totalInputTokens(summary);
   const cacheRate = totalInput > 0 && summary ? Math.round((summary.cache_read_tokens / totalInput) * 100) : 0;
 
   return (
@@ -966,7 +966,7 @@ function UsageTab({
                   {c.error_summary && <div class="err-text">{c.error_summary}</div>}
                 </div>
                 <div class="mono">
-                  {formatTokens((c.input_uncached_tokens || 0) + (c.cache_read_tokens || 0))}→{formatTokens(c.output_tokens)} · {formatCost(c.cost_nano_usd)}
+                  {formatTokens(totalInputTokens(c))}→{formatTokens(c.output_tokens)} · {formatCost(c.cost_nano_usd)}
                 </div>
               </div>
               {expanded && (

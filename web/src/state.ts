@@ -364,10 +364,9 @@ type TimerId = ReturnType<typeof setTimeout>;
 type ScheduleFn = (fn: () => void, ms: number) => TimerId;
 type CancelScheduleFn = (id: TimerId) => void;
 
-interface BufferedSessionEvent {
-  name: string;
-  data: SessionDeltaPayload;
-}
+type BufferedSessionEvent =
+  | { kind: "event"; name: string; data: SessionDeltaPayload }
+  | { kind: "local_patch"; data: SessionInfo };
 
 export interface GlobalSessionSyncOptions {
   fetchSessions: () => Promise<SessionInfo[]>;
@@ -473,8 +472,12 @@ export function createGlobalSessionSync({
       clearAllRefreshRetries();
       let merged = list;
       for (const ev of buffered) {
-        if (ev.name === "session.deleted") deletedIds.add((ev.data as SessionDeletedEvent).id);
-        merged = applySessionEvent(merged, ev.name, ev.data);
+        if (ev.kind === "local_patch") {
+          merged = applyLocalPatch(merged, ev.data);
+        } else {
+          if (ev.name === "session.deleted") deletedIds.add((ev.data as SessionDeletedEvent).id);
+          merged = applySessionEvent(merged, ev.name, ev.data);
+        }
       }
       onError?.("");
       onSnapshot(merged);
@@ -499,7 +502,7 @@ export function createGlobalSessionSync({
       deletedIds.add(id);
     }
     if (activeBuffer !== null) {
-      activeBuffer.events.push({ name, data });
+      activeBuffer.events.push({ kind: "event", name, data });
     }
     if (name === "session.deleted" && id != null) {
       onDeleted?.(id);
@@ -526,6 +529,9 @@ export function createGlobalSessionSync({
       if (getSessionVersion(id) !== startVersion) return;
       if (getSession && !getSession(id)) return;
       touchSession(id);
+      if (activeBuffer !== null) {
+        activeBuffer.events.push({ kind: "local_patch", data: fresh });
+      }
       if (onLocalPatchApplied) onLocalPatchApplied(fresh);
       else onDelta("session.updated", fresh);
     } catch (err) {
@@ -574,6 +580,9 @@ export function createGlobalSessionSync({
     if (getSession && !existing) return false;
     if (getSessionVersion(updated.id) === baseVersion) {
       touchSession(updated.id);
+      if (activeBuffer !== null) {
+        activeBuffer.events.push({ kind: "local_patch", data: updated });
+      }
       if (onLocalPatchApplied) onLocalPatchApplied(updated);
       else onDelta("session.updated", updated);
       return true;
@@ -614,6 +623,7 @@ export interface SessionSyncOptions {
 }
 
 export interface SessionSync {
+  start: () => void;
   onReady: () => void;
   onResync: () => void;
   onLiveItem: (item: HistoryItem) => void;
@@ -674,7 +684,7 @@ export function createSessionSync({
         if (!runAgain) gapOpen = false;
         retryDelay = 1000;
         onError?.("");
-        triggerSidecars();
+        if (!runAgain) triggerSidecars();
       } else {
         while (!disposed) {
           const page = await fetchAfter(syncedThroughId);
@@ -714,6 +724,13 @@ export function createSessionSync({
     }
   };
 
+  const start = (): void => {
+    if (disposed || initialLoaded || inFlight) return;
+    retryDelay = 1000;
+    clearRetry();
+    void runSync();
+  };
+
   const onReady = (): void => {
     if (disposed) return;
     gapOpen = true;
@@ -745,5 +762,5 @@ export function createSessionSync({
 
   const getState = () => ({ initialLoaded, syncedThroughId, gapOpen });
 
-  return { onReady, onResync, onLiveItem, dispose, getState };
+  return { start, onReady, onResync, onLiveItem, dispose, getState };
 }
