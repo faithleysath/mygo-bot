@@ -36,7 +36,7 @@ pub fn definitions() -> Value {
                     windows => { "; Windows .bat/.cmd require cmd.exe" }
                     _ => { "" }
                 },
-                "), kills its process group on exit, and returns {exit_code,signal,stdout,stderr,truncated} (256 KiB cap per stream). ",
+                "), kills its process group on exit, and returns {exit_code,signal,timed_out,stdout,stderr,truncated} (1 MiB cap per stream; on timeout, kills the process group and returns timed_out: true with captured output). ",
                 "await mcp.servers() lists enabled MCP servers by name and description. await mcp.tools(server,{query?,cursor?}) returns {tools,nextCursor} with names, descriptions and inputSchema; pass nextCursor as cursor to continue. ",
                 "await mcp.call(server,tool,args) calls by exact names with an object and returns {content,structuredContent?,isError}. Check isError for tool failures. ",
                 "mcp.resources(server,{cursor?}), mcp.resourceTemplates(server,{cursor?}) and mcp.prompts(server,{cursor?}) return one page under resources, resourceTemplates or prompts plus nextCursor. ",
@@ -56,7 +56,7 @@ pub fn definitions() -> Value {
                 "(sessions, messages, run/pause, history, context, events, providers, models, config, mcp, calls, attachments). ",
                 "Default foreground mode waits up to 90s, then continues the same task in the background without losing work. ",
                 "Keep background false unless you have independent work to do immediately or are starting a persistent listener or service. ",
-                "Do independent work while tasks run. Use codemode_task_wait when you need a result, then finish your turn once the work is complete."
+                "Do independent work while tasks run. Call codemode_wait with {} when you need a background task's events or result (do not poll with another codemode call), then finish your turn once the work is complete."
             ),
             json!({
                 "code": {"type":"string", "description":"Async JavaScript function body (nonempty, up to 256 KiB)."},
@@ -72,15 +72,19 @@ pub fn definitions() -> Value {
             &[]
         ),
         definition(
-            "codemode_task_wait",
+            "codemode_wait",
             concat!(
-                "Wait in the current step for session events or user messages without polling. Without trigger_code, pending input or an active codemode task is required. ",
-                "Returns on pending input, session pause, all active tasks finishing, or an internal time limit. ",
-                "With trigger_code, race an async codemode script (even with no active tasks) against those events. A return or reaching the end wakes immediately with reason 'trigger', the return value and console output. ",
-                "Pending input, pause, or all active tasks draining after a wait that began with tasks cancels the script and discards its output."
+                "Wait in the current step for active codemode tasks, task events, or user messages without polling. ",
+                "To wait for a background task's result or events, call codemode_wait with {} (omit trigger_code) — do not spawn another codemode script to poll with sleep. ",
+                "Without trigger_code, pending input or an active codemode task is required; returns on queued task events, user messages, session pause, all active tasks finishing, or an internal time limit. ",
+                "With trigger_code, race a one-shot async JS script (even with no active tasks) against those events. ",
+                "trigger_code is NOT a periodic callback: returning any value (including null/undefined) or reaching the end wakes immediately with reason 'trigger', its return value, and console output. ",
+                "Queued task events, user messages, pause, or all active tasks draining after a wait that began with tasks cancels the script and discards its output."
             ),
             json!({"trigger_code":{"type":"string", "description":concat!(
-                "Optional nonempty async JS body up to 256 KiB. Same runtime as codemode, including await task.status(id), await task.list(), fs, http, proc, mcp, mygo and await sleep(ms); emitEvent is unavailable. ",
+                "Optional one-shot nonempty async JS body up to 256 KiB; omit it when simply waiting for background tasks to finish. ",
+                "Same runtime as codemode, including await task.status(id), await task.list(), fs, http, proc, mcp, mygo and await sleep(ms); emitEvent is unavailable. ",
+                "Write your own loop only when polling for a custom condition (such as matching live output or external state), because returning anything (including null) ends the wait immediately. ",
                 "Use side-effect-free checks only: events can interrupt the script at any time, and it is never recovered or replayed. Avoid file writes or other side effects. ",
                 "Example: while (true) { const s = await task.status('cm_1'); if (s.running_commands?.some(c => /ERR/.test(c.stderr))) return s; await sleep(500); }"
             )}}),
@@ -88,7 +92,7 @@ pub fn definitions() -> Value {
         ),
         definition(
             "codemode_task_status",
-            "Inspect one task's current or final state. Live snapshots include console output and running proc.exec stdout/stderr. A live task with unchanged output and state omits repeat text and returns unchanged_since_last_status: true. A completion event already queued for the next step is reported with delivery: queued. Use codemode_task_wait (optionally with trigger_code) to wait for progress or matching output instead of polling.",
+            "Inspect one task's current or final state. Live snapshots include console output and running proc.exec stdout/stderr. A live task with unchanged output and state omits repeat text and returns unchanged_since_last_status: true. A completion event already queued for the next step is reported with delivery: queued. Call codemode_wait ({} for completion/events, or with trigger_code to watch live output) instead of polling.",
             json!({"id":id}),
             &["id"]
         ),
@@ -186,7 +190,7 @@ fn action(name: &str, arguments: &str) -> std::result::Result<Action, String> {
             Ok(Action::List)
         }
         "codemode_task_status" => Ok(Action::Status(task_id(&parse::<Target>(arguments)?.id)?)),
-        "codemode_task_wait" => {
+        "codemode_wait" => {
             let code = parse::<Wait>(arguments)?.trigger_code;
             if code
                 .as_ref()

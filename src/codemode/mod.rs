@@ -13,7 +13,7 @@ mod windows;
 
 use crate::{
     App, Error, Result,
-    store::{SessionStatus, Store, has_pending, session},
+    store::{SessionStatus, Store, pending_reason, session},
     tools::Script,
 };
 use chrono::{DateTime, Utc};
@@ -350,7 +350,7 @@ impl Task {
         body["delivery"] = json!("background");
         body["status"] = json!("background");
         body["message"] = json!(
-            "Do independent work while this task runs. Use codemode_task_wait when you need its events or result. Finish your turn once the work is complete."
+            "Do independent work while this task runs. Call codemode_wait with {} when you need its events or result (do not poll in another codemode call). Finish your turn once the work is complete."
         );
         Value::String(body.to_string())
     }
@@ -473,7 +473,7 @@ pub async fn status(app: App, call: Call, id: i64, hard: CancellationToken) -> R
             drop(live);
             if unchanged {
                 info["unchanged_since_last_status"] = json!(true);
-                info["message"] = json!("No new output or state change since the last status check. Use codemode_task_wait (optionally with trigger_code) instead of polling codemode_task_status.");
+                info["message"] = json!("No new output or state change since the last status check. Call codemode_wait ({} for completion/events, or with trigger_code for live output) instead of polling codemode_task_status.");
             }
             call.reply(s, info)?;
             s.tasks.get_mut(&id).unwrap().last_status_fingerprint = Some(fingerprint);
@@ -518,8 +518,18 @@ impl Wait {
             .get(&sid)
             .filter(|c| !s.closing && !c.soft.is_cancelled());
         let reply = if let Some(control) = control {
-            if has_pending(&s.conn, sid)? {
-                json!({"status":"woke", "reason":"pending_input", "waited_ms":if had_tasks.is_none() {0} else {waited_ms}})
+            if let Some(reason) = pending_reason(&s.conn, sid)? {
+                let message = match reason {
+                    "task_event" => "Queued task event(s) will be delivered in the next step.",
+                    "user_message" => "Queued user message(s) will be delivered in the next step.",
+                    _ => "Queued user message(s) and task event(s) will be delivered in the next step.",
+                };
+                json!({
+                    "status": "woke",
+                    "reason": reason,
+                    "waited_ms": if had_tasks.is_none() { 0 } else { waited_ms },
+                    "message": message,
+                })
             } else {
                 let active = s.tasks.values().filter(|t| t.origin.sid == sid).count();
                 let has_tasks = active > 0 || ledger::starting_sibling(&s.conn, sid, self.call.id)?;
@@ -954,7 +964,12 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
             "succeeded"
         }
     });
-    let mut summary = json!({"id":format!("cm_{id}"),"status":status});
+    let duration_ms = task.created.elapsed().as_millis();
+    let mut summary = json!({
+        "id": format!("cm_{id}"),
+        "status": status,
+        "duration_ms": duration_ms,
+    });
     if let Some(e) = &result.error {
         summary["error"] = json!(e);
     }

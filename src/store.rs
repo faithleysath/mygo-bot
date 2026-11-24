@@ -472,6 +472,24 @@ pub fn has_pending(conn: &Connection, sid: i64) -> Result<bool> {
     Ok(ready)
 }
 
+pub fn pending_reason(conn: &Connection, sid: i64) -> Result<Option<&'static str>> {
+    let (user, event): (bool, bool) = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pending p JOIN items i ON i.id=p.id WHERE p.session_id=?1 AND i.kind='user_message'),
+                EXISTS(SELECT 1 FROM pending p JOIN items i ON i.id=p.id WHERE p.session_id=?1 AND i.kind='codemode_event')",
+        [sid],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    match (user, event) {
+        (true, true) => Ok(Some("pending_input")),
+        (true, false) => Ok(Some("user_message")),
+        (false, true) => Ok(Some("task_event")),
+        (false, false) => {
+            advance_queue(conn, sid, false)?;
+            Ok(None)
+        }
+    }
+}
+
 pub fn take_pending(tx: &Connection, sid: i64) -> Result<()> {
     let added = tx.execute("INSERT INTO context_items(session_id,item_id) SELECT session_id,id FROM pending WHERE session_id=? ORDER BY id",[sid])?;
     advance_queue(tx, sid, added > 0)

@@ -155,6 +155,9 @@ pub fn task_status(conn: &Connection, sid: i64, origin: i64, fold_queued: bool) 
     let mut info = json!({"id":id,"state":"completed","status":match summary["status"].as_str() {
         Some("error") | None => "failed", Some(status) => status,
     }});
+    if let Some(duration_ms) = summary.get("duration_ms").filter(|v| v.is_number()) {
+        info["duration_ms"] = duration_ms.clone();
+    }
     if queued {
         if let Some(error) = summary["error"].as_str() {
             info["error"] = json!(&error[..error.floor_char_boundary(512)]);

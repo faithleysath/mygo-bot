@@ -12,7 +12,7 @@ use rustix::{
     io::Errno,
     process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::{
     io::AsyncWriteExt,
     process::{ChildStderr, ChildStdin, ChildStdout},
@@ -56,15 +56,19 @@ pub(super) async fn execute(
     }
     // Subscribe before launch so even an immediate child exit wakes the waiter.
     let mut exits = signal(SignalKind::child()).map_err(|e| format!("spawn_failed: {e}"))?;
+    enum SpawnOutcome {
+        Child(Child),
+        TimedOut,
+    }
     let start_cancel = cancel.clone();
-    let mut child = tokio::task::spawn_blocking(move || {
+    let SpawnOutcome::Child(mut child) = tokio::task::spawn_blocking(move || {
         if start_cancel.is_cancelled() {
             return Err("cancelled".to_owned());
         }
         if deadline.is_some_and(|t| Instant::now() >= t) {
-            return Err("timeout: command".to_owned());
+            return Ok(SpawnOutcome::TimedOut);
         }
-        command.spawn().map_err(|e| {
+        command.spawn().map(SpawnOutcome::Child).map_err(|e| {
             let code = if e.kind() == io::ErrorKind::NotFound
                 && command.get_current_dir().is_none_or(|cwd| cwd.is_dir())
             {
@@ -76,7 +80,17 @@ pub(super) async fn execute(
         })
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())??
+    else {
+        return Ok(super::io::command_output(
+            None,
+            None,
+            true,
+            String::new(),
+            String::new(),
+            false,
+        ));
+    };
 
     let pgid = Pid::from_child(&child);
     let (input, stdout, stderr) = match pipes(&mut child) {
@@ -94,13 +108,13 @@ pub(super) async fn execute(
             _ = async { match deadline {
                 Some(at) => tokio::time::sleep_until(at).await,
                 None => std::future::pending().await,
-            } } => Err("timeout: command".to_owned()),
-            observed = observe_exit(pgid, &mut exits) => observed.map_err(|e| e.to_string()),
+            } } => Ok(true),
+            observed = observe_exit(pgid, &mut exits) => observed.map(|()| false).map_err(|e| e.to_string()),
         };
         finished.cancel();
         let status = clean_group(child, pgid).await?;
-        outcome?;
-        Ok::<_, String>(status)
+        let timed_out = outcome?;
+        Ok::<_, String>((status, timed_out))
     };
     let write = async {
         if let (Some(mut pipe), Some(bytes)) = (input, stdin) {
@@ -121,15 +135,19 @@ pub(super) async fn execute(
         drain(stdout, &finished, Some((command_preview, Stream::Stdout))),
         drain(stderr, &finished, Some((command_preview, Stream::Stderr)))
     );
-    let status = status?;
+    let (status, timed_out) = status?;
     let pipe_error = |e| format!("pipe_failed: {e}");
     input.map_err(pipe_error)?;
     let (stdout, out_truncated) = stdout.map_err(pipe_error)?;
     let (stderr, err_truncated) = stderr.map_err(pipe_error)?;
-    Ok(json!({
-        "exit_code": status.code(), "signal": status.signal(), "stdout": stdout, "stderr": stderr,
-        "truncated": out_truncated || err_truncated,
-    }))
+    Ok(super::io::command_output(
+        status.code().map(i64::from),
+        status.signal(),
+        timed_out,
+        stdout,
+        stderr,
+        out_truncated || err_truncated,
+    ))
 }
 
 fn pipes(child: &mut Child) -> io::Result<(Option<ChildStdin>, ChildStdout, ChildStderr)> {

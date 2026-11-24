@@ -18,8 +18,26 @@ use super::{
 };
 
 pub(super) const BODY_LIMIT: usize = 8 * 1024 * 1024;
-const OUTPUT_LIMIT: usize = 256 * 1024;
+const OUTPUT_LIMIT: usize = 1024 * 1024;
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+pub(super) fn command_output(
+    exit_code: Option<i64>,
+    signal: Option<i32>,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+    truncated: bool,
+) -> Value {
+    json!({
+        "exit_code": exit_code,
+        "signal": signal,
+        "timed_out": timed_out,
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": truncated,
+    })
+}
 
 pub async fn execute(
     host: &Host,

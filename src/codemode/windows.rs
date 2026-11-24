@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::{
     net::windows::named_pipe::{NamedPipeServer, ServerOptions},
     sync::Notify,
@@ -337,6 +337,11 @@ impl Drop for Process {
     }
 }
 
+enum LaunchOutcome {
+    Started(Job, Process),
+    TimedOut,
+}
+
 fn launch(
     program: &str,
     argv: &[String],
@@ -344,7 +349,7 @@ fn launch(
     stdio: [File; 3],
     cancel: &CancellationToken,
     deadline: Option<Instant>,
-) -> Result<(Job, Process), String> {
+) -> Result<LaunchOutcome, String> {
     let failed = |e: io::Error| format!("spawn_failed: {program}: {e}");
     let mut cmd = command_line(program, argv).map_err(failed)?;
     let cwd = std::path::absolute(opts["cwd"].as_str().unwrap_or(".")).map_err(failed)?;
@@ -400,7 +405,7 @@ fn launch(
         return Err("cancelled".into());
     }
     if deadline.is_some_and(|at| Instant::now() >= at) {
-        return Err("timeout: command".into());
+        return Ok(LaunchOutcome::TimedOut);
     }
     // Both attribute arrays and all handles live until CreateProcessW returns.
     // The job is already attached when the child's first instruction runs.
@@ -422,7 +427,7 @@ fn launch(
     drop(unsafe { OwnedHandle::from_raw_handle(info.hThread) });
     let process =
         Process::new(unsafe { OwnedHandle::from_raw_handle(info.hProcess) }).map_err(failed)?;
-    Ok((job, process))
+    Ok(LaunchOutcome::Started(job, process))
 }
 
 async fn feed(mut pipe: File, bytes: Vec<u8>, finished: &CancellationToken) -> io::Result<()> {
@@ -469,7 +474,7 @@ pub async fn execute(
     let opts = opts.clone();
     let launch_cancel = cancel.child_token();
     let _cancel_on_drop = launch_cancel.clone().drop_guard();
-    let (job, process) = tokio::task::spawn_blocking(move || {
+    let LaunchOutcome::Started(job, process) = tokio::task::spawn_blocking(move || {
         launch(
             &program,
             &argv,
@@ -480,7 +485,17 @@ pub async fn execute(
         )
     })
     .await
-    .map_err(|e| format!("spawn_failed: {e}"))??;
+    .map_err(|e| format!("spawn_failed: {e}"))??
+    else {
+        return Ok(super::io::command_output(
+            None,
+            None,
+            true,
+            String::new(),
+            String::new(),
+            false,
+        ));
+    };
     let finished = CancellationToken::new();
     let monitor = async {
         let timeout = async {
@@ -492,8 +507,10 @@ pub async fn execute(
         let status = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err("cancelled".to_owned()),
-            _ = timeout => Err("timeout: command".to_owned()),
-            result = process.exit_code() => result.map_err(|e| format!("wait_failed: {e}")),
+            _ = timeout => Ok((None, true)),
+            result = process.exit_code() => result
+                .map(|code| (Some(code), false))
+                .map_err(|e| format!("wait_failed: {e}")),
         };
         finished.cancel();
         job.terminate()
@@ -513,15 +530,16 @@ pub async fn execute(
         drain(stdout, &finished, Some((command_preview, Stream::Stdout))),
         drain(stderr, &finished, Some((command_preview, Stream::Stderr)))
     );
-    let status = status?;
+    let (exit_code, timed_out) = status?;
     written.map_err(pipe_error)?;
     let (out, out_truncated) = out.map_err(pipe_error)?;
     let (err, err_truncated) = err.map_err(pipe_error)?;
-    Ok(json!({
-        "exit_code": status,
-        "signal": null,
-        "stdout": out,
-        "stderr": err,
-        "truncated": out_truncated || err_truncated,
-    }))
+    Ok(super::io::command_output(
+        exit_code.map(i64::from),
+        None,
+        timed_out,
+        out,
+        err,
+        out_truncated || err_truncated,
+    ))
 }
