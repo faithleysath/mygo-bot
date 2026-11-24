@@ -6,6 +6,7 @@ mod codemode;
 mod daemon;
 mod docs;
 mod events;
+mod id;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod install;
 mod mcp;

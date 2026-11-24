@@ -264,14 +264,14 @@ export function TraceView({
   items: HistoryItem[];
   hasMore: boolean;
   loadingMore: boolean;
-  queuedIds: Set<number>;
+  queuedIds: Set<string>;
   draft: ActiveDraft | null;
   onLoadMore: () => void;
-  onWithdraw: (mid: number) => void;
+  onWithdraw: (mid: string) => void;
 }) {
   const { t } = useI18n();
   const withdrawn = useMemo(() => {
-    const s = new Set<number>();
+    const s = new Set<string>();
     for (const it of items) if (it.kind === "withdrawal" && it.target_id) s.add(it.target_id);
     return s;
   }, [items]);
@@ -285,10 +285,10 @@ export function TraceView({
       payload: item.payload || {},
       badges: (
         <>
-          <span class="pill mono">#{item.id}</span>
+          <span class="pill mono">{item.id}</span>
           <span class={`kind-badge kind-${item.kind} mono`}>{item.kind}</span>
-          {item.target_id != null && <span class="pill mono">→ #{item.target_id}</span>}
-          {item.llm_call_id != null && <span class="muted small mono">call #{item.llm_call_id}</span>}
+          {item.target_id != null && <span class="pill mono">→ {item.target_id}</span>}
+          {item.llm_call_id != null && <span class="muted small mono">call {item.llm_call_id}</span>}
           {isWithdrawn && <span class="pill">{t("withdrawn")}</span>}
           {isQueued && <span class="pill pill-queued">{t("queued")}</span>}
         </>
@@ -312,7 +312,7 @@ export function TraceView({
             </span>
             <span class="kind-badge mono">{d.kind}</span>
             {d.name && <span class="mono tool-name">{d.name}</span>}
-            <span class="muted small mono">call #{draft.llm_call_id}</span>
+            <span class="muted small mono">call {draft.llm_call_id}</span>
           </summary>
           <div class="card-body">
             <pre class="code-box">
@@ -338,7 +338,7 @@ export function TraceView({
   );
 }
 
-function inferContextKind(c: ContextItem, itemsById: Map<number, HistoryItem>): string {
+function inferContextKind(c: ContextItem, itemsById: Map<string, HistoryItem>): string {
   const known = itemsById.get(c.item_id)?.kind;
   if (known) return known;
   const p = c.payload || {};
@@ -383,7 +383,7 @@ export function ContextView({
 
   const itemsById = useMemo(() => new Map(items.map((it) => [it.id, it])), [items]);
 
-  const loadInitial = async (sid: number) => {
+  const loadInitial = async (sid: string) => {
     setLoading(true);
     setErr("");
     try {
@@ -461,9 +461,9 @@ export function ContextView({
       badges: (
         <>
           <span class="pill mono">pos #{c.position}</span>
-          <span class="muted small mono">item #{c.item_id}</span>
+          <span class="muted small mono">item {c.item_id}</span>
           <span class={`kind-badge kind-${kind} mono`}>{kind}</span>
-          {c.llm_call_id != null && <span class="muted small mono">call #{c.llm_call_id}</span>}
+          {c.llm_call_id != null && <span class="muted small mono">call {c.llm_call_id}</span>}
         </>
       ),
     };

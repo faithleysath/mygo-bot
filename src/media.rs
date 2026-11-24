@@ -10,7 +10,10 @@ use base64::prelude::{BASE64_STANDARD, Engine as _};
 use rusqlite::{Connection, OptionalExtension, types::ValueRef};
 use serde_json::{Value, json};
 
-use crate::{App, Error, Result};
+use crate::{
+    App, Error, Result,
+    id::{AttachmentId, SessionId},
+};
 
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 
@@ -23,7 +26,7 @@ pub fn routes() -> Router<App> {
 
 #[derive(serde::Serialize)]
 struct Attachment {
-    id: i64,
+    id: AttachmentId,
     mime_type: String,
 }
 
@@ -63,7 +66,7 @@ pub enum ContentBlock<'a> {
     Media {
         #[serde(rename = "type")]
         kind: MediaKind,
-        attachment_id: i64,
+        attachment_id: AttachmentId,
     },
 }
 
@@ -105,16 +108,17 @@ pub fn attachment_mime(value: &str) -> Result<mime::Mime> {
         .ok_or_else(|| Error::bad("expected a concrete image, audio or video Content-Type"))
 }
 
-pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Result<i64> {
+pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Result<AttachmentId> {
     if data.is_empty() || data.len() > MAX_ATTACHMENT_BYTES {
         return Err(Error::bad("expected 1 byte to 50 MiB of attachment data"));
     }
-    conn.prepare_cached("INSERT INTO attachments(mime_type,data) VALUES(?,?)")?
-        .execute((mime.as_ref(), data))?;
-    Ok(conn.last_insert_rowid())
+    let id = AttachmentId::new()?;
+    conn.prepare_cached("INSERT INTO attachments(id,mime_type,data) VALUES(?,?,?)")?
+        .execute((id, mime.as_ref(), data))?;
+    Ok(id)
 }
 
-async fn download(State(app): State<App>, Path(id): Path<i64>) -> Result<Response> {
+async fn download(State(app): State<App>, Path(id): Path<AttachmentId>) -> Result<Response> {
     let (mime, data) = app
         .db
         .call(move |store| {
@@ -170,9 +174,9 @@ impl<'a> ContentBlock<'a> {
             ));
         }
         let attachment_id = part["attachment_id"]
-            .as_i64()
-            .filter(|&id| id > 0)
-            .ok_or_else(|| Error::bad("media block requires a positive integer attachment_id"))?;
+            .as_str()
+            .and_then(|s| s.parse::<AttachmentId>().ok())
+            .ok_or_else(|| Error::bad("media block requires a valid attachment_id"))?;
         Ok(Self::Media {
             kind,
             attachment_id,
@@ -245,7 +249,7 @@ impl<'a> ContentBlock<'a> {
     }
 }
 
-fn check_mime(kind: &str, id: i64, mime: &str) -> Result<()> {
+fn check_mime(kind: &str, id: AttachmentId, mime: &str) -> Result<()> {
     if mime
         .split_once('/')
         .is_some_and(|(family, _)| family == kind)
@@ -330,7 +334,7 @@ pub fn check_event(conn: &Connection, content: &Value, modalities: &Value) -> Re
     check_parts(conn, content, modalities)
 }
 
-pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<()> {
+pub fn check_session(conn: &Connection, sid: SessionId, modalities: &Value) -> Result<()> {
     // Match context order first, then the tool results publish_tools will append in
     // call order, and finally the unwithdrawn queue take_pending will append by id.
     let queries = [
@@ -348,7 +352,7 @@ pub fn check_session(conn: &Connection, sid: i64, modalities: &Value) -> Result<
         let mut stmt = conn.prepare_cached(query)?;
         let mut rows = stmt.query([sid])?;
         while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
+            let id: crate::id::ItemId = row.get(0)?;
             let kind: String = row.get(1)?;
             let payload: Value = row.get(2)?;
             let checked = match kind.as_str() {

@@ -29,17 +29,17 @@ export interface ComposerProps {
   tasks: ActiveTask[];
   queuedCount: number;
   summary: CallsSummary | null;
-  onChangeText: (sid: number, text: string) => void;
-  onUploadFiles: (sid: number, files: FileList | null) => void;
-  onRemoveAttachment: (sid: number, aid: number) => void;
-  onSubmit: (sid: number, startRun: boolean) => void;
+  onChangeText: (sid: string, text: string) => void;
+  onUploadFiles: (sid: string, files: FileList | null) => void;
+  onRemoveAttachment: (sid: string, aid: string) => void;
+  onSubmit: (sid: string, startRun: boolean) => void;
   onPause: (mode: "soft" | "hard") => void;
   onKillTask: (tid: string) => void;
   onPatchSession: (
-    sid: number,
+    sid: string,
     patch: Partial<Pick<SessionInfo, "model_id" | "reasoning_effort">>
   ) => void;
-  onOpenUsage: (sid: number) => void;
+  onOpenUsage: (sid: string) => void;
 }
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
@@ -324,7 +324,7 @@ export function Composer({
               title={t("Session Model")}
               value={session.model_id ?? ""}
               onChange={(e) => {
-                const val = e.currentTarget.value ? Number(e.currentTarget.value) : null;
+                const val = e.currentTarget.value || null;
                 onPatchSession(session.id, { model_id: val, reasoning_effort: null });
               }}
             >

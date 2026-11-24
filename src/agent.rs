@@ -1,6 +1,7 @@
 use crate::{
     App, Error, Result, calls,
     events::Notice,
+    id::{ItemId, SessionId},
     model::{self, Failure},
     store::{self, Session, SessionStatus, Store, session},
 };
@@ -23,24 +24,24 @@ pub struct Control {
 enum StartEffect {
     None,
     Idle(i64),
-    Worker(Vec<i64>, i64),
+    Worker(Vec<ItemId>, i64),
 }
 
 /// 启动或恢复会话
 ///
 /// 会话需要可用模型；没有待处理工作时返回当前会话。
-pub async fn start(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Session>> {
+pub async fn start(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Session>> {
     app.start_worker(sid, false).await
 }
 
 impl App {
-    pub fn wake(&self, sid: i64) {
+    pub fn wake(&self, sid: SessionId) {
         let app = self.clone();
         self.workers.spawn(async move {
             if let Err(e) = app.start_worker(sid, true).await
                 && !app.stopping.is_cancelled()
             {
-                tracing::error!(sid,error=%e,"could not start session for a task event");
+                tracing::error!(%sid, error=%e, "could not start session for a task event");
                 // Preserve a visible recovery path if the selected model became unavailable.
                 let _ = app
                     .db
@@ -58,7 +59,7 @@ impl App {
         });
     }
 
-    async fn start_worker(&self, sid: i64, automatic: bool) -> Result<Json<Session>> {
+    async fn start_worker(&self, sid: SessionId, automatic: bool) -> Result<Json<Session>> {
         let worker = self.clone();
         self.db
             .start_write(
@@ -149,7 +150,7 @@ pub struct Pause {
 }
 pub async fn pause(
     State(app): State<App>,
-    Path(sid): Path<i64>,
+    Path(sid): Path<SessionId>,
     Query(q): Query<Pause>,
 ) -> Result<Json<Session>> {
     app.db
@@ -165,7 +166,7 @@ pub async fn pause(
         })
         .await
 }
-fn request_pause(s: &mut Store, sid: i64, hard: bool, reason: &str) -> Result<()> {
+fn request_pause(s: &mut Store, sid: SessionId, hard: bool, reason: &str) -> Result<()> {
     if let Some(control) = s.active.get(&sid).cloned() {
         if !control.soft.is_cancelled() {
             s.status(sid, "pausing", reason)?;
@@ -218,7 +219,7 @@ impl App {
         crate::mcp::close(&self.db).await
     }
 
-    async fn run(self, sid: i64, control: Control, channel: broadcast::Sender<Notice>) {
+    async fn run(self, sid: SessionId, control: Control, channel: broadcast::Sender<Notice>) {
         let outcome = self.run_loop(sid, &control, &channel).await;
         if let Err(problem) = outcome {
             let settled = self
@@ -239,14 +240,14 @@ impl App {
                 })
                 .await;
             if let Err(err) = settled {
-                tracing::error!(sid, error = %err, "cannot pause session");
+                tracing::error!(%sid, error = %err, "cannot pause session");
             }
         }
     }
 
     async fn run_loop(
         &self,
-        sid: i64,
+        sid: SessionId,
         control: &Control,
         channel: &broadcast::Sender<Notice>,
     ) -> Result<()> {
@@ -272,11 +273,7 @@ impl App {
                         s.active.remove(&sid);
                         return Ok(None);
                     }
-                    let end = tx.query_row(
-                        "SELECT coalesce(max(position),0) FROM context_items WHERE session_id=?",
-                        [sid],
-                        |r| r.get(0),
-                    )?;
+                    let end = store::max_context_position(&tx, sid)?;
                     let input = calls::begin(&tx, sid, end)?;
                     tx.commit()?;
                     Ok(Some(input))

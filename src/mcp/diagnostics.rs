@@ -3,7 +3,7 @@ use super::{
     client::{KNOWN_VERSIONS, McpError},
     config, connect,
 };
-use crate::{App, Result};
+use crate::{App, Result, id::McpServerId};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -27,7 +27,7 @@ struct ListSummary {
 
 #[derive(Serialize)]
 struct Probe {
-    id: i64,
+    id: McpServerId,
     revision: i64,
     ok: bool,
     stage: &'static str,
@@ -96,7 +96,7 @@ fn list_error(error: McpError) -> String {
     "MCP catalog request failed; check the connection and server capabilities".into()
 }
 
-async fn test_server(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Probe>> {
+async fn test_server(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<Json<Probe>> {
     let endpoint = app
         .db
         .call(move |s| config::endpoint_by_id(&s.conn, id))

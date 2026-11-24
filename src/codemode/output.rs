@@ -1,5 +1,7 @@
 use tokio::sync::Semaphore;
 
+use crate::id::AttachmentId;
+
 const MIB: usize = 1024 * 1024;
 pub(crate) const TASK_BYTES: usize = 52 * MIB;
 const GLOBAL_BYTES: usize = 192 * MIB;
@@ -9,7 +11,7 @@ pub enum Part {
     Text(String),
     Attachment {
         kind: String,
-        id: i64,
+        id: AttachmentId,
     },
     Bytes {
         kind: String,
@@ -68,8 +70,8 @@ impl Blocks {
         self.parts.push(Part::Text(text));
         Ok(())
     }
-    pub fn push_attachment(&mut self, kind: String, id: i64) -> Result<(), String> {
-        if !matches!(kind.as_str(), "image" | "audio" | "video") || id <= 0 {
+    pub fn push_attachment(&mut self, kind: String, id: AttachmentId) -> Result<(), String> {
+        if !matches!(kind.as_str(), "image" | "audio" | "video") {
             return Err("invalid attachment reference".into());
         }
         self.reserve(kind.len())?;

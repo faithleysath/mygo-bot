@@ -1,6 +1,7 @@
 use crate::{
     App, Result,
     codemode::{self, Call},
+    id::ItemId,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -81,7 +82,7 @@ pub fn definitions() -> Value {
                 "Same runtime as codemode (task.status/list, fs, http, proc, mcp, mygo, sleep; no emitEvent, mygo.taskId is null). ",
                 "Not a periodic callback: returning any value (including null/undefined) or reaching the end wakes immediately with reason 'trigger', return value, and console output—write your own loop to poll a custom condition. ",
                 "Keep side-effect-free (never recovered or replayed if interrupted). ",
-                "Example: while (true) { const s = await task.status('cm_1'); if (s.running_commands?.some(c => /ERR/.test(c.stderr))) return s; await sleep(500); }"
+                "Example: while (true) { const s = await task.status('cm_01h455vb4pex5vsknk084sn02q'); if (s.running_commands?.some(c => /ERR/.test(c.stderr))) return s; await sleep(500); }"
             )}}),
             &[]
         ),
@@ -150,17 +151,14 @@ pub struct Script {
 enum Action {
     Run(Script),
     List,
-    Status(i64),
+    Status(ItemId),
     Wait(Option<String>),
-    Kill(i64),
-    Renew(i64, u32),
+    Kill(ItemId),
+    Renew(ItemId, u32),
 }
 
-pub(crate) fn task_id(id: &str) -> std::result::Result<i64, String> {
-    id.strip_prefix("cm_")
-        .and_then(|n| n.parse::<i64>().ok())
-        .filter(|n| *n > 0 && format!("cm_{n}") == id)
-        .ok_or_else(|| "expected a cm_ task ID".to_owned())
+pub(crate) fn task_id(id: &str) -> std::result::Result<ItemId, String> {
+    ItemId::from_task_id(id)
 }
 
 fn action(name: &str, arguments: &str) -> std::result::Result<Action, String> {

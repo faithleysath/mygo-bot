@@ -1,4 +1,8 @@
-use crate::{App, Result, store::session};
+use crate::{
+    App, Result,
+    id::{CallId, SessionId},
+    store::session,
+};
 use axum::{
     extract::{Path, State},
     response::sse::{Event, KeepAlive, Sse},
@@ -75,7 +79,7 @@ impl DraftItem {
 }
 
 struct ActiveDraft {
-    llm_call_id: i64,
+    llm_call_id: CallId,
     items: BTreeMap<u32, DraftItem>,
 }
 
@@ -87,7 +91,7 @@ struct SessionStream {
 
 struct HubInner {
     global: broadcast::Sender<Notice>,
-    sessions: Mutex<HashMap<i64, SessionStream>>,
+    sessions: Mutex<HashMap<SessionId, SessionStream>>,
 }
 
 #[derive(Clone)]
@@ -114,7 +118,7 @@ impl Hub {
 
     pub fn subscribe_delta(
         &self,
-        sid: i64,
+        sid: SessionId,
     ) -> (
         broadcast::Sender<Notice>,
         broadcast::Receiver<Notice>,
@@ -146,7 +150,7 @@ impl Hub {
         (tx, rx, snapshot, min_seq)
     }
 
-    pub fn start_call(&self, sid: i64, llm_call_id: i64) {
+    pub fn start_call(&self, sid: SessionId, llm_call_id: CallId) {
         let mut sessions = self.0.sessions.lock().unwrap();
         let entry = sessions.entry(sid).or_default();
         entry.draft = Some(ActiveDraft {
@@ -157,8 +161,8 @@ impl Hub {
 
     pub fn item_started(
         &self,
-        sid: i64,
-        llm_call_id: i64,
+        sid: SessionId,
+        llm_call_id: CallId,
         output_index: u32,
         kind: String,
         name: Option<String>,
@@ -197,8 +201,8 @@ impl Hub {
 
     pub fn append_delta(
         &self,
-        sid: i64,
-        llm_call_id: i64,
+        sid: SessionId,
+        llm_call_id: CallId,
         output_index: u32,
         field: &'static str,
         delta: &str,
@@ -249,7 +253,7 @@ impl Hub {
         }
     }
 
-    pub fn finish_item(&self, sid: i64, llm_call_id: i64, output_index: u32) {
+    pub fn finish_item(&self, sid: SessionId, llm_call_id: CallId, output_index: u32) {
         let mut sessions = self.0.sessions.lock().unwrap();
         let Some(entry) = sessions.get_mut(&sid) else {
             return;
@@ -261,7 +265,7 @@ impl Hub {
         }
     }
 
-    pub fn clear_call(&self, sid: i64, llm_call_id: i64, emit_clear: bool) {
+    pub fn clear_call(&self, sid: SessionId, llm_call_id: CallId, emit_clear: bool) {
         let mut sessions = self.0.sessions.lock().unwrap();
         if let Some(entry) = sessions.get_mut(&sid)
             && entry
@@ -282,7 +286,7 @@ impl Hub {
         });
     }
 
-    pub fn remove_session(&self, sid: i64) {
+    pub fn remove_session(&self, sid: SessionId) {
         self.0.sessions.lock().unwrap().remove(&sid);
     }
 }
@@ -341,7 +345,7 @@ fn take_older_deltas(
 
 pub async fn subscribe(
     State(app): State<App>,
-    Path(sid): Path<i64>,
+    Path(sid): Path<SessionId>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
     let (channel, mut rx, initial) = app
         .db

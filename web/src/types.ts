@@ -5,34 +5,34 @@ export type SseStatus = "open" | "reconnecting";
 export type SessionStatus = "idle" | "running" | "pausing" | "paused";
 
 export interface SessionInfo {
-  id: number;
+  id: string;
   title: string;
   created_at: number;
   updated_at: number;
   status: SessionStatus;
   reasoning_effort: string | null;
   last_error: string;
-  model_id: number | null;
+  model_id: string | null;
 }
 
 export interface SessionStatusEvent {
-  id?: number;
+  id?: string;
   status: SessionStatus;
   reason?: string;
   updated_at?: number;
 }
 
 export interface SessionDeletedEvent {
-  id: number;
+  id: string;
 }
 
 export interface AppConfig {
-  default_model_id: number | null;
+  default_model_id: string | null;
   default_reasoning_effort: string | null;
 }
 
 export interface ProviderInfo {
-  id: number;
+  id: string;
   name: string;
   base_url: string;
   has_api_key: boolean;
@@ -40,8 +40,8 @@ export interface ProviderInfo {
 }
 
 export interface ModelInfo {
-  id: number;
-  provider_id: number;
+  id: string;
+  provider_id: string;
   model_key: string;
   context_window_tokens: number | null;
   input_modalities: string[];
@@ -57,7 +57,7 @@ export type McpSecretAction = "keep" | "replace" | "clear";
 export type McpOAuthAction = "keep" | "replace" | "disable";
 
 export interface McpServerInfo {
-  id: number;
+  id: string;
   name: string;
   description: string;
   enabled: boolean;
@@ -76,7 +76,7 @@ export interface McpServerInfo {
 }
 
 export interface McpFormState {
-  id: number | null;
+  id: string | null;
   orig: McpServerInfo | null;
   name: string;
   description: string;
@@ -107,7 +107,7 @@ export interface McpProbeListSummary {
 }
 
 export interface McpProbeResult {
-  id: number;
+  id: string;
   revision: number;
   ok: boolean;
   stage: string;
@@ -139,9 +139,9 @@ export interface CallsSummary {
 }
 
 export interface LlmCallInfo {
-  id: number;
-  session_id: number | null;
-  model_id: number;
+  id: string;
+  session_id: string | null;
+  model_id: string;
   reasoning_effort: string | null;
   input_end_position: number | null;
   started_at: number;
@@ -161,7 +161,7 @@ export interface ContentBlock {
   type?: string;
   text?: string;
   refusal?: string;
-  attachment_id?: number;
+  attachment_id?: string;
   [k: string]: unknown;
 }
 
@@ -182,17 +182,17 @@ export type HistoryPayload = {
 };
 
 export interface HistoryItem {
-  id: number;
+  id: string;
   kind: string;
   payload: HistoryPayload;
-  target_id: number | null;
-  llm_call_id: number | null;
+  target_id: string | null;
+  llm_call_id: string | null;
 }
 
 export interface ContextItem {
   position: number;
-  item_id: number;
-  llm_call_id: number | null;
+  item_id: string;
+  llm_call_id: string | null;
   payload: HistoryPayload;
 }
 
@@ -207,12 +207,12 @@ export interface DraftItem {
 }
 
 export interface ActiveDraft {
-  llm_call_id: number;
+  llm_call_id: string;
   items: DraftItem[];
 }
 
 export interface DraftStartedEvent {
-  llm_call_id: number;
+  llm_call_id: string;
   output_index: number;
   kind?: string;
   name?: string | null;
@@ -220,7 +220,7 @@ export interface DraftStartedEvent {
 }
 
 export interface DraftDeltaEvent {
-  llm_call_id: number;
+  llm_call_id: string;
   output_index: number;
   field: "text" | "reasoning" | "arguments" | string;
   delta?: string;
@@ -258,7 +258,7 @@ export interface ActiveTask {
 export type MediaKind = "image" | "audio" | "video";
 
 export interface ComposerAttachment {
-  id: number;
+  id: string;
   kind: MediaKind;
   name: string;
   preview: string | null;
@@ -282,5 +282,5 @@ export interface SubmittedComposerSnapshot {
   key: string;
   version: number;
   textVersion: number;
-  attachmentIds: Set<number>;
+  attachmentIds: Set<string>;
 }

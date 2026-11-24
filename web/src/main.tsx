@@ -166,7 +166,7 @@ function TopBar({
   onSelectTab: (tab: MainTab) => void;
   onOpenSidebar: () => void;
   onOpenSettings: () => void;
-  onPatchSession: (sid: number, patch: Partial<Pick<SessionInfo, "title">>) => void;
+  onPatchSession: (sid: string, patch: Partial<Pick<SessionInfo, "title">>) => void;
 }) {
   const { locale, t } = useI18n();
   const [title, setTitle] = useState(session?.title || "");
@@ -200,7 +200,7 @@ function TopBar({
           </button>
           <input
             class="title-input"
-            placeholder={`${t("Session")} #${session.id}`}
+            placeholder={`${t("Session")} ${session.id}`}
             value={title}
             onInput={(e) => setTitle(e.currentTarget.value)}
             onBlur={commitTitle}
@@ -293,39 +293,39 @@ function App() {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [activeId, setActiveId] = useState<number | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<MainTab>("chat");
 
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [queuedIds, setQueuedIds] = useState<Set<number>>(() => new Set());
+  const [queuedIds, setQueuedIds] = useState<Set<string>>(() => new Set());
   const [draft, setDraft] = useState<ActiveDraft | null>(null);
   const [retryNotice, setRetryNotice] = useState<RetryNotice | null>(null);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [summary, setSummary] = useState<CallsSummary | null>(null);
-  const [callsById, setCallsById] = useState<Map<number, LlmCallInfo>>(() => new Map());
+  const [callsById, setCallsById] = useState<Map<string, LlmCallInfo>>(() => new Map());
   const [contextRefreshNonce, setContextRefreshNonce] = useState(0);
   const [sseStatus, setSseStatus] = useState<SseStatus>("open");
   const [bannerErr, setBannerErr] = useState("");
 
-  const [composers, setComposers] = useState<Record<number, ComposerDraft>>({});
-  const [uploadingBySid, setUploadingBySid] = useState<Record<number, number>>({});
-  const [sendingBySid, setSendingBySid] = useState<Record<number, boolean>>({});
+  const [composers, setComposers] = useState<Record<string, ComposerDraft>>({});
+  const [uploadingBySid, setUploadingBySid] = useState<Record<string, number>>({});
+  const [sendingBySid, setSendingBySid] = useState<Record<string, boolean>>({});
 
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const activeIdRef = useRef<number | null>(null);
+  const activeIdRef = useRef<string | null>(null);
   activeIdRef.current = activeId;
   const sessionsRef = useRef<SessionInfo[]>([]);
   sessionsRef.current = sessions;
-  const composersRef = useRef<Record<number, ComposerDraft>>({});
+  const composersRef = useRef<Record<string, ComposerDraft>>({});
   composersRef.current = composers;
-  const sendingRef = useRef<Record<number, boolean>>({});
+  const sendingRef = useRef<Record<string, boolean>>({});
   sendingRef.current = sendingBySid;
   const globalSyncRef = useRef<GlobalSessionSync | null>(null);
-  const settledCallCursorRef = useRef(0);
+  const settledCallCursorRef = useRef("");
 
-  const updateComposer = (sid: number, fn: (cur: ComposerDraft) => ComposerDraft) => {
+  const updateComposer = (sid: string, fn: (cur: ComposerDraft) => ComposerDraft) => {
     setComposers((prev) => {
       const cur = prev[sid] || emptyComposer();
       const next = fn(cur);
@@ -335,7 +335,7 @@ function App() {
     });
   };
 
-  const cleanupComposer = (sid: number) => {
+  const cleanupComposer = (sid: string) => {
     setComposers((prev) => {
       if (!prev[sid]) return prev;
       revokeAttachments(prev[sid].attachments);
@@ -420,9 +420,10 @@ function App() {
 
   const fetchAllSessions = async (): Promise<SessionInfo[]> => {
     const all: SessionInfo[] = [];
-    let after = 0;
+    let after = "";
     while (true) {
-      const page = await apiFetch<SessionInfo[]>(`/sessions?after=${after}&limit=200`);
+      const q = after ? `after=${encodeURIComponent(after)}&limit=200` : "limit=200";
+      const page = await apiFetch<SessionInfo[]>(`/sessions?${q}`);
       all.push(...page);
       if (page.length < 200) break;
       after = page[page.length - 1].id;
@@ -458,9 +459,9 @@ function App() {
           if (activeIdRef.current != null) {
             selectedInitial = true;
           } else {
-            let saved: number | null = null;
+            let saved: string | null = null;
             try {
-              saved = Number(localStorage.getItem("mygo_sid")) || null;
+              saved = localStorage.getItem("mygo_sid");
             } catch {}
             const chosen =
               merged.find((s) => s.id === saved) ||
@@ -524,12 +525,13 @@ function App() {
     }
   }, [activeId]);
 
-  const refreshSessionSidecars = async (sid: number): Promise<void> => {
+  const refreshSessionSidecars = async (sid: string): Promise<void> => {
     const fetchNewCalls = async (): Promise<LlmCallInfo[]> => {
       const collected: LlmCallInfo[] = [];
       let after = settledCallCursorRef.current;
       while (true) {
-        const page = await apiFetch<LlmCallInfo[]>(`/calls?session_id=${sid}&after=${after}&limit=200`);
+        const q = after ? `&after=${encodeURIComponent(after)}` : "";
+        const page = await apiFetch<LlmCallInfo[]>(`/calls?session_id=${encodeURIComponent(sid)}${q}&limit=200`);
         collected.push(...page);
         if (page.length < 200) break;
         after = page[page.length - 1].id;
@@ -549,16 +551,11 @@ function App() {
     setTasks(tlist);
     if (newCalls.length > 0) {
       let nextCursor = settledCallCursorRef.current;
-      let sawInFlight = false;
       for (const c of newCalls) {
-        if (c.status === "in_flight") {
-          nextCursor = Math.min(sawInFlight ? nextCursor : c.id - 1, c.id - 1);
-          sawInFlight = true;
-        } else if (!sawInFlight) {
-          nextCursor = Math.max(nextCursor, c.id);
-        }
+        if (c.status === "in_flight") break;
+        if (c.id > nextCursor) nextCursor = c.id;
       }
-      settledCallCursorRef.current = Math.max(0, nextCursor);
+      settledCallCursorRef.current = nextCursor;
       setCallsById((prev) => {
         const next = new Map(prev);
         for (const c of newCalls) next.set(c.id, c);
@@ -569,7 +566,7 @@ function App() {
   };
 
   useEffect(() => {
-    settledCallCursorRef.current = 0;
+    settledCallCursorRef.current = "";
     setCallsById(new Map());
     if (!authed || !activeId) {
       setItems([]);
@@ -587,12 +584,17 @@ function App() {
     setHasMore(false);
     setBannerErr("");
 
-    const closedCalls = new Set<number>();
+    const closedCalls = new Set<string>();
     const closedItems = new Set<string>();
 
     const sessionSync = createSessionSync({
       fetchInitial: () => apiFetch<HistoryItem[]>(`/sessions/${sid}/history?tail=true&limit=50`),
-      fetchAfter: (afterId) => apiFetch<HistoryItem[]>(`/sessions/${sid}/history?after=${afterId}&limit=200`),
+      fetchAfter: (afterId) =>
+        apiFetch<HistoryItem[]>(
+          afterId
+            ? `/sessions/${sid}/history?after=${encodeURIComponent(afterId)}&limit=200`
+            : `/sessions/${sid}/history?limit=200`
+        ),
       onItems: (page) => {
         if (activeIdRef.current === sid) setItems((prev) => mergeItems(prev, page));
       },
@@ -631,7 +633,7 @@ function App() {
           setRetryNotice(null);
           setDraft((prev) => applyDraftDelta(prev, ev));
         } else if (name === "stream.clear") {
-          const ev = data as { llm_call_id?: number } | null;
+          const ev = data as { llm_call_id?: string } | null;
           if (ev?.llm_call_id != null) closedCalls.add(ev.llm_call_id);
           setDraft((prev) => (prev?.llm_call_id === ev?.llm_call_id ? null : prev));
         } else if (name === "attempt.retry") {
@@ -743,7 +745,7 @@ function App() {
     }
   };
 
-  const deleteSession = async (sid: number) => {
+  const deleteSession = async (sid: string) => {
     setBannerErr("");
     try {
       await apiFetch(`/sessions/${sid}`, { method: "DELETE" });
@@ -760,7 +762,7 @@ function App() {
   };
 
   const patchSession = async (
-    sid: number,
+    sid: string,
     patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort">>
   ) => {
     setBannerErr("");
@@ -780,7 +782,7 @@ function App() {
     const firstId = items[0].id;
     setLoadingMore(true);
     try {
-      const older = await apiFetch<HistoryItem[]>(`/sessions/${sid}/history?before=${firstId}&limit=50`);
+      const older = await apiFetch<HistoryItem[]>(`/sessions/${sid}/history?before=${encodeURIComponent(firstId)}&limit=50`);
       if (activeIdRef.current !== sid) return;
       setItems((prev) => mergeItems(prev, older));
       setHasMore(older.length === 50);
@@ -791,7 +793,7 @@ function App() {
     }
   };
 
-  const onChangeText = (sid: number, text: string) => {
+  const onChangeText = (sid: string, text: string) => {
     updateComposer(sid, (c) => ({
       ...c,
       text,
@@ -802,7 +804,7 @@ function App() {
     }));
   };
 
-  const onRemoveAttachment = (sid: number, aid: number) => {
+  const onRemoveAttachment = (sid: string, aid: string) => {
     updateComposer(sid, (c) => {
       const target = c.attachments.find((a) => a.id === aid);
       if (target?.preview) URL.revokeObjectURL(target.preview);
@@ -816,7 +818,7 @@ function App() {
     });
   };
 
-  const onUploadFiles = async (targetSid: number, files: FileList | null) => {
+  const onUploadFiles = async (targetSid: string, files: FileList | null) => {
     const list = Array.from(files || []).filter((f) => /^(image|audio|video)\//.test(f.type));
     if (!list.length) {
       updateComposer(targetSid, (c) => ({
@@ -829,7 +831,7 @@ function App() {
     setUploadingBySid((prev) => ({ ...prev, [targetSid]: (prev[targetSid] || 0) + 1 }));
     try {
       for (const file of list) {
-        const res = await apiFetch<{ id: number }>("/attachments", {
+        const res = await apiFetch<{ id: string }>("/attachments", {
           method: "POST",
           headers: { "Content-Type": file.type },
           body: file,
@@ -865,7 +867,7 @@ function App() {
     }
   };
 
-  const onSubmitComposer = async (targetSid: number, startRun: boolean) => {
+  const onSubmitComposer = async (targetSid: string, startRun: boolean) => {
     if (sendingRef.current[targetSid]) return;
     const cur = composersRef.current[targetSid] || emptyComposer();
     const content = buildContentBlocks(cur);
@@ -951,7 +953,7 @@ function App() {
     setSettingsState({ open: true, tab, sessionFilter: sid });
 
   const activeModel = activeSession?.model_id ? modelsById.get(activeSession.model_id) : undefined;
-  const withdrawMsg = (mid: number) => {
+  const withdrawMsg = (mid: string) => {
     if (!activeSession) return;
     void apiFetch(`/sessions/${activeSession.id}/messages/${mid}`, { method: "DELETE" }).catch((e) =>
       setBannerErr(errorMessage(e))

@@ -1,6 +1,7 @@
 use crate::{
     App, Error, Result,
     calls::Report,
+    id::{CallId, SessionId},
     store::{self, Db},
     tools,
 };
@@ -20,7 +21,7 @@ use tokio_util::{
 };
 
 pub struct Input {
-    pub call_id: i64,
+    pub call_id: CallId,
     pub model: String,
     pub base_url: String,
     pub api_key: Option<String>,
@@ -83,7 +84,7 @@ const INSTRUCTIONS: &str = concat!(
     "- Before recommending destructive or maintenance shell commands to the user, verify unfamiliar subcommands read-only (e.g. checking tool availability or `--help`) rather than guessing flags."
 );
 
-async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
+async fn body(db: Db, sid: SessionId, input: &Input) -> Result<reqwest::Body> {
     let mut header =
         json!({"model":input.model,"tools":tools::definitions(),"stream":true,"store":false});
     if let Some(e) = &input.effort {
@@ -101,7 +102,7 @@ async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
         prefix.push(b',');
     }
     store::JsonRows::ModelInput
-        .body(db, sid, 0, input.end, prefix, b"]}")
+        .context_body(db, sid, (input.end > 0).then_some((1, input.end)), prefix, b"]}")
         .await
 }
 #[derive(Deserialize)]
@@ -117,15 +118,15 @@ struct Frame {
 
 struct DeltaBatcher<'a> {
     streams: &'a crate::events::Hub,
-    sid: i64,
-    call_id: i64,
+    sid: SessionId,
+    call_id: CallId,
     key: Option<(u32, &'static str)>,
     buf: String,
     flush_at: Option<Instant>,
 }
 
 impl<'a> DeltaBatcher<'a> {
-    fn new(streams: &'a crate::events::Hub, sid: i64, call_id: i64) -> Self {
+    fn new(streams: &'a crate::events::Hub, sid: SessionId, call_id: CallId) -> Self {
         Self {
             streams,
             sid,
@@ -217,7 +218,7 @@ fn has_answer(item: &Value) -> bool {
 impl App {
     pub async fn stream(
         &self,
-        sid: i64,
+        sid: SessionId,
         input: Input,
         out: &mut Output,
         hard: &CancellationToken,
@@ -380,8 +381,8 @@ impl App {
 
     async fn accept(
         &self,
-        sid: i64,
-        llm_call_id: i64,
+        sid: SessionId,
+        llm_call_id: CallId,
         item: Value,
         out: &mut Output,
         hard: &CancellationToken,

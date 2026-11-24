@@ -6,7 +6,7 @@ mod transport;
 pub(in crate::mcp) use client::header_has_bearer_challenge;
 pub(super) use transport::HttpClient;
 
-use crate::{App, Error, Result, store::Db};
+use crate::{App, Error, Result, id::McpServerId, store::Db};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -92,11 +92,11 @@ impl Config {
 
 #[derive(Default)]
 pub(super) struct Runtime {
-    listeners: HashMap<i64, (String, CancellationToken)>,
+    listeners: HashMap<McpServerId, (String, CancellationToken)>,
     refresh: HashMap<String, Weak<Mutex<()>>>,
 }
 impl Runtime {
-    pub(super) fn cancel_login(&mut self, id: i64) {
+    pub(super) fn cancel_login(&mut self, id: McpServerId) {
         if let Some((_, stop)) = self.listeners.remove(&id) {
             stop.cancel();
         }
@@ -165,7 +165,7 @@ struct Status {
     status: OAuthStatus,
 }
 
-async fn status(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Status>> {
+async fn status(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<Json<Status>> {
     app.db
         .call(move |s| {
             let sql = format!(
@@ -190,20 +190,20 @@ async fn status(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Stat
         .await
 }
 
-async fn login(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Login>> {
+async fn login(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<Json<Login>> {
     flow::start(&app, id).await.map(Json)
 }
 
 async fn callback(
     State(app): State<App>,
-    Path(id): Path<i64>,
+    Path(id): Path<McpServerId>,
     Json(body): Json<Callback>,
 ) -> Result<StatusCode> {
     flow::complete(&app.db, id, &body.url, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn logout(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+async fn logout(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<StatusCode> {
     // An accepted logout must finish revocation even if the HTTP caller disconnects.
     app.workers
         .clone()

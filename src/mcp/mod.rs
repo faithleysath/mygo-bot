@@ -8,7 +8,12 @@ mod oauth;
 mod stdio;
 pub use config::routes;
 
-use crate::{App, Error, Result, codemode::Reply, store::Db};
+use crate::{
+    App, Error, Result,
+    codemode::Reply,
+    id::{ItemId, McpServerId, SessionId},
+    store::Db,
+};
 use capabilities::AttemptError;
 use client::{Client, McpError};
 use serde::Deserialize;
@@ -78,14 +83,14 @@ impl Slot {
 // An in-flight operation retains its Arc while a replacement can open a fresh connection.
 #[derive(Default)]
 pub struct Connections {
-    slots: HashMap<(i64, i64), (Arc<Slot>, Instant)>,
+    slots: HashMap<(SessionId, McpServerId), (Arc<Slot>, Instant)>,
     oauth: oauth::Runtime,
 }
 impl Connections {
     fn oauth(&mut self) -> &mut oauth::Runtime {
         &mut self.oauth
     }
-    fn acquire(&mut self, sid: i64, id: i64) -> Result<Arc<Slot>> {
+    fn acquire(&mut self, sid: SessionId, id: McpServerId) -> Result<Arc<Slot>> {
         let key = (sid, id);
         let now = Instant::now();
         if let Some((slot, touched)) = self.slots.get_mut(&key)
@@ -108,7 +113,7 @@ impl Connections {
         self.slots.insert(key, (slot.clone(), now));
         Ok(slot)
     }
-    fn forget(&mut self, id: i64) {
+    fn forget(&mut self, id: McpServerId) {
         self.slots.retain(|(_, server), (slot, _)| {
             if *server == id {
                 slot.retire();
@@ -117,7 +122,7 @@ impl Connections {
             true
         });
     }
-    pub fn forget_session(&mut self, sid: i64) {
+    pub fn forget_session(&mut self, sid: SessionId) {
         self.slots.retain(|(session, _), (slot, _)| {
             if *session == sid {
                 slot.retire();
@@ -271,8 +276,8 @@ async fn discover(
 
 pub async fn execute(
     app: &App,
-    sid: i64,
-    origin: i64,
+    sid: SessionId,
+    origin: ItemId,
     op: &str,
     args: Value,
     stage: impl Fn(&'static str) + Send + Sync,
@@ -374,8 +379,8 @@ pub async fn execute(
         Err(_) => "error",
     };
     tracing::info!(
-        sid,
-        origin,
+        %sid,
+        %origin,
         server,
         tool = tool.unwrap_or(""),
         op,

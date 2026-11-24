@@ -8,15 +8,15 @@ import type { SessionInfo, ThemePref } from "./types.ts";
 
 export interface SidebarProps {
   sessions: SessionInfo[];
-  activeId: number | null;
+  activeId: string | null;
   open: boolean;
   collapsed: boolean;
   searchOpen: boolean;
   themePref: ThemePref;
   searchInputRef: RefObject<HTMLInputElement | null>;
-  onSelect: (id: number) => void;
+  onSelect: (id: string) => void;
   onCreate: () => void;
-  onDelete: (id: number) => void;
+  onDelete: (id: string) => void;
   onCycleTheme: () => void;
   onOpenSettingsTab: (tab: SettingsTabId) => void;
   onToggleCollapse: () => void;
@@ -42,7 +42,7 @@ export function Sidebar({
   onClose,
 }: SidebarProps) {
   const { locale, t } = useI18n();
-  const [confirmId, setConfirmId] = useState<number | null>(null);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
 
   useEffect(() => {
@@ -52,14 +52,14 @@ export function Sidebar({
   }, [confirmId]);
 
   const sorted = [...sessions].sort(
-    (a, b) => (b.updated_at || 0) - (a.updated_at || 0) || b.id - a.id
+    (a, b) => (b.updated_at || 0) - (a.updated_at || 0) || (b.id > a.id ? 1 : b.id < a.id ? -1 : 0)
   );
 
   const q = query.trim().toLowerCase();
   const filtered = q
     ? sorted.filter((s) => {
-        const title = (s.title || `${t("Session")} #${s.id}`).toLowerCase();
-        return title.includes(q) || `#${s.id}`.includes(q) || String(s.id).includes(q);
+        const title = (s.title || `${t("Session")} ${s.id}`).toLowerCase();
+        return title.includes(q) || s.id.toLowerCase().includes(q);
       })
     : sorted;
 
@@ -227,7 +227,7 @@ export function Sidebar({
                   }}
                 >
                   <span class={`status-dot ${dotClass}`} title={tip} />
-                  <span class="session-title">{s.title || `${t("Session")} #${s.id}`}</span>
+                  <span class="session-title">{s.title || `${t("Session")} ${s.id}`}</span>
                   <span class="session-time" title={formatAbsTime(s.updated_at)}>
                     {formatRelTimeLoc(s.updated_at, locale)}
                   </span>

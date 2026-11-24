@@ -1,4 +1,8 @@
-use crate::{App, Error, Result, media, pricing};
+use crate::{
+    App, Error, Result,
+    id::{Id, ModelId, Prefix, ProviderId},
+    media, pricing,
+};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -41,10 +45,10 @@ fn document<T: DeserializeOwned + Serialize>(old: Option<&T>, fields: Document) 
     serde_json::from_value(value).map_err(|e| Error::bad(e.to_string()))
 }
 
-fn record<T>(
+fn record<T, K: Prefix>(
     conn: &Connection,
     select: &str,
-    id: i64,
+    id: Id<K>,
     read: fn(&Row) -> rusqlite::Result<T>,
 ) -> Result<T> {
     let mut stmt = conn.prepare_cached(&format!("{select} WHERE id=?"))?;
@@ -80,7 +84,12 @@ fn catalog_error(err: rusqlite::Error) -> Error {
 }
 
 // The database worker commits this write (including any default change) atomically.
-async fn set_archived(app: App, table: &'static str, id: i64, archive: bool) -> Result<StatusCode> {
+async fn set_archived<K: Prefix>(
+    app: App,
+    table: &'static str,
+    id: Id<K>,
+    archive: bool,
+) -> Result<StatusCode> {
     app.db
         .write(
             move |conn| {
@@ -109,23 +118,29 @@ async fn set_archived(app: App, table: &'static str, id: i64, archive: bool) -> 
         .await
 }
 
-async fn archive_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+async fn archive_provider(
+    State(app): State<App>,
+    Path(id): Path<ProviderId>,
+) -> Result<StatusCode> {
     set_archived(app, "llm_providers", id, true).await
 }
 
-async fn restore_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+async fn restore_provider(
+    State(app): State<App>,
+    Path(id): Path<ProviderId>,
+) -> Result<StatusCode> {
     set_archived(app, "llm_providers", id, false).await
 }
 
-async fn archive_model(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+async fn archive_model(State(app): State<App>, Path(id): Path<ModelId>) -> Result<StatusCode> {
     set_archived(app, "llm_models", id, true).await
 }
 
-async fn restore_model(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+async fn restore_model(State(app): State<App>, Path(id): Path<ModelId>) -> Result<StatusCode> {
     set_archived(app, "llm_models", id, false).await
 }
 
-pub fn available_capabilities(conn: &Connection, id: i64) -> Result<(Value, Value)> {
+pub fn available_capabilities(conn: &Connection, id: ModelId) -> Result<(Value, Value)> {
     let (available, modalities, efforts) = conn
         .prepare_cached(
             "SELECT available,input_modalities,reasoning_efforts FROM model_catalog WHERE id=?",
@@ -152,7 +167,7 @@ const PROVIDER: &str =
 
 #[derive(Serialize)]
 struct ProviderInfo {
-    id: i64,
+    id: ProviderId,
     name: String,
     base_url: String,
     has_api_key: bool,
@@ -169,7 +184,10 @@ fn public_provider(row: &Row) -> rusqlite::Result<ProviderInfo> {
     })
 }
 
-async fn get_provider(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<ProviderInfo>> {
+async fn get_provider(
+    State(app): State<App>,
+    Path(id): Path<ProviderId>,
+) -> Result<Json<ProviderInfo>> {
     app.db
         .call(move |s| Ok(Json(record(&s.conn, PROVIDER, id, public_provider)?)))
         .await
@@ -189,11 +207,11 @@ async fn list_providers(
         .await
 }
 
-async fn save<T: Send + 'static>(
+async fn save<T: Send + 'static, K: Prefix>(
     app: App,
-    id: Option<i64>,
+    id: Option<Id<K>>,
     fields: Document,
-    apply: fn(&Connection, Option<i64>, Document) -> Result<T>,
+    apply: fn(&Connection, Option<Id<K>>, Document) -> Result<T>,
 ) -> Result<Json<T>> {
     app.db
         .write(
@@ -203,7 +221,11 @@ async fn save<T: Send + 'static>(
         .await
 }
 
-fn save_provider(conn: &Connection, id: Option<i64>, fields: Document) -> Result<ProviderInfo> {
+fn save_provider(
+    conn: &Connection,
+    id: Option<ProviderId>,
+    fields: Document,
+) -> Result<ProviderInfo> {
     let old = id
         .map(|id| {
             conn.query_row(
@@ -236,7 +258,11 @@ fn save_provider(conn: &Connection, id: Option<i64>, fields: Document) -> Result
             "expected HTTP(S) base_url without credentials, query or fragment",
         ));
     }
-    let id = conn.query_row(
+    let id = match id {
+        Some(id) => id,
+        None => ProviderId::new()?,
+    };
+    let id: ProviderId = conn.query_row(
         "INSERT INTO llm_providers(id,name,base_url,api_key) VALUES(?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,api_key=excluded.api_key
          RETURNING id",
@@ -258,7 +284,7 @@ async fn create_provider(
 
 async fn patch_provider(
     State(app): State<App>,
-    Path(id): Path<i64>,
+    Path(id): Path<ProviderId>,
     fields: Document,
 ) -> Result<Json<ProviderInfo>> {
     save(app, Some(id), fields, save_provider).await
@@ -267,7 +293,7 @@ async fn patch_provider(
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Model {
-    provider_id: i64,
+    provider_id: ProviderId,
     model_key: String,
     context_window_tokens: Option<i64>,
     input_modalities: Vec<String>,
@@ -326,7 +352,7 @@ impl Model {
         pricing::validate(self.pricing.as_ref().unwrap_or(&Value::Null))
     }
 
-    fn check_update(&self, conn: &Connection, id: i64, old: &Self) -> Result<()> {
+    fn check_update(&self, conn: &Connection, id: ModelId, old: &Self) -> Result<()> {
         if (self.provider_id != old.provider_id || self.model_key != old.model_key)
             && conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM llm_calls WHERE model_id=?)",
@@ -372,7 +398,7 @@ impl Model {
         )?;
         let mut rows = sessions.query([id])?;
         while let Some(row) = rows.next()? {
-            let sid: i64 = row.get(0)?;
+            let sid: crate::id::SessionId = row.get(0)?;
             if fewer_efforts
                 && let Some(e) = row.get::<_, Option<String>>(1)?
                 && !self.reasoning_efforts.contains(&e)
@@ -391,8 +417,8 @@ impl Model {
 
 #[derive(Serialize)]
 struct ModelInfo {
-    id: i64,
-    provider_id: i64,
+    id: ModelId,
+    provider_id: ProviderId,
     model_key: String,
     context_window_tokens: Option<i64>,
     input_modalities: Vec<String>,
@@ -417,7 +443,7 @@ fn public_model(row: &Row) -> rusqlite::Result<ModelInfo> {
     })
 }
 
-async fn get_model(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<ModelInfo>> {
+async fn get_model(State(app): State<App>, Path(id): Path<ModelId>) -> Result<Json<ModelInfo>> {
     app.db
         .call(move |s| Ok(Json(record(&s.conn, MODEL, id, public_model)?)))
         .await
@@ -437,7 +463,7 @@ async fn list_models(
         .await
 }
 
-fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<ModelInfo> {
+fn save_model(conn: &Connection, id: Option<ModelId>, fields: Document) -> Result<ModelInfo> {
     let old = id
         .map(|id| record(conn, MODEL, id, Model::read))
         .transpose()?;
@@ -463,7 +489,11 @@ fn save_model(conn: &Connection, id: Option<i64>, fields: Document) -> Result<Mo
     if let (Some(id), Some(old)) = (id, old) {
         model.check_update(conn, id, &old)?;
     }
-    let id = conn.query_row(
+    let id = match id {
+        Some(id) => id,
+        None => ModelId::new()?,
+    };
+    let id: ModelId = conn.query_row(
         "INSERT INTO llm_models(id,provider_id,model_key,context_window_tokens,input_modalities,reasoning_efforts,pricing)
          VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,
          model_key=excluded.model_key,context_window_tokens=excluded.context_window_tokens,
@@ -490,7 +520,7 @@ async fn create_model(
 
 async fn patch_model(
     State(app): State<App>,
-    Path(id): Path<i64>,
+    Path(id): Path<ModelId>,
     fields: Document,
 ) -> Result<Json<ModelInfo>> {
     save(app, Some(id), fields, save_model).await

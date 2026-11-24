@@ -52,6 +52,11 @@ impl Api {
     pub async fn send(req: RequestBuilder, expected: &[u16]) -> Result<(u16, Value)> {
         let res = req.send().await?;
         let status = res.status().as_u16();
+        let is_json = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/json"));
         let bytes = res.bytes().await?;
         if !expected.contains(&status) {
             return Err(format!(
@@ -64,8 +69,10 @@ impl Api {
             status,
             if bytes.is_empty() {
                 Value::Null
-            } else {
+            } else if is_json {
                 serde_json::from_slice(&bytes)?
+            } else {
+                Value::String(String::from_utf8_lossy(&bytes).into_owned())
             },
         ))
     }
@@ -95,7 +102,7 @@ impl Api {
                 201,
             )
             .await?;
-        let provider_id = provider["id"].as_u64().ok_or("missing provider id")?;
+        let provider_id = provider["id"].as_str().ok_or("missing provider id")?;
         let model = self
             .json(
                 Method::POST,
@@ -109,7 +116,7 @@ impl Api {
                 201,
             )
             .await?;
-        let model_id = model["id"].as_u64().ok_or("missing model id")?;
+        let model_id = model["id"].as_str().ok_or("missing model id")?;
         self.json(
             Method::PATCH,
             "/config",
@@ -122,11 +129,11 @@ impl Api {
 
     pub async fn session(&self) -> Result<String> {
         let data = self.json(Method::POST, "/sessions", None, 201).await?;
-        let id = data["id"].as_u64().ok_or("missing session id")?;
+        let id = data["id"].as_str().ok_or("missing session id")?;
         Ok(format!("/sessions/{id}"))
     }
 
-    pub async fn enqueue(&self, path: &str, text: &str) -> Result<u64> {
+    pub async fn enqueue(&self, path: &str, text: &str) -> Result<String> {
         let msg = self
             .json(
                 Method::POST,
@@ -135,7 +142,10 @@ impl Api {
                 201,
             )
             .await?;
-        Ok(msg["id"].as_u64().ok_or("missing message id")?)
+        Ok(msg["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or("missing message id")?)
     }
 
     pub async fn start(&self, path: &str) -> Result<()> {

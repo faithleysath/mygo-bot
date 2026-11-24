@@ -35,7 +35,7 @@ struct Server {
     headers: BTreeMap<String, String>,
 }
 
-pub(super) async fn start(app: &App, id: i64) -> Result<Login> {
+pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
     let mut nonce = [0_u8; 24];
     getrandom::fill(&mut nonce).map_err(|_| Error::internal("OAuth nonce unavailable"))?;
     let generation: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
@@ -226,7 +226,7 @@ fn serve_callback(
 
 pub(super) async fn complete(
     db: &Db,
-    id: i64,
+    id: McpServerId,
     url: &str,
     expected_generation: Option<String>,
 ) -> Result<()> {

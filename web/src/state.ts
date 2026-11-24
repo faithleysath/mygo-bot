@@ -57,12 +57,16 @@ export function buildContentBlocks(draft: ComposerDraft): ContentBlock[] {
   return blocks;
 }
 
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function mergeItems(prev: HistoryItem[], incoming: HistoryItem[]): HistoryItem[] {
   if (!incoming || incoming.length === 0) return prev;
-  const byId = new Map<number, HistoryItem>();
+  const byId = new Map<string, HistoryItem>();
   for (const item of prev) byId.set(item.id, item);
   for (const item of incoming) byId.set(item.id, item);
-  return [...byId.values()].sort((a, b) => a.id - b.id);
+  return [...byId.values()].sort((a, b) => compareIds(a.id, b.id));
 }
 
 export function applyDraftStarted(prev: ActiveDraft | null, ev: DraftStartedEvent): ActiveDraft {
@@ -367,12 +371,12 @@ interface BufferedSessionEvent {
 
 export interface GlobalSessionSyncOptions {
   fetchSessions: () => Promise<SessionInfo[]>;
-  fetchSession?: (id: number) => Promise<SessionInfo>;
-  getSession?: (id: number) => SessionInfo | undefined;
+  fetchSession?: (id: string) => Promise<SessionInfo>;
+  getSession?: (id: string) => SessionInfo | undefined;
   onSnapshot: (merged: SessionInfo[]) => void;
   onDelta: (name: string, data: SessionDeltaPayload) => void;
   onLocalPatchApplied?: (updated: SessionInfo) => void;
-  onDeleted?: (id: number) => void;
+  onDeleted?: (id: string) => void;
   onError?: (msg: string) => void;
   schedule?: ScheduleFn;
   cancelSchedule?: CancelScheduleFn;
@@ -388,9 +392,9 @@ export interface GlobalSessionSync {
   };
   onLocalCreated: (session: SessionInfo) => boolean;
   onLocalPatch: (updated: SessionInfo, baseVersion: number) => boolean;
-  refreshSession: (id: number) => Promise<void>;
-  getSessionVersion: (id: number) => number;
-  touchSession: (id: number | null | undefined) => void;
+  refreshSession: (id: string) => Promise<void>;
+  getSessionVersion: (id: string) => number;
+  touchSession: (id: string | null | undefined) => void;
   dispose: () => void;
 }
 
@@ -413,13 +417,13 @@ export function createGlobalSessionSync({
   let retryDelay = 1000;
   let versionCounter = 0;
   let snapshotVersion = 0;
-  const sessionVersions = new Map<number, number>();
-  const deletedIds = new Set<number>();
-  const refreshSeqById = new Map<number, number>();
-  const refreshRetryTimers = new Map<number, TimerId>();
-  const refreshRetryDelays = new Map<number, number>();
+  const sessionVersions = new Map<string, number>();
+  const deletedIds = new Set<string>();
+  const refreshSeqById = new Map<string, number>();
+  const refreshRetryTimers = new Map<string, TimerId>();
+  const refreshRetryDelays = new Map<string, number>();
 
-  const clearRefreshRetry = (id: number): void => {
+  const clearRefreshRetry = (id: string): void => {
     const timer = refreshRetryTimers.get(id);
     if (timer !== undefined) {
       cancelSchedule(timer);
@@ -436,10 +440,10 @@ export function createGlobalSessionSync({
     refreshRetryDelays.clear();
   };
 
-  const getSessionVersion = (id: number): number =>
+  const getSessionVersion = (id: string): number =>
     Math.max(snapshotVersion, sessionVersions.get(id) || 0);
 
-  const touchSession = (id: number | null | undefined): void => {
+  const touchSession = (id: string | null | undefined): void => {
     if (id != null) {
       sessionVersions.set(id, ++versionCounter);
       clearRefreshRetry(id);
@@ -503,7 +507,7 @@ export function createGlobalSessionSync({
     onDelta(name, data);
   };
 
-  const runRefresh = async (id: number, isRetry: boolean): Promise<void> => {
+  const runRefresh = async (id: string, isRetry: boolean): Promise<void> => {
     if (disposed || !fetchSession || deletedIds.has(id)) return;
     if (getSession && !getSession(id)) return;
     const prevTimer = refreshRetryTimers.get(id);
@@ -556,7 +560,7 @@ export function createGlobalSessionSync({
     }
   };
 
-  const refreshSession = (id: number): Promise<void> => runRefresh(id, false);
+  const refreshSession = (id: string): Promise<void> => runRefresh(id, false);
 
   const onLocalCreated = (session: SessionInfo): boolean => {
     if (disposed || deletedIds.has(session.id)) return false;
@@ -600,7 +604,7 @@ export function createGlobalSessionSync({
 
 export interface SessionSyncOptions {
   fetchInitial: () => Promise<HistoryItem[]>;
-  fetchAfter: (afterId: number) => Promise<HistoryItem[]>;
+  fetchAfter: (afterId: string) => Promise<HistoryItem[]>;
   onItems: (items: HistoryItem[]) => void;
   onHasMore: (hasMore: boolean) => void;
   onSidecars?: () => Promise<void> | void;
@@ -614,7 +618,7 @@ export interface SessionSync {
   onResync: () => void;
   onLiveItem: (item: HistoryItem) => void;
   dispose: () => void;
-  getState: () => { initialLoaded: boolean; syncedThroughId: number; gapOpen: boolean };
+  getState: () => { initialLoaded: boolean; syncedThroughId: string; gapOpen: boolean };
 }
 
 export function createSessionSync({
@@ -629,7 +633,7 @@ export function createSessionSync({
 }: SessionSyncOptions): SessionSync {
   let disposed = false;
   let initialLoaded = false;
-  let syncedThroughId = 0;
+  let syncedThroughId = "";
   let gapOpen = false;
   let inFlight = false;
   let runAgain = false;
@@ -665,7 +669,7 @@ export function createSessionSync({
         if (disposed) return;
         onItems(hist);
         onHasMore(hist.length === 50);
-        syncedThroughId = hist.length ? hist[hist.length - 1].id : 0;
+        syncedThroughId = hist.length ? hist[hist.length - 1].id : "";
         initialLoaded = true;
         if (!runAgain) gapOpen = false;
         retryDelay = 1000;
@@ -677,7 +681,8 @@ export function createSessionSync({
           if (disposed) return;
           if (page.length) {
             onItems(page);
-            syncedThroughId = Math.max(syncedThroughId, page[page.length - 1].id);
+            const last = page[page.length - 1].id;
+            if (last > syncedThroughId) syncedThroughId = last;
           }
           if (page.length < 200) break;
         }
@@ -728,8 +733,8 @@ export function createSessionSync({
   const onLiveItem = (item: HistoryItem): void => {
     if (disposed) return;
     onItems([item]);
-    if (initialLoaded && !gapOpen && typeof item?.id === "number") {
-      syncedThroughId = Math.max(syncedThroughId, item.id);
+    if (initialLoaded && !gapOpen && typeof item?.id === "string" && item.id > syncedThroughId) {
+      syncedThroughId = item.id;
     }
   };
 

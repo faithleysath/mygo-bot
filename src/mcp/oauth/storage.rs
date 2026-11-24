@@ -5,7 +5,7 @@ use rusqlite::OptionalExtension;
 #[derive(Clone)]
 pub(super) struct Account {
     pub db: Db,
-    pub id: i64,
+    pub id: McpServerId,
     pub revision: i64,
     pub generation: String,
 }

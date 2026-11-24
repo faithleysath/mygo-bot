@@ -161,12 +161,13 @@ rm -rf {s}""",
 
     async def follow(self, environment, sid):
         path = f"/sessions/{sid}"
-        after = 0
+        after = None
         outstanding = set()
         with (self.logs_dir / "items.jsonl").open("w", buffering=1) as log:
             while True:
                 state = await self.api(environment, "GET", path)
-                items = await self.api(environment, "GET", f"{path}/history?after={after}&limit=100")
+                query = f"{path}/history?limit=100" + (f"&after={after}" if after else "")
+                items = await self.api(environment, "GET", query)
                 for item in items:
                     print(json.dumps(item, ensure_ascii=False), file=log)
                     after = item["id"]
@@ -188,18 +189,21 @@ rm -rf {s}""",
                     # A completion may be committed before its asynchronous wake. PUT
                     # consumes pending events atomically, or reports that work is finished.
                     settled = await self.api(environment, "PUT", path + "/run")
+                    check_query = f"{path}/history?limit=1" + (f"&after={after}" if after else "")
                     if settled["status"] == "idle" and not await self.api(
-                        environment, "GET", f"{path}/history?after={after}&limit=1"
+                        environment, "GET", check_query
                     ):
                         return
                 await asyncio.sleep(0.5)
 
     async def save_calls(self, environment, sid, context):
-        after = 0
+        after = None
         with (self.logs_dir / "llm_calls.jsonl").open("w") as log:
-            while calls := await self.api(
-                environment, "GET", f"/calls?session_id={sid}&after={after}&limit=100"
-            ):
+            while True:
+                query = f"/calls?session_id={sid}&limit=100" + (f"&after={after}" if after else "")
+                calls = await self.api(environment, "GET", query)
+                if not calls:
+                    break
                 for call in calls:
                     after = call["id"]
                     print(json.dumps(call, ensure_ascii=False), file=log)

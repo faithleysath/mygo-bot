@@ -2,11 +2,19 @@ use std::{collections::HashMap, fs::OpenOptions, path::Path, thread};
 
 use axum::body::Bytes;
 use reqwest::Body;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{
+    Connection, OptionalExtension, ToSql, params,
+    types::{FromSql, ValueRef},
+};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::{Error, Result, agent::Control, events::Notice};
+use crate::{
+    Error, Result,
+    agent::Control,
+    events::Notice,
+    id::{CallId, ItemId, ModelId, SessionId},
+};
 
 // One owner serializes transactions and the matching in-memory worker transitions.
 // A slow disk never blocks the HTTP executor. No job holds SQLite across network I/O.
@@ -14,7 +22,7 @@ type Acknowledge = Box<dyn FnOnce(&mut Store, &Result<()>)>;
 type ApplyWrite = Box<dyn FnOnce(Result<&Connection>, bool) -> (bool, Acknowledge) + Send>;
 
 struct Write {
-    start_session: Option<i64>,
+    start_session: Option<SessionId>,
     apply: ApplyWrite,
 }
 
@@ -35,14 +43,14 @@ enum Command {
 }
 
 struct Enqueue {
-    sid: i64,
+    sid: SessionId,
     content: Value,
     key: Option<String>,
 }
 
 pub enum Enqueued {
-    Created(i64),
-    Existing(i64),
+    Created(ItemId),
+    Existing(ItemId),
 }
 
 #[derive(Clone)]
@@ -50,11 +58,11 @@ pub struct Db(mpsc::Sender<Command>);
 
 pub struct Store {
     pub conn: Connection,
-    pub active: HashMap<i64, Control>,
-    pub tasks: HashMap<i64, crate::codemode::Task>,
+    pub active: HashMap<SessionId, Control>,
+    pub tasks: HashMap<ItemId, crate::codemode::Task>,
     pub mcp: crate::mcp::Connections,
-    pub channels: HashMap<i64, broadcast::WeakSender<Notice>>,
-    pub wake_sequences: HashMap<i64, watch::Sender<u64>>,
+    pub channels: HashMap<SessionId, broadcast::WeakSender<Notice>>,
+    pub wake_sequences: HashMap<SessionId, watch::Sender<u64>>,
     pub global_events: broadcast::Sender<Notice>,
     pub closing: bool,
 }
@@ -79,25 +87,13 @@ impl Db {
         )?;
         if !initialized {
             tx.execute_batch(include_str!("../schema.sql"))?;
-        } else if !tx.column_exists(None, "sessions", "input_queue_cursor")?
-            || !tx.column_exists(None, "sessions", "title")?
-            || !tx.column_exists(None, "sessions", "updated_at")?
-            || !tx
-                .query_row(
-                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='sessions'",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-                .is_some_and(|sql| sql.contains("AUTOINCREMENT"))
-            || !tx.column_exists(None, "items", "codemode_call_item_id")?
-            || !tx.table_exists(None, "mcp_oauth")?
-            || !tx.column_exists(None, "mcp_servers", "allowed_tools")?
-            || tx.column_exists(None, "mcp_servers", "session_ids")?
-        {
-            return Err(Error::internal(
-                "incompatible database schema; select a new database directory",
-            ));
+        } else {
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version != 2 {
+                return Err(Error::internal(
+                    "incompatible database schema; select a new database directory",
+                ));
+            }
         }
         tx.execute("UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE status='in_flight'", [])?;
         tx.execute("UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE status IN ('running','pausing')", [])?;
@@ -158,7 +154,12 @@ impl Db {
         .await
     }
 
-    pub async fn enqueue(&self, sid: i64, content: Value, key: Option<String>) -> Result<Enqueued> {
+    pub async fn enqueue(
+        &self,
+        sid: SessionId,
+        content: Value,
+        key: Option<String>,
+    ) -> Result<Enqueued> {
         self.write(
             move |conn| Enqueue { sid, content, key }.insert(conn),
             move |store, saved| {
@@ -184,7 +185,7 @@ impl Db {
 
     pub async fn start_write<T: 'static, R: Send + 'static>(
         &self,
-        sid: i64,
+        sid: SessionId,
         apply: impl FnOnce(&Connection, bool) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
@@ -193,7 +194,7 @@ impl Db {
 
     async fn grouped_write<T: 'static, R: Send + 'static>(
         &self,
-        start_session: Option<i64>,
+        start_session: Option<SessionId>,
         apply: impl FnOnce(&Connection, bool) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
@@ -250,15 +251,16 @@ impl Enqueue {
                 return Ok(Enqueued::Existing(id));
             }
         }
-        let model_id: Option<i64> = conn
+        let model_id: Option<ModelId> = conn
             .prepare_cached("SELECT model_id FROM sessions WHERE id=?")?
             .query_row([self.sid], |row| row.get(0))?;
         let model_id = model_id
             .ok_or_else(|| Error::conflict("select a session model before sending messages"))?;
         let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
         crate::media::validate_message(conn, &self.content, &modalities)?;
-        conn.prepare_cached("INSERT INTO items(session_id,kind,payload,idempotency_key) VALUES(?1,'user_message',json_object('content',json(?2),'role','user'),?3)")?.execute(params![self.sid, self.content, self.key])?;
-        let id = conn.last_insert_rowid();
+        let id = ItemId::new()?;
+        conn.prepare_cached("INSERT INTO items(id,session_id,kind,payload,idempotency_key) VALUES(?1,?2,'user_message',json_object('content',json(?3),'role','user'),?4)")?
+            .execute(params![id, self.sid, self.content, self.key])?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute((self.sid, now))?;
@@ -310,7 +312,7 @@ impl Store {
         }
     }
 
-    pub fn wake_waiters(&mut self, sid: i64) {
+    pub fn wake_waiters(&mut self, sid: SessionId) {
         if let std::collections::hash_map::Entry::Occupied(entry) = self.wake_sequences.entry(sid) {
             if entry.get().receiver_count() > 0 {
                 entry.get().send_modify(|sequence| *sequence += 1);
@@ -320,7 +322,7 @@ impl Store {
         }
     }
 
-    pub fn subscribe_wait(&mut self, sid: i64) -> watch::Receiver<u64> {
+    pub fn subscribe_wait(&mut self, sid: SessionId) -> watch::Receiver<u64> {
         if let Some(sender) = self.wake_sequences.get(&sid) {
             let mut rx = sender.subscribe();
             rx.borrow_and_update();
@@ -333,7 +335,7 @@ impl Store {
         rx
     }
 
-    pub fn channel(&mut self, sid: i64) -> broadcast::Sender<Notice> {
+    pub fn channel(&mut self, sid: SessionId) -> broadcast::Sender<Notice> {
         if let Some(sender) = self.channels.get(&sid).and_then(|w| w.upgrade()) {
             return sender;
         }
@@ -343,7 +345,7 @@ impl Store {
         sender
     }
 
-    pub fn item_saved(&self, sid: i64, id: i64) -> Result<()> {
+    pub fn item_saved(&self, sid: SessionId, id: ItemId) -> Result<()> {
         if let Some(channel) = self.channels.get(&sid).and_then(|w| w.upgrade())
             && channel.receiver_count() > 0
         {
@@ -363,7 +365,7 @@ impl Store {
         Notice::publish(&self.global_events, name, data);
     }
 
-    pub fn status(&mut self, sid: i64, state: &str, reason: &str) -> Result<()> {
+    pub fn status(&mut self, sid: SessionId, state: &str, reason: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         self.conn.execute(
             "UPDATE sessions SET status=?2,last_error=?3,updated_at=?4 WHERE id=?1",
@@ -373,7 +375,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn notify_status(&self, sid: i64, state: &str, reason: &str, updated_at: i64) {
+    pub fn notify_status(&self, sid: SessionId, state: &str, reason: &str, updated_at: i64) {
         if let Some(channel) = self.channels.get(&sid).and_then(|w| w.upgrade()) {
             Notice::publish(
                 &channel,
@@ -390,11 +392,11 @@ impl Store {
 
 #[derive(serde::Serialize)]
 pub struct HistoryItem {
-    id: i64,
+    id: ItemId,
     kind: String,
     payload: Value,
-    target_id: Option<i64>,
-    llm_call_id: Option<i64>,
+    target_id: Option<ItemId>,
+    llm_call_id: Option<CallId>,
 }
 
 fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
@@ -407,7 +409,7 @@ fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
     })
 }
 
-pub fn session(conn: &Connection, sid: i64) -> Result<Session> {
+pub fn session(conn: &Connection, sid: SessionId) -> Result<Session> {
     let mut stmt = conn.prepare_cached(
         "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id FROM sessions WHERE id=?",
     )?;
@@ -416,14 +418,14 @@ pub fn session(conn: &Connection, sid: i64) -> Result<Session> {
 
 #[derive(serde::Serialize)]
 pub struct Session {
-    pub id: i64,
+    pub id: SessionId,
     pub title: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub status: SessionStatus,
     pub reasoning_effort: Option<String>,
     pub last_error: String,
-    pub model_id: Option<i64>,
+    pub model_id: Option<ModelId>,
 }
 
 #[derive(PartialEq, serde::Deserialize, serde::Serialize)]
@@ -436,7 +438,7 @@ pub enum SessionStatus {
 }
 
 impl rusqlite::types::FromSql for SessionStatus {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         use serde::{Deserialize, de::value::StrDeserializer};
         Self::deserialize(StrDeserializer::<serde::de::value::Error>::new(
             value.as_str()?,
@@ -459,7 +461,7 @@ pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
 }
 
 // This view is shared by queue inspection, consumption and the idle transition.
-pub fn has_pending(conn: &Connection, sid: i64) -> Result<bool> {
+pub fn has_pending(conn: &Connection, sid: SessionId) -> Result<bool> {
     let ready: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id=?)",
         [sid],
@@ -472,7 +474,7 @@ pub fn has_pending(conn: &Connection, sid: i64) -> Result<bool> {
     Ok(ready)
 }
 
-pub fn pending_reason(conn: &Connection, sid: i64) -> Result<Option<&'static str>> {
+pub fn pending_reason(conn: &Connection, sid: SessionId) -> Result<Option<&'static str>> {
     let (user, event): (bool, bool) = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pending p JOIN items i ON i.id=p.id WHERE p.session_id=?1 AND i.kind='user_message'),
                 EXISTS(SELECT 1 FROM pending p JOIN items i ON i.id=p.id WHERE p.session_id=?1 AND i.kind='codemode_event')",
@@ -490,12 +492,24 @@ pub fn pending_reason(conn: &Connection, sid: i64) -> Result<Option<&'static str
     }
 }
 
-pub fn take_pending(tx: &Connection, sid: i64) -> Result<()> {
-    let added = tx.execute("INSERT INTO context_items(session_id,item_id) SELECT session_id,id FROM pending WHERE session_id=? ORDER BY id",[sid])?;
+pub fn max_context_position(conn: &Connection, sid: SessionId) -> Result<i64> {
+    Ok(conn
+        .prepare_cached("SELECT coalesce(max(position),0) FROM context_items WHERE session_id=?")?
+        .query_row([sid], |r| r.get(0))?)
+}
+
+pub fn take_pending(tx: &Connection, sid: SessionId) -> Result<()> {
+    let base = max_context_position(tx, sid)?;
+    let added = tx.execute(
+        "INSERT INTO context_items(session_id,position,item_id)
+         SELECT session_id, ?2 + row_number() OVER (ORDER BY id), id
+         FROM pending WHERE session_id=?1 ORDER BY id",
+        (sid, base),
+    )?;
     advance_queue(tx, sid, added > 0)
 }
 
-fn advance_queue(conn: &Connection, sid: i64, added: bool) -> Result<()> {
+fn advance_queue(conn: &Connection, sid: SessionId, added: bool) -> Result<()> {
     conn.execute(
         "UPDATE sessions SET input_queue_cursor=last_id,needs_model=needs_model OR ?2
          FROM (SELECT max(id) AS last_id FROM items WHERE session_id=?1 AND kind IN ('user_message','codemode_event'))
@@ -507,39 +521,42 @@ fn advance_queue(conn: &Connection, sid: i64, added: bool) -> Result<()> {
 
 pub fn add_item(
     conn: &Connection,
-    sid: i64,
+    sid: SessionId,
     kind: &str,
     payload: &Value,
-    target: Option<i64>,
-    llm_call_id: Option<i64>,
-) -> Result<i64> {
+    target: Option<ItemId>,
+    llm_call_id: Option<CallId>,
+) -> Result<ItemId> {
+    let id = ItemId::new()?;
     conn.execute(
-        "INSERT INTO items(session_id,kind,payload,target_id,llm_call_id) VALUES(?,?,?,?,?)",
-        params![sid, kind, payload, target, llm_call_id],
+        "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id) VALUES(?,?,?,?,?,?)",
+        params![id, sid, kind, payload, target, llm_call_id],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(id)
 }
 
 pub fn add_context_item(
     tx: &Connection,
-    sid: i64,
+    sid: SessionId,
     kind: &str,
     item: &Value,
-    call_id: i64,
-) -> Result<i64> {
+    call_id: CallId,
+) -> Result<ItemId> {
     let id = add_item(tx, sid, kind, item, None, Some(call_id))?;
+    let pos = max_context_position(tx, sid)? + 1;
     tx.execute(
-        "INSERT INTO context_items(session_id,item_id) VALUES(?,?)",
-        (sid, id),
+        "INSERT INTO context_items(session_id,position,item_id) VALUES(?,?,?)",
+        (sid, pos, id),
     )?;
     Ok(id)
 }
 
 // Publish all completed tools in call order. A missing result after interruption
 // is recorded explicitly: replaying an already executed tool could repeat its effect.
-pub fn publish_tools(tx: &Connection, sid: i64, recovering: bool) -> Result<Vec<i64>> {
+pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Result<Vec<ItemId>> {
     let mut recovered = Vec::new();
-    let mut after = 0;
+    let mut after: Option<ItemId> = None;
+    let mut pos = max_context_position(tx, sid)? + 1;
     let mut pending = tx.prepare_cached(
         "SELECT c.id, json_extract(c.payload,'$.call_id'), r.id FROM items c
          LEFT JOIN items r ON r.kind='function_call_output' AND r.target_id=c.id
@@ -548,16 +565,16 @@ pub fn publish_tools(tx: &Connection, sid: i64, recovering: bool) -> Result<Vec<
          ORDER BY c.id LIMIT 1",
     )?;
     while let Some((id, call, output)) = pending
-        .query_row((sid, after), |r| {
+        .query_row((sid, after.as_ref().map_or("", ItemId::as_str)), |r| {
             Ok((
-                r.get::<_, i64>(0)?,
+                r.get::<_, ItemId>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<ItemId>>(2)?,
             ))
         })
         .optional()?
     {
-        after = id;
+        after = Some(id);
         let result = match output {
             Some(id) => id,
             None if recovering => {
@@ -569,15 +586,20 @@ pub fn publish_tools(tx: &Connection, sid: i64, recovering: bool) -> Result<Vec<
             None => return Err(Error::internal("missing tool result")),
         };
         tx.execute(
-            "INSERT INTO context_items(session_id,item_id) VALUES(?1,?2),(?1,?3)",
-            (sid, id, result),
+            "INSERT INTO context_items(session_id,position,item_id) VALUES(?1,?2,?3),(?1,?4,?5)",
+            (sid, pos, id, pos + 1, result),
         )?;
+        pos += 2;
     }
     Ok(recovered)
 }
 
 const BATCH_ITEMS: i64 = 256;
 const BATCH_BYTES: usize = 64 * 1024;
+
+trait Cursor: Copy + Eq + Ord + Send + ToSql + FromSql + 'static {}
+impl Cursor for i64 {}
+impl Cursor for ItemId {}
 
 #[derive(Clone, Copy)]
 pub enum JsonRows {
@@ -586,84 +608,115 @@ pub enum JsonRows {
     ModelInput,
 }
 
+fn page_bounds<C: Cursor>(
+    conn: &Connection,
+    table: &str,
+    col: &str,
+    sid: SessionId,
+    after: impl ToSql,
+    before: Option<C>,
+    tail: bool,
+    limit: i64,
+) -> Result<Option<(C, C)>> {
+    let pair = if tail {
+        let sql = format!(
+            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 ORDER BY {col} DESC LIMIT ?2)"
+        );
+        conn.prepare_cached(&sql)?.query_row((sid, limit), |r| {
+            Ok((r.get::<_, Option<C>>(0)?, r.get::<_, Option<C>>(1)?))
+        })?
+    } else if let Some(before) = before {
+        let sql = format!(
+            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}<?2 ORDER BY {col} DESC LIMIT ?3)"
+        );
+        conn.prepare_cached(&sql)?
+            .query_row((sid, before, limit), |r| {
+                Ok((r.get::<_, Option<C>>(0)?, r.get::<_, Option<C>>(1)?))
+            })?
+    } else {
+        let sql = format!(
+            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}>?2 ORDER BY {col} LIMIT ?3)"
+        );
+        conn.prepare_cached(&sql)?
+            .query_row(params![sid, after, limit], |r| {
+                Ok((r.get::<_, Option<C>>(0)?, r.get::<_, Option<C>>(1)?))
+            })?
+    };
+    Ok(pair.0.zip(pair.1))
+}
+
 impl JsonRows {
-    // Both tables are append-only. Pin the last cursor of this page before sending
+    // Both tables are append-only. Pin the cursor span of this page before sending
     // bytes so a concurrent append can't appear halfway through the response.
-    pub fn page_end(self, conn: &Connection, sid: i64, after: i64, limit: i64) -> Result<i64> {
-        let sql = match self {
-            Self::History => {
-                "SELECT max(id) FROM (SELECT id FROM items WHERE session_id=? AND id>? ORDER BY id LIMIT ?)"
-            }
-            Self::Context | Self::ModelInput => {
-                "SELECT max(position) FROM (SELECT position FROM context_items WHERE session_id=? AND position>? ORDER BY position LIMIT ?)"
-            }
-        };
-        let end: Option<i64> = conn
-            .prepare_cached(sql)?
-            .query_row((sid, after, limit), |r| r.get(0))?;
-        Ok(end.unwrap_or(after))
+    pub fn history_range(
+        conn: &Connection,
+        sid: SessionId,
+        after: Option<ItemId>,
+        before: Option<ItemId>,
+        tail: bool,
+        limit: i64,
+    ) -> Result<Option<(ItemId, ItemId)>> {
+        page_bounds(
+            conn,
+            "items",
+            "id",
+            sid,
+            after.as_ref().map_or("", ItemId::as_str),
+            before,
+            tail,
+            limit,
+        )
     }
 
-    pub fn page_range(
-        self,
+    pub fn context_range(
         conn: &Connection,
-        sid: i64,
+        sid: SessionId,
         after: Option<i64>,
         before: Option<i64>,
         tail: bool,
         limit: i64,
-    ) -> Result<(i64, i64)> {
-        if !tail && before.is_none() {
-            let start = after.unwrap_or(0);
-            return Ok((start, self.page_end(conn, sid, start, limit)?));
-        }
-        let (table, col) = match self {
-            Self::History => ("items", "id"),
-            Self::Context | Self::ModelInput => ("context_items", "position"),
-        };
-        let range = if tail {
-            let sql = format!(
-                "SELECT min(k) - 1, max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 ORDER BY {col} DESC LIMIT ?2)"
-            );
-            conn.prepare_cached(&sql)?.query_row((sid, limit), |r| {
-                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
-            })?
-        } else {
-            let sql = format!(
-                "SELECT min(k) - 1, max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}<?2 ORDER BY {col} DESC LIMIT ?3)"
-            );
-            conn.prepare_cached(&sql)?
-                .query_row((sid, before.unwrap(), limit), |r| {
-                    Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
-                })?
-        };
-        Ok(match range {
-            (Some(start), Some(end)) => (start, end),
-            _ => (0, 0),
-        })
+    ) -> Result<Option<(i64, i64)>> {
+        page_bounds(
+            conn,
+            "context_items",
+            "position",
+            sid,
+            after.unwrap_or(0),
+            before,
+            tail,
+            limit,
+        )
     }
 
-    fn batch(
+    fn batch<C: Cursor>(
         self,
         conn: &Connection,
-        sid: i64,
-        after: i64,
-        end: i64,
+        sid: SessionId,
+        cursor: C,
+        end: C,
+        inclusive: bool,
         mut bytes: Vec<u8>,
         mut comma: bool,
-    ) -> Result<(Vec<u8>, i64)> {
+    ) -> Result<(Vec<u8>, C)> {
+        let cmp = if inclusive { ">=" } else { ">" };
         let sql = match self {
-            Self::ModelInput => "SELECT c.position,i.payload,i.kind FROM context_items c JOIN items i ON i.id=c.item_id
-                       WHERE c.session_id=? AND c.position>? AND c.position<=? ORDER BY c.position LIMIT ?",
-            Self::Context => "SELECT c.position,json_object('position',c.position,'item_id',i.id,'llm_call_id',i.llm_call_id,'payload',json(i.payload))
-                       FROM context_items c JOIN items i ON i.id=c.item_id
-                       WHERE c.session_id=? AND c.position>? AND c.position<=? ORDER BY c.position LIMIT ?",
-            Self::History => "SELECT id,json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'llm_call_id',llm_call_id)
-                       FROM items WHERE session_id=? AND id>? AND id<=? ORDER BY id LIMIT ?",
+            Self::ModelInput => format!(
+                "SELECT c.position,i.payload,i.kind FROM context_items c JOIN items i ON i.id=c.item_id
+                 WHERE c.session_id=? AND c.position{cmp}? AND c.position<=? ORDER BY c.position LIMIT ?"
+            ),
+            Self::Context => format!(
+                "SELECT c.position,json_object('position',c.position,'item_id',i.id,'llm_call_id',i.llm_call_id,'payload',json(i.payload))
+                 FROM context_items c JOIN items i ON i.id=c.item_id
+                 WHERE c.session_id=? AND c.position{cmp}? AND c.position<=? ORDER BY c.position LIMIT ?"
+            ),
+            Self::History => format!(
+                "SELECT id,json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'llm_call_id',llm_call_id)
+                 FROM items WHERE session_id=? AND id{cmp}? AND id<=? ORDER BY id LIMIT ?"
+            ),
         };
-        let mut stmt = conn.prepare_cached(sql)?;
-        let mut rows = stmt.query((sid, after, end, BATCH_ITEMS))?;
-        let mut position = after;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query((sid, cursor, end, BATCH_ITEMS))?;
+        let mut position = None;
         while let Some(row) = rows.next()? {
             let encoded;
             let raw = if matches!(self, Self::ModelInput)
@@ -677,7 +730,7 @@ impl JsonRows {
                     .as_bytes()
                     .map_err(|e| Error::internal(e.to_string()))?
             };
-            if position != after && bytes.len() + raw.len() + 1 > BATCH_BYTES {
+            if position.is_some() && bytes.len() + raw.len() + 1 > BATCH_BYTES {
                 break;
             }
             if comma {
@@ -685,28 +738,53 @@ impl JsonRows {
             }
             bytes.extend_from_slice(raw);
             comma = true;
-            position = row.get(0)?;
+            position = Some(row.get::<_, C>(0)?);
             if bytes.len() >= BATCH_BYTES {
                 break;
             }
         }
-        if position == after && after < end {
+        let Some(position) = position else {
             return Err(Error::internal("missing row in saved history"));
-        }
+        };
         Ok((bytes, position))
     }
 
-    pub async fn body(
+    pub async fn history_body(
         self,
         db: Db,
-        sid: i64,
-        after: i64,
-        end: i64,
+        sid: SessionId,
+        range: Option<(ItemId, ItemId)>,
         prefix: Vec<u8>,
         suffix: &'static [u8],
     ) -> Result<Body> {
+        self.body_with_range(db, sid, range, prefix, suffix).await
+    }
+
+    pub async fn context_body(
+        self,
+        db: Db,
+        sid: SessionId,
+        range: Option<(i64, i64)>,
+        prefix: Vec<u8>,
+        suffix: &'static [u8],
+    ) -> Result<Body> {
+        self.body_with_range(db, sid, range, prefix, suffix).await
+    }
+
+    async fn body_with_range<C: Cursor>(
+        self,
+        db: Db,
+        sid: SessionId,
+        range: Option<(C, C)>,
+        mut prefix: Vec<u8>,
+        suffix: &'static [u8],
+    ) -> Result<Body> {
+        let Some((start, end)) = range else {
+            prefix.extend_from_slice(suffix);
+            return Ok(Body::from(prefix));
+        };
         let (mut bytes, mut position) = db
-            .call(move |s| self.batch(&s.conn, sid, after, end, prefix, false))
+            .call(move |s| self.batch(&s.conn, sid, start, end, true, prefix, false))
             .await?;
         if position == end {
             bytes.extend_from_slice(suffix);
@@ -714,15 +792,22 @@ impl JsonRows {
         }
         let stream = async_stream::stream! {
             yield Ok::<Bytes, Error>(Bytes::from(bytes));
-            while position<end {
-                let result = db.call(move |s| self.batch(&s.conn,sid,position,end,Vec::new(),true)).await;
+            while position < end {
+                let result = db
+                    .call(move |s| self.batch(&s.conn, sid, position, end, false, Vec::new(), true))
+                    .await;
                 match result {
-                    Ok((mut bytes,next)) => {
-                        position=next;
-                        if position==end {bytes.extend_from_slice(suffix);}
+                    Ok((mut bytes, next)) => {
+                        position = next;
+                        if position == end {
+                            bytes.extend_from_slice(suffix);
+                        }
                         yield Ok(Bytes::from(bytes));
                     }
-                    Err(err) => {yield Err(err); break;}
+                    Err(err) => {
+                        yield Err(err);
+                        break;
+                    }
                 }
             }
         };

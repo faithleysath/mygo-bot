@@ -1,5 +1,5 @@
 use super::{Binding, client::StoredCredentials, decode, validate_endpoint};
-use crate::{App, Error, Result};
+use crate::{App, Error, Result, id::McpServerId};
 use axum::http::StatusCode;
 use form_urlencoded::{Serializer, byte_serialize};
 use reqwest::{Client, Url, header::CONTENT_TYPE};
@@ -13,7 +13,7 @@ struct Grant {
 }
 
 // Keep decoding and network errors outside the transaction so neither can undo logout.
-fn take(conn: &Connection, id: i64, expected: Option<&str>, timeout: Duration) -> Result<Grant> {
+fn take(conn: &Connection, id: McpServerId, expected: Option<&str>, timeout: Duration) -> Result<Grant> {
     let (generation, grant) = conn.query_row(
         "SELECT generation,credentials,binding FROM mcp_servers
          LEFT JOIN mcp_oauth ON server_id=id WHERE id=?",
@@ -148,7 +148,7 @@ impl Revocation<'_> {
     }
 }
 
-pub(super) async fn logout(app: &App, id: i64) -> Result<()> {
+pub(super) async fn logout(app: &App, id: McpServerId) -> Result<()> {
     let (generation, gate, timeout) = app
         .db
         .call(move |s| {

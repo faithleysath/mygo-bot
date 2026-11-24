@@ -85,7 +85,7 @@ function AuthMedia({
   onPreviewImage,
 }: {
   kind: MediaKind;
-  attachmentId: number;
+  attachmentId: string;
   onPreviewImage?: (url: string) => void;
 }) {
   const { t } = useI18n();
@@ -106,14 +106,14 @@ function AuthMedia({
     };
   }, [attachmentId]);
 
-  if (err) return <div class="media-err">#{attachmentId}: {err}</div>;
-  if (!url) return <div class="media-loading">{t("Loading")} {kind} #{attachmentId}…</div>;
+  if (err) return <div class="media-err">{attachmentId}: {err}</div>;
+  if (!url) return <div class="media-loading">{t("Loading")} {kind} {attachmentId}…</div>;
   if (kind === "image") {
     return (
       <img
         class="media-img"
         src={url}
-        alt={`#${attachmentId}`}
+        alt={attachmentId}
         title={t("Click to enlarge")}
         onClick={() => onPreviewImage?.(url)}
       />
@@ -456,14 +456,14 @@ export interface TimelineProps {
   items: HistoryItem[];
   hasMore: boolean;
   loadingMore: boolean;
-  queuedIds: Set<number>;
+  queuedIds: Set<string>;
   draft: ActiveDraft | null;
   retryNotice: RetryNotice | null;
-  callsById: Map<number, LlmCallInfo>;
+  callsById: Map<string, LlmCallInfo>;
   modelLabel?: string | null;
   effortLabel?: string | null;
   onLoadMore: () => void;
-  onWithdraw: (mid: number) => void;
+  onWithdraw: (mid: string) => void;
   onOpenSettings?: () => void;
 }
 
@@ -486,8 +486,8 @@ export function Timeline({
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const rafRef = useRef(0);
-  const prevSessionIdRef = useRef<number | null>(null);
-  const prevFirstIdRef = useRef<number | null>(null);
+  const prevSessionIdRef = useRef<string | null>(null);
+  const prevFirstIdRef = useRef<string | null>(null);
   const prevScrollHeightRef = useRef<number>(0);
   const [showJump, setShowJump] = useState(false);
   const [activeTurn, setActiveTurn] = useState(0);
@@ -572,22 +572,22 @@ export function Timeline({
     setShowJump(false);
   };
 
-  const withdrawn = new Set<number>();
-  const callsSet = new Set<number>();
-  const outputsByTarget = new Map<number, HistoryItem>();
+  const withdrawn = new Set<string>();
+  const callsSet = new Set<string>();
+  const outputsByTarget = new Map<string, HistoryItem>();
   for (const item of items) {
     if (item.kind === "withdrawal" && item.target_id) withdrawn.add(item.target_id);
     if (item.kind === "function_call") callsSet.add(item.id);
     if (item.kind === "function_call_output" && item.target_id) outputsByTarget.set(item.target_id, item);
   }
 
-  const turns: Array<{ id: number; role: "user" | "assistant"; label: string }> = [];
-  const turnIdxByItemId = new Map<number, number>();
+  const turns: Array<{ id: string; role: "user" | "assistant"; label: string }> = [];
+  const turnIdxByItemId = new Map<string, number>();
   for (const item of items) {
     if (item.kind === "user_message" && !withdrawn.has(item.id)) {
       const txt = extractMessageText(item.payload?.content).replace(/\s+/g, " ").trim();
       turnIdxByItemId.set(item.id, turns.length);
-      turns.push({ id: item.id, role: "user", label: txt.slice(0, 64) || `#${item.id}` });
+      turns.push({ id: item.id, role: "user", label: txt.slice(0, 64) || item.id });
     } else if (item.kind === "assistant_message") {
       const txt = extractMessageText(item.payload?.content).replace(/\s+/g, " ").trim();
       if (txt) {
@@ -615,7 +615,7 @@ export function Timeline({
           {items.length === 0 && !draft && !showWorking && (
             <div class="empty-chat">
               <BrandMark size={36} />
-              <h3>{session?.title || `${t("Session")} #${session?.id}`}</h3>
+              <h3>{session?.title || `${t("Session")} ${session?.id}`}</h3>
               <div class="empty-badges">
                 {modelLabel ? (
                   <>

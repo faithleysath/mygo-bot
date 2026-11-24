@@ -1,5 +1,5 @@
 use super::{oauth, stdio};
-use crate::{App, Error, Result};
+use crate::{App, Error, Result, id::McpServerId};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -67,7 +67,7 @@ type Fields = Json<Map<String, Value>>;
 
 #[derive(Serialize)]
 struct McpServerInfo {
-    id: i64,
+    id: McpServerId,
     name: String,
     description: String,
     enabled: bool,
@@ -86,7 +86,7 @@ struct McpServerInfo {
     revision: i64,
 }
 pub(super) struct Endpoint {
-    pub id: i64,
+    pub id: McpServerId,
     pub revision: i64,
     pub timeout_ms: u32,
     pub allow_disabled: bool,
@@ -132,7 +132,7 @@ fn parse_headers(raw: &BTreeMap<String, String>) -> Result<HashMap<HeaderName, H
 }
 
 struct Stored {
-    id: i64,
+    id: McpServerId,
     revision: i64,
     cfg: McpServerConfig,
 }
@@ -215,15 +215,15 @@ impl Stored {
         })
     }
 }
-fn load(conn: &Connection, id: i64) -> Result<Stored> {
+fn load(conn: &Connection, id: McpServerId) -> Result<Stored> {
     Ok(conn
         .prepare_cached(&format!("{SELECT} WHERE id=?"))?
         .query_row([id], stored)?)
 }
-fn by_id(conn: &Connection, id: i64) -> Result<McpServerInfo> {
+fn by_id(conn: &Connection, id: McpServerId) -> Result<McpServerInfo> {
     Ok(load(conn, id)?.info())
 }
-pub(super) fn endpoint_by_id(conn: &Connection, id: i64) -> Result<Endpoint> {
+pub(super) fn endpoint_by_id(conn: &Connection, id: McpServerId) -> Result<Endpoint> {
     load(conn, id)?.endpoint(true)
 }
 pub(super) fn endpoint(conn: &Connection, name: &str) -> Result<Endpoint> {
@@ -327,7 +327,11 @@ fn validate(c: &mut McpServerConfig) -> Result<()> {
     }
     Ok(())
 }
-fn save(conn: &Connection, id: Option<i64>, fields: Fields) -> Result<(McpServerInfo, bool)> {
+fn save(
+    conn: &Connection,
+    id: Option<McpServerId>,
+    fields: Fields,
+) -> Result<(McpServerInfo, bool)> {
     if fields.is_empty() {
         return Err(Error::bad("expected MCP configuration fields"));
     }
@@ -376,6 +380,10 @@ fn save(conn: &Connection, id: Option<i64>, fields: Fields) -> Result<(McpServer
         McpTransport::StreamableHttp => "streamable-http",
         McpTransport::Stdio => "stdio",
     };
+    let id = match id {
+        Some(id) => id,
+        None => McpServerId::new()?,
+    };
     let id = conn
         .query_row(
             sql,
@@ -413,7 +421,10 @@ async fn list_servers(State(app): State<App>) -> Result<Json<Vec<McpServerInfo>>
         .await
 }
 
-async fn get_server(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<McpServerInfo>> {
+async fn get_server(
+    State(app): State<App>,
+    Path(id): Path<McpServerId>,
+) -> Result<Json<McpServerInfo>> {
     app.db.call(move |s| by_id(&s.conn, id).map(Json)).await
 }
 
@@ -431,7 +442,7 @@ async fn create_server(
 
 async fn patch_server(
     State(app): State<App>,
-    Path(id): Path<i64>,
+    Path(id): Path<McpServerId>,
     fields: Fields,
 ) -> Result<Json<McpServerInfo>> {
     app.db
@@ -448,7 +459,7 @@ async fn patch_server(
         .await
 }
 
-async fn delete_server(State(app): State<App>, Path(id): Path<i64>) -> Result<StatusCode> {
+async fn delete_server(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<StatusCode> {
     app.db
         .write(
             move |conn| {

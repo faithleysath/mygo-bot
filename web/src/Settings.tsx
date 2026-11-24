@@ -25,7 +25,7 @@ import type {
 } from "./types.ts";
 
 interface ProviderFormState {
-  id: number | null;
+  id: string | null;
   name: string;
   base_url: string;
   api_key: string;
@@ -33,8 +33,8 @@ interface ProviderFormState {
 }
 
 interface ModelFormState {
-  id: number | null;
-  provider_id: number | string;
+  id: string | null;
+  provider_id: string;
   model_key: string;
   context_window_tokens: number | string;
   input_modalities: string[];
@@ -106,7 +106,7 @@ function ModelsTab({
       }
     }
     const body = {
-      provider_id: Number(f.provider_id),
+      provider_id: f.provider_id,
       model_key: f.model_key,
       context_window_tokens: f.context_window_tokens ? Number(f.context_window_tokens) : null,
       input_modalities: f.input_modalities,
@@ -142,14 +142,14 @@ function ModelsTab({
               value={config?.default_model_id ?? ""}
               onChange={(e) =>
                 void saveDefault({
-                  default_model_id: e.currentTarget.value ? Number(e.currentTarget.value) : null,
+                  default_model_id: e.currentTarget.value || null,
                 })
               }
             >
               <option value="">{t("None")}</option>
               {availableModels.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.model_key} (#{m.id})
+                  {m.model_key} ({m.id})
                 </option>
               ))}
             </select>
@@ -373,12 +373,12 @@ function ModelsTab({
 function McpTab() {
   const { t } = useI18n();
   const [servers, setServers] = useState<McpServerInfo[]>([]);
-  const [oauth, setOauth] = useState<Record<number, string>>({});
-  const [probe, setProbe] = useState<Record<number, McpProbeResult>>({});
-  const [busyTestId, setBusyTestId] = useState<number | null>(null);
-  const [confirmDelId, setConfirmDelId] = useState<number | null>(null);
-  const [loginInfo, setLoginInfo] = useState<Record<number, McpOAuthLoginInfo | null>>({});
-  const [callbackUrl, setCallbackUrl] = useState<Record<number, string>>({});
+  const [oauth, setOauth] = useState<Record<string, string>>({});
+  const [probe, setProbe] = useState<Record<string, McpProbeResult>>({});
+  const [busyTestId, setBusyTestId] = useState<string | null>(null);
+  const [confirmDelId, setConfirmDelId] = useState<string | null>(null);
+  const [loginInfo, setLoginInfo] = useState<Record<string, McpOAuthLoginInfo | null>>({});
+  const [callbackUrl, setCallbackUrl] = useState<Record<string, string>>({});
   const [form, setForm] = useState<McpFormState | null>(null);
   const [err, setErr] = useState("");
 
@@ -845,23 +845,25 @@ function UsageTab({
   const [summary, setSummary] = useState<CallsSummary | null>(null);
   const [calls, setCalls] = useState<LlmCallInfo[]>([]);
   const [sessionId, setSessionId] = useState(initialSessionId || "");
-  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
 
   const modelsById = useMemo(() => new Map(models.map((m) => [m.id, m])), [models]);
   const sessionsById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
 
-  const load = async (after = 0, append = false, sidOverride?: string) => {
+  const load = async (after = "", append = false, sidOverride?: string) => {
     setErr("");
     setLoading(true);
     const sid = (sidOverride !== undefined ? sidOverride : sessionId).trim();
-    const q = sid ? `?session_id=${encodeURIComponent(sid)}` : "";
-    const sep = q ? "&" : "?";
+    const sumQ = sid ? `?session_id=${encodeURIComponent(sid)}` : "";
+    const params = new URLSearchParams({ limit: "50" });
+    if (sid) params.set("session_id", sid);
+    if (after) params.set("after", after);
     try {
       const [sum, list] = await Promise.all([
-        apiFetch<CallsSummary>(`/calls/summary${q}`),
-        apiFetch<LlmCallInfo[]>(`/calls${q}${sep}after=${after}&limit=50`),
+        apiFetch<CallsSummary>(`/calls/summary${sumQ}`),
+        apiFetch<LlmCallInfo[]>(`/calls?${params.toString()}`),
       ]);
       setSummary(sum);
       setCalls((prev) => (append ? [...prev, ...list] : list));
@@ -873,7 +875,7 @@ function UsageTab({
   };
 
   useEffect(() => {
-    void load(0, false, initialSessionId || "");
+    void load("", false, initialSessionId || "");
   }, []);
 
   const totalInput = summary ? summary.input_uncached_tokens + summary.cache_read_tokens : 0;
@@ -884,30 +886,30 @@ function UsageTab({
       {err && <div class="err-inline">{err}</div>}
       <div class="row gap-1" style="flex-wrap:wrap">
         <select
-          value={sessionsById.has(Number(sessionId)) ? sessionId : ""}
+          value={sessionsById.has(sessionId) ? sessionId : ""}
           onChange={(e) => {
             const val = e.currentTarget.value;
             setSessionId(val);
-            void load(0, false, val);
+            void load("", false, val);
           }}
         >
           <option value="">{t("All sessions")}</option>
           {sessions.map((s) => (
-            <option key={s.id} value={String(s.id)}>
-              #{s.id} · {s.title || t("Untitled")}
+            <option key={s.id} value={s.id}>
+              {s.id} · {s.title || t("Untitled")}
             </option>
           ))}
         </select>
         <input
           placeholder={t("Session ID…")}
-          style="width:110px"
+          style="width:180px"
           value={sessionId}
           onInput={(e) => setSessionId(e.currentTarget.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") void load(0, false);
+            if (e.key === "Enter") void load("", false);
           }}
         />
-        <button type="button" class="btn-ghost btn-sm" disabled={loading} onClick={() => void load(0, false)}>
+        <button type="button" class="btn-ghost btn-sm" disabled={loading} onClick={() => void load("", false)}>
           {loading ? t("Loading…") : t("Refresh")}
         </button>
       </div>
@@ -952,12 +954,12 @@ function UsageTab({
                 onClick={() => setExpandedId(expanded ? null : c.id)}
               >
                 <div>
-                  <span class="mono">#{c.id}</span>{" "}
+                  <span class="mono">{c.id}</span>{" "}
                   <span class={`pill pill-${c.status}`}>{statusText(c.status, locale)}</span>{" "}
-                  <span class="mono">{model ? model.model_key : `model #${c.model_id}`}</span>
+                  <span class="mono">{model ? model.model_key : c.model_id}</span>
                   {c.reasoning_effort && <span class="pill">{c.reasoning_effort}</span>}{" "}
                   <span class="muted">
-                    {c.session_id != null ? (sess?.title || `#${c.session_id}`) : t("deleted")}
+                    {c.session_id != null ? (sess?.title || c.session_id) : t("deleted")}
                     {durMs != null ? ` · ${formatDuration(durMs)}` : ""}
                     {` · ${formatRelTimeLoc(c.started_at, locale)}`}
                   </span>

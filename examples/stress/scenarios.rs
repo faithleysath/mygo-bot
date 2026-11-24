@@ -88,7 +88,7 @@ impl Subscribers {
         }
         Ok(Self { path, readers })
     }
-    async fn broadcast(&mut self, api: &Api) -> Result<u64> {
+    async fn broadcast(&mut self, api: &Api) -> Result<String> {
         let id = api.enqueue(&self.path, "broadcast").await?;
         for reader in &mut self.readers {
             let (name, item) = reader.next().await?;
@@ -162,13 +162,19 @@ impl Work {
                     200,
                 )
                 .await?;
-            let id = updated["id"].as_u64().ok_or("missing session id")?;
+            let id = updated["id"].as_str().ok_or("missing session id")?;
             let list = self
                 .api
-                .get(&format!("/sessions?after={}&limit=1", id - 1))
+                .get(&format!("/sessions?after={id}&limit=1"))
                 .await?;
             check(
-                list[0] == updated && updated["reasoning_effort"] == "high",
+                id.starts_with("ses_")
+                    && updated["reasoning_effort"] == "high"
+                    && self.api.get(&path).await? == updated
+                    && list.as_array().is_some_and(|rows| {
+                        rows.len() <= 1
+                            && rows.first().is_none_or(|row| row["id"].as_str() > Some(id))
+                    }),
                 "session update or page mismatch",
             )?;
             return Ok(Outcome::default());
@@ -217,7 +223,9 @@ impl Work {
                 )?;
                 check(
                     session["status"] == "idle"
-                        && config["default_model_id"].is_u64()
+                        && config["default_model_id"]
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("mdl_"))
                         && session["model_id"] == config["default_model_id"]
                         && list.is_array(),
                     "invalid mixed response",
@@ -235,7 +243,9 @@ impl Work {
                     Api::send(request("one"), &[200, 201])
                 )?;
                 check(
-                    a.0 != b.0 && a.1["id"].is_u64() && a.1 == b.1,
+                    a.0 != b.0
+                        && a.1["id"].as_str().is_some_and(|s| s.starts_with("itm_"))
+                        && a.1 == b.1,
                     "duplicate key created inconsistent replies",
                 )?;
                 Api::send(request("two"), &[409]).await?;
@@ -259,7 +269,14 @@ impl Work {
             "invalid" => {
                 api.json(Method::POST, &messages, Some(text_message(" ")), 400)
                     .await?;
-                api.json(Method::GET, "/sessions/0", None, 404).await?;
+                api.json(
+                    Method::GET,
+                    "/sessions/ses_00000000000000000000000000",
+                    None,
+                    404,
+                )
+                .await?;
+                api.json(Method::GET, "/sessions/0", None, 400).await?;
                 api.json(Method::GET, "/sessions?limit=201", None, 400)
                     .await?;
                 Ok(Outcome::default())
@@ -294,6 +311,7 @@ impl Work {
         let id = self.api.enqueue(&path, "broadcast").await?;
         let mut deliveries = tokio::task::JoinSet::new();
         for mut reader in readers {
+            let id = id.clone();
             deliveries.spawn(async move {
                 let (name, item) = reader.next().await?;
                 check(
@@ -443,41 +461,54 @@ impl Work {
 
     async fn pages(&self, path: &str) -> Result<()> {
         let mut history = Vec::new();
-        for (endpoint, cursor) in [("history", "id"), ("context", "position")] {
-            let mut ids = Vec::new();
-            let mut after = 0;
-            loop {
-                let page = self
-                    .api
-                    .get(&format!("{path}/{endpoint}?after={after}&limit=3"))
-                    .await?;
-                let items = page.as_array().ok_or("invalid page")?;
-                check(items.len() <= 3, "page limit exceeded")?;
-                if items.is_empty() {
-                    break;
-                }
-                for item in items {
-                    let next = item[cursor].as_u64().ok_or("missing page cursor")?;
-                    check(
-                        next > after && ids.len() < 10,
-                        "invalid pagination order or count",
-                    )?;
-                    after = next;
-                    let id = if endpoint == "history" {
-                        next
-                    } else {
-                        item["item_id"].as_u64().ok_or("missing context item")?
-                    };
-                    ids.push(id);
-                }
+        let mut after: Option<String> = None;
+        loop {
+            let q = match &after {
+                Some(cursor) => format!("{path}/history?after={cursor}&limit=3"),
+                None => format!("{path}/history?limit=3"),
+            };
+            let page = self.api.get(&q).await?;
+            let items = page.as_array().ok_or("invalid page")?;
+            check(items.len() <= 3, "page limit exceeded")?;
+            if items.is_empty() {
+                break;
             }
-            check(ids.len() == 10, "incomplete paginated data")?;
-            if endpoint == "history" {
-                history = ids;
-            } else {
-                check(ids == history, "history and context disagree")?;
+            for item in items {
+                let next = item["id"].as_str().ok_or("missing page cursor")?;
+                check(
+                    after.as_deref().is_none_or(|prev| next > prev) && history.len() < 10,
+                    "invalid pagination order or count",
+                )?;
+                after = Some(next.to_owned());
+                history.push(next.to_owned());
             }
         }
+        check(history.len() == 10, "incomplete paginated history")?;
+
+        let mut context = Vec::new();
+        let mut after = 0u64;
+        loop {
+            let page = self
+                .api
+                .get(&format!("{path}/context?after={after}&limit=3"))
+                .await?;
+            let items = page.as_array().ok_or("invalid page")?;
+            check(items.len() <= 3, "page limit exceeded")?;
+            if items.is_empty() {
+                break;
+            }
+            for item in items {
+                let next = item["position"].as_u64().ok_or("missing page cursor")?;
+                check(
+                    next > after && context.len() < 10,
+                    "invalid pagination order or count",
+                )?;
+                after = next;
+                let id = item["item_id"].as_str().ok_or("missing context item")?;
+                context.push(id.to_owned());
+            }
+        }
+        check(context == history, "history and context disagree")?;
         Ok(())
     }
 }

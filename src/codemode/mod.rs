@@ -13,6 +13,7 @@ mod windows;
 
 use crate::{
     App, Error, Result,
+    id::{ItemId, SessionId},
     store::{SessionStatus, Store, pending_reason, session},
     tools::Script,
 };
@@ -44,7 +45,7 @@ const MAX_SESSION_TASKS: usize = 32;
 
 pub struct Engine {
     pool: vm::Pool,
-    vm_counts: Mutex<HashMap<i64, usize>>,
+    vm_counts: Mutex<HashMap<SessionId, usize>>,
     client: reqwest::Client,
 }
 impl Engine {
@@ -135,11 +136,11 @@ impl Outcome {
 // even if a hard pause has already released the step that submitted it.
 struct VmSlot {
     engine: Arc<Engine>,
-    sid: i64,
+    sid: SessionId,
     _worker: TaskTrackerToken,
 }
 impl VmSlot {
-    fn reserve(app: &App, sid: i64) -> std::result::Result<Self, String> {
+    fn reserve(app: &App, sid: SessionId) -> std::result::Result<Self, String> {
         let mut counts = app.codemode.vm_counts.lock().unwrap();
         if counts.values().sum::<usize>() >= MAX_TASKS
             || counts.get(&sid).copied().unwrap_or(0) >= MAX_SESSION_TASKS
@@ -177,8 +178,8 @@ pub struct Job {
 pub struct Host {
     live: Arc<Mutex<LiveState>>,
     app: App,
-    sid: i64,
-    origin: i64,
+    sid: SessionId,
+    origin: ItemId,
     trigger: bool,
     last_task_query: Arc<tokio::sync::Mutex<Option<Instant>>>,
     deadline: watch::Receiver<Instant>,
@@ -220,7 +221,7 @@ impl Host {
         }
         io::execute(self, &op, args, data).await
     }
-    pub async fn emit(&self, blocks: Blocks) -> std::result::Result<i64, String> {
+    pub async fn emit(&self, blocks: Blocks) -> std::result::Result<ItemId, String> {
         if self.trigger {
             return Err("emitEvent is not available in trigger_code; return from trigger_code to finish waiting".into());
         }
@@ -265,12 +266,12 @@ impl Host {
 
 #[derive(Clone)]
 pub struct Call {
-    pub sid: i64,
-    pub id: i64,
+    pub sid: SessionId,
+    pub id: ItemId,
     pub call: String,
 }
 impl Call {
-    fn save(&self, conn: &Connection, output: &Value, background: bool) -> Result<i64> {
+    fn save(&self, conn: &Connection, output: &Value, background: bool) -> Result<ItemId> {
         ledger::tool(conn, self.sid, self.id, &self.call, output, background)
     }
     pub fn reply(&self, store: &mut Store, body: Value) -> Result<()> {
@@ -279,13 +280,13 @@ impl Call {
         Ok(())
     }
 }
-fn notice(s: &mut Store, sid: i64, id: i64) {
+fn notice(s: &mut Store, sid: SessionId, id: ItemId) {
     s.wake_waiters(sid);
     if let Err(e) = s.item_saved(sid, id) {
-        tracing::warn!(sid,id,error=%e,"item notification failed after commit");
+        tracing::warn!(%sid, %id, error=%e, "item notification failed after commit");
     }
 }
-fn event_saved(s: &mut Store, app: &App, sid: i64, id: i64, notify: bool) {
+fn event_saved(s: &mut Store, app: &App, sid: SessionId, id: ItemId, notify: bool) {
     notice(s, sid, id);
     if notify && !s.closing && !s.active.contains_key(&sid) {
         app.wake(sid);
@@ -321,7 +322,7 @@ impl Task {
         let deadline = *self.deadline.borrow();
         let expiry = self.started_at + deadline.duration_since(self.created);
         json!({
-            "id": format!("cm_{}", self.origin.id),
+            "id": self.origin.id.task_id(),
             "label": self.label,
             "state": if self.reason.is_some() { "stopping" } else { "running" },
             "delivery": if self.background { "background" } else { "foreground" },
@@ -377,17 +378,17 @@ impl Task {
     }
 }
 
-pub fn stop_session(s: &mut Store, sid: i64) {
+pub fn stop_session(s: &mut Store, sid: SessionId) {
     for t in s.tasks.values_mut().filter(|t| t.origin.sid == sid) {
         t.stop("killed");
     }
 }
 
-pub fn has_session_tasks(s: &Store, sid: i64) -> bool {
+pub fn has_session_tasks(s: &Store, sid: SessionId) -> bool {
     s.tasks.values().any(|t| t.origin.sid == sid)
 }
 
-pub fn session_tasks_snapshot(s: &Store, sid: i64) -> Value {
+pub fn session_tasks_snapshot(s: &Store, sid: SessionId) -> Value {
     let mut tasks: Vec<_> = s.tasks.values().filter(|t| t.origin.sid == sid).collect();
     tasks.sort_unstable_by_key(|t| t.origin.id);
     Value::Array(
@@ -402,10 +403,10 @@ pub fn session_tasks_snapshot(s: &Store, sid: i64) -> Value {
     )
 }
 
-pub fn stop_task(s: &mut Store, sid: i64, id: i64) -> Option<Value> {
+pub fn stop_task(s: &mut Store, sid: SessionId, id: ItemId) -> Option<Value> {
     let task = s.tasks.get_mut(&id).filter(|t| t.origin.sid == sid)?;
     task.stop(if task.expired() { "expired" } else { "killed" });
-    Some(json!({"id": format!("cm_{id}"), "status": "stopping"}))
+    Some(json!({"id": id.task_id(), "status": "stopping"}))
 }
 pub fn shutdown_tasks(s: &mut Store, hard: bool) -> Result<()> {
     let mut paused = std::collections::BTreeSet::new();
@@ -426,7 +427,7 @@ pub fn shutdown_tasks(s: &mut Store, hard: bool) -> Result<()> {
     Ok(())
 }
 
-fn task_list(s: &Store, sid: i64) -> Value {
+fn task_list(s: &Store, sid: SessionId) -> Value {
     let mut tasks: Vec<_> = s.tasks.values().filter(|t| t.origin.sid == sid).collect();
     tasks.sort_unstable_by_key(|t| t.origin.id);
     json!({"tasks": tasks.into_iter().map(Task::info).collect::<Vec<_>>()})
@@ -438,7 +439,7 @@ pub async fn list(app: App, call: Call) -> Result<()> {
         .await
 }
 
-fn full_status(s: &Store, sid: i64, id: i64) -> Result<Value> {
+fn full_status(s: &Store, sid: SessionId, id: ItemId) -> Result<Value> {
     if let Some(task) = owned(s, sid, id) {
         let mut info = task.info();
         task.live.lock().unwrap().snapshot(&mut info, true);
@@ -448,14 +449,14 @@ fn full_status(s: &Store, sid: i64, id: i64) -> Result<Value> {
     }
 }
 
-fn owned(s: &Store, sid: i64, id: i64) -> Option<&Task> {
+fn owned(s: &Store, sid: SessionId, id: ItemId) -> Option<&Task> {
     s.tasks.get(&id).filter(|t| t.origin.sid == sid)
 }
-fn inactive(call: &Call, s: &mut Store, id: i64) -> Result<()> {
-    call.reply(s, json!({"id":format!("cm_{id}"),"status":"not_active"}))
+fn inactive(call: &Call, s: &mut Store, id: ItemId) -> Result<()> {
+    call.reply(s, json!({"id":id.task_id(),"status":"not_active"}))
 }
 
-pub async fn status(app: App, call: Call, id: i64, hard: CancellationToken) -> Result<()> {
+pub async fn status(app: App, call: Call, id: ItemId, hard: CancellationToken) -> Result<()> {
     app.db
         .call(move |s| {
             if hard.is_cancelled() {
@@ -693,7 +694,7 @@ pub async fn wait(
 pub async fn renew(
     app: App,
     call: Call,
-    id: i64,
+    id: ItemId,
     seconds: u32,
     hard: CancellationToken,
 ) -> Result<()> {
@@ -715,7 +716,7 @@ pub async fn renew(
             let duration = Duration::from_secs(seconds.into());
             let expires = task.started_at + (now + duration - task.created);
             let response = json!({
-                "id": format!("cm_{id}"), "status":"renewed",
+                "id": id.task_id(), "status":"renewed",
                 "expires_at": expires.to_rfc3339(), "remaining_seconds": seconds
             });
             let tx = s.conn.transaction()?;
@@ -729,7 +730,7 @@ pub async fn renew(
         .await
 }
 
-pub async fn kill(app: App, call: Call, id: i64, hard: CancellationToken) -> Result<()> {
+pub async fn kill(app: App, call: Call, id: ItemId, hard: CancellationToken) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     app.db
         .call(move |s| {
@@ -740,7 +741,7 @@ pub async fn kill(app: App, call: Call, id: i64, hard: CancellationToken) -> Res
                 return inactive(&call, s, id);
             };
             if task.reason.is_some() {
-                return call.reply(s, json!({"status":"stopping","id":format!("cm_{id}")}));
+                return call.reply(s, json!({"status":"stopping","id":id.task_id()}));
             }
             task.stop(if task.expired() { "expired" } else { "killed" });
             task.kill = Some(KillWait {
@@ -831,7 +832,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
     Ok(())
 }
 
-fn tick(s: &mut Store, app: &App, id: i64) -> Result<Option<Instant>> {
+fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
     let task = s.tasks.get_mut(&id).expect("supervisor owns task");
     let now = Instant::now();
     let sid = task.origin.sid;
@@ -839,7 +840,7 @@ fn tick(s: &mut Store, app: &App, id: i64) -> Result<Option<Instant>> {
         let k = task.kill.as_ref().unwrap();
         let saved = k.call.save(
             &s.conn,
-            &Value::String(json!({"status":"stopping","id":format!("cm_{id}")}).to_string()),
+            &Value::String(json!({"status":"stopping","id":id.task_id()}).to_string()),
             false,
         )?;
         let _ = task.kill.take().unwrap().committed.send(());
@@ -880,7 +881,7 @@ fn tick(s: &mut Store, app: &App, id: i64) -> Result<Option<Instant>> {
 
 async fn supervise(
     app: App,
-    id: i64,
+    id: ItemId,
     changed: Arc<Notify>,
     mut finish: oneshot::Receiver<Outcome>,
     submitted: std::result::Result<(), String>,
@@ -892,7 +893,7 @@ async fn supervise(
             let timer = match app.db.call(move |s| tick(s, &worker, id)).await {
                 Ok(timer) => timer,
                 Err(e) => {
-                    tracing::error!(id,error=%e,"task timer transaction failed");
+                    tracing::error!(%id, error=%e, "task timer transaction failed");
                     Some(Instant::now() + Duration::from_secs(1))
                 }
             };
@@ -921,7 +922,7 @@ async fn supervise(
         {
             Ok(()) => break,
             Err(e) => {
-                tracing::error!(id,error=%e,"task result transaction failed");
+                tracing::error!(%id, error=%e, "task result transaction failed");
                 if app.stopping.is_cancelled() {
                     break;
                 }
@@ -951,7 +952,7 @@ fn pack_output(
     (Value::Array(parts), text)
 }
 
-fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
+fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()> {
     let task = &s.tasks[&id];
     let sid = task.origin.sid;
     let tx = s.conn.transaction()?;
@@ -966,7 +967,7 @@ fn complete(s: &mut Store, app: &App, id: i64, result: &Outcome) -> Result<()> {
     });
     let duration_ms = task.created.elapsed().as_millis();
     let mut summary = json!({
-        "id": format!("cm_{id}"),
+        "id": id.task_id(),
         "status": status,
         "duration_ms": duration_ms,
     });

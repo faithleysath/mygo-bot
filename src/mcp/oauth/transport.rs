@@ -20,7 +20,7 @@ impl HttpClient {
     pub(in crate::mcp) async fn new(
         http: reqwest::Client,
         db: Db,
-        id: i64,
+        id: McpServerId,
         revision: i64,
         oauth_enabled: bool,
         allow_disabled: bool,

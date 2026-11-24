@@ -202,8 +202,13 @@ async fn reply(model: Model, request: Value) -> Result<Response> {
                     .as_str()
                     .and_then(|id| id.strip_prefix("cm_"))
                     .ok_or("missing task ID")?;
+                let valid_cm = id.len() == 26
+                    && matches!(id.as_bytes()[0], b'0'..=b'7')
+                    && id
+                        .bytes()
+                        .all(|b| b"0123456789abcdefghjkmnpqrstvwxyz".contains(&b));
                 check(
-                    id.parse::<u64>()? > 0 && outcome["status"] == "succeeded",
+                    valid_cm && outcome["status"] == "succeeded",
                     "invalid codemode clock result",
                 )?;
                 let date = outcome["output"].as_str().ok_or("missing codemode date")?;

@@ -1,4 +1,5 @@
 use super::{Blocks, Host, HostError, Job, Outcome, Reply};
+use crate::id::AttachmentId;
 use rquickjs::{
     AsyncContext, AsyncRuntime, Ctx, Error, Exception, Function, Object, Persistent, Promise,
     Result as JsResult, String as JsString, TypedArray, Value, context::EvalOptions,
@@ -440,7 +441,7 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
     })?;
     let decoder: Function = ctx.eval(include_str!("decoder.js"))?;
     decoder.call::<_, ()>((decode.clone(), encode))?;
-    let task_id = (!scope.host.trigger).then(|| format!("cm_{}", scope.host.origin));
+    let task_id = (!scope.host.trigger).then(|| scope.host.origin.task_id());
     let init: Function = ctx.eval(include_str!("bootstrap.js"))?;
     init.call((
         io,
@@ -448,7 +449,7 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
         close,
         decode,
         log,
-        scope.host.sid,
+        scope.host.sid.as_str(),
         task_id,
     ))
 }
@@ -630,16 +631,17 @@ fn push_part<'js>(ctx: &Ctx<'js>, blocks: &mut Blocks, part: &Object<'js>) -> Js
             blocks.push_text(part.get("text")?)
         }
         "image" | "audio" | "video" => {
-            let id: Option<f64> = part.get("attachment_id")?;
-            if let Some(id) = id {
+            let raw: Value = part.get("attachment_id")?;
+            if !raw.is_undefined() && !raw.is_null() {
                 fields(part, &["type", "attachment_id"])?;
-                if id.fract() != 0.0 || !(1.0..=9_007_199_254_740_991.0).contains(&id) {
-                    return Err(Exception::throw_type(
-                        ctx,
-                        "expected a positive attachment_id or media data",
-                    ));
-                }
-                blocks.push_attachment(kind, id as i64)
+                let id = raw
+                    .as_string()
+                    .and_then(|s| s.to_string().ok())
+                    .and_then(|s| s.parse::<AttachmentId>().ok())
+                    .ok_or_else(|| {
+                        Exception::throw_type(ctx, "expected a valid attachment_id or media data")
+                    })?;
+                blocks.push_attachment(kind, id)
             } else {
                 fields(part, &["type", "mime_type", "data"])?;
                 let mime = part.get("mime_type")?;

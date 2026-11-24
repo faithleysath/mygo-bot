@@ -208,8 +208,8 @@ export function connectSse(path: string, { onEvent, onStatus, signal }: SseOptio
 const mediaCache = new Map<string, string>();
 const MAX_MEDIA_CACHE = 48;
 
-export async function fetchMediaUrl(id: number): Promise<string> {
-  const key = String(id);
+export async function fetchMediaUrl(id: string): Promise<string> {
+  const key = id;
   const cached = mediaCache.get(key);
   if (cached !== undefined) {
     mediaCache.delete(key);

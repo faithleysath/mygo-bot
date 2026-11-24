@@ -1,4 +1,10 @@
-use crate::{App, Error, Result, media, model::Input, pricing};
+use crate::{
+    App, Error, Result,
+    id::{CallId, ModelId, SessionId},
+    media,
+    model::Input,
+    pricing,
+};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -10,13 +16,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // Called inside the transaction which pins the session's input prefix.
-pub fn begin(conn: &Connection, sid: i64, end: i64) -> Result<Input> {
+pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
     let (model_id, model, url, key, effort, prices) = conn.query_row(
         "SELECT m.id,m.model_key,p.base_url,p.api_key,s.reasoning_effort,m.pricing
          FROM sessions s JOIN llm_models m ON m.id=s.model_id JOIN llm_providers p ON p.id=m.provider_id WHERE s.id=?",
         [sid],
         |r| Ok((
-            r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+            r.get::<_, ModelId>(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
             r.get::<_, Option<String>>(4)?, r.get::<_, Option<Value>>(5)?,
         )),
     )?;
@@ -26,13 +32,14 @@ pub fn begin(conn: &Connection, sid: i64, end: i64) -> Result<Input> {
     let snapshot = prices
         .as_ref()
         .and_then(|p| pricing::snapshot(p, started_at));
+    let call_id = CallId::new()?;
     conn.execute(
-        "INSERT INTO llm_calls(session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot)
-         VALUES(?,?,?,?,?,'in_flight',?)",
-        params![sid, model_id, effort, end, started_at, snapshot],
+        "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot)
+         VALUES(?,?,?,?,?,?,'in_flight',?)",
+        params![call_id, sid, model_id, effort, end, started_at, snapshot],
     )?;
     Ok(Input {
-        call_id: conn.last_insert_rowid(),
+        call_id,
         model,
         base_url: url,
         api_key: key,
@@ -52,7 +59,7 @@ impl Report {
     pub fn finish(
         self,
         conn: &Connection,
-        id: i64,
+        id: CallId,
         status: &str,
         reason: Option<&str>,
         at: i64,
@@ -85,9 +92,9 @@ pub fn routes() -> Router<App> {
 
 #[derive(Serialize)]
 struct Call {
-    id: i64,
-    session_id: Option<i64>,
-    model_id: i64,
+    id: CallId,
+    session_id: Option<SessionId>,
+    model_id: ModelId,
     reasoning_effort: Option<String>,
     input_end_position: Option<i64>,
     started_at: i64,
@@ -131,25 +138,25 @@ fn row(r: &Row<'_>) -> rusqlite::Result<Call> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Filter {
-    session_id: Option<i64>,
-    model_id: Option<i64>,
-    #[serde(default)]
-    after: i64,
+    session_id: Option<SessionId>,
+    model_id: Option<ModelId>,
+    after: Option<CallId>,
     limit: Option<i64>,
 }
 
 async fn list(State(app): State<App>, Query(q): Query<Filter>) -> Result<Json<Vec<Call>>> {
     let limit = q.limit.unwrap_or(50);
-    if q.after < 0 || !(1..=200).contains(&limit) {
-        return Err(Error::bad("expected after >= 0 and limit 1..200"));
+    if !(1..=200).contains(&limit) {
+        return Err(Error::bad("expected limit 1..200"));
     }
     app.db.call(move |s| {
         let mut stmt = s.conn.prepare_cached("SELECT * FROM llm_calls WHERE id>?1 AND (?2 IS NULL OR session_id=?2) AND (?3 IS NULL OR model_id=?3) ORDER BY id LIMIT ?4")?;
-        Ok(Json(stmt.query_map(params![q.after,q.session_id,q.model_id,limit],row)?.collect::<rusqlite::Result<_>>()?))
+        let after = q.after.as_ref().map_or("", CallId::as_str);
+        Ok(Json(stmt.query_map(params![after, q.session_id, q.model_id, limit], row)?.collect::<rusqlite::Result<_>>()?))
     }).await
 }
 
-async fn one(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Call>> {
+async fn one(State(app): State<App>, Path(id): Path<CallId>) -> Result<Json<Call>> {
     app.db
         .call(move |s| {
             Ok(Json(s.conn.query_row(
@@ -164,8 +171,8 @@ async fn one(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Call>> 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SummaryFilter {
-    session_id: Option<i64>,
-    model_id: Option<i64>,
+    session_id: Option<SessionId>,
+    model_id: Option<ModelId>,
 }
 
 #[derive(Serialize)]

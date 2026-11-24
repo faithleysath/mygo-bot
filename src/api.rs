@@ -1,6 +1,7 @@
 use crate::{
     App, Error, ErrorBody, Result, agent, codemode, events,
     events::Notice,
+    id::{ItemId, ModelId, SessionId},
     store::{self, Session, SessionStatus, session},
 };
 use axum::{
@@ -81,14 +82,14 @@ type Document = Json<Map<String, Value>>;
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
-    default_model_id: Option<i64>,
+    default_model_id: Option<ModelId>,
     default_reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Selection {
-    model_id: Option<i64>,
+    model_id: Option<ModelId>,
     reasoning_effort: Option<String>,
 }
 
@@ -204,12 +205,13 @@ async fn create_session(
             move |conn| {
                 let next = Selection::defaults(conn)?.apply(fields)?;
                 next.validate(conn)?;
+                let id = SessionId::new()?;
                 let now = chrono::Utc::now().timestamp_millis();
                 conn.execute(
-                    "INSERT INTO sessions(title,created_at,updated_at,model_id,reasoning_effort) VALUES(?,?,?,?,?)",
-                    params![title, now, now, next.model_id, next.reasoning_effort],
+                    "INSERT INTO sessions(id,title,created_at,updated_at,model_id,reasoning_effort) VALUES(?,?,?,?,?,?)",
+                    params![id, title, now, now, next.model_id, next.reasoning_effort],
                 )?;
-                session(conn, conn.last_insert_rowid())
+                session(conn, id)
             },
             |s, created| {
                 s.publish_global("session.created", json!(created));
@@ -220,13 +222,13 @@ async fn create_session(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-async fn get_session(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Session>> {
+async fn get_session(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Session>> {
     app.db.call(move |s| Ok(Json(session(&s.conn, sid)?))).await
 }
 
 async fn patch_session(
     State(app): State<App>,
-    Path(sid): Path<i64>,
+    Path(sid): Path<SessionId>,
     Json(mut fields): Document,
 ) -> Result<Json<Session>> {
     if fields.is_empty() {
@@ -279,7 +281,10 @@ async fn patch_session(
         .await
 }
 
-async fn delete_session(State(app): State<App>, Path(sid): Path<i64>) -> Result<StatusCode> {
+async fn delete_session(
+    State(app): State<App>,
+    Path(sid): Path<SessionId>,
+) -> Result<StatusCode> {
     app.db
         .call(move |s| {
             let current = session(&s.conn, sid)?;
@@ -319,8 +324,7 @@ async fn delete_session(State(app): State<App>, Path(sid): Path<i64>) -> Result<
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Page {
-    #[serde(default)]
-    after: i64,
+    after: Option<SessionId>,
     #[serde(default = "default_limit")]
     limit: i64,
 }
@@ -329,8 +333,8 @@ fn default_limit() -> i64 {
 }
 impl Page {
     fn check(&self) -> Result<()> {
-        if self.after < 0 || !(1..=200).contains(&self.limit) {
-            Err(Error::bad("expected after >= 0 and limit 1..200"))
+        if !(1..=200).contains(&self.limit) {
+            Err(Error::bad("expected limit 1..200"))
         } else {
             Ok(())
         }
@@ -347,8 +351,9 @@ async fn list_sessions(
             let sql = "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id FROM sessions
                    WHERE id>? ORDER BY id LIMIT ?";
             let mut stmt = s.conn.prepare_cached(sql)?;
+            let after = page.after.as_ref().map_or("", SessionId::as_str);
             let rows = stmt
-                .query_map((page.after, page.limit), store::session_row)?
+                .query_map((after, page.limit), store::session_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(Json(rows))
         })
@@ -362,19 +367,19 @@ struct Message {
 }
 #[derive(Serialize)]
 struct MessageId {
-    id: i64,
+    id: ItemId,
 }
 
 #[derive(Serialize)]
 struct QueuedMessage {
-    id: i64,
+    id: ItemId,
     content: Value,
     status: String,
 }
 
 async fn enqueue(
     State(app): State<App>,
-    Path(sid): Path<i64>,
+    Path(sid): Path<SessionId>,
     headers: HeaderMap,
     Json(message): Json<Message>,
 ) -> Result<(StatusCode, Json<MessageId>)> {
@@ -400,21 +405,20 @@ async fn enqueue(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Filter {
-    id: Option<i64>,
+    id: Option<ItemId>,
     status: Option<String>,
-    #[serde(default)]
-    after: i64,
+    after: Option<ItemId>,
     #[serde(default = "default_limit")]
     limit: i64,
 }
 
 async fn messages(
     State(app): State<App>,
-    Path(sid): Path<i64>,
+    Path(sid): Path<SessionId>,
     Query(q): Query<Filter>,
 ) -> Result<Json<Vec<QueuedMessage>>> {
     Page {
-        after: q.after,
+        after: None,
         limit: q.limit,
     }
     .check()?;
@@ -434,18 +438,12 @@ async fn messages(
                    LEFT JOIN items w ON w.target_id=i.id AND w.kind='withdrawal'
                    LEFT JOIN context_items c ON c.item_id=i.id
                    WHERE i.session_id=?1 AND i.kind='user_message'
-                     AND i.id BETWEEN ?2 AND ?3 AND i.id>?4
-                     AND (?5 IS NULL OR status=?5)
-                   ORDER BY i.id LIMIT ?6";
+                     AND (?2 IS NULL OR i.id=?2) AND i.id>?3
+                     AND (?4 IS NULL OR status=?4)
+                   ORDER BY i.id LIMIT ?5";
             let mut stmt = s.conn.prepare_cached(sql)?;
-            let args = params![
-                sid,
-                q.id.unwrap_or(1),
-                q.id.unwrap_or(i64::MAX),
-                q.after,
-                q.status,
-                q.limit
-            ];
+            let after = q.after.as_ref().map_or("", ItemId::as_str);
+            let args = params![sid, q.id, after, q.status, q.limit];
             let data = stmt
                 .query_map(args, |r| {
                     Ok(QueuedMessage {
@@ -461,7 +459,7 @@ async fn messages(
 }
 async fn withdraw(
     State(app): State<App>,
-    Path((sid, mid)): Path<(i64, i64)>,
+    Path((sid, mid)): Path<(SessionId, ItemId)>,
 ) -> Result<StatusCode> {
     app.db
         .call(move |s| {
@@ -482,9 +480,32 @@ async fn withdraw(
         })
         .await
 }
+
+fn check_page_mode(has_after: bool, has_before: bool, tail: bool, limit: i64) -> Result<()> {
+    let modes = usize::from(has_after) + usize::from(has_before) + usize::from(tail);
+    if modes > 1 {
+        return Err(Error::bad("specify at most one of after, before, or tail"));
+    }
+    if !(1..=200).contains(&limit) {
+        return Err(Error::bad("expected limit 1..200"));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RecordPage {
+struct HistoryPage {
+    after: Option<ItemId>,
+    before: Option<ItemId>,
+    #[serde(default)]
+    tail: bool,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextPage {
     after: Option<i64>,
     before: Option<i64>,
     #[serde(default)]
@@ -493,67 +514,82 @@ struct RecordPage {
     limit: i64,
 }
 
-impl RecordPage {
-    fn check(&self) -> Result<()> {
-        let modes = usize::from(self.after.is_some())
-            + usize::from(self.before.is_some())
-            + usize::from(self.tail);
-        if modes > 1 {
-            return Err(Error::bad("specify at most one of after, before, or tail"));
-        }
-        if self.after.is_some_and(|v| v < 0)
-            || self.before.is_some_and(|v| v <= 0)
-            || !(1..=200).contains(&self.limit)
-        {
-            return Err(Error::bad(
-                "expected after >= 0, before > 0, and limit 1..200",
-            ));
-        }
-        Ok(())
-    }
-}
-
-async fn record_page(
-    app: App,
-    sid: i64,
-    page: RecordPage,
-    rows: store::JsonRows,
-) -> Result<Response> {
-    page.check()?;
-    let (start, end) = app
-        .db
-        .call(move |s| {
-            session(&s.conn, sid)?;
-            rows.page_range(&s.conn, sid, page.after, page.before, page.tail, page.limit)
-        })
-        .await?;
-    let body = rows
-        .body(app.db, sid, start, end, vec![b'['], b"]")
-        .await?;
-    Ok((
+fn json_response(body: reqwest::Body) -> Response {
+    (
         [(header::CONTENT_TYPE, "application/json")],
         axum::body::Body::new(body),
     )
-        .into_response())
+        .into_response()
 }
 
 async fn history(
     State(app): State<App>,
-    Path(sid): Path<i64>,
-    Query(page): Query<RecordPage>,
+    Path(sid): Path<SessionId>,
+    Query(page): Query<HistoryPage>,
 ) -> Result<Response> {
-    record_page(app, sid, page, store::JsonRows::History).await
+    check_page_mode(
+        page.after.is_some(),
+        page.before.is_some(),
+        page.tail,
+        page.limit,
+    )?;
+    let range = app
+        .db
+        .call(move |s| {
+            session(&s.conn, sid)?;
+            store::JsonRows::history_range(
+                &s.conn,
+                sid,
+                page.after,
+                page.before,
+                page.tail,
+                page.limit,
+            )
+        })
+        .await?;
+    let body = store::JsonRows::History
+        .history_body(app.db, sid, range, vec![b'['], b"]")
+        .await?;
+    Ok(json_response(body))
 }
 
 async fn context(
     State(app): State<App>,
-    Path(sid): Path<i64>,
-    Query(page): Query<RecordPage>,
+    Path(sid): Path<SessionId>,
+    Query(page): Query<ContextPage>,
 ) -> Result<Response> {
-    record_page(app, sid, page, store::JsonRows::Context).await
+    check_page_mode(
+        page.after.is_some(),
+        page.before.is_some(),
+        page.tail,
+        page.limit,
+    )?;
+    if page.after.is_some_and(|v| v < 0) || page.before.is_some_and(|v| v <= 0) {
+        return Err(Error::bad(
+            "expected after >= 0, before > 0, and limit 1..200",
+        ));
+    }
+    let range = app
+        .db
+        .call(move |s| {
+            session(&s.conn, sid)?;
+            store::JsonRows::context_range(
+                &s.conn,
+                sid,
+                page.after,
+                page.before,
+                page.tail,
+                page.limit,
+            )
+        })
+        .await?;
+    let body = store::JsonRows::Context
+        .context_body(app.db, sid, range, vec![b'['], b"]")
+        .await?;
+    Ok(json_response(body))
 }
 
-async fn list_tasks(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json<Value>> {
+async fn list_tasks(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Value>> {
     app.db
         .call(move |s| {
             session(&s.conn, sid)?;
@@ -564,7 +600,7 @@ async fn list_tasks(State(app): State<App>, Path(sid): Path<i64>) -> Result<Json
 
 async fn kill_task(
     State(app): State<App>,
-    Path((sid, tid)): Path<(i64, String)>,
+    Path((sid, tid)): Path<(SessionId, String)>,
 ) -> Result<Json<Value>> {
     let id = crate::tools::task_id(&tid).map_err(Error::bad)?;
     app.db
