@@ -106,7 +106,7 @@ const ZH = {
   "Expand all": "全部展开",
   "Collapse all": "全部折叠",
   "Refresh": "刷新",
-  "Filter #id, kind, text…": "筛选 #id、类型、文本…",
+  "Filter id, kind, text…": "筛选 id、类型、文本…",
   "Filter pos, item_id, text…": "筛选 pos、item_id、文本…",
   "No matching records": "没有匹配的记录",
   "No items recorded in this session yet.": "当前会话还没有任何 items 记录。",

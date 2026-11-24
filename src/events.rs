@@ -400,6 +400,9 @@ pub async fn subscribe(
         let mut delta_lagged = false;
         loop {
             while delta_lagged {
+                if app.stopping.is_cancelled() {
+                    return;
+                }
                 buffered_delta = None;
                 loop {
                     match rx.try_recv() {
@@ -478,7 +481,9 @@ pub async fn subscribe(
                     }
                     Err(TryRecvError::Lagged(_)) => {
                         buffered_delta = None;
+                        delta_lagged = true;
                         yield Ok(Event::default().event("resync").data("{}"));
+                        break;
                     }
                     Err(TryRecvError::Closed) => {
                         if let Some(b) = buffered_delta.take()
@@ -529,6 +534,7 @@ pub async fn subscribe(
                 }
                 Incoming::Durable(Err(RecvError::Lagged(_))) => {
                     buffered_delta = None;
+                    delta_lagged = true;
                     yield Ok(Event::default().event("resync").data("{}"));
                 }
                 Incoming::Durable(Err(RecvError::Closed)) => break,

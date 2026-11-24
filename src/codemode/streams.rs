@@ -111,20 +111,24 @@ impl Reservation<'_> {
                     entry.timed_out.store(true, Ordering::Release);
                     entry.closed.cancel();
                 }
-                if let Some(table) = table_weak.upgrade() {
+                let removed = table_weak.upgrade().and_then(|table| {
                     let mut table = table.lock().unwrap();
                     if table
                         .entries
                         .get(&id)
                         .is_some_and(|cur| entry_weak.ptr_eq(&Arc::downgrade(cur)))
                     {
-                        table.entries.remove(&id);
+                        let removed = table.entries.remove(&id);
                         if table.expired.len() >= MAX_EXPIRED_REASONS {
                             table.expired.pop_front();
                         }
                         table.expired.push_back((id, message));
+                        removed
+                    } else {
+                        None
                     }
-                }
+                });
+                drop(removed);
             });
         }
         self.id.into()
@@ -172,10 +176,14 @@ impl Streams {
     }
 
     pub fn close(&self, id: u32) {
-        let mut table = self.table.lock().unwrap();
-        table.expired.retain(|(eid, _)| *eid != id);
-        if let Some(entry) = table.entries.remove(&id) {
+        let removed = {
+            let mut table = self.table.lock().unwrap();
+            table.expired.retain(|(eid, _)| *eid != id);
+            table.entries.remove(&id)
+        };
+        if let Some(entry) = removed {
             entry.closed.cancel();
+            drop(entry);
         }
     }
 

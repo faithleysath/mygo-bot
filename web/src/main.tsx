@@ -59,6 +59,8 @@ import type {
   ThemePref,
 } from "./types.ts";
 
+const EMPTY_ITEMS: HistoryItem[] = [];
+
 function readThemePref(): ThemePref {
   try {
     const v = localStorage.getItem("mygo_theme");
@@ -296,7 +298,11 @@ function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<MainTab>("chat");
 
-  const [items, setItems] = useState<HistoryItem[]>([]);
+  const [itemsState, setItemsState] = useState<{ sid: string | null; list: HistoryItem[] }>({
+    sid: null,
+    list: EMPTY_ITEMS,
+  });
+  const items = itemsState.sid === activeId ? itemsState.list : EMPTY_ITEMS;
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [queuedIds, setQueuedIds] = useState<Set<string>>(() => new Set());
@@ -593,9 +599,9 @@ function App() {
   };
 
   useEffect(() => {
-    if (!authed || !activeId) return;
-    void syncVisibleCalls(activeId, items);
-  }, [authed, activeId, items]);
+    if (!authed || !activeId || itemsState.sid !== activeId) return;
+    void syncVisibleCalls(activeId, itemsState.list);
+  }, [authed, activeId, itemsState]);
 
   useEffect(() => {
     const epoch = ++sessionEpochRef.current;
@@ -607,7 +613,7 @@ function App() {
     inFlightCallIdsRef.current.clear();
     failedCallIdsRef.current.clear();
     if (!authed || !activeId) {
-      setItems([]);
+      setItemsState({ sid: null, list: EMPTY_ITEMS });
       setDraft(null);
       setQueuedIds(new Set());
       setTasks([]);
@@ -616,7 +622,7 @@ function App() {
       return;
     }
     const sid = activeId;
-    setItems([]);
+    setItemsState({ sid, list: EMPTY_ITEMS });
     setDraft(null);
     setRetryNotice(null);
     setHasMore(false);
@@ -659,6 +665,9 @@ function App() {
 
     const closedCalls = new Set<string>();
     const closedItems = new Set<string>();
+    let clearedThroughCallId = "";
+    const isCallClosed = (callId: string) =>
+      closedCalls.has(callId) || (clearedThroughCallId !== "" && callId <= clearedThroughCallId);
 
     const sessionSync = createSessionSync({
       fetchInitial: () => apiFetch<HistoryItem[]>(`/sessions/${sid}/history?tail=true&limit=50`),
@@ -670,7 +679,10 @@ function App() {
         ),
       onItems: (page) => {
         if (activeIdRef.current === sid && sessionEpochRef.current === epoch) {
-          setItems((prev) => mergeItems(prev, page));
+          setItemsState((prev) => ({
+            sid,
+            list: mergeItems(prev.sid === sid ? prev.list : EMPTY_ITEMS, page),
+          }));
         }
       },
       onHasMore: (more) => {
@@ -698,20 +710,35 @@ function App() {
           sessionSync.onReady();
         } else if (name === "stream.snapshot") {
           const snap = data as ActiveDraft;
-          if (!closedCalls.has(snap.llm_call_id)) setDraft(snap);
+          if (!isCallClosed(snap.llm_call_id)) {
+            const liveItems = Array.isArray(snap.items)
+              ? snap.items.filter((d) => !closedItems.has(`${snap.llm_call_id}:${d.output_index}`))
+              : [];
+            setDraft(liveItems.length ? { llm_call_id: snap.llm_call_id, items: liveItems } : null);
+          }
         } else if (name === "item.started") {
           const ev = data as DraftStartedEvent;
-          if (closedCalls.has(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) return;
+          if (isCallClosed(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) return;
           setDraft((prev) => applyDraftStarted(prev, ev));
         } else if (name === "item.delta") {
           const ev = data as DraftDeltaEvent;
-          if (closedCalls.has(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) return;
+          if (isCallClosed(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) return;
           setRetryNotice(null);
           setDraft((prev) => applyDraftDelta(prev, ev));
         } else if (name === "stream.clear") {
           const ev = data as { llm_call_id?: string } | null;
-          if (ev?.llm_call_id != null) closedCalls.add(ev.llm_call_id);
-          setDraft((prev) => (prev?.llm_call_id === ev?.llm_call_id ? null : prev));
+          const clearId = ev?.llm_call_id;
+          if (clearId != null) {
+            closedCalls.add(clearId);
+            if (clearId > clearedThroughCallId) clearedThroughCallId = clearId;
+            setDraft((prev) => {
+              if (prev && prev.llm_call_id <= clearId) {
+                closedCalls.add(prev.llm_call_id);
+                return null;
+              }
+              return prev;
+            });
+          }
         } else if (name === "attempt.retry") {
           const ev = data as RetryNotice;
           setDraft((prev) => {
@@ -764,6 +791,7 @@ function App() {
           globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
         } else if (name === "resync") {
+          setRetryNotice(null);
           globalSyncRef.current?.touchSession(sid);
           apiFetch<SessionInfo>(`/sessions/${sid}`)
             .then((sess) => {
@@ -862,7 +890,7 @@ function App() {
     try {
       const older = await apiFetch<HistoryItem[]>(`/sessions/${sid}/history?before=${encodeURIComponent(firstId)}&limit=50`);
       if (activeIdRef.current !== sid || loadMoreSeqRef.current !== mySeq) return;
-      setItems((prev) => mergeItems(prev, older));
+      setItemsState((prev) => (prev.sid === sid ? { sid, list: mergeItems(prev.list, older) } : prev));
       setHasMore(older.length === 50);
     } catch (e) {
       if (activeIdRef.current === sid && loadMoreSeqRef.current === mySeq) {
@@ -1166,6 +1194,7 @@ function App() {
 
                 {activeTab === "trace" && (
                   <TraceView
+                    key={activeSession.id}
                     items={items}
                     hasMore={hasMore}
                     loadingMore={loadingMore}
@@ -1178,6 +1207,7 @@ function App() {
 
                 {activeTab === "context" && (
                   <ContextView
+                    key={activeSession.id}
                     session={activeSession}
                     items={items}
                     summary={summary}

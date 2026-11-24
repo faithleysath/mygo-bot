@@ -60,7 +60,7 @@ function summarizePayload(kind: string, p: HistoryPayload): string {
     const txt = extractMessageText(p.content).replace(/\s+/g, " ").trim();
     if (txt) return `${head} · ${txt}`;
     const media = mediaBlocksFromPayload(p);
-    return media.length ? `${head} · ${media.map((b) => `[${b.type}#${b.attachment_id}]`).join(" ")}` : head;
+    return media.length ? `${head} · ${media.map((b) => `[${b.type} ${b.attachment_id}]`).join(" ")}` : head;
   }
   if (kind === "reasoning") {
     return extractReasoningText(p).replace(/\s+/g, " ").trim();
@@ -69,13 +69,14 @@ function summarizePayload(kind: string, p: HistoryPayload): string {
   const txt = extractMessageText(p.content).replace(/\s+/g, " ").trim();
   if (txt) return txt;
   const media = mediaBlocksFromPayload(p);
-  return media.length ? media.map((b) => `[${b.type}#${b.attachment_id}]`).join(" ") : "";
+  return media.length ? media.map((b) => `[${b.type} ${b.attachment_id}]`).join(" ") : "";
 }
 
 interface InspectorRowData {
   key: string | number;
   kind: string;
   payload: HistoryPayload;
+  searchText?: string;
   badges: ComponentChildren;
   actions?: ComponentChildren;
 }
@@ -120,14 +121,20 @@ function InspectorShell({
   const presentKinds = kindOrder
     ? [...kindOrder.filter((k) => counts.has(k)), ...[...counts.keys()].filter((k) => !kindOrder.includes(k))]
     : [...counts.keys()];
+  const activeKind = kindFilter !== "all" && counts.has(kindFilter) ? kindFilter : "all";
+
+  useEffect(() => {
+    if (kindFilter !== "all" && !counts.has(kindFilter)) setKindFilter("all");
+  }, [kindFilter, rows]);
 
   const q = query.trim().toLowerCase();
   const filtered = rows.filter((r) => {
-    if (kindFilter !== "all" && r.kind !== kindFilter) return false;
+    if (activeKind !== "all" && r.kind !== activeKind) return false;
     if (!q) return true;
     return (
       String(r.key).toLowerCase().includes(q) ||
       r.kind.toLowerCase().includes(q) ||
+      (r.searchText ? r.searchText.toLowerCase().includes(q) : false) ||
       JSON.stringify(r.payload).toLowerCase().includes(q)
     );
   });
@@ -140,7 +147,7 @@ function InspectorShell({
             {leadingPill}
             <button
               type="button"
-              class={`filter-pill ${kindFilter === "all" ? "active" : ""}`}
+              class={`filter-pill ${activeKind === "all" ? "active" : ""}`}
               onClick={() => setKindFilter("all")}
             >
               {t("All")} <span class="mono">{totalCount}</span>
@@ -149,8 +156,8 @@ function InspectorShell({
               <button
                 key={k}
                 type="button"
-                class={`filter-pill ${kindFilter === k ? "active" : ""}`}
-                onClick={() => setKindFilter(kindFilter === k ? "all" : k)}
+                class={`filter-pill ${activeKind === k ? "active" : ""}`}
+                onClick={() => setKindFilter(activeKind === k ? "all" : k)}
               >
                 <span class="mono">{k}</span> <span class="mono">{counts.get(k)}</span>
               </button>
@@ -283,6 +290,7 @@ export function TraceView({
       key: item.id,
       kind: item.kind,
       payload: item.payload || {},
+      searchText: [item.id, item.target_id, item.llm_call_id].filter(Boolean).join(" "),
       badges: (
         <>
           <span class="pill mono">{item.id}</span>
@@ -328,7 +336,7 @@ export function TraceView({
       rows={rows}
       kindOrder={TRACE_KIND_ORDER}
       totalCount={items.length}
-      searchPlaceholder={t("Filter #id, kind, text…")}
+      searchPlaceholder={t("Filter id, kind, text…")}
       emptyText={t("No items recorded in this session yet.")}
       hasMore={hasMore}
       loadingMore={loadingMore}
@@ -503,6 +511,7 @@ export function ContextView({
       key: c.position,
       kind,
       payload: c.payload || {},
+      searchText: [`pos #${c.position}`, c.item_id, c.llm_call_id].filter(Boolean).join(" "),
       badges: (
         <>
           <span class="pill mono">pos #{c.position}</span>

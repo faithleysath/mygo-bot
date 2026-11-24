@@ -700,7 +700,7 @@ export function Timeline({
                       {call && (
                         <span
                           class="meta-chip"
-                          title={`#${call.id}: in ${call.input_uncached_tokens ?? 0} + cache_read ${call.cache_read_tokens ?? 0}${call.cache_write_tokens ? ` + cache_write ${call.cache_write_tokens}` : ""} → out ${call.output_tokens ?? 0}`}
+                          title={`${call.id}: in ${call.input_uncached_tokens ?? 0} + cache_read ${call.cache_read_tokens ?? 0}${call.cache_write_tokens ? ` + cache_write ${call.cache_write_tokens}` : ""} → out ${call.output_tokens ?? 0}`}
                         >
                           <Icon n="database" s={12} />
                           <span>{t("Usage")} {formatTokens(callTokens)} tok</span>
@@ -732,7 +732,7 @@ export function Timeline({
                 <summary class="card-head">
                   <Icon n="chevron" s={13} cls="chev" />
                   <span class="mono">{item.kind}</span>
-                  <span class="muted">#{item.id}</span>
+                  <span class="muted">{item.id}</span>
                 </summary>
                 <div class="card-body">
                   <pre class="code-box">{JSON.stringify(item.payload, null, 2)}</pre>

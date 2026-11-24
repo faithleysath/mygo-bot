@@ -902,7 +902,7 @@ function UsageTab({
         </select>
         <input
           placeholder={t("Session ID…")}
-          style="width:180px"
+          style="width:270px"
           value={sessionId}
           onInput={(e) => setSessionId(e.currentTarget.value)}
           onKeyDown={(e) => {

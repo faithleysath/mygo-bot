@@ -53,7 +53,7 @@ function showAgent(name, agent) {
   for (const [i,step] of agent.steps.entries()) {
     const details = element('details',undefined,'step'); const title = element('summary');
     title.append(element('small',String(i+1).padStart(2,'0')),document.createTextNode(step.name));
-    if (step.call) title.append(element('small','　模型 #'+step.call));
+    if (step.call) title.append(element('small','　模型 '+step.call));
     if (step.seconds != null) title.append(element('small','　'+step.seconds+' 秒'));
     details.append(title);
     for (const [key,label] of [['args','参数'],['result','返回'],['text','内容']]) {
