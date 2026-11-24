@@ -17,6 +17,7 @@ import { Sidebar } from "./Sidebar.jsx";
 import {
   applyDraftDelta,
   applyDraftStarted,
+  applyLocalPatch,
   applySessionEvent,
   buildContentBlocks,
   createGlobalSessionSync,
@@ -297,8 +298,9 @@ function App() {
         if (!alive) return;
         setSessions(merged);
         if (!selectedInitial) {
-          selectedInitial = true;
-          if (activeIdRef.current == null) {
+          if (activeIdRef.current != null) {
+            selectedInitial = true;
+          } else {
             let saved = null;
             try {
               saved = Number(localStorage.getItem("mygo_sid")) || null;
@@ -306,12 +308,18 @@ function App() {
             const chosen =
               merged.find((s) => s.id === saved) ||
               [...merged].sort((a, b) => b.updated_at - a.updated_at)[0];
-            if (chosen) setActiveId(chosen.id);
+            if (chosen) {
+              selectedInitial = true;
+              setActiveId(chosen.id);
+            }
           }
         } else if (activeIdRef.current != null && !merged.some((s) => s.id === activeIdRef.current)) {
           cleanupComposer(activeIdRef.current);
           setActiveId(null);
         }
+      },
+      onLocalPatchApplied: (updated) => {
+        if (alive) setSessions((prev) => applyLocalPatch(prev, updated));
       },
       onDelta: (name, data) => {
         if (alive) setSessions((prev) => applySessionEvent(prev, name, data));
@@ -326,6 +334,7 @@ function App() {
       },
     });
     globalSyncRef.current = sync;
+    sync.sync();
 
     const ctrl = new AbortController();
     connectSse("/events", {
@@ -413,6 +422,7 @@ function App() {
       onEvent: (name, data) => {
         if (activeIdRef.current !== sid) return;
         if (name === "ready") {
+          globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
           setDraft(null);
           setRetryNotice(null);
@@ -469,6 +479,7 @@ function App() {
               return null;
             });
           }
+          globalSyncRef.current?.touchSession(sid);
           setSessions((prev) =>
             prev.map((s) =>
               s.id === sid
@@ -478,11 +489,14 @@ function App() {
           );
           refreshSessionSidecars(sid).catch(() => {});
         } else if (name === "session.updated") {
+          globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
         } else if (name === "resync") {
+          globalSyncRef.current?.touchSession(sid);
           apiFetch(`/sessions/${sid}`)
             .then((sess) => {
               if (activeIdRef.current === sid) {
+                globalSyncRef.current?.touchSession(sid);
                 setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
               }
             })
@@ -524,9 +538,10 @@ function App() {
     setBannerErr("");
     try {
       const s = await apiFetch("/sessions", { method: "POST", body: {} });
-      if (globalSyncRef.current) globalSyncRef.current.onEvent("session.created", s);
-      else setSessions((prev) => applySessionEvent(prev, "session.created", s));
-      setActiveId(s.id);
+      const added = globalSyncRef.current
+        ? globalSyncRef.current.onLocalCreated(s)
+        : (setSessions((prev) => applySessionEvent(prev, "session.created", s)), true);
+      if (added) setActiveId(s.id);
     } catch (e) {
       setBannerErr(e.message);
     }
@@ -550,10 +565,11 @@ function App() {
 
   const patchSession = async (sid, patch) => {
     setBannerErr("");
+    const baseVersion = globalSyncRef.current?.getSessionVersion(sid) ?? 0;
     try {
       const updated = await apiFetch(`/sessions/${sid}`, { method: "PATCH", body: patch });
-      if (globalSyncRef.current) globalSyncRef.current.onEvent("session.updated", updated);
-      else setSessions((prev) => applySessionEvent(prev, "session.updated", updated));
+      if (globalSyncRef.current) globalSyncRef.current.onLocalPatch(updated, baseVersion);
+      else setSessions((prev) => applyLocalPatch(prev, updated));
     } catch (e) {
       setBannerErr(e.message);
     }

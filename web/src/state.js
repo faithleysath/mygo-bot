@@ -276,9 +276,7 @@ export function applySessionEvent(list, name, data) {
     return list.some((s) => s.id === data.id) ? list : [...list, data];
   }
   if (name === "session.updated") {
-    return list.some((s) => s.id === data.id)
-      ? list.map((s) => (s.id === data.id ? data : s))
-      : [...list, data];
+    return list.map((s) => (s.id === data.id ? data : s));
   }
   if (name === "session.status") {
     return list.map((s) =>
@@ -298,10 +296,25 @@ export function applySessionEvent(list, name, data) {
   return list;
 }
 
+export function applyLocalPatch(list, updated) {
+  return list.map((s) => {
+    if (s.id !== updated.id) return s;
+    if (
+      typeof s.updated_at === "number" &&
+      typeof updated.updated_at === "number" &&
+      updated.updated_at < s.updated_at
+    ) {
+      return s;
+    }
+    return updated;
+  });
+}
+
 export function createGlobalSessionSync({
   fetchSessions,
   onSnapshot,
   onDelta,
+  onLocalPatchApplied,
   onDeleted,
   onError,
   schedule = setTimeout,
@@ -312,6 +325,15 @@ export function createGlobalSessionSync({
   let activeBuffer = null;
   let retryTimer = null;
   let retryDelay = 1000;
+  let versionCounter = 0;
+  let snapshotVersion = 0;
+  const sessionVersions = new Map();
+  const deletedIds = new Set();
+
+  const getSessionVersion = (id) => Math.max(snapshotVersion, sessionVersions.get(id) || 0);
+  const touchSession = (id) => {
+    if (id != null) sessionVersions.set(id, ++versionCounter);
+  };
 
   const clearRetry = () => {
     if (retryTimer !== null) {
@@ -331,8 +353,11 @@ export function createGlobalSessionSync({
       const buffered = activeBuffer?.seq === mySeq ? activeBuffer.events : [];
       activeBuffer = null;
       retryDelay = 1000;
+      snapshotVersion = ++versionCounter;
+      sessionVersions.clear();
       let merged = list;
       for (const ev of buffered) {
+        if (ev.name === "session.deleted") deletedIds.add(ev.data.id);
         merged = applySessionEvent(merged, ev.name, ev.data);
       }
       onError?.("");
@@ -352,6 +377,10 @@ export function createGlobalSessionSync({
 
   const onEvent = (name, data) => {
     if (disposed) return;
+    touchSession(data?.id);
+    if (name === "session.deleted" && data?.id != null) {
+      deletedIds.add(data.id);
+    }
     if (activeBuffer !== null) {
       activeBuffer.events.push({ name, data });
     }
@@ -361,13 +390,36 @@ export function createGlobalSessionSync({
     onDelta(name, data);
   };
 
+  const onLocalCreated = (session) => {
+    if (disposed || deletedIds.has(session.id)) return false;
+    onEvent("session.created", session);
+    return true;
+  };
+
+  const onLocalPatch = (updated, baseVersion) => {
+    if (disposed || deletedIds.has(updated.id)) return false;
+    if (getSessionVersion(updated.id) !== baseVersion) return false;
+    touchSession(updated.id);
+    if (onLocalPatchApplied) onLocalPatchApplied(updated);
+    else onDelta("session.updated", updated);
+    return true;
+  };
+
   const dispose = () => {
     disposed = true;
     clearRetry();
     activeBuffer = null;
   };
 
-  return { sync, onEvent, dispose };
+  return {
+    sync,
+    onEvent,
+    onLocalCreated,
+    onLocalPatch,
+    getSessionVersion,
+    touchSession,
+    dispose,
+  };
 }
 
 export function createSessionSync({
