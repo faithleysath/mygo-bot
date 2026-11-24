@@ -17,7 +17,7 @@
 然后父进程并没有立刻甩手退出，而是**守在子进程的 `stdout` 管道口等一行 `Ready` JSON 回信**：
 - 只有等子进程真正把 TCP 端口绑稳、把 Unix Socket 建好、拿着独占锁打开了 `mygo.sqlite3`、并起好了 `--js-threads` 条 JS 工人线程（默认 `min(逻辑核数, 4)`），才往管道吐出 `{ listen, socket, token }`；
 - 收到这行就绪回信后，父进程把 PID、监听地址和一次性随机生成的 **64 位十六进制 Bearer Token**（未传 `--token` 时由 `getrandom` 生成 32 字节随机数）打印到终端然后退出；
-- 而**子进程一写出管道，立刻把内存里的 `self.token` 抹成 `None`** 再往 `mygo.log` 写启动日志——所以**自动生成的 Token 只会在终端打印这一次，绝不落入 `mygo.log`**！（唯一需要注意的差异是 `--foreground` 模式下因为没有父进程管道中转，自动生成的 Token 会直接打进 `stderr`；若在服务配置里固定传了可见 ASCII 的 `--token`，则永远不会打印或落盘日志。）
+- 而**子进程一写出管道，立刻把内存里的 `self.token` 抹成 `None`** 再往 `mygo.log` 写启动日志——并且整个系统**绝不把任何 Token 写进 `tracing` 日志**。哪怕是在 `--foreground` 模式下（没有父进程管道中转），也**只有当 `stderr` 连着交互式终端（`IsTerminal`）时**，才会直接往终端打一次 `TCP Bearer token: ...`；只要被重定向进日志文件或者跑在 `systemd`/`launchd` 托管服务里，随机 Token 就绝不会落入日志或磁盘（而若在启动参数里固定传了 `--token`，则永远不会自动输出）。
 - 万一端口全被占或同目录已经有另一个实例占死了数据库锁，子进程还没来得及还终端就会把错误顺着管道吐回来，父进程当场报错退出。
 
 ### 2. TCP 探测与 Unix Socket（`src/main.rs`、`src/socket.rs`）

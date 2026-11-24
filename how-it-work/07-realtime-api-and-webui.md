@@ -21,10 +21,10 @@
 2. **两股通道怎么保证“碎片不跑到成品后面”？**
    既然打字机碎片走 `Hub` 的 256 通道、成品 `item.saved` 走记账员的 64 通道，万一两路消息在 `tokio::select!` 里抢跑，用户刚看到完整的 `item.saved` 落盘卡片，下一毫秒一条迟到的 `item.delta` 才冒出来怎么办？
 
-   解决招数非常漂亮——**全进程共抢一个原子递增序号 [`NEXT_SEQ`](../src/events.rs#L25-L43)**（[推送协调循环](../src/events.rs#L313-L436)）：
+   解决招数非常漂亮——**全进程共抢一个原子递增序号 [`NEXT_SEQ`](../src/events.rs#L29-L47)**（[推送协调循环](../src/events.rs#L345-L549)）：
    - 每一条发往持久通道和临时通道的通知，在放进槽里的那一瞬间都领一个唯一的 `seq`；
    - 连入 SSE 时顺手记下此刻快照已经覆盖到的线 **`min_seq`**，所有比 `min_seq` 老的碎片直接丢弃，免得快照和碎片重复叠字；
-   - 推送协程每收到一条持久事件 `d` 时，先把 `take_older_deltas` 排干——把临时通道里所有序号 `seq < d.seq` 的碎片先吐干净，**然后再吐 `d`**！如果慢窗口在**持久通道**掉队了，清掉缓存在手里的草稿、吐一条 `resync` 让前端去拉历史重对齐；如果在**临时通道**掉队，静默跳过旧草稿继续收新的即可，绝不耽误主账。
+   - 推送协程每收到一条持久事件 `d` 时，先把 `take_older_deltas` 排干——把临时通道里所有序号 `seq < d.seq` 的碎片先吐干净，**然后再吐 `d`**！如果慢窗口在**持久通道**掉队了，清掉缓存在手里的草稿、吐一条 `resync` 让前端去拉历史重对齐；如果在**临时通道**掉队，先把已经排进持久通道的事件送完保证因果顺序，再拿着 `Hub` 锁重拍一次最新快照、把 `min_seq` 往前推，并补发 `stream.snapshot`（若该轮调用刚结束清盘，则补发 `stream.clear`）把实时草稿接回来，既不缺字、也不用把整条长对话重拉一遍。
 
 ---
 
@@ -64,9 +64,9 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 ### 1. 构建、压缩与强 ETag 嵌入（`web/build.mjs` & `src/webui.rs`）
 
 执行 `bun run build` 先跑一遍 `tsc --noEmit` 全量类型检查，随后：
-- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 24.7 KiB）**；
-- 自定义状态机压缩 CSS（保留引号内容、去注释、去尾分号），压进 **`src/webui/app.css.gz`（约 3.5 KiB）**；
-- `index.html` 折叠标签间空白生成 **`src/webui/index.html`（851 字节）**，开头直接内联了一小段同步 `<script>`，在浏览器首帧绘制前读取 `localStorage.mygo_theme` 和系统深浅色偏好把 `dataset.theme` 设好，彻底杜绝深色模式下切白闪屏（FOUC）。
+- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 41.5 KiB）**；
+- 自定义状态机压缩 CSS（保留引号内容、去注释、去尾分号），压进 **`src/webui/app.css.gz`（约 6.6 KiB）**；
+- `index.html` 折叠标签间空白生成 **`src/webui/index.html`（898 字节）**，开头直接内联了一小段同步 `<script>`，在浏览器首帧绘制前读取 `localStorage.mygo_theme` 和系统深浅色偏好把 `dataset.theme` 设好，彻底杜绝深色模式下切白闪屏（FOUC）。
 
 这三份静态资源在 Rust 编译时通过 `include_bytes!` 直接焊进最终二进制里。`GET /`、`GET /ui/app.js` 和 `GET /ui/app.css` 每次按 64 位 FNV-1a 算法算好强 ETag（`"16位十六进制"`），客户端带 `If-None-Match` 命中直接回 `304 Not Modified`；`.js` 和 `.css` 直接附带 `Content-Encoding: gzip` + `Vary: Accept-Encoding` 原样吐出压缩字节。
 
@@ -81,15 +81,15 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 
 | 机关 | 它只管哪件事、省掉会出什么乱子 |
 | :--- | :--- |
-| **1. 全局快照与增量缓冲（`activeBuffer` + `latestSeq`）** | 全量拉取 `GET /sessions` 还在半路时，全局 SSE 推来的 `session.created`/`status` 先一边就地更新一边记进临时缓冲，等全量快照回来再把缓冲按序重放盖上去。省掉它，拉列表那几百毫秒里刚发生的事件就会被旧快照抹掉。 |
+| **1. 全局快照与增量缓冲（`activeBuffer` + `latestSeq`）** | 全量拉取 `GET /sessions` 还在半路时，全局 SSE 推来的 `session.created`/`status` 以及本地已经确认成功的 `onLocalPatch`/`runRefresh` 更新，都会先就地生效并记进临时缓冲，等全量快照回来再按序（本地改动走 `applyLocalPatch`）重放盖上去。省掉它，拉列表那几百毫秒里刚发生的事件或刚改好的标题/模型就会被旧快照抹掉。 |
 | **2. 单会话版本号 + 永久墓碑 `deletedIds` + 回拉退避** | 每次调 `PATCH /sessions/{sid}` 前先拍下该会话此刻的版本号 `baseVersion`。如果请求飞在半路时有更新的 SSE 事件把版本号推高了，或者该会话已经被删进 `deletedIds` 墓碑集里——回包绝对不允许直接盖上去把旧数据覆盖回来、更不许把删掉的会话“复活”！冲突时自动改调一次带 `1s..8s` 退避的 `GET /sessions/{sid}` 对齐权威状态（`404` 立刻转为删除）。 |
-| **3. 历史缺口闭合锁（`gapOpen`）** | 刚切进会话先拉最新 50 条（`?tail=true&limit=50`），记下已同步游标 `syncedThroughId`。一旦断线重连 `ready` 或收到 `resync`，立刻把 `gapOpen` 置 `true` 锁住游标：期间新到达的 `item.saved` 可以先渲染上屏给人看，但**绝不推高 `syncedThroughId`**，一直等到 `?after=...&limit=200` 把断线期间漏掉的所有历史一页页补齐合并，才把缺口合拢！ |
+| **3. 立即首屏与历史缺口闭合锁（`start` + `gapOpen`）** | 切进会话不等 SSE `ready`，`SessionSync.start()` 立刻先拉最新 50 条（`?tail=true&limit=50`），记下已同步游标 `syncedThroughId`（哪怕实时流被代理卡住也能正常看聊天记录）。随后一旦连上 `ready` 或收到 `resync`，立刻把 `gapOpen` 置 `true` 锁住游标：期间新到达的 `item.saved` 可以先渲染上屏给人看，但**绝不推高 `syncedThroughId`**，一直等到 `?after=...&limit=200` 把断线或首屏交接期间漏掉的历史一页页补齐合并，才把缺口合拢！同时同一会话的 sidecar 刷新（排队消息、汇总、活跃任务）会合并为最多“一个在途 + 一个尾随”，可见回复的用量则只按页面上出现的 `llm_call_id` 按需单条拉取 `GET /calls/{id}`，不再全量扫 `/calls`。 |
 | **4. 草稿防幽灵重现（`closedCalls` / `closedItems`）** | 当某条流式回答或工具调用已经被 `item.saved` 正式落盘、或者收到 `stream.clear` / `attempt.retry` 时，不仅立刻清掉屏幕上的流式草稿，还把对应的 `llm_call_id` 或 `call_id:output_index` 记进关闭集合，把任何迟到的增量碎片或旧快照彻底拦在门外，防止同一句话闪回屏幕两次。 |
 
 ### 4. 四块界面能力速览
 
 - **侧边栏（`Sidebar.tsx`）**：按 `updated_at` 倒序排列，状态圆点一目了然（`idle`/`running` 呼吸灯/`pausing`/`paused`/带 `last_error` 红灯），运行中和暂停中隐藏删除按钮，删会话需 3 秒内二次确认；窄屏自动折叠为抽屉。
-- **时间线（`Timeline.tsx`、`markdown.tsx`）**：把 `withdrawal` 折叠并直接给对应用户消息画删除线；把同一组 `function_call` 与 `function_call_output` 配对成可展开工具卡片（专门把 `codemode` 的 `code`/`trigger_code` 高亮展示，也支持展示工具返回的图片音视频附件）；自研零依赖 Preact JSX Markdown 解析器——**全程零 `dangerouslySetInnerHTML`**，所有链接严格用 `new URL` 校验只放行显式 `http://`、`https://`、`mailto:`，且故意屏蔽 `![img](...)` 外链防跟踪像素。
+- **时间线（`Timeline.tsx`、`markdown.tsx`）**：把 `withdrawal` 折叠并直接给对应用户消息画删除线；把同一组 `function_call` 与 `function_call_output` 配对成可展开工具卡片（专门把 `codemode` 的 `code`/`trigger_code` 高亮展示，也支持展示工具返回的图片音视频附件）；自研零依赖 Preact JSX Markdown 解析器——**全程零 `dangerouslySetInnerHTML`**，所有链接用单趟线性括号配对扫描解析目标地址并严格经 `new URL` 校验只放行显式 `http://`、`https://`、`mailto:`（彻底杜绝流式未闭合长链接引发正则回溯卡死），且故意屏蔽 `![img](...)` 外链防跟踪像素；每条回复卡片和底部汇总栏统一按后端 `uncached + cache_read + cache_write` 口径计算总输入与缓存命中率。
 - **输入框与顶栏（`Composer.tsx`、`TopBar`）**：按会话独立保存未发草稿与粘贴/拖拽上传的待发附件；提交前锁定内容快照复用或生成 `Idempotency-Key`（4xx 报错重置 Key，网络/5xx 报错保留 Key 防重投），而且只有当用户在请求飞出期间**没继续打字改文本框（`textVersion` 未变）**时才清空输入，绝不吞掉用户刚续写的新字；上方在有活跃任务时展示可折叠的任务栏（每 2 秒轮询，直接展示 `running_commands` 实时终端尾部与 `Kill` 按钮）；顶栏集中放会话改名、模型切换（切模型主动清零 `reasoning_effort`）、推理档位选择和基于 `last_input_tokens / context_window_tokens` 计算的上下文用量与花费统计。
 - **设置弹窗（`Settings.tsx`）**：分 `Models`（全局默认、显示归档、供应商密钥安全编辑、模型能力与定价 JSON）、`MCP`（编辑时屏蔽未改动的查询串/Headers/Args/Env/OAuth 防误覆盖且无改动不发 PATCH；OAuth 既提供一键弹窗打开授权，也贴心留了粘贴远程回调 URL 的 `Submit Callback` 框方便跨机部署）、`Usage`（按会话筛调用费和历史流水）与 `General`（主题、`/docs` 链接、登出）。
 
