@@ -145,7 +145,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
           {busy ? "Verifying…" : "Connect"}
         </button>
         <div class="muted small">
-          Run <code class="md-inline-code">mygo status</code> on the host to view the token.
+          Run <code class="md-inline-code">mygo service status</code> on the host to view the token.
         </div>
       </form>
     </div>
