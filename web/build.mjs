@@ -8,7 +8,7 @@ const outDir = resolve(here, "../src/webui");
 mkdirSync(outDir, { recursive: true });
 
 const result = await Bun.build({
-  entrypoints: [resolve(here, "src/main.jsx")],
+  entrypoints: [resolve(here, "src/main.tsx")],
   minify: true,
   target: "browser",
   format: "esm",

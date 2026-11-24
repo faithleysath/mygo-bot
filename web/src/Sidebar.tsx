@@ -1,5 +1,20 @@
 import { useEffect, useState } from "preact/hooks";
-import { formatRelTime } from "./api.js";
+import { formatRelTime } from "./api.ts";
+import type { ModelInfo, SessionInfo, Theme } from "./types.ts";
+
+export interface SidebarProps {
+  sessions: SessionInfo[];
+  activeId: number | null;
+  modelsById: Map<number, ModelInfo>;
+  open: boolean;
+  theme: Theme;
+  onSelect: (id: number) => void;
+  onCreate: () => void;
+  onDelete: (id: number) => void;
+  onToggleTheme: () => void;
+  onOpenSettings: () => void;
+  onClose: () => void;
+}
 
 export function Sidebar({
   sessions,
@@ -13,8 +28,8 @@ export function Sidebar({
   onToggleTheme,
   onOpenSettings,
   onClose,
-}) {
-  const [confirmId, setConfirmId] = useState(null);
+}: SidebarProps) {
+  const [confirmId, setConfirmId] = useState<number | null>(null);
 
   useEffect(() => {
     if (confirmId == null) return;

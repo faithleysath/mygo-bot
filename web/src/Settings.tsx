@@ -1,47 +1,96 @@
+import type { TargetedSubmitEvent } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { apiFetch, formatCost, formatTokens } from "./api.js";
-import { buildMcpPayload, createMcpForm } from "./state.js";
+import { apiFetch, errorMessage, formatCost, formatTokens } from "./api.ts";
+import { buildMcpPayload, createMcpForm } from "./state.ts";
+import type {
+  AppConfig,
+  CallsSummary,
+  LlmCallInfo,
+  McpFormState,
+  McpOAuthAction,
+  McpOAuthLoginInfo,
+  McpOAuthStatusResponse,
+  McpProbeResult,
+  McpSecretAction,
+  McpServerInfo,
+  McpToolPolicy,
+  McpTransport,
+  ModelInfo,
+  ProviderInfo,
+  Theme,
+} from "./types.ts";
 
-function ModelsTab({ config, providers, models, onRefresh }) {
+interface ProviderFormState {
+  id: number | null;
+  name: string;
+  base_url: string;
+  api_key: string;
+  clearKey: boolean;
+}
+
+interface ModelFormState {
+  id: number | null;
+  provider_id: number | string;
+  model_key: string;
+  context_window_tokens: number | string;
+  input_modalities: string[];
+  reasoning_efforts: string;
+  pricingText: string;
+}
+
+function ModelsTab({
+  config,
+  providers,
+  models,
+  onRefresh,
+}: {
+  config: AppConfig | null;
+  providers: ProviderInfo[];
+  models: ModelInfo[];
+  onRefresh: () => Promise<void>;
+}) {
   const [showArchived, setShowArchived] = useState(false);
   const [err, setErr] = useState("");
-  const [provForm, setProvForm] = useState(null);
-  const [modelForm, setModelForm] = useState(null);
+  const [provForm, setProvForm] = useState<ProviderFormState | null>(null);
+  const [modelForm, setModelForm] = useState<ModelFormState | null>(null);
 
   const visibleProviders = showArchived ? providers : providers.filter((p) => !p.archived_at);
   const visibleModels = showArchived ? models : models.filter((m) => !m.archived_at && !m.provider_archived_at);
   const availableModels = models.filter((m) => !m.archived_at && !m.provider_archived_at);
   const selectedDefault = models.find((m) => m.id === config?.default_model_id);
 
-  const run = async (fn) => {
+  const run = async (fn: () => Promise<void>) => {
     setErr("");
     try {
       await fn();
       await onRefresh();
     } catch (e) {
-      setErr(e.message);
+      setErr(errorMessage(e));
     }
   };
 
-  const saveDefault = (patch) => run(() => apiFetch("/config", { method: "PATCH", body: patch }));
+  const saveDefault = (patch: Partial<AppConfig>) =>
+    run(() => apiFetch("/config", { method: "PATCH", body: patch }).then(() => undefined));
 
-  const saveProvider = (e) => {
+  const saveProvider = (e: TargetedSubmitEvent<HTMLFormElement>) => {
     e.preventDefault();
     const f = provForm;
-    const body = { name: f.name, base_url: f.base_url };
+    if (!f) return;
+    const body: Record<string, unknown> = { name: f.name, base_url: f.base_url };
     if (f.api_key !== "") body.api_key = f.api_key;
     else if (f.clearKey) body.api_key = null;
-    run(async () => {
+    void run(async () => {
       if (f.id) await apiFetch(`/providers/${f.id}`, { method: "PATCH", body });
       else await apiFetch("/providers", { method: "POST", body });
       setProvForm(null);
     });
   };
 
-  const saveModel = (e) => {
+  const saveModel = (e: TargetedSubmitEvent<HTMLFormElement>) => {
     e.preventDefault();
     const f = modelForm;
-    let pricing = null;
+    if (!f) return;
+    let pricing: unknown = null;
     if (f.pricingText.trim()) {
       try {
         pricing = JSON.parse(f.pricingText);
@@ -61,7 +110,7 @@ function ModelsTab({ config, providers, models, onRefresh }) {
         .filter(Boolean),
       pricing,
     };
-    run(async () => {
+    void run(async () => {
       if (f.id) await apiFetch(`/models/${f.id}`, { method: "PATCH", body });
       else await apiFetch("/models", { method: "POST", body });
       setModelForm(null);
@@ -76,7 +125,7 @@ function ModelsTab({ config, providers, models, onRefresh }) {
         <div class="panel-head">
           <h4>Default Selection</h4>
           <label class="check-row">
-            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.currentTarget.checked)} />
             Show archived
           </label>
         </div>
@@ -85,7 +134,11 @@ function ModelsTab({ config, providers, models, onRefresh }) {
             <span>Default Model</span>
             <select
               value={config?.default_model_id ?? ""}
-              onChange={(e) => saveDefault({ default_model_id: e.target.value ? Number(e.target.value) : null })}
+              onChange={(e) =>
+                void saveDefault({
+                  default_model_id: e.currentTarget.value ? Number(e.currentTarget.value) : null,
+                })
+              }
             >
               <option value="">None</option>
               {availableModels.map((m) => (
@@ -100,7 +153,9 @@ function ModelsTab({ config, providers, models, onRefresh }) {
             <select
               disabled={!selectedDefault || selectedDefault.reasoning_efforts.length === 0}
               value={config?.default_reasoning_effort ?? ""}
-              onChange={(e) => saveDefault({ default_reasoning_effort: e.target.value || null })}
+              onChange={(e) =>
+                void saveDefault({ default_reasoning_effort: e.currentTarget.value || null })
+              }
             >
               <option value="">Default</option>
               {(selectedDefault?.reasoning_efforts || []).map((ef) => (
@@ -127,20 +182,20 @@ function ModelsTab({ config, providers, models, onRefresh }) {
             <div class="grid-2">
               <label class="field">
                 <span>Name</span>
-                <input required value={provForm.name} onInput={(e) => setProvForm({ ...provForm, name: e.target.value })} />
+                <input required value={provForm.name} onInput={(e) => setProvForm({ ...provForm, name: e.currentTarget.value })} />
               </label>
               <label class="field">
                 <span>Base URL</span>
-                <input required placeholder="https://api.openai.com/v1" value={provForm.base_url} onInput={(e) => setProvForm({ ...provForm, base_url: e.target.value })} />
+                <input required placeholder="https://api.openai.com/v1" value={provForm.base_url} onInput={(e) => setProvForm({ ...provForm, base_url: e.currentTarget.value })} />
               </label>
             </div>
             <label class="field">
               <span>API Key {provForm.id ? "(leave blank to keep)" : ""}</span>
-              <input type="password" value={provForm.api_key} onInput={(e) => setProvForm({ ...provForm, api_key: e.target.value })} />
+              <input type="password" value={provForm.api_key} onInput={(e) => setProvForm({ ...provForm, api_key: e.currentTarget.value })} />
             </label>
             {provForm.id && (
               <label class="check-row">
-                <input type="checkbox" checked={provForm.clearKey} onChange={(e) => setProvForm({ ...provForm, clearKey: e.target.checked })} />
+                <input type="checkbox" checked={provForm.clearKey} onChange={(e) => setProvForm({ ...provForm, clearKey: e.currentTarget.checked })} />
                 Clear stored key
               </label>
             )}
@@ -162,11 +217,11 @@ function ModelsTab({ config, providers, models, onRefresh }) {
                   Edit
                 </button>
                 {p.archived_at ? (
-                  <button type="button" class="btn-ghost btn-xs" onClick={() => run(() => apiFetch(`/providers/${p.id}/restore`, { method: "POST" }))}>
+                  <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/providers/${p.id}/restore`, { method: "POST" }).then(() => undefined))}>
                     Restore
                   </button>
                 ) : (
-                  <button type="button" class="btn-ghost btn-xs" onClick={() => run(() => apiFetch(`/providers/${p.id}`, { method: "DELETE" }))}>
+                  <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/providers/${p.id}`, { method: "DELETE" }).then(() => undefined))}>
                     Archive
                   </button>
                 )}
@@ -203,7 +258,7 @@ function ModelsTab({ config, providers, models, onRefresh }) {
             <div class="grid-2">
               <label class="field">
                 <span>Provider</span>
-                <select value={modelForm.provider_id} onChange={(e) => setModelForm({ ...modelForm, provider_id: e.target.value })}>
+                <select value={modelForm.provider_id} onChange={(e) => setModelForm({ ...modelForm, provider_id: e.currentTarget.value })}>
                   {visibleProviders.filter((p) => !p.archived_at).map((p) => (
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
@@ -211,15 +266,15 @@ function ModelsTab({ config, providers, models, onRefresh }) {
               </label>
               <label class="field">
                 <span>Model Key</span>
-                <input required value={modelForm.model_key} onInput={(e) => setModelForm({ ...modelForm, model_key: e.target.value })} />
+                <input required value={modelForm.model_key} onInput={(e) => setModelForm({ ...modelForm, model_key: e.currentTarget.value })} />
               </label>
               <label class="field">
                 <span>Context Window</span>
-                <input type="number" min="1" placeholder="optional" value={modelForm.context_window_tokens} onInput={(e) => setModelForm({ ...modelForm, context_window_tokens: e.target.value })} />
+                <input type="number" min="1" placeholder="optional" value={modelForm.context_window_tokens} onInput={(e) => setModelForm({ ...modelForm, context_window_tokens: e.currentTarget.value })} />
               </label>
               <label class="field">
                 <span>Efforts (comma-separated)</span>
-                <input value={modelForm.reasoning_efforts} onInput={(e) => setModelForm({ ...modelForm, reasoning_efforts: e.target.value })} />
+                <input value={modelForm.reasoning_efforts} onInput={(e) => setModelForm({ ...modelForm, reasoning_efforts: e.currentTarget.value })} />
               </label>
             </div>
             <div class="row gap-2">
@@ -229,7 +284,7 @@ function ModelsTab({ config, providers, models, onRefresh }) {
                     type="checkbox"
                     checked={modelForm.input_modalities.includes(mod)}
                     onChange={(e) => {
-                      const next = e.target.checked
+                      const next = e.currentTarget.checked
                         ? [...modelForm.input_modalities, mod]
                         : modelForm.input_modalities.filter((x) => x !== mod);
                       setModelForm({ ...modelForm, input_modalities: next });
@@ -241,7 +296,7 @@ function ModelsTab({ config, providers, models, onRefresh }) {
             </div>
             <label class="field">
               <span>Pricing JSON (optional)</span>
-              <textarea rows={2} value={modelForm.pricingText} onInput={(e) => setModelForm({ ...modelForm, pricingText: e.target.value })} />
+              <textarea rows={2} value={modelForm.pricingText} onInput={(e) => setModelForm({ ...modelForm, pricingText: e.currentTarget.value })} />
             </label>
             <div class="row gap-1">
               <button type="submit" class="btn-primary btn-xs">Save</button>
@@ -277,11 +332,11 @@ function ModelsTab({ config, providers, models, onRefresh }) {
                   Edit
                 </button>
                 {m.archived_at ? (
-                  <button type="button" class="btn-ghost btn-xs" onClick={() => run(() => apiFetch(`/models/${m.id}/restore`, { method: "POST" }))}>
+                  <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}/restore`, { method: "POST" }).then(() => undefined))}>
                     Restore
                   </button>
                 ) : (
-                  <button type="button" class="btn-ghost btn-xs" onClick={() => run(() => apiFetch(`/models/${m.id}`, { method: "DELETE" }))}>
+                  <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}`, { method: "DELETE" }).then(() => undefined))}>
                     Archive
                   </button>
                 )}
@@ -295,58 +350,65 @@ function ModelsTab({ config, providers, models, onRefresh }) {
 }
 
 function McpTab() {
-  const [servers, setServers] = useState([]);
-  const [oauth, setOauth] = useState({});
-  const [probe, setProbe] = useState({});
-  const [loginInfo, setLoginInfo] = useState({});
-  const [callbackUrl, setCallbackUrl] = useState({});
-  const [form, setForm] = useState(null);
+  const [servers, setServers] = useState<McpServerInfo[]>([]);
+  const [oauth, setOauth] = useState<Record<number, string>>({});
+  const [probe, setProbe] = useState<Record<number, McpProbeResult>>({});
+  const [loginInfo, setLoginInfo] = useState<Record<number, McpOAuthLoginInfo | null>>({});
+  const [callbackUrl, setCallbackUrl] = useState<Record<number, string>>({});
+  const [form, setForm] = useState<McpFormState | null>(null);
   const [err, setErr] = useState("");
 
   const load = async () => {
-    const list = await apiFetch("/mcp/servers");
+    const list = await apiFetch<McpServerInfo[]>("/mcp/servers");
     setServers(list);
     const entries = await Promise.all(
-      list.filter((s) => s.has_oauth).map(async (s) => [s.id, (await apiFetch(`/mcp/servers/${s.id}/oauth`)).status])
+      list
+        .filter((s) => s.has_oauth)
+        .map(async (s) => {
+          const info = await apiFetch<McpOAuthStatusResponse>(`/mcp/servers/${s.id}/oauth`);
+          return [s.id, info.status] as const;
+        })
     );
     setOauth(Object.fromEntries(entries));
   };
 
   useEffect(() => {
-    load().catch((e) => setErr(e.message));
+    load().catch((e) => setErr(errorMessage(e)));
   }, []);
 
-  const run = async (fn) => {
+  const run = async (fn: () => Promise<void>) => {
     setErr("");
     try {
       await fn();
       await load();
     } catch (e) {
-      setErr(e.message);
+      setErr(errorMessage(e));
     }
   };
 
-  const save = (e) => {
+  const save = (e: TargetedSubmitEvent<HTMLFormElement>) => {
     e.preventDefault();
-    let body;
+    if (!form) return;
+    let body: Record<string, unknown>;
     try {
       body = buildMcpPayload(form);
     } catch (ex) {
-      setErr(ex.message);
+      setErr(errorMessage(ex));
       return;
     }
     if (form.id && Object.keys(body).length === 0) {
       setForm(null);
       return;
     }
-    run(async () => {
-      if (form.id) await apiFetch(`/mcp/servers/${form.id}`, { method: "PATCH", body });
+    const targetId = form.id;
+    void run(async () => {
+      if (targetId) await apiFetch(`/mcp/servers/${targetId}`, { method: "PATCH", body });
       else await apiFetch("/mcp/servers", { method: "POST", body });
       setForm(null);
     });
   };
 
-  const editingSameTransport = form?.id && form.transport === form.orig?.transport;
+  const editingSameTransport = Boolean(form?.id && form.transport === form.orig?.transport);
 
   const addAllowedTool = () => {
     if (!form) return;
@@ -359,7 +421,7 @@ function McpTab() {
     });
   };
 
-  const removeAllowedTool = (name) => {
+  const removeAllowedTool = (name: string) => {
     if (!form) return;
     setForm({
       ...form,
@@ -386,14 +448,14 @@ function McpTab() {
           <div class="grid-2">
             <label class="field">
               <span>Name {form.id ? "(immutable)" : ""}</span>
-              <input required disabled={Boolean(form.id)} value={form.name} onInput={(e) => setForm({ ...form, name: e.target.value })} />
+              <input required disabled={Boolean(form.id)} value={form.name} onInput={(e) => setForm({ ...form, name: e.currentTarget.value })} />
             </label>
             <label class="field">
               <span>Transport</span>
               <select
                 value={form.transport}
                 onChange={(e) => {
-                  const next = e.target.value;
+                  const next = e.currentTarget.value as McpTransport;
                   setForm({
                     ...form,
                     transport: next,
@@ -407,11 +469,11 @@ function McpTab() {
             </label>
             <label class="field">
               <span>Description</span>
-              <input value={form.description} onInput={(e) => setForm({ ...form, description: e.target.value })} />
+              <input value={form.description} onInput={(e) => setForm({ ...form, description: e.currentTarget.value })} />
             </label>
             <label class="field">
               <span>Timeout (ms)</span>
-              <input type="number" min="1" value={form.timeout_ms} onInput={(e) => setForm({ ...form, timeout_ms: e.target.value })} />
+              <input type="number" min="1" value={form.timeout_ms} onInput={(e) => setForm({ ...form, timeout_ms: e.currentTarget.value })} />
             </label>
           </div>
 
@@ -423,7 +485,7 @@ function McpTab() {
                   <div class="row gap-2">
                     <span class="mono small truncate">{form.orig.url}?…</span>
                     <label class="check-row">
-                      <input type="checkbox" checked={form.replaceUrl} onChange={(e) => setForm({ ...form, replaceUrl: e.target.checked })} />
+                      <input type="checkbox" checked={form.replaceUrl} onChange={(e) => setForm({ ...form, replaceUrl: e.currentTarget.checked })} />
                       Replace URL
                     </label>
                   </div>
@@ -432,10 +494,20 @@ function McpTab() {
                 <label class="field">
                   <span>URL</span>
                   <div class="row gap-2">
-                    <input required value={form.url} onInput={(e) => setForm({ ...form, url: e.target.value })} style="flex:1" />
+                    <input required value={form.url} onInput={(e) => setForm({ ...form, url: e.currentTarget.value })} style="flex:1" />
                     {editingSameTransport && form.orig?.has_url_query && (
                       <label class="check-row">
-                        <input type="checkbox" checked={form.replaceUrl} onChange={(e) => setForm({ ...form, replaceUrl: e.target.checked, url: form.orig.url || "" })} />
+                        <input
+                          type="checkbox"
+                          checked={form.replaceUrl}
+                          onChange={(e) =>
+                            setForm({
+                              ...form,
+                              replaceUrl: e.currentTarget.checked,
+                              url: form.orig?.url || "",
+                            })
+                          }
+                        />
                         Replace URL
                       </label>
                     )}
@@ -447,7 +519,7 @@ function McpTab() {
                 <div class="grid-2">
                   <label class="field">
                     <span>Headers</span>
-                    <select value={form.headersAction} onChange={(e) => setForm({ ...form, headersAction: e.target.value })}>
+                    <select value={form.headersAction} onChange={(e) => setForm({ ...form, headersAction: e.currentTarget.value as McpSecretAction })}>
                       <option value="keep">{form.orig?.has_headers ? "Keep existing headers" : "None (unchanged)"}</option>
                       <option value="replace">Replace headers (JSON)</option>
                       <option value="clear">Clear headers</option>
@@ -455,7 +527,7 @@ function McpTab() {
                   </label>
                   <label class="field">
                     <span>OAuth 2.1</span>
-                    <select value={form.oauthAction} onChange={(e) => setForm({ ...form, oauthAction: e.target.value })}>
+                    <select value={form.oauthAction} onChange={(e) => setForm({ ...form, oauthAction: e.currentTarget.value as McpOAuthAction })}>
                       <option value="keep">{form.orig?.has_oauth ? "Keep existing OAuth config" : "Disabled (unchanged)"}</option>
                       <option value="replace">{form.orig?.has_oauth ? "Replace OAuth config" : "Enable / set OAuth config"}</option>
                       {form.orig?.has_oauth && <option value="disable">Disable OAuth</option>}
@@ -467,7 +539,7 @@ function McpTab() {
                   <input
                     type="checkbox"
                     checked={form.oauthAction === "replace"}
-                    onChange={(e) => setForm({ ...form, oauthAction: e.target.checked ? "replace" : "keep" })}
+                    onChange={(e) => setForm({ ...form, oauthAction: e.currentTarget.checked ? "replace" : "keep" })}
                   />
                   Enable OAuth 2.1
                 </label>
@@ -476,13 +548,13 @@ function McpTab() {
               {(!form.id || form.headersAction === "replace") && (
                 <label class="field">
                   <span>Headers JSON {form.id ? "" : "(optional)"}</span>
-                  <textarea rows={2} placeholder='{"Authorization":"Bearer ..."}' value={form.headersJson} onInput={(e) => setForm({ ...form, headersJson: e.target.value })} />
+                  <textarea rows={2} placeholder='{"Authorization":"Bearer ..."}' value={form.headersJson} onInput={(e) => setForm({ ...form, headersJson: e.currentTarget.value })} />
                 </label>
               )}
               {form.oauthAction === "replace" && (
                 <label class="field">
                   <span>OAuth Config JSON (optional)</span>
-                  <textarea rows={2} placeholder="{}" value={form.oauthJson} onInput={(e) => setForm({ ...form, oauthJson: e.target.value })} />
+                  <textarea rows={2} placeholder="{}" value={form.oauthJson} onInput={(e) => setForm({ ...form, oauthJson: e.currentTarget.value })} />
                 </label>
               )}
             </>
@@ -491,18 +563,18 @@ function McpTab() {
               <div class="grid-2">
                 <label class="field">
                   <span>Command</span>
-                  <input required value={form.command} onInput={(e) => setForm({ ...form, command: e.target.value })} />
+                  <input required value={form.command} onInput={(e) => setForm({ ...form, command: e.currentTarget.value })} />
                 </label>
                 <label class="field">
                   <span>Working Dir (optional)</span>
-                  <input value={form.cwd} onInput={(e) => setForm({ ...form, cwd: e.target.value })} />
+                  <input value={form.cwd} onInput={(e) => setForm({ ...form, cwd: e.currentTarget.value })} />
                 </label>
               </div>
               {form.id ? (
                 <div class="grid-2">
                   <label class="field">
                     <span>Args</span>
-                    <select value={form.argsAction} onChange={(e) => setForm({ ...form, argsAction: e.target.value })}>
+                    <select value={form.argsAction} onChange={(e) => setForm({ ...form, argsAction: e.currentTarget.value as McpSecretAction })}>
                       <option value="keep">Keep existing ({form.orig?.arg_count || 0} args)</option>
                       <option value="replace">Replace args</option>
                       <option value="clear">Clear args</option>
@@ -510,7 +582,7 @@ function McpTab() {
                   </label>
                   <label class="field">
                     <span>Env</span>
-                    <select value={form.envAction} onChange={(e) => setForm({ ...form, envAction: e.target.value })}>
+                    <select value={form.envAction} onChange={(e) => setForm({ ...form, envAction: e.currentTarget.value as McpSecretAction })}>
                       <option value="keep">{form.orig?.has_env ? "Keep existing env" : "None (unchanged)"}</option>
                       <option value="replace">Replace env (JSON)</option>
                       <option value="clear">Clear env</option>
@@ -521,13 +593,13 @@ function McpTab() {
               {(!form.id || form.argsAction === "replace") && (
                 <label class="field">
                   <span>Args (one per line)</span>
-                  <textarea rows={2} value={form.argsText} onInput={(e) => setForm({ ...form, argsText: e.target.value })} />
+                  <textarea rows={2} value={form.argsText} onInput={(e) => setForm({ ...form, argsText: e.currentTarget.value })} />
                 </label>
               )}
               {(!form.id || form.envAction === "replace") && (
                 <label class="field">
                   <span>Env JSON {form.id ? "" : "(optional)"}</span>
-                  <textarea rows={2} value={form.envJson} onInput={(e) => setForm({ ...form, envJson: e.target.value })} />
+                  <textarea rows={2} value={form.envJson} onInput={(e) => setForm({ ...form, envJson: e.currentTarget.value })} />
                 </label>
               )}
             </>
@@ -535,7 +607,7 @@ function McpTab() {
 
           <label class="field">
             <span>Tool Policy</span>
-            <select value={form.toolPolicy} onChange={(e) => setForm({ ...form, toolPolicy: e.target.value })}>
+            <select value={form.toolPolicy} onChange={(e) => setForm({ ...form, toolPolicy: e.currentTarget.value as McpToolPolicy })}>
               <option value="all">Allow all tools</option>
               <option value="none">Deny all tools</option>
               <option value="allowlist">Allow listed tools only</option>
@@ -558,7 +630,7 @@ function McpTab() {
                 <input
                   placeholder="Exact tool name…"
                   value={form.newAllowedTool}
-                  onInput={(e) => setForm({ ...form, newAllowedTool: e.target.value })}
+                  onInput={(e) => setForm({ ...form, newAllowedTool: e.currentTarget.value })}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.isComposing) {
                       e.preventDefault();
@@ -575,7 +647,7 @@ function McpTab() {
           )}
 
           <label class="check-row">
-            <input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />
+            <input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.currentTarget.checked })} />
             Enabled
           </label>
           <div class="row gap-1">
@@ -604,10 +676,12 @@ function McpTab() {
                 <button
                   type="button"
                   class="btn-ghost btn-xs"
-                  onClick={() => run(async () => {
-                    const res = await apiFetch(`/mcp/servers/${s.id}/test`, { method: "POST" });
-                    setProbe((p) => ({ ...p, [s.id]: res }));
-                  })}
+                  onClick={() =>
+                    void run(async () => {
+                      const res = await apiFetch<McpProbeResult>(`/mcp/servers/${s.id}/test`, { method: "POST" });
+                      setProbe((p) => ({ ...p, [s.id]: res }));
+                    })
+                  }
                 >
                   Test
                 </button>
@@ -616,17 +690,23 @@ function McpTab() {
                     <button
                       type="button"
                       class="btn-ghost btn-xs"
-                      onClick={() => run(async () => {
-                        const res = await apiFetch(`/mcp/servers/${s.id}/oauth/login`, { method: "POST" });
-                        setLoginInfo((l) => ({ ...l, [s.id]: res }));
-                      })}
+                      onClick={() =>
+                        void run(async () => {
+                          const res = await apiFetch<McpOAuthLoginInfo>(`/mcp/servers/${s.id}/oauth/login`, {
+                            method: "POST",
+                          });
+                          setLoginInfo((l) => ({ ...l, [s.id]: res }));
+                        })
+                      }
                     >
                       Login
                     </button>
                     <button
                       type="button"
                       class="btn-ghost btn-xs"
-                      onClick={() => run(() => apiFetch(`/mcp/servers/${s.id}/oauth`, { method: "DELETE" }))}
+                      onClick={() =>
+                        void run(() => apiFetch(`/mcp/servers/${s.id}/oauth`, { method: "DELETE" }).then(() => undefined))
+                      }
                     >
                       Logout
                     </button>
@@ -642,7 +722,9 @@ function McpTab() {
                 <button
                   type="button"
                   class="btn-danger btn-xs"
-                  onClick={() => run(() => apiFetch(`/mcp/servers/${s.id}`, { method: "DELETE" }))}
+                  onClick={() =>
+                    void run(() => apiFetch(`/mcp/servers/${s.id}`, { method: "DELETE" }).then(() => undefined))
+                  }
                 >
                   Delete
                 </button>
@@ -662,7 +744,7 @@ function McpTab() {
               <div class="form-box">
                 <div class="small">
                   Authorize here:{" "}
-                  <a href={loginInfo[s.id].authorization_url} target="_blank" rel="noopener noreferrer">
+                  <a href={loginInfo[s.id]?.authorization_url} target="_blank" rel="noopener noreferrer">
                     Open OAuth Login
                   </a>
                 </div>
@@ -670,13 +752,13 @@ function McpTab() {
                   <input
                     placeholder="Paste redirect URL if remote…"
                     value={callbackUrl[s.id] || ""}
-                    onInput={(e) => setCallbackUrl((c) => ({ ...c, [s.id]: e.target.value }))}
+                    onInput={(e) => setCallbackUrl((c) => ({ ...c, [s.id]: e.currentTarget.value }))}
                   />
                   <button
                     type="button"
                     class="btn-primary btn-xs"
                     onClick={() =>
-                      run(async () => {
+                      void run(async () => {
                         await apiFetch(`/mcp/servers/${s.id}/oauth/callback`, {
                           method: "POST",
                           body: { url: callbackUrl[s.id] || "" },
@@ -698,8 +780,8 @@ function McpTab() {
 }
 
 function UsageTab() {
-  const [summary, setSummary] = useState(null);
-  const [calls, setCalls] = useState([]);
+  const [summary, setSummary] = useState<CallsSummary | null>(null);
+  const [calls, setCalls] = useState<LlmCallInfo[]>([]);
   const [sessionId, setSessionId] = useState("");
   const [err, setErr] = useState("");
 
@@ -709,18 +791,18 @@ function UsageTab() {
     const sep = q ? "&" : "?";
     try {
       const [sum, list] = await Promise.all([
-        apiFetch(`/calls/summary${q}`),
-        apiFetch(`/calls${q}${sep}after=${after}&limit=50`),
+        apiFetch<CallsSummary>(`/calls/summary${q}`),
+        apiFetch<LlmCallInfo[]>(`/calls${q}${sep}after=${after}&limit=50`),
       ]);
       setSummary(sum);
       setCalls((prev) => (append ? [...prev, ...list] : list));
     } catch (e) {
-      setErr(e.message);
+      setErr(errorMessage(e));
     }
   };
 
   useEffect(() => {
-    load(0, false);
+    void load(0, false);
   }, []);
 
   return (
@@ -730,9 +812,9 @@ function UsageTab() {
         <input
           placeholder="Filter by session ID…"
           value={sessionId}
-          onInput={(e) => setSessionId(e.target.value)}
+          onInput={(e) => setSessionId(e.currentTarget.value)}
         />
-        <button type="button" class="btn-ghost btn-sm" onClick={() => load(0, false)}>
+        <button type="button" class="btn-ghost btn-sm" onClick={() => void load(0, false)}>
           Filter
         </button>
       </div>
@@ -773,13 +855,26 @@ function UsageTab() {
           </div>
         ))}
         {calls.length > 0 && calls.length % 50 === 0 && (
-          <button type="button" class="btn-ghost btn-sm" onClick={() => load(calls[calls.length - 1].id, true)}>
+          <button type="button" class="btn-ghost btn-sm" onClick={() => void load(calls[calls.length - 1].id, true)}>
             Load more
           </button>
         )}
       </div>
     </div>
   );
+}
+
+type SettingsTabId = "models" | "mcp" | "usage" | "general";
+
+export interface SettingsProps {
+  config: AppConfig | null;
+  providers: ProviderInfo[];
+  models: ModelInfo[];
+  theme: Theme;
+  onToggleTheme: () => void;
+  onRefreshCatalog: () => Promise<void>;
+  onSignOut: () => void;
+  onClose: () => void;
 }
 
 export function Settings({
@@ -791,20 +886,21 @@ export function Settings({
   onRefreshCatalog,
   onSignOut,
   onClose,
-}) {
-  const [tab, setTab] = useState("models");
+}: SettingsProps) {
+  const [tab, setTab] = useState<SettingsTabId>("models");
+  const tabs: ReadonlyArray<readonly [SettingsTabId, string]> = [
+    ["models", "Models"],
+    ["mcp", "MCP"],
+    ["usage", "Usage"],
+    ["general", "General"],
+  ];
 
   return (
     <div class="modal-backdrop" onClick={onClose}>
       <div class="modal" onClick={(e) => e.stopPropagation()}>
         <div class="modal-head">
           <div class="tabs">
-            {[
-              ["models", "Models"],
-              ["mcp", "MCP"],
-              ["usage", "Usage"],
-              ["general", "General"],
-            ].map(([id, label]) => (
+            {tabs.map(([id, label]) => (
               <button
                 key={id}
                 type="button"

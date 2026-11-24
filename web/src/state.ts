@@ -1,10 +1,30 @@
-export function emptyComposer() {
+import { errorMessage } from "./api.ts";
+import type {
+  ActiveDraft,
+  ComposerAttachment,
+  ComposerDraft,
+  ContentBlock,
+  DraftDeltaEvent,
+  DraftStartedEvent,
+  HistoryItem,
+  McpFormState,
+  McpServerInfo,
+  SessionDeletedEvent,
+  SessionInfo,
+  SessionStatusEvent,
+  SubmittedComposerSnapshot,
+} from "./types.ts";
+
+export function emptyComposer(): ComposerDraft {
   return { text: "", attachments: [], version: 0, textVersion: 0, pending: null, error: "" };
 }
 
-export function reconcileSubmittedComposer(cur, snapshot) {
-  const removed = [];
-  const keptAttachments = [];
+export function reconcileSubmittedComposer(
+  cur: ComposerDraft,
+  snapshot: SubmittedComposerSnapshot
+): { next: ComposerDraft; removed: ComposerAttachment[] } {
+  const removed: ComposerAttachment[] = [];
+  const keptAttachments: ComposerAttachment[] = [];
   for (const a of cur.attachments || []) {
     if (snapshot.attachmentIds?.has(a.id)) removed.push(a);
     else keptAttachments.push(a);
@@ -28,8 +48,8 @@ export function reconcileSubmittedComposer(cur, snapshot) {
   };
 }
 
-export function buildContentBlocks(draft) {
-  const blocks = [];
+export function buildContentBlocks(draft: ComposerDraft): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
   if (draft.text.trim()) blocks.push({ type: "text", text: draft.text });
   for (const a of draft.attachments) {
     blocks.push({ type: a.kind, attachment_id: a.id });
@@ -37,16 +57,16 @@ export function buildContentBlocks(draft) {
   return blocks;
 }
 
-export function mergeItems(prev, incoming) {
+export function mergeItems(prev: HistoryItem[], incoming: HistoryItem[]): HistoryItem[] {
   if (!incoming || incoming.length === 0) return prev;
-  const byId = new Map();
+  const byId = new Map<number, HistoryItem>();
   for (const item of prev) byId.set(item.id, item);
   for (const item of incoming) byId.set(item.id, item);
   return [...byId.values()].sort((a, b) => a.id - b.id);
 }
 
-export function applyDraftStarted(prev, ev) {
-  const base =
+export function applyDraftStarted(prev: ActiveDraft | null, ev: DraftStartedEvent): ActiveDraft {
+  const base: ActiveDraft =
     prev && prev.llm_call_id === ev.llm_call_id
       ? prev
       : { llm_call_id: ev.llm_call_id, items: [] };
@@ -64,14 +84,15 @@ export function applyDraftStarted(prev, ev) {
   return { llm_call_id: base.llm_call_id, items };
 }
 
-export function applyDraftDelta(prev, ev) {
-  const base =
+export function applyDraftDelta(prev: ActiveDraft | null, ev: DraftDeltaEvent): ActiveDraft {
+  const base: ActiveDraft =
     prev && prev.llm_call_id === ev.llm_call_id
       ? prev
       : { llm_call_id: ev.llm_call_id, items: [] };
   const idx = base.items.findIndex((x) => x.output_index === ev.output_index);
   const items = [...base.items];
-  const field = ev.field === "reasoning" || ev.field === "arguments" ? ev.field : "text";
+  const field: "text" | "reasoning" | "arguments" =
+    ev.field === "reasoning" || ev.field === "arguments" ? ev.field : "text";
   if (idx === -1) {
     const kind = field === "arguments" ? "function_call" : field === "reasoning" ? "reasoning" : "message";
     items.push({
@@ -92,9 +113,12 @@ export function applyDraftDelta(prev, ev) {
   return { llm_call_id: base.llm_call_id, items };
 }
 
-export function dropDraftForSaved(prev, item) {
+export function dropDraftForSaved(
+  prev: ActiveDraft | null,
+  item: HistoryItem
+): { next: ActiveDraft | null; droppedIndex: number | null } {
   if (!prev) return { next: null, droppedIndex: null };
-  let droppedIndex = null;
+  let droppedIndex: number | null = null;
   const items = prev.items.filter((d) => {
     if (droppedIndex !== null) return true;
     if (item.kind === "function_call" && d.kind === "function_call" && d.call_id === item.payload?.call_id) {
@@ -114,7 +138,7 @@ export function dropDraftForSaved(prev, item) {
   return { next: items.length ? { ...prev, items } : null, droppedIndex };
 }
 
-export function createMcpForm(s = null) {
+export function createMcpForm(s: McpServerInfo | null = null): McpFormState {
   if (!s) {
     return {
       id: null,
@@ -172,15 +196,15 @@ export function createMcpForm(s = null) {
   };
 }
 
-function sameAllowedTools(a, b) {
+function sameAllowedTools(a: string[] | null, b: string[] | null): boolean {
   if (a === null || b === null) return a === b;
   if (a.length !== b.length) return false;
   const setB = new Set(b);
   return a.every((x) => setB.has(x));
 }
 
-export function buildMcpPayload(f) {
-  let nextAllowed = null;
+export function buildMcpPayload(f: McpFormState): Record<string, unknown> {
+  let nextAllowed: string[] | null = null;
   if (f.toolPolicy === "none") {
     nextAllowed = [];
   } else if (f.toolPolicy === "allowlist") {
@@ -199,8 +223,8 @@ export function buildMcpPayload(f) {
     throw new Error("Timeout must be a positive integer.");
   }
 
-  if (!f.id) {
-    const body = {
+  if (!f.id || !f.orig) {
+    const body: Record<string, unknown> = {
       name: f.name,
       description: f.description,
       enabled: f.enabled,
@@ -224,7 +248,7 @@ export function buildMcpPayload(f) {
   }
 
   const orig = f.orig;
-  const body = {};
+  const body: Record<string, unknown> = {};
   if (f.description !== orig.description) body.description = f.description;
   if (f.enabled !== orig.enabled) body.enabled = f.enabled;
   if (timeoutNum !== orig.timeout_ms) body.timeout_ms = timeoutNum;
@@ -271,32 +295,42 @@ export function buildMcpPayload(f) {
   return body;
 }
 
-export function applySessionEvent(list, name, data) {
+export type SessionDeltaPayload = SessionInfo | SessionStatusEvent | SessionDeletedEvent;
+
+export function applySessionEvent(
+  list: SessionInfo[],
+  name: string,
+  data: SessionDeltaPayload
+): SessionInfo[] {
   if (name === "session.created") {
-    return list.some((s) => s.id === data.id) ? list : [...list, data];
+    const created = data as SessionInfo;
+    return list.some((s) => s.id === created.id) ? list : [...list, created];
   }
   if (name === "session.updated") {
-    return list.map((s) => (s.id === data.id ? data : s));
+    const updated = data as SessionInfo;
+    return list.map((s) => (s.id === updated.id ? updated : s));
   }
   if (name === "session.status") {
+    const st = data as SessionStatusEvent;
     return list.map((s) =>
-      s.id === data.id
+      s.id === st.id
         ? {
             ...s,
-            status: data.status,
-            last_error: data.reason || "",
-            updated_at: data.updated_at ?? s.updated_at,
+            status: st.status,
+            last_error: st.reason || "",
+            updated_at: st.updated_at ?? s.updated_at,
           }
         : s
     );
   }
   if (name === "session.deleted") {
-    return list.filter((s) => s.id !== data.id);
+    const del = data as SessionDeletedEvent;
+    return list.filter((s) => s.id !== del.id);
   }
   return list;
 }
 
-export function applyLocalPatch(list, updated) {
+export function applyLocalPatch(list: SessionInfo[], updated: SessionInfo): SessionInfo[] {
   return list.map((s) => {
     if (s.id !== updated.id) return s;
     if (
@@ -310,8 +344,60 @@ export function applyLocalPatch(list, updated) {
   });
 }
 
+function sameSession(a: SessionInfo, b: SessionInfo): boolean {
+  return (
+    a.id === b.id &&
+    a.title === b.title &&
+    a.status === b.status &&
+    a.model_id === b.model_id &&
+    a.reasoning_effort === b.reasoning_effort &&
+    a.last_error === b.last_error &&
+    a.updated_at === b.updated_at
+  );
+}
+
+type TimerId = ReturnType<typeof setTimeout>;
+type ScheduleFn = (fn: () => void, ms: number) => TimerId;
+type CancelScheduleFn = (id: TimerId) => void;
+
+interface BufferedSessionEvent {
+  name: string;
+  data: SessionDeltaPayload;
+}
+
+export interface GlobalSessionSyncOptions {
+  fetchSessions: () => Promise<SessionInfo[]>;
+  fetchSession?: (id: number) => Promise<SessionInfo>;
+  getSession?: (id: number) => SessionInfo | undefined;
+  onSnapshot: (merged: SessionInfo[]) => void;
+  onDelta: (name: string, data: SessionDeltaPayload) => void;
+  onLocalPatchApplied?: (updated: SessionInfo) => void;
+  onDeleted?: (id: number) => void;
+  onError?: (msg: string) => void;
+  schedule?: ScheduleFn;
+  cancelSchedule?: CancelScheduleFn;
+}
+
+export interface GlobalSessionSync {
+  sync: () => Promise<void>;
+  onEvent: {
+    (name: "session.created" | "session.updated", data: SessionInfo): void;
+    (name: "session.status", data: SessionStatusEvent): void;
+    (name: "session.deleted", data: SessionDeletedEvent): void;
+    (name: string, data: SessionDeltaPayload): void;
+  };
+  onLocalCreated: (session: SessionInfo) => boolean;
+  onLocalPatch: (updated: SessionInfo, baseVersion: number) => boolean;
+  refreshSession: (id: number) => Promise<void>;
+  getSessionVersion: (id: number) => number;
+  touchSession: (id: number | null | undefined) => void;
+  dispose: () => void;
+}
+
 export function createGlobalSessionSync({
   fetchSessions,
+  fetchSession,
+  getSession,
   onSnapshot,
   onDelta,
   onLocalPatchApplied,
@@ -319,30 +405,33 @@ export function createGlobalSessionSync({
   onError,
   schedule = setTimeout,
   cancelSchedule = clearTimeout,
-}) {
+}: GlobalSessionSyncOptions): GlobalSessionSync {
   let disposed = false;
   let latestSeq = 0;
-  let activeBuffer = null;
-  let retryTimer = null;
+  let activeBuffer: { seq: number; events: BufferedSessionEvent[] } | null = null;
+  let retryTimer: TimerId | null = null;
   let retryDelay = 1000;
   let versionCounter = 0;
   let snapshotVersion = 0;
-  const sessionVersions = new Map();
-  const deletedIds = new Set();
+  const sessionVersions = new Map<number, number>();
+  const deletedIds = new Set<number>();
+  const refreshSeqById = new Map<number, number>();
 
-  const getSessionVersion = (id) => Math.max(snapshotVersion, sessionVersions.get(id) || 0);
-  const touchSession = (id) => {
+  const getSessionVersion = (id: number): number =>
+    Math.max(snapshotVersion, sessionVersions.get(id) || 0);
+
+  const touchSession = (id: number | null | undefined): void => {
     if (id != null) sessionVersions.set(id, ++versionCounter);
   };
 
-  const clearRetry = () => {
+  const clearRetry = (): void => {
     if (retryTimer !== null) {
       cancelSchedule(retryTimer);
       retryTimer = null;
     }
   };
 
-  const sync = async () => {
+  const sync = async (): Promise<void> => {
     if (disposed) return;
     clearRetry();
     const mySeq = ++latestSeq;
@@ -357,7 +446,7 @@ export function createGlobalSessionSync({
       sessionVersions.clear();
       let merged = list;
       for (const ev of buffered) {
-        if (ev.name === "session.deleted") deletedIds.add(ev.data.id);
+        if (ev.name === "session.deleted") deletedIds.add((ev.data as SessionDeletedEvent).id);
         merged = applySessionEvent(merged, ev.name, ev.data);
       }
       onError?.("");
@@ -365,47 +454,77 @@ export function createGlobalSessionSync({
     } catch (err) {
       if (disposed || mySeq !== latestSeq) return;
       activeBuffer = null;
-      onError?.(err?.message || String(err));
+      onError?.(errorMessage(err));
       const delay = retryDelay;
       retryDelay = Math.min(retryDelay * 2, 8000);
       retryTimer = schedule(() => {
         retryTimer = null;
-        sync();
+        void sync();
       }, delay);
     }
   };
 
-  const onEvent = (name, data) => {
+  const onEvent = (name: string, data: SessionDeltaPayload): void => {
     if (disposed) return;
-    touchSession(data?.id);
-    if (name === "session.deleted" && data?.id != null) {
-      deletedIds.add(data.id);
+    const id = data?.id;
+    touchSession(id);
+    if (name === "session.deleted" && id != null) {
+      deletedIds.add(id);
     }
     if (activeBuffer !== null) {
       activeBuffer.events.push({ name, data });
     }
-    if (name === "session.deleted") {
-      onDeleted?.(data.id);
+    if (name === "session.deleted" && id != null) {
+      onDeleted?.(id);
     }
     onDelta(name, data);
   };
 
-  const onLocalCreated = (session) => {
+  const refreshSession = async (id: number): Promise<void> => {
+    if (disposed || !fetchSession || deletedIds.has(id)) return;
+    if (getSession && !getSession(id)) return;
+    const myRefreshSeq = (refreshSeqById.get(id) ?? 0) + 1;
+    refreshSeqById.set(id, myRefreshSeq);
+    const startVersion = getSessionVersion(id);
+    try {
+      const fresh = await fetchSession(id);
+      if (disposed || deletedIds.has(id)) return;
+      if (refreshSeqById.get(id) !== myRefreshSeq) return;
+      if (getSessionVersion(id) !== startVersion) return;
+      if (getSession && !getSession(id)) return;
+      touchSession(id);
+      if (onLocalPatchApplied) onLocalPatchApplied(fresh);
+      else onDelta("session.updated", fresh);
+    } catch (err) {
+      if (disposed || refreshSeqById.get(id) !== myRefreshSeq) return;
+      if ((err as { status?: number })?.status === 404) {
+        onEvent("session.deleted", { id });
+      }
+    }
+  };
+
+  const onLocalCreated = (session: SessionInfo): boolean => {
     if (disposed || deletedIds.has(session.id)) return false;
     onEvent("session.created", session);
     return true;
   };
 
-  const onLocalPatch = (updated, baseVersion) => {
+  const onLocalPatch = (updated: SessionInfo, baseVersion: number): boolean => {
     if (disposed || deletedIds.has(updated.id)) return false;
-    if (getSessionVersion(updated.id) !== baseVersion) return false;
-    touchSession(updated.id);
-    if (onLocalPatchApplied) onLocalPatchApplied(updated);
-    else onDelta("session.updated", updated);
-    return true;
+    const existing = getSession?.(updated.id);
+    if (getSession && !existing) return false;
+    if (getSessionVersion(updated.id) === baseVersion) {
+      touchSession(updated.id);
+      if (onLocalPatchApplied) onLocalPatchApplied(updated);
+      else onDelta("session.updated", updated);
+      return true;
+    }
+    if (existing && sameSession(existing, updated)) return false;
+    void refreshSession(updated.id);
+    return false;
   };
 
-  const dispose = () => {
+  const dispose = (): void => {
     disposed = true;
     clearRetry();
     activeBuffer = null;
@@ -416,10 +535,30 @@ export function createGlobalSessionSync({
     onEvent,
     onLocalCreated,
     onLocalPatch,
+    refreshSession,
     getSessionVersion,
     touchSession,
     dispose,
   };
+}
+
+export interface SessionSyncOptions {
+  fetchInitial: () => Promise<HistoryItem[]>;
+  fetchAfter: (afterId: number) => Promise<HistoryItem[]>;
+  onItems: (items: HistoryItem[]) => void;
+  onHasMore: (hasMore: boolean) => void;
+  onSidecars?: () => Promise<void> | void;
+  onError?: (msg: string) => void;
+  schedule?: ScheduleFn;
+  cancelSchedule?: CancelScheduleFn;
+}
+
+export interface SessionSync {
+  onReady: () => void;
+  onResync: () => void;
+  onLiveItem: (item: HistoryItem) => void;
+  dispose: () => void;
+  getState: () => { initialLoaded: boolean; syncedThroughId: number; gapOpen: boolean };
 }
 
 export function createSessionSync({
@@ -431,31 +570,31 @@ export function createSessionSync({
   onError,
   schedule = setTimeout,
   cancelSchedule = clearTimeout,
-}) {
+}: SessionSyncOptions): SessionSync {
   let disposed = false;
   let initialLoaded = false;
   let syncedThroughId = 0;
   let gapOpen = false;
   let inFlight = false;
   let runAgain = false;
-  let retryTimer = null;
+  let retryTimer: TimerId | null = null;
   let retryDelay = 1000;
 
-  const clearRetry = () => {
+  const clearRetry = (): void => {
     if (retryTimer !== null) {
       cancelSchedule(retryTimer);
       retryTimer = null;
     }
   };
 
-  const triggerSidecars = () => {
+  const triggerSidecars = (): void => {
     if (!onSidecars) return;
     Promise.resolve()
       .then(() => onSidecars())
       .catch(() => {});
   };
 
-  const runSync = async () => {
+  const runSync = async (): Promise<void> => {
     if (disposed) return;
     if (inFlight) {
       runAgain = true;
@@ -496,41 +635,41 @@ export function createSessionSync({
     } catch (e) {
       if (disposed) return;
       if (initialLoaded) gapOpen = true;
-      onError?.(e?.message || String(e));
+      onError?.(errorMessage(e));
       shouldScheduleRetry = !runAgain;
     } finally {
       inFlight = false;
       if (runAgain && !disposed) {
         runAgain = false;
-        runSync();
+        void runSync();
       } else if (shouldScheduleRetry && !disposed) {
         const delay = retryDelay;
         retryDelay = Math.min(retryDelay * 2, 8000);
         retryTimer = schedule(() => {
           retryTimer = null;
-          runSync();
+          void runSync();
         }, delay);
       }
     }
   };
 
-  const onReady = () => {
+  const onReady = (): void => {
     if (disposed) return;
     gapOpen = true;
     retryDelay = 1000;
     clearRetry();
-    runSync();
+    void runSync();
   };
 
-  const onResync = () => {
+  const onResync = (): void => {
     if (disposed) return;
     gapOpen = true;
     retryDelay = 1000;
     clearRetry();
-    runSync();
+    void runSync();
   };
 
-  const onLiveItem = (item) => {
+  const onLiveItem = (item: HistoryItem): void => {
     if (disposed) return;
     onItems([item]);
     if (initialLoaded && !gapOpen && typeof item?.id === "number") {
@@ -538,7 +677,7 @@ export function createSessionSync({
     }
   };
 
-  const dispose = () => {
+  const dispose = (): void => {
     disposed = true;
     clearRetry();
   };

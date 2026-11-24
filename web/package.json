@@ -3,9 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "bun run build.mjs"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && bun run build.mjs"
   },
   "dependencies": {
     "preact": "11.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
   }
 }

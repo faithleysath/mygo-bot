@@ -1,0 +1,272 @@
+export type Theme = "light" | "dark";
+export type SseStatus = "open" | "reconnecting";
+export type SessionStatus = "idle" | "running" | "pausing" | "paused";
+
+export interface SessionInfo {
+  id: number;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  status: SessionStatus;
+  reasoning_effort: string | null;
+  last_error: string;
+  model_id: number | null;
+}
+
+export interface SessionStatusEvent {
+  id?: number;
+  status: SessionStatus;
+  reason?: string;
+  updated_at?: number;
+}
+
+export interface SessionDeletedEvent {
+  id: number;
+}
+
+export interface AppConfig {
+  default_model_id: number | null;
+  default_reasoning_effort: string | null;
+}
+
+export interface ProviderInfo {
+  id: number;
+  name: string;
+  base_url: string;
+  has_api_key: boolean;
+  archived_at: number | null;
+}
+
+export interface ModelInfo {
+  id: number;
+  provider_id: number;
+  model_key: string;
+  context_window_tokens: number | null;
+  input_modalities: string[];
+  reasoning_efforts: string[];
+  pricing: Record<string, unknown> | null;
+  archived_at: number | null;
+  provider_archived_at: number | null;
+}
+
+export type McpTransport = "streamable-http" | "stdio";
+export type McpToolPolicy = "all" | "none" | "allowlist";
+export type McpSecretAction = "keep" | "replace" | "clear";
+export type McpOAuthAction = "keep" | "replace" | "disable";
+
+export interface McpServerInfo {
+  id: number;
+  name: string;
+  description: string;
+  enabled: boolean;
+  transport: McpTransport;
+  url: string | null;
+  has_url_query: boolean;
+  has_headers: boolean;
+  has_oauth: boolean;
+  command: string | null;
+  arg_count: number;
+  has_env: boolean;
+  cwd: string | null;
+  allowed_tools: string[] | null;
+  timeout_ms: number;
+  revision: number;
+}
+
+export interface McpFormState {
+  id: number | null;
+  orig: McpServerInfo | null;
+  name: string;
+  description: string;
+  enabled: boolean;
+  transport: McpTransport;
+  url: string;
+  replaceUrl: boolean;
+  headersAction: McpSecretAction;
+  headersJson: string;
+  oauthAction: McpOAuthAction;
+  oauthJson: string;
+  command: string;
+  argsAction: McpSecretAction;
+  argsText: string;
+  envAction: McpSecretAction;
+  envJson: string;
+  cwd: string;
+  toolPolicy: McpToolPolicy;
+  allowedTools: string[];
+  newAllowedTool: string;
+  timeout_ms: number | string;
+}
+
+export interface McpProbeListSummary {
+  operation: string;
+  count: number;
+  has_more: boolean;
+}
+
+export interface McpProbeResult {
+  id: number;
+  revision: number;
+  ok: boolean;
+  stage: string;
+  elapsed_ms: number;
+  protocol_version: string | null;
+  lists: McpProbeListSummary[];
+  error: string | null;
+}
+
+export interface McpOAuthStatusResponse {
+  status: string;
+}
+
+export interface McpOAuthLoginInfo {
+  authorization_url: string;
+}
+
+export interface CallsSummary {
+  call_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  input_uncached_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  output_tokens: number;
+  cost_nano_usd: number;
+  unpriced_succeeded_count: number;
+  last_input_tokens: number | null;
+}
+
+export interface LlmCallInfo {
+  id: number;
+  session_id: number | null;
+  model_id: number;
+  reasoning_effort: string | null;
+  input_end_position: number | null;
+  started_at: number;
+  finished_at: number | null;
+  status: string;
+  upstream_response_id: string | null;
+  http_status: number | null;
+  error_summary: string | null;
+  input_uncached_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  output_tokens: number | null;
+  cost_nano_usd: number | null;
+}
+
+export interface ContentBlock {
+  type?: string;
+  text?: string;
+  refusal?: string;
+  attachment_id?: number;
+  [k: string]: unknown;
+}
+
+export type HistoryPayload = {
+  content?: string | ContentBlock[];
+  name?: string;
+  call_id?: string;
+  arguments?: string;
+  output?: string | ContentBlock[];
+  summary?: Array<{ text?: string }>;
+  task_id?: string;
+  event?: string;
+  sequence?: number;
+  [k: string]: unknown;
+};
+
+export interface HistoryItem {
+  id: number;
+  kind: string;
+  payload: HistoryPayload;
+  target_id: number | null;
+  llm_call_id: number | null;
+}
+
+export interface DraftItem {
+  output_index: number;
+  kind: string;
+  name: string | null;
+  call_id: string | null;
+  text: string;
+  reasoning: string;
+  arguments: string;
+}
+
+export interface ActiveDraft {
+  llm_call_id: number;
+  items: DraftItem[];
+}
+
+export interface DraftStartedEvent {
+  llm_call_id: number;
+  output_index: number;
+  kind?: string;
+  name?: string | null;
+  call_id?: string | null;
+}
+
+export interface DraftDeltaEvent {
+  llm_call_id: number;
+  output_index: number;
+  field: "text" | "reasoning" | "arguments" | string;
+  delta?: string;
+}
+
+export interface RetryNotice {
+  attempt: number;
+  reason: string;
+}
+
+export interface RunningCommand {
+  id: number;
+  program: string;
+  args?: string[];
+  stdout?: string;
+  stderr?: string;
+}
+
+export interface ActiveTask {
+  id: string;
+  label?: string;
+  delivery: string;
+  remaining_seconds?: number | null;
+  state?: string;
+  running_commands?: RunningCommand[];
+  console?: {
+    total_bytes?: number;
+    truncated?: boolean;
+    output?: string;
+  };
+}
+
+export type MediaKind = "image" | "audio" | "video";
+
+export interface ComposerAttachment {
+  id: number;
+  kind: MediaKind;
+  name: string;
+  preview: string | null;
+}
+
+export interface ComposerPending {
+  key: string;
+  contentJson: string;
+}
+
+export interface ComposerDraft {
+  text: string;
+  attachments: ComposerAttachment[];
+  version: number;
+  textVersion: number;
+  pending: ComposerPending | null;
+  error: string;
+}
+
+export interface SubmittedComposerSnapshot {
+  key: string;
+  version: number;
+  textVersion: number;
+  attachmentIds: Set<number>;
+}

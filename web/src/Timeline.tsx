@@ -1,16 +1,21 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { fetchMediaUrl } from "./api.js";
-import { Markdown } from "./markdown.jsx";
+import { errorMessage, fetchMediaUrl } from "./api.ts";
+import { Markdown } from "./markdown.tsx";
+import type { ActiveDraft, ContentBlock, HistoryItem, MediaKind, RetryNotice, SessionInfo } from "./types.ts";
 
-function AuthMedia({ kind, attachmentId }) {
-  const [url, setUrl] = useState(null);
+function AuthMedia({ kind, attachmentId }: { kind: MediaKind; attachmentId: number }) {
+  const [url, setUrl] = useState<string | null>(null);
   const [err, setErr] = useState("");
 
   useEffect(() => {
     let alive = true;
     fetchMediaUrl(attachmentId)
-      .then((u) => alive && setUrl(u))
-      .catch((e) => alive && setErr(e.message));
+      .then((u) => {
+        if (alive) setUrl(u);
+      })
+      .catch((e) => {
+        if (alive) setErr(errorMessage(e));
+      });
     return () => {
       alive = false;
     };
@@ -24,7 +29,13 @@ function AuthMedia({ kind, attachmentId }) {
   return null;
 }
 
-function ContentBlocks({ blocks, markdown = false }) {
+function ContentBlocks({
+  blocks,
+  markdown = false,
+}: {
+  blocks: string | ContentBlock[] | undefined;
+  markdown?: boolean;
+}) {
   if (typeof blocks === "string") {
     return markdown ? <Markdown text={blocks} /> : <pre class="plain-pre">{blocks}</pre>;
   }
@@ -56,24 +67,32 @@ function ContentBlocks({ blocks, markdown = false }) {
   );
 }
 
-function tryJson(str) {
+function tryJson(str: unknown): Record<string, unknown> | null {
   if (typeof str !== "string") return null;
   try {
-    return JSON.parse(str);
+    const parsed = JSON.parse(str);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
 }
 
-function ToolCard({ callItem, outputItem }) {
+function ToolCard({ callItem, outputItem }: { callItem: HistoryItem; outputItem?: HistoryItem }) {
   const payload = callItem.payload || {};
   const args = tryJson(payload.arguments);
   const name = payload.name || "tool";
-  const label = args?.label || (args?.id ? String(args.id) : "");
+  const label =
+    typeof args?.label === "string"
+      ? args.label
+      : args?.id != null
+        ? String(args.id)
+        : "";
 
   const rawOut = outputItem?.payload?.output;
-  let summary = null;
-  let extraBlocks = null;
+  let summary: Record<string, unknown> | null = null;
+  let extraBlocks: ContentBlock[] | null = null;
   if (typeof rawOut === "string") {
     summary = tryJson(rawOut);
   } else if (Array.isArray(rawOut) && rawOut.length > 0) {
@@ -82,17 +101,22 @@ function ToolCard({ callItem, outputItem }) {
   }
 
   let status = outputItem ? "done" : "running";
-  if (summary?.status) status = summary.status;
+  if (typeof summary?.status === "string") status = summary.status;
   else if (summary?.delivery === "background") status = "background";
 
-  const code = args?.code || args?.trigger_code || null;
+  const code =
+    typeof args?.code === "string"
+      ? args.code
+      : typeof args?.trigger_code === "string"
+        ? args.trigger_code
+        : null;
 
   return (
     <details class="card tool-card">
       <summary class="card-head">
         <span class="mono">{name}</span>
         {label && <span class="muted truncate">{label}</span>}
-        {summary?.id && <span class="pill">{summary.id}</span>}
+        {summary?.id != null && <span class="pill">{String(summary.id)}</span>}
         <span class={`pill pill-${status}`}>{status}</span>
       </summary>
       <div class="card-body">
@@ -104,8 +128,12 @@ function ToolCard({ callItem, outputItem }) {
         {outputItem && (
           <div class="tool-out">
             <div class="section-label">Result</div>
-            {summary?.error && <div class="err-inline">{summary.error}</div>}
-            {summary?.output && <pre class="code-box">{summary.output}</pre>}
+            {typeof summary?.error === "string" && summary.error && (
+              <div class="err-inline">{summary.error}</div>
+            )}
+            {typeof summary?.output === "string" && summary.output && (
+              <pre class="code-box">{summary.output}</pre>
+            )}
             {extraBlocks && <ContentBlocks blocks={extraBlocks} />}
             {!summary && !extraBlocks && (
               <pre class="code-box">{typeof rawOut === "string" ? rawOut : JSON.stringify(rawOut, null, 2)}</pre>
@@ -117,15 +145,26 @@ function ToolCard({ callItem, outputItem }) {
   );
 }
 
-function ReasoningBlock({ item, streaming = false, text = "" }) {
+function ReasoningBlock({
+  item,
+  streaming = false,
+  text = "",
+}: {
+  item?: HistoryItem;
+  streaming?: boolean;
+  text?: string;
+}) {
   let body = text;
   if (!streaming && item) {
     const p = item.payload || {};
-    const parts = [];
-    for (const key of ["summary", "content"]) {
-      if (Array.isArray(p[key])) {
-        for (const chunk of p[key]) {
-          if (chunk?.text) parts.push(chunk.text);
+    const parts: string[] = [];
+    for (const key of ["summary", "content"] as const) {
+      const chunks = p[key];
+      if (Array.isArray(chunks)) {
+        for (const chunk of chunks) {
+          if (chunk && typeof chunk === "object" && "text" in chunk && typeof chunk.text === "string" && chunk.text) {
+            parts.push(chunk.text);
+          }
         }
       }
     }
@@ -143,7 +182,7 @@ function ReasoningBlock({ item, streaming = false, text = "" }) {
   );
 }
 
-function EventCard({ item }) {
+function EventCard({ item }: { item: HistoryItem }) {
   const p = item.payload || {};
   return (
     <div class="card event-card">
@@ -159,6 +198,18 @@ function EventCard({ item }) {
   );
 }
 
+export interface TimelineProps {
+  session: SessionInfo | null;
+  items: HistoryItem[];
+  hasMore: boolean;
+  loadingMore: boolean;
+  queuedIds: Set<number>;
+  draft: ActiveDraft | null;
+  retryNotice: RetryNotice | null;
+  onLoadMore: () => void;
+  onWithdraw: (mid: number) => void;
+}
+
 export function Timeline({
   session,
   items,
@@ -169,8 +220,8 @@ export function Timeline({
   retryNotice,
   onLoadMore,
   onWithdraw,
-}) {
-  const scrollRef = useRef(null);
+}: TimelineProps) {
+  const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const [showJump, setShowJump] = useState(false);
 
@@ -197,9 +248,9 @@ export function Timeline({
     setShowJump(false);
   };
 
-  const withdrawn = new Set();
-  const callsById = new Set();
-  const outputsByTarget = new Map();
+  const withdrawn = new Set<number>();
+  const callsById = new Set<number>();
+  const outputsByTarget = new Map<number, HistoryItem>();
 
   for (const item of items) {
     if (item.kind === "withdrawal" && item.target_id) withdrawn.add(item.target_id);

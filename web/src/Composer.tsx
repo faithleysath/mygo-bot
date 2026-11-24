@@ -1,10 +1,27 @@
+import type { TargetedClipboardEvent, TargetedDragEvent, TargetedKeyboardEvent } from "preact";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
+import type { ActiveTask, ComposerDraft, SessionInfo } from "./types.ts";
 
-function formatRem(sec) {
+function formatRem(sec: number | null | undefined): string {
   if (sec == null) return "";
   if (sec < 60) return `${sec}s`;
   if (sec < 3600) return `${Math.floor(sec / 60)}m`;
   return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
+}
+
+export interface ComposerProps {
+  session: SessionInfo;
+  draft: ComposerDraft;
+  uploading: boolean;
+  sending: boolean;
+  tasks: ActiveTask[];
+  queuedCount: number;
+  onChangeText: (sid: number, text: string) => void;
+  onUploadFiles: (sid: number, files: FileList | null) => void;
+  onRemoveAttachment: (sid: number, aid: number) => void;
+  onSubmit: (sid: number, startRun: boolean) => void;
+  onPause: (mode: "soft" | "hard") => void;
+  onKillTask: (tid: string) => void;
 }
 
 export function Composer({
@@ -20,15 +37,15 @@ export function Composer({
   onSubmit,
   onPause,
   onKillTask,
-}) {
+}: ComposerProps) {
   const [tasksOpen, setTasksOpen] = useState(false);
-  const fileRef = useRef(null);
-  const taRef = useRef(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
 
-  const running = session?.status === "running" || session?.status === "pausing";
-  const text = draft?.text || "";
-  const attachments = draft?.attachments || [];
-  const error = draft?.error || "";
+  const running = session.status === "running" || session.status === "pausing";
+  const text = draft.text || "";
+  const attachments = draft.attachments || [];
+  const error = draft.error || "";
   const hasPayload = Boolean(text.trim() || attachments.length > 0);
   const busy = uploading || sending;
 
@@ -37,9 +54,9 @@ export function Composer({
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  }, [session?.id, text]);
+  }, [session.id, text]);
 
-  const onKeyDown = (e) => {
+  const onKeyDown = (e: TargetedKeyboardEvent<HTMLTextAreaElement>) => {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -47,12 +64,12 @@ export function Composer({
     }
   };
 
-  const onPaste = (e) => {
+  const onPaste = (e: TargetedClipboardEvent<HTMLTextAreaElement>) => {
     const files = e.clipboardData?.files;
     if (files?.length) onUploadFiles(session.id, files);
   };
 
-  const onDrop = (e) => {
+  const onDrop = (e: TargetedDragEvent<HTMLDivElement>) => {
     e.preventDefault();
     if (e.dataTransfer?.files?.length) onUploadFiles(session.id, e.dataTransfer.files);
   };
@@ -127,7 +144,7 @@ export function Composer({
           rows={1}
           value={text}
           placeholder={running ? "Steer running session (queues for next step)…" : "Message MyGo… (Enter to send, Shift+Enter for newline)"}
-          onInput={(e) => onChangeText(session.id, e.target.value)}
+          onInput={(e) => onChangeText(session.id, e.currentTarget.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
         />
@@ -141,8 +158,8 @@ export function Composer({
               multiple
               hidden
               onChange={(e) => {
-                onUploadFiles(session.id, e.target.files);
-                e.target.value = "";
+                onUploadFiles(session.id, e.currentTarget.files);
+                e.currentTarget.value = "";
               }}
             />
             <button
@@ -197,14 +214,14 @@ export function Composer({
                 <button
                   type="button"
                   class="btn-primary btn-sm"
-                  disabled={busy || (!hasPayload && session?.status !== "paused" && queuedCount === 0)}
+                  disabled={busy || (!hasPayload && session.status !== "paused" && queuedCount === 0)}
                   onClick={() => onSubmit(session.id, true)}
                 >
                   {sending
                     ? "Sending…"
                     : hasPayload
                       ? "Send & Run"
-                      : session?.status === "paused"
+                      : session.status === "paused"
                         ? "Resume"
                         : "Run"}
                 </button>

@@ -1,3 +1,4 @@
+import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 
 const TABLE_SEP_RE = /^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
@@ -7,11 +8,13 @@ const HEADING_RE = /^(#{1,6})(?:\s+(.*)|\s*)$/;
 const UL_RE = /^\s*[-*+]\s+(.*)$/;
 const OL_RE = /^\s*\d+\.\s+(.*)$/;
 
-function isTableStart(line, nextLine) {
+type HeadingTag = "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
+
+function isTableStart(line: string, nextLine: string | undefined): boolean {
   return Boolean(line && nextLine && line.includes("|") && TABLE_SEP_RE.test(nextLine));
 }
 
-function isBlockStart(line, nextLine) {
+function isBlockStart(line: string, nextLine: string | undefined): boolean {
   if (!line.trim()) return true;
   return (
     FENCE_OPEN_RE.test(line) ||
@@ -24,7 +27,7 @@ function isBlockStart(line, nextLine) {
   );
 }
 
-function safeUrl(raw) {
+function safeUrl(raw: string): string | null {
   try {
     const u = new URL(raw, "https://invalid.local");
     if (["http:", "https:", "mailto:"].includes(u.protocol)) {
@@ -36,12 +39,12 @@ function safeUrl(raw) {
   return null;
 }
 
-function renderInline(text, keyPrefix) {
-  const nodes = [];
+function renderInline(text: string, keyPrefix: string): ComponentChildren[] {
+  const nodes: ComponentChildren[] = [];
   const pattern = /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(~~[^~\n]+?~~)|(\*[^*\n]+?\*)|(\[[^\]\n]+\]\([^)\s]+\))/g;
   let last = 0;
   let idx = 0;
-  let m;
+  let m: RegExpExecArray | null;
   while ((m = pattern.exec(text)) !== null) {
     if (m.index > last) nodes.push(text.slice(last, m.index));
     const tok = m[0];
@@ -74,7 +77,7 @@ function renderInline(text, keyPrefix) {
   return nodes;
 }
 
-function CodeBlock({ lang, code }) {
+function CodeBlock({ lang, code }: { lang: string; code: string }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
     try {
@@ -96,10 +99,10 @@ function CodeBlock({ lang, code }) {
   );
 }
 
-export function Markdown({ text }) {
+export function Markdown({ text }: { text: string }) {
   if (!text) return null;
   const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
-  const blocks = [];
+  const blocks: ComponentChildren[] = [];
   let i = 0;
 
   while (i < lines.length) {
@@ -112,7 +115,7 @@ export function Markdown({ text }) {
     const fence = line.match(FENCE_OPEN_RE);
     if (fence) {
       const lang = fence[1].trim().split(/\s+/)[0] || "";
-      const buf = [];
+      const buf: string[] = [];
       i += 1;
       while (i < lines.length && !lines[i].match(/^```\s*$/)) {
         buf.push(lines[i]);
@@ -125,7 +128,7 @@ export function Markdown({ text }) {
 
     const heading = line.match(HEADING_RE);
     if (heading) {
-      const Tag = `h${heading[1].length}`;
+      const Tag = `h${heading[1].length}` as HeadingTag;
       blocks.push(<Tag key={`b${i}`}>{renderInline(heading[2] || "", `h${i}`)}</Tag>);
       i += 1;
       continue;
@@ -138,7 +141,7 @@ export function Markdown({ text }) {
     }
 
     if (line.startsWith(">")) {
-      const q = [];
+      const q: string[] = [];
       while (i < lines.length && lines[i].startsWith(">")) {
         q.push(lines[i].replace(/^>\s?/, ""));
         i += 1;
@@ -152,7 +155,7 @@ export function Markdown({ text }) {
     }
 
     if (isTableStart(line, lines[i + 1])) {
-      const parseRow = (r) =>
+      const parseRow = (r: string): string[] =>
         r
           .trim()
           .replace(/^\|/, "")
@@ -161,7 +164,7 @@ export function Markdown({ text }) {
           .map((c) => c.trim());
       const head = parseRow(line);
       i += 2;
-      const rows = [];
+      const rows: string[][] = [];
       while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
         rows.push(parseRow(lines[i]));
         i += 1;
@@ -196,7 +199,7 @@ export function Markdown({ text }) {
     if (ulMatch || olMatch) {
       const ordered = Boolean(olMatch);
       const Tag = ordered ? "ol" : "ul";
-      const items = [];
+      const items: string[] = [];
       while (i < lines.length) {
         const m = ordered ? lines[i].match(OL_RE) : lines[i].match(UL_RE);
         if (!m) break;
@@ -213,7 +216,7 @@ export function Markdown({ text }) {
       continue;
     }
 
-    const para = [];
+    const para: string[] = [];
     do {
       para.push(lines[i]);
       i += 1;
