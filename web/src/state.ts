@@ -416,12 +416,34 @@ export function createGlobalSessionSync({
   const sessionVersions = new Map<number, number>();
   const deletedIds = new Set<number>();
   const refreshSeqById = new Map<number, number>();
+  const refreshRetryTimers = new Map<number, TimerId>();
+  const refreshRetryDelays = new Map<number, number>();
+
+  const clearRefreshRetry = (id: number): void => {
+    const timer = refreshRetryTimers.get(id);
+    if (timer !== undefined) {
+      cancelSchedule(timer);
+      refreshRetryTimers.delete(id);
+    }
+    refreshRetryDelays.delete(id);
+  };
+
+  const clearAllRefreshRetries = (): void => {
+    for (const timer of refreshRetryTimers.values()) {
+      cancelSchedule(timer);
+    }
+    refreshRetryTimers.clear();
+    refreshRetryDelays.clear();
+  };
 
   const getSessionVersion = (id: number): number =>
     Math.max(snapshotVersion, sessionVersions.get(id) || 0);
 
   const touchSession = (id: number | null | undefined): void => {
-    if (id != null) sessionVersions.set(id, ++versionCounter);
+    if (id != null) {
+      sessionVersions.set(id, ++versionCounter);
+      clearRefreshRetry(id);
+    }
   };
 
   const clearRetry = (): void => {
@@ -444,6 +466,7 @@ export function createGlobalSessionSync({
       retryDelay = 1000;
       snapshotVersion = ++versionCounter;
       sessionVersions.clear();
+      clearAllRefreshRetries();
       let merged = list;
       for (const ev of buffered) {
         if (ev.name === "session.deleted") deletedIds.add((ev.data as SessionDeletedEvent).id);
@@ -480,9 +503,15 @@ export function createGlobalSessionSync({
     onDelta(name, data);
   };
 
-  const refreshSession = async (id: number): Promise<void> => {
+  const runRefresh = async (id: number, isRetry: boolean): Promise<void> => {
     if (disposed || !fetchSession || deletedIds.has(id)) return;
     if (getSession && !getSession(id)) return;
+    const prevTimer = refreshRetryTimers.get(id);
+    if (prevTimer !== undefined) {
+      cancelSchedule(prevTimer);
+      refreshRetryTimers.delete(id);
+    }
+    if (!isRetry) refreshRetryDelays.delete(id);
     const myRefreshSeq = (refreshSeqById.get(id) ?? 0) + 1;
     refreshSeqById.set(id, myRefreshSeq);
     const startVersion = getSessionVersion(id);
@@ -497,11 +526,37 @@ export function createGlobalSessionSync({
       else onDelta("session.updated", fresh);
     } catch (err) {
       if (disposed || refreshSeqById.get(id) !== myRefreshSeq) return;
-      if ((err as { status?: number })?.status === 404) {
+      const status = (err as { status?: number })?.status;
+      if (status === 404) {
+        clearRefreshRetry(id);
         onEvent("session.deleted", { id });
+        return;
       }
+      const retryable = typeof status !== "number" || status >= 500;
+      if (
+        !retryable ||
+        deletedIds.has(id) ||
+        getSessionVersion(id) !== startVersion ||
+        (getSession && !getSession(id))
+      ) {
+        clearRefreshRetry(id);
+        return;
+      }
+      const delay = refreshRetryDelays.get(id) ?? 1000;
+      refreshRetryDelays.set(id, Math.min(delay * 2, 8000));
+      const timer = schedule(() => {
+        refreshRetryTimers.delete(id);
+        if (disposed || deletedIds.has(id)) return;
+        if (refreshSeqById.get(id) !== myRefreshSeq) return;
+        if (getSessionVersion(id) !== startVersion) return;
+        if (getSession && !getSession(id)) return;
+        void runRefresh(id, true);
+      }, delay);
+      refreshRetryTimers.set(id, timer);
     }
   };
+
+  const refreshSession = (id: number): Promise<void> => runRefresh(id, false);
 
   const onLocalCreated = (session: SessionInfo): boolean => {
     if (disposed || deletedIds.has(session.id)) return false;
@@ -527,6 +582,7 @@ export function createGlobalSessionSync({
   const dispose = (): void => {
     disposed = true;
     clearRetry();
+    clearAllRefreshRetries();
     activeBuffer = null;
   };
 
