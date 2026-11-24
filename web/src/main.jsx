@@ -17,10 +17,14 @@ import { Sidebar } from "./Sidebar.jsx";
 import {
   applyDraftDelta,
   applyDraftStarted,
+  applySessionEvent,
   buildContentBlocks,
+  createGlobalSessionSync,
+  createSessionSync,
   dropDraftForSaved,
   emptyComposer,
   mergeItems,
+  reconcileSubmittedComposer,
 } from "./state.js";
 import { Timeline } from "./Timeline.jsx";
 
@@ -212,8 +216,7 @@ function App() {
   composersRef.current = composers;
   const sendingRef = useRef({});
   sendingRef.current = sendingBySid;
-  const lastItemIdRef = useRef(0);
-  lastItemIdRef.current = items.length ? items[items.length - 1].id : 0;
+  const globalSyncRef = useRef(null);
 
   const updateComposer = (sid, fn) => {
     setComposers((prev) => {
@@ -259,7 +262,7 @@ function App() {
       });
   }, []);
 
-  const loadSessions = async () => {
+  const fetchAllSessions = async () => {
     const all = [];
     let after = 0;
     while (true) {
@@ -268,7 +271,6 @@ function App() {
       if (page.length < 200) break;
       after = page[page.length - 1].id;
     }
-    setSessions(all);
     return all;
   };
 
@@ -286,49 +288,65 @@ function App() {
   useEffect(() => {
     if (!authed) return;
     let alive = true;
-    Promise.all([loadCatalog(), loadSessions()])
-      .then(([, list]) => {
+    let selectedInitial = false;
+    loadCatalog().catch((e) => alive && setBannerErr(e.message));
+
+    const sync = createGlobalSessionSync({
+      fetchSessions: fetchAllSessions,
+      onSnapshot: (merged) => {
         if (!alive) return;
-        let saved = null;
-        try {
-          saved = Number(localStorage.getItem("mygo_sid")) || null;
-        } catch {}
-        const chosen = list.find((s) => s.id === saved) || [...list].sort((a, b) => b.updated_at - a.updated_at)[0];
-        if (chosen) setActiveId(chosen.id);
-      })
-      .catch((e) => alive && setBannerErr(e.message));
+        setSessions(merged);
+        if (!selectedInitial) {
+          selectedInitial = true;
+          if (activeIdRef.current == null) {
+            let saved = null;
+            try {
+              saved = Number(localStorage.getItem("mygo_sid")) || null;
+            } catch {}
+            const chosen =
+              merged.find((s) => s.id === saved) ||
+              [...merged].sort((a, b) => b.updated_at - a.updated_at)[0];
+            if (chosen) setActiveId(chosen.id);
+          }
+        } else if (activeIdRef.current != null && !merged.some((s) => s.id === activeIdRef.current)) {
+          cleanupComposer(activeIdRef.current);
+          setActiveId(null);
+        }
+      },
+      onDelta: (name, data) => {
+        if (alive) setSessions((prev) => applySessionEvent(prev, name, data));
+      },
+      onDeleted: (id) => {
+        if (!alive) return;
+        cleanupComposer(id);
+        setActiveId((cur) => (cur === id ? null : cur));
+      },
+      onError: (msg) => {
+        if (alive) setBannerErr(msg);
+      },
+    });
+    globalSyncRef.current = sync;
 
     const ctrl = new AbortController();
-    let seenGlobalReady = false;
     connectSse("/events", {
       signal: ctrl.signal,
       onEvent: (name, data) => {
-        if (name === "ready") {
-          if (seenGlobalReady) loadSessions().catch(() => {});
-          seenGlobalReady = true;
-        } else if (name === "session.created") {
-          setSessions((prev) => (prev.some((s) => s.id === data.id) ? prev : [...prev, data]));
-        } else if (name === "session.updated") {
-          setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
-        } else if (name === "session.status") {
-          setSessions((prev) =>
-            prev.map((s) =>
-              s.id === data.id
-                ? { ...s, status: data.status, last_error: data.reason || "", updated_at: data.updated_at ?? s.updated_at }
-                : s
-            )
-          );
-        } else if (name === "session.deleted") {
-          cleanupComposer(data.id);
-          setSessions((prev) => prev.filter((s) => s.id !== data.id));
-          setActiveId((cur) => (cur === data.id ? null : cur));
-        } else if (name === "resync") {
-          loadSessions().catch(() => {});
+        if (name === "ready" || name === "resync") {
+          sync.sync();
+        } else if (
+          name === "session.created" ||
+          name === "session.updated" ||
+          name === "session.status" ||
+          name === "session.deleted"
+        ) {
+          sync.onEvent(name, data);
         }
       },
     });
     return () => {
       alive = false;
+      sync.dispose();
+      if (globalSyncRef.current === sync) globalSyncRef.current = null;
       ctrl.abort();
     };
   }, [authed]);
@@ -370,20 +388,23 @@ function App() {
     setHasMore(false);
     setBannerErr("");
 
-    let initialLoaded = false;
     const closedCalls = new Set();
     const closedItems = new Set();
 
-    const catchUp = async (afterId) => {
-      let cursor = afterId;
-      while (activeIdRef.current === sid) {
-        const page = await apiFetch(`/sessions/${sid}/history?after=${cursor}&limit=200`);
-        if (activeIdRef.current !== sid || !page.length) break;
-        setItems((prev) => mergeItems(prev, page));
-        cursor = page[page.length - 1].id;
-        if (page.length < 200) break;
-      }
-    };
+    const sessionSync = createSessionSync({
+      fetchInitial: () => apiFetch(`/sessions/${sid}/history?tail=true&limit=50`),
+      fetchAfter: (afterId) => apiFetch(`/sessions/${sid}/history?after=${afterId}&limit=200`),
+      onItems: (page) => {
+        if (activeIdRef.current === sid) setItems((prev) => mergeItems(prev, page));
+      },
+      onHasMore: (more) => {
+        if (activeIdRef.current === sid) setHasMore(more);
+      },
+      onSidecars: () => refreshSessionSidecars(sid),
+      onError: (msg) => {
+        if (activeIdRef.current === sid) setBannerErr(msg);
+      },
+    });
 
     const ctrl = new AbortController();
     connectSse(`/sessions/${sid}/events`, {
@@ -395,23 +416,7 @@ function App() {
           setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
           setDraft(null);
           setRetryNotice(null);
-          if (!initialLoaded) {
-            initialLoaded = true;
-            Promise.all([
-              apiFetch(`/sessions/${sid}/history?tail=true&limit=50`),
-              refreshSessionSidecars(sid),
-            ])
-              .then(([hist]) => {
-                if (activeIdRef.current !== sid) return;
-                setItems((prev) => mergeItems(prev, hist));
-                setHasMore(hist.length === 50);
-              })
-              .catch((e) => activeIdRef.current === sid && setBannerErr(e.message));
-          } else {
-            Promise.all([catchUp(lastItemIdRef.current), refreshSessionSidecars(sid)]).catch(
-              () => {}
-            );
-          }
+          sessionSync.onReady();
         } else if (name === "stream.snapshot") {
           if (!closedCalls.has(data.llm_call_id)) {
             setDraft(data);
@@ -437,7 +442,7 @@ function App() {
           });
           setRetryNotice(data);
         } else if (name === "item.saved") {
-          setItems((prev) => mergeItems(prev, [data]));
+          sessionSync.onLiveItem(data);
           setDraft((prev) => {
             const { next, droppedIndex } = dropDraftForSaved(prev, data);
             if (droppedIndex !== null && data.llm_call_id != null) {
@@ -475,20 +480,22 @@ function App() {
         } else if (name === "session.updated") {
           setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
         } else if (name === "resync") {
-          Promise.all([
-            apiFetch(`/sessions/${sid}`).then((sess) => {
+          apiFetch(`/sessions/${sid}`)
+            .then((sess) => {
               if (activeIdRef.current === sid) {
                 setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
               }
-            }),
-            catchUp(lastItemIdRef.current),
-            refreshSessionSidecars(sid),
-          ]).catch(() => {});
+            })
+            .catch(() => {});
+          sessionSync.onResync();
         }
       },
     });
 
-    return () => ctrl.abort();
+    return () => {
+      sessionSync.dispose();
+      ctrl.abort();
+    };
   }, [authed, activeId]);
 
   const activeSession = useMemo(
@@ -517,7 +524,8 @@ function App() {
     setBannerErr("");
     try {
       const s = await apiFetch("/sessions", { method: "POST", body: {} });
-      setSessions((prev) => (prev.some((x) => x.id === s.id) ? prev : [...prev, s]));
+      if (globalSyncRef.current) globalSyncRef.current.onEvent("session.created", s);
+      else setSessions((prev) => applySessionEvent(prev, "session.created", s));
       setActiveId(s.id);
     } catch (e) {
       setBannerErr(e.message);
@@ -528,9 +536,13 @@ function App() {
     setBannerErr("");
     try {
       await apiFetch(`/sessions/${sid}`, { method: "DELETE" });
-      cleanupComposer(sid);
-      setSessions((prev) => prev.filter((s) => s.id !== sid));
-      if (activeId === sid) setActiveId(null);
+      if (globalSyncRef.current) {
+        globalSyncRef.current.onEvent("session.deleted", { id: sid });
+      } else {
+        cleanupComposer(sid);
+        setSessions((prev) => applySessionEvent(prev, "session.deleted", { id: sid }));
+        if (activeId === sid) setActiveId(null);
+      }
     } catch (e) {
       setBannerErr(e.message);
     }
@@ -540,7 +552,8 @@ function App() {
     setBannerErr("");
     try {
       const updated = await apiFetch(`/sessions/${sid}`, { method: "PATCH", body: patch });
-      setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
+      if (globalSyncRef.current) globalSyncRef.current.onEvent("session.updated", updated);
+      else setSessions((prev) => applySessionEvent(prev, "session.updated", updated));
     } catch (e) {
       setBannerErr(e.message);
     }
@@ -564,7 +577,14 @@ function App() {
   };
 
   const onChangeText = (sid, text) => {
-    updateComposer(sid, (c) => ({ ...c, text, pending: null, error: "" }));
+    updateComposer(sid, (c) => ({
+      ...c,
+      text,
+      version: (c.version ?? 0) + 1,
+      textVersion: (c.textVersion ?? 0) + 1,
+      pending: null,
+      error: "",
+    }));
   };
 
   const onRemoveAttachment = (sid, aid) => {
@@ -574,6 +594,7 @@ function App() {
       return {
         ...c,
         attachments: c.attachments.filter((a) => a.id !== aid),
+        version: (c.version ?? 0) + 1,
         pending: null,
         error: "",
       };
@@ -606,6 +627,7 @@ function App() {
         }
         updateComposer(targetSid, (c) => ({
           ...c,
+          version: (c.version ?? 0) + 1,
           pending: null,
           attachments: [
             ...c.attachments,
@@ -649,6 +671,12 @@ function App() {
 
     const contentJson = JSON.stringify(content);
     const key = cur.pending?.contentJson === contentJson ? cur.pending.key : makeIdempotencyKey();
+    const submitted = {
+      key,
+      version: cur.version ?? 0,
+      textVersion: cur.textVersion ?? 0,
+      attachmentIds: new Set(cur.attachments.map((a) => a.id)),
+    };
     updateComposer(targetSid, (c) => ({ ...c, pending: { key, contentJson }, error: "" }));
     setSendingBySid((prev) => ({ ...prev, [targetSid]: true }));
 
@@ -661,23 +689,27 @@ function App() {
         });
       } catch (e) {
         const clientRejected = e.status >= 400 && e.status < 500;
+        if (!sessionsRef.current.some((s) => s.id === targetSid)) return;
         updateComposer(targetSid, (c) => ({
           ...c,
-          pending: clientRejected ? null : c.pending,
+          pending: clientRejected && c.pending?.key === key ? null : c.pending,
           error: e.message,
         }));
         return;
       }
 
+      if (!sessionsRef.current.some((s) => s.id === targetSid)) return;
       updateComposer(targetSid, (c) => {
-        revokeAttachments(c.attachments);
-        return emptyComposer();
+        const { next, removed } = reconcileSubmittedComposer(c, submitted);
+        revokeAttachments(removed);
+        return next;
       });
 
       if (startRun) {
         try {
           await apiFetch(`/sessions/${targetSid}/run`, { method: "PUT" });
         } catch (e) {
+          if (!sessionsRef.current.some((s) => s.id === targetSid)) return;
           updateComposer(targetSid, (c) => ({
             ...c,
             error: `Message queued, but failed to start run: ${e.message}`,

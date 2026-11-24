@@ -1,6 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { apiFetch, formatCost, formatTokens } from "./api.js";
-import { buildMcpPayload } from "./state.js";
+import { buildMcpPayload, createMcpForm } from "./state.js";
 
 function ModelsTab({ config, providers, models, onRefresh }) {
   const [showArchived, setShowArchived] = useState(false);
@@ -348,6 +348,25 @@ function McpTab() {
 
   const editingSameTransport = form?.id && form.transport === form.orig?.transport;
 
+  const addAllowedTool = () => {
+    if (!form) return;
+    const name = form.newAllowedTool.trim();
+    if (!name) return;
+    setForm({
+      ...form,
+      allowedTools: form.allowedTools.includes(name) ? form.allowedTools : [...form.allowedTools, name],
+      newAllowedTool: "",
+    });
+  };
+
+  const removeAllowedTool = (name) => {
+    if (!form) return;
+    setForm({
+      ...form,
+      allowedTools: form.allowedTools.filter((x) => x !== name),
+    });
+  };
+
   return (
     <div class="tab-stack">
       {err && <div class="err-inline">{err}</div>}
@@ -356,31 +375,7 @@ function McpTab() {
         <button
           type="button"
           class="btn-primary btn-xs"
-          onClick={() =>
-            setForm({
-              id: null,
-              orig: null,
-              name: "",
-              description: "",
-              enabled: true,
-              transport: "streamable-http",
-              url: "",
-              replaceUrl: true,
-              headersAction: "keep",
-              headersJson: "",
-              oauthAction: "keep",
-              oauthJson: "",
-              command: "",
-              argsAction: "replace",
-              argsText: "",
-              envAction: "keep",
-              envJson: "",
-              cwd: "",
-              toolPolicy: "all",
-              allowedTools: "",
-              timeout_ms: 60000,
-            })
-          }
+          onClick={() => setForm(createMcpForm())}
         >
           + Server
         </button>
@@ -538,22 +533,46 @@ function McpTab() {
             </>
           )}
 
-          <div class="grid-2">
-            <label class="field">
-              <span>Tool Policy</span>
-              <select value={form.toolPolicy} onChange={(e) => setForm({ ...form, toolPolicy: e.target.value })}>
-                <option value="all">Allow all tools</option>
-                <option value="none">Deny all tools</option>
-                <option value="allowlist">Allow listed tools only</option>
-              </select>
-            </label>
-            {form.toolPolicy === "allowlist" && (
-              <label class="field">
-                <span>Allowed Tools (comma-separated)</span>
-                <input required value={form.allowedTools} onInput={(e) => setForm({ ...form, allowedTools: e.target.value })} />
-              </label>
-            )}
-          </div>
+          <label class="field">
+            <span>Tool Policy</span>
+            <select value={form.toolPolicy} onChange={(e) => setForm({ ...form, toolPolicy: e.target.value })}>
+              <option value="all">Allow all tools</option>
+              <option value="none">Deny all tools</option>
+              <option value="allowlist">Allow listed tools only</option>
+            </select>
+          </label>
+          {form.toolPolicy === "allowlist" && (
+            <div class="field">
+              <span>Allowed Tools (exact names)</span>
+              {form.allowedTools.length > 0 && (
+                <div class="attach-strip">
+                  {form.allowedTools.map((name) => (
+                    <div key={name} class="attach-chip tool-chip">
+                      <span class="mono">{name}</span>
+                      <button type="button" onClick={() => removeAllowedTool(name)}>×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div class="row gap-1">
+                <input
+                  placeholder="Exact tool name…"
+                  value={form.newAllowedTool}
+                  onInput={(e) => setForm({ ...form, newAllowedTool: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.isComposing) {
+                      e.preventDefault();
+                      addAllowedTool();
+                    }
+                  }}
+                  style="flex:1"
+                />
+                <button type="button" class="btn-ghost btn-xs" onClick={addAllowedTool}>
+                  + Add
+                </button>
+              </div>
+            </div>
+          )}
 
           <label class="check-row">
             <input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />
@@ -616,36 +635,7 @@ function McpTab() {
                 <button
                   type="button"
                   class="btn-ghost btn-xs"
-                  onClick={() =>
-                    setForm({
-                      id: s.id,
-                      orig: s,
-                      name: s.name,
-                      description: s.description,
-                      enabled: s.enabled,
-                      transport: s.transport,
-                      url: s.url || "",
-                      replaceUrl: false,
-                      headersAction: "keep",
-                      headersJson: "",
-                      oauthAction: "keep",
-                      oauthJson: "",
-                      command: s.command || "",
-                      argsAction: "keep",
-                      argsText: "",
-                      envAction: "keep",
-                      envJson: "",
-                      cwd: s.cwd || "",
-                      toolPolicy:
-                        s.allowed_tools === null
-                          ? "all"
-                          : s.allowed_tools.length === 0
-                            ? "none"
-                            : "allowlist",
-                      allowedTools: (s.allowed_tools || []).join(", "),
-                      timeout_ms: s.timeout_ms,
-                    })
-                  }
+                  onClick={() => setForm(createMcpForm(s))}
                 >
                   Edit
                 </button>

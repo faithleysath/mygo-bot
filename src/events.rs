@@ -132,7 +132,7 @@ impl Hub {
             }
         };
         let rx = tx.subscribe();
-        let snapshot_seq = NEXT_SEQ.load(Ordering::Acquire);
+        let min_seq = NEXT_SEQ.load(Ordering::Acquire);
         let snapshot = entry
             .draft
             .as_ref()
@@ -143,23 +143,7 @@ impl Hub {
                     "items": d.items.values().collect::<Vec<_>>(),
                 })
             });
-        (tx, rx, snapshot, snapshot_seq)
-    }
-
-    fn emit_ephemeral(
-        sessions: &Mutex<HashMap<i64, SessionStream>>,
-        sid: i64,
-        name: &'static str,
-        data: Value,
-    ) {
-        let map = sessions.lock().unwrap();
-        if let Some(tx) = map
-            .get(&sid)
-            .and_then(|s| s.tx.as_ref())
-            .and_then(|w| w.upgrade())
-        {
-            Notice::publish(&tx, name, data);
-        }
+        (tx, rx, snapshot, min_seq)
     }
 
     pub fn start_call(&self, sid: i64, llm_call_id: i64) {
@@ -278,30 +262,24 @@ impl Hub {
     }
 
     pub fn clear_call(&self, sid: i64, llm_call_id: i64, emit_clear: bool) {
-        let mut emit = false;
+        let mut sessions = self.0.sessions.lock().unwrap();
+        if let Some(entry) = sessions.get_mut(&sid)
+            && entry
+                .draft
+                .as_ref()
+                .is_some_and(|d| d.llm_call_id == llm_call_id)
         {
-            let mut sessions = self.0.sessions.lock().unwrap();
-            if let Some(entry) = sessions.get_mut(&sid)
-                && entry
-                    .draft
-                    .as_ref()
-                    .is_some_and(|d| d.llm_call_id == llm_call_id)
+            let old = entry.draft.take().unwrap();
+            if emit_clear
+                && !old.items.is_empty()
+                && let Some(tx) = entry.tx.as_ref().and_then(|w| w.upgrade())
             {
-                let old = entry.draft.take().unwrap();
-                emit = emit_clear && !old.items.is_empty();
+                Notice::publish(&tx, "stream.clear", json!({"llm_call_id": llm_call_id}));
             }
-            sessions.retain(|_, s| {
-                s.draft.is_some() || s.tx.as_ref().is_some_and(|w| w.strong_count() > 0)
-            });
         }
-        if emit {
-            Self::emit_ephemeral(
-                &self.0.sessions,
-                sid,
-                "stream.clear",
-                json!({"llm_call_id": llm_call_id}),
-            );
-        }
+        sessions.retain(|_, s| {
+            s.draft.is_some() || s.tx.as_ref().is_some_and(|w| w.strong_count() > 0)
+        });
     }
 
     pub fn remove_session(&self, sid: i64) {
@@ -336,7 +314,7 @@ fn take_older_deltas(
     buffered_delta: &mut Option<Notice>,
     delta_rx: &mut broadcast::Receiver<Notice>,
     delta_open: &mut bool,
-    snapshot_seq: u64,
+    min_seq: u64,
     before_seq: u64,
 ) -> Vec<Notice> {
     let mut ready = Vec::new();
@@ -344,13 +322,13 @@ fn take_older_deltas(
         && b.seq < before_seq
     {
         let b = buffered_delta.take().unwrap();
-        if b.seq > snapshot_seq {
+        if b.seq >= min_seq {
             ready.push(b);
         }
     }
     while buffered_delta.is_none() && *delta_open {
         match delta_rx.try_recv() {
-            Ok(m) if m.seq <= snapshot_seq => continue,
+            Ok(m) if m.seq < min_seq => continue,
             Ok(m) if m.seq < before_seq => ready.push(m),
             Ok(m) => *buffered_delta = Some(m),
             Err(TryRecvError::Lagged(_)) => continue,
@@ -374,7 +352,7 @@ pub async fn subscribe(
             Ok((channel, rx, initial))
         })
         .await?;
-    let (delta_tx, mut delta_rx, snapshot, snapshot_seq) = app.streams.subscribe_delta(sid);
+    let (delta_tx, mut delta_rx, snapshot, min_seq) = app.streams.subscribe_delta(sid);
     let stream = async_stream::stream! {
         let _channel = channel;
         let _delta = delta_tx;
@@ -392,7 +370,7 @@ pub async fn subscribe(
                             &mut buffered_delta,
                             &mut delta_rx,
                             &mut delta_open,
-                            snapshot_seq,
+                            min_seq,
                             d.seq,
                         ) {
                             yield Ok(m.into_event());
@@ -405,7 +383,7 @@ pub async fn subscribe(
                     }
                     Err(TryRecvError::Closed) => {
                         if let Some(b) = buffered_delta.take()
-                            && b.seq > snapshot_seq
+                            && b.seq >= min_seq
                         {
                             yield Ok(b.into_event());
                         }
@@ -413,7 +391,7 @@ pub async fn subscribe(
                     }
                     Err(TryRecvError::Empty) => {
                         let b = buffered_delta.take().unwrap();
-                        if b.seq > snapshot_seq {
+                        if b.seq >= min_seq {
                             yield Ok(b.into_event());
                         }
                     }
@@ -435,7 +413,7 @@ pub async fn subscribe(
                         &mut buffered_delta,
                         &mut delta_rx,
                         &mut delta_open,
-                        snapshot_seq,
+                        min_seq,
                         d.seq,
                     ) {
                         yield Ok(m.into_event());
@@ -448,7 +426,7 @@ pub async fn subscribe(
                 }
                 Incoming::Durable(Err(RecvError::Closed)) => break,
                 Incoming::Delta(Ok(m)) => {
-                    if m.seq > snapshot_seq {
+                    if m.seq >= min_seq {
                         buffered_delta = Some(m);
                     }
                 }
