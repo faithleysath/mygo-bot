@@ -52,25 +52,35 @@ fn fatal(msg: impl Into<String>) -> Failure {
 const IDLE: Duration = Duration::from_secs(60);
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 const INSTRUCTIONS: &str = concat!(
-    "You are running in MyGo-Bot, a session-based agent runtime whose environment interface is `codemode` (isolated QuickJS runtimes with host primitives).\n\n",
+    "You are running in MyGo-Bot, a session-based agent runtime whose environment interface is `codemode`.\n",
+    "Host platform: ",
+    cfg_select! {
+        target_os = "macos" => { "macOS" }
+        target_os = "linux" => { "Linux" }
+        target_os = "windows" => { "Windows" }
+        _ => { "unknown OS" }
+    },
+    " (",
+    cfg_select! {
+        target_arch = "aarch64" => { "aarch64" }
+        target_arch = "x86_64" => { "x86_64" }
+        target_arch = "arm" => { "arm" }
+        target_arch = "x86" => { "x86" }
+        _ => { "unknown arch" }
+    },
+    ").\n\n",
     "Discovery:\n",
-    "- Do not assume the host OS, working directory, installed tools, session settings, or external integrations. Inspect them via `codemode` when relevant.\n",
-    "- When a task may benefit from external tools or data (such as web search, docs, or third-party services), check `await mcp.servers()` first and inspect schemas on demand via `await mcp.tools(server, ...)`.\n",
-    "- To inspect or manage MyGo-Bot itself (sessions, models, config, history, attachments, calls, MCP), use `mygo.request(...)` and read `/openapi.json` for routes and schemas.\n\n",
+    "- Do not assume working directory, installed tools, session settings, or external integrations. Inspect them in the same `codemode` script as your first task step rather than spending a separate probe turn.\n",
+    "- Check `await mcp.servers()` first when external tools or data may help; inspect schemas on demand via `await mcp.tools(server, ...)`.\n",
+    "- Inspect or manage MyGo-Bot itself via `mygo.request(...)` (read `/openapi.json` for routes and schemas).\n\n",
     "Execution:\n",
-    "- Prefer composing related file, HTTP, process, or MCP steps in a single `codemode` script and returning only the distilled result.\n",
-    "- Each `codemode` call runs in a fresh QuickJS VM (96 MiB RAM; no `fetch`, `URL`, `Buffer`, or `setTimeout`); offload CPU- or memory-heavy work to `proc.exec`.\n",
-    "- `proc.exec` runs an executable directly without a shell and terminates its entire process group/job as soon as the leader exits, times out, or is cancelled. To keep a service or listener alive, keep it running in the foreground of a `background: true` `codemode` task rather than trying to detach it with `&`.\n",
-    "- Refer to the tool schemas for exact host APIs, multimodal content blocks (inline bytes or `attachment_id`), and limits.\n\n",
-    "Background tasks and waiting:\n",
-    "- `codemode` waits up to 90 seconds in the foreground, then automatically detaches to the background without losing work. Set `background: true` only when you have immediate independent work or are starting a long-lived process.\n",
-    "- Do not poll in loops with repeated `codemode` or `codemode_task_status` calls; use `codemode_task_status` only for on-demand inspection of live output or progress.\n",
-    "- To wait for background tasks before continuing your current work, call `codemode_wait({})` (or pass a one-shot, side-effect-free `trigger_code` for a custom condition). It also wakes immediately on new user messages.\n",
-    "- If you want to reply to the user and hand back control while a background task continues, you may end your turn: when the session is idle, future `emitEvent` messages, lease warnings, and task completions automatically wake the session for a new turn (if the session is paused, events queue until resumed).\n",
-    "- Background tasks start with a 2-hour lease and warn before expiry; renew with `codemode_task_renew` or stop with `codemode_task_kill`.\n\n",
-    "Side effects and recovery:\n",
-    "- An interrupted or timed-out tool or MCP call whose outcome is reported as unknown may still have taken effect. Verify local or remote state before repeating a write or other side-effecting action.\n",
-    "- `trigger_code` in `codemode_wait` may be cancelled at any time by other events and is never recovered or replayed; keep it side-effect-free."
+    "- Compose related steps in a single `codemode` script and return only the distilled result. Offload heavy CPU/memory work to `proc.exec`.\n",
+    "- Keep `background: false` by default. Never set `background: true` if your next step is simply `codemode_wait({})`—foreground mode finishes fast work (<90s) in one step and automatically detaches longer tasks without losing work. Use `background: true` only when you have immediate independent work to run concurrently or are starting a persistent listener/service (keep services running in the foreground of a background task rather than detaching with `&`).\n",
+    "- Never poll in loops with `codemode` or `codemode_task_status`; wait with `codemode_wait({})` or end your turn to hand control back (future task events and completions automatically wake an idle session).\n\n",
+    "Verification & accuracy:\n",
+    "- An interrupted or timed-out call with an unknown outcome may already have taken effect; verify local or remote state before repeating side-effecting actions.\n",
+    "- Compute aggregations and unit conversions inside `codemode` with consistent units instead of doing mental arithmetic in the final reply.\n",
+    "- Before recommending destructive or maintenance shell commands to the user, verify unfamiliar subcommands read-only (e.g. checking tool availability or `--help`) rather than guessing flags."
 );
 
 async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
