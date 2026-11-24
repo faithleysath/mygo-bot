@@ -406,6 +406,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   padding: 10px 14px;
   box-shadow: var(--shadow-sm);
 }
+.user-bubble .blocks { max-height: 360px; overflow-y: auto; }
 .msg-user.withdrawn .user-bubble { opacity: 0.55; text-decoration: line-through; }
 .msg-foot {
   display: flex;
@@ -473,9 +474,12 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 .card-head:hover { background: var(--bg); }
 .card-head::-webkit-details-marker { display: none; }
+.card-head .truncate { min-width: 0; }
 .card-spacer { flex: 1; }
 .tool-name { font-weight: 600; }
-.card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); }
+.card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); max-height: 65vh; overflow-y: auto; }
+.card-body > * { flex-shrink: 0; }
+.card-body .plain-text { max-height: 320px; overflow: auto; }
 .section-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .section-label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
 
@@ -499,7 +503,7 @@ details[open] > summary .chev, .chev.open { transform: rotate(90deg); }
 }
 .thought summary::-webkit-details-marker { display: none; }
 .thought-meta { font-size: 11.5px; opacity: 0.75; }
-.thought-body { margin-top: 8px; font-size: 13px; line-height: 1.55; }
+.thought-body { margin-top: 8px; font-size: 13px; line-height: 1.55; max-height: 360px; overflow-y: auto; padding-right: 4px; }
 
 .pulse-dot {
   width: 7px;
@@ -551,7 +555,7 @@ details[open] > summary .chev, .chev.open { transform: rotate(90deg); }
   border: 1px solid var(--border);
   border-radius: 7px;
   padding: 9px 11px;
-  overflow-x: auto;
+  overflow: auto;
   max-height: 320px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -574,6 +578,10 @@ details[open] > summary .chev, .chev.open { transform: rotate(90deg); }
   padding: 7px 10px;
   border-radius: 7px;
   font-size: 12.5px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .retry-banner {
   display: flex;
@@ -689,13 +697,14 @@ details[open] > summary .chev, .chev.open { transform: rotate(90deg); }
   font-family: var(--mono);
   font-size: 12.5px;
   line-height: 1.55;
-  overflow-x: auto;
+  max-height: 420px;
+  overflow: auto;
 }
-.md-table-wrap { overflow-x: auto; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.md-table-wrap { overflow: auto; max-height: 420px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 8px; }
 .md table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .md th, .md td { border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left; }
 .md tr:last-child td { border-bottom: none; }
-.md th { background: var(--surface-2); font-weight: 600; }
+.md th { background: var(--surface-2); font-weight: 600; position: sticky; top: 0; z-index: 1; }
 .md tbody tr:nth-child(even) { background: rgba(128, 128, 128, 0.03); }
 .md tbody tr:hover { background: var(--accent-soft); }
 

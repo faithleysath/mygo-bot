@@ -324,6 +324,9 @@ function ReasoningBlock({
   streaming?: boolean;
   text?: string;
 }) {
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const stickRef = useRef(true);
+
   let body = text;
   if (!streaming && item) {
     const p = item.payload || {};
@@ -340,8 +343,22 @@ function ReasoningBlock({
     }
     body = parts.join("\n\n");
   }
+
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (streaming && el && stickRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [streaming, body]);
+
   if (!body && !streaming) return null;
   const lenHint = body.length > 1000 ? `${(body.length / 1000).toFixed(1)}k chars` : `${body.length} chars`;
+  const onBodyScroll = () => {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 36;
+  };
+
   return (
     <details class="thought" open={streaming}>
       <summary>
@@ -350,7 +367,7 @@ function ReasoningBlock({
         <span>{streaming ? "Thinking…" : "Thought process"}</span>
         {!streaming && body && <span class="thought-meta">{lenHint}</span>}
       </summary>
-      <div class="thought-body">
+      <div class="thought-body" ref={bodyRef} onScroll={onBodyScroll}>
         <Markdown text={body} />
       </div>
     </details>
@@ -372,17 +389,31 @@ function EventCard({
     evSummary = tryJson(content[0].text);
     evExtraBlocks = evSummary ? content.slice(1) : content;
   }
+  let evPreview = "";
+  if (!evSummary) {
+    if (typeof content === "string") {
+      evPreview = content.replace(/\s+/g, " ").trim();
+    } else if (Array.isArray(content)) {
+      for (const b of content) {
+        if (b && typeof b === "object" && typeof b.text === "string" && b.text.trim()) {
+          evPreview = b.text.replace(/\s+/g, " ").trim();
+          break;
+        }
+      }
+    }
+  }
   const evStatus = typeof evSummary?.status === "string" ? evSummary.status : "";
   const evDur = typeof evSummary?.duration_ms === "number" ? formatDuration(evSummary.duration_ms) : "";
 
   return (
-    <details class="card event-card" open>
+    <details class="card event-card">
       <summary class="card-head">
         <IconChevron size={13} cls="chev" />
         <IconBolt size={13} />
         <span class="pill mono">{p.task_id || "task"}</span>
         <span class="mono">{p.event}</span>
         {p.sequence != null && <span class="muted small">#{p.sequence}</span>}
+        {evPreview && <span class="muted truncate">{evPreview}</span>}
         <span class="card-spacer" />
         {evDur && <span class="pill mono">{evDur}</span>}
         {evStatus && <span class={`pill pill-${evStatus}`}>{evStatus}</span>}
