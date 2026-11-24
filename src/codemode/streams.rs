@@ -10,6 +10,7 @@ use tokio::{
     fs::{File, ReadDir},
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, SemaphorePermit, mpsc},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +31,7 @@ pub(super) enum Resource {
 struct Entry {
     resource: AsyncMutex<Resource>,
     closed: CancellationToken,
+    deadline: Option<(Instant, &'static str)>,
     _permits: (OwnedSemaphorePermit, SemaphorePermit<'static>),
 }
 
@@ -61,9 +63,18 @@ pub(super) struct Reservation<'a> {
 
 impl Reservation<'_> {
     pub fn insert(self, resource: Resource) -> u64 {
+        self.insert_with_deadline(resource, None)
+    }
+
+    pub fn insert_with_deadline(
+        self,
+        resource: Resource,
+        deadline: Option<(Instant, &'static str)>,
+    ) -> u64 {
         let entry = Entry {
             resource: AsyncMutex::new(resource),
             closed: CancellationToken::new(),
+            deadline,
             _permits: self.permits,
         };
         self.streams
@@ -134,7 +145,17 @@ impl Streams {
             });
             return Ok(Reply::value(json!(id)));
         }
+        let stream_id = id
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or("invalid stream ID")?;
         let entry = self.get(id)?;
+        if let Some((at, message)) = entry.deadline
+            && Instant::now() >= at
+        {
+            self.close(stream_id);
+            return Err(message.into());
+        }
         let operation = async {
             let mut resource = entry.resource.lock().await;
             let value = match (op, &mut *resource) {
@@ -186,9 +207,19 @@ impl Streams {
             };
             Ok(Reply::value(value))
         };
+        let deadline = async {
+            match entry.deadline {
+                Some((at, _)) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             biased;
             _ = entry.closed.cancelled() => Err("stream closed".into()),
+            _ = deadline => {
+                self.close(stream_id);
+                Err(entry.deadline.unwrap().1.into())
+            }
             result = operation => result,
         }
     }

@@ -14,6 +14,14 @@ import {
 import { Composer } from "./Composer.jsx";
 import { Settings } from "./Settings.jsx";
 import { Sidebar } from "./Sidebar.jsx";
+import {
+  applyDraftDelta,
+  applyDraftStarted,
+  buildContentBlocks,
+  dropDraftForSaved,
+  emptyComposer,
+  mergeItems,
+} from "./state.js";
 import { Timeline } from "./Timeline.jsx";
 
 function TokenGate({ onSuccess }) {
@@ -161,73 +169,10 @@ function TopBar({
   );
 }
 
-function applyDraftStarted(prev, ev) {
-  const base =
-    prev && prev.llm_call_id === ev.llm_call_id
-      ? prev
-      : { llm_call_id: ev.llm_call_id, items: [] };
-  const items = base.items.filter((x) => x.output_index !== ev.output_index);
-  items.push({
-    output_index: ev.output_index,
-    kind: ev.kind || "message",
-    name: ev.name || null,
-    call_id: ev.call_id || null,
-    text: "",
-    reasoning: "",
-    arguments: "",
-  });
-  items.sort((a, b) => a.output_index - b.output_index);
-  return { llm_call_id: base.llm_call_id, items };
-}
-
-function applyDraftDelta(prev, ev) {
-  const base =
-    prev && prev.llm_call_id === ev.llm_call_id
-      ? prev
-      : { llm_call_id: ev.llm_call_id, items: [] };
-  const idx = base.items.findIndex((x) => x.output_index === ev.output_index);
-  const items = [...base.items];
-  const field = ev.field === "reasoning" || ev.field === "arguments" ? ev.field : "text";
-  if (idx === -1) {
-    const kind = field === "arguments" ? "function_call" : field === "reasoning" ? "reasoning" : "message";
-    items.push({
-      output_index: ev.output_index,
-      kind,
-      name: null,
-      call_id: null,
-      text: "",
-      reasoning: "",
-      arguments: "",
-      [field]: ev.delta || "",
-    });
-    items.sort((a, b) => a.output_index - b.output_index);
-  } else {
-    const cur = items[idx];
-    items[idx] = { ...cur, [field]: (cur[field] || "") + (ev.delta || "") };
+function revokeAttachments(attachments) {
+  for (const a of attachments || []) {
+    if (a.preview) URL.revokeObjectURL(a.preview);
   }
-  return { llm_call_id: base.llm_call_id, items };
-}
-
-function dropDraftForSaved(prev, item) {
-  if (!prev) return null;
-  let removed = false;
-  const items = prev.items.filter((d) => {
-    if (removed) return true;
-    if (item.kind === "function_call" && d.kind === "function_call" && d.call_id === item.payload?.call_id) {
-      removed = true;
-      return false;
-    }
-    if (item.kind === "assistant_message" && d.kind === "message") {
-      removed = true;
-      return false;
-    }
-    if (item.kind === "reasoning" && d.kind === "reasoning") {
-      removed = true;
-      return false;
-    }
-    return true;
-  });
-  return items.length ? { ...prev, items } : null;
 }
 
 function App() {
@@ -255,10 +200,41 @@ function App() {
   const [sseStatus, setSseStatus] = useState("open");
   const [bannerErr, setBannerErr] = useState("");
 
+  const [composers, setComposers] = useState({});
+  const [uploadingBySid, setUploadingBySid] = useState({});
+  const [sendingBySid, setSendingBySid] = useState({});
+
   const activeIdRef = useRef(null);
   activeIdRef.current = activeId;
+  const sessionsRef = useRef([]);
+  sessionsRef.current = sessions;
+  const composersRef = useRef({});
+  composersRef.current = composers;
+  const sendingRef = useRef({});
+  sendingRef.current = sendingBySid;
   const lastItemIdRef = useRef(0);
   lastItemIdRef.current = items.length ? items[items.length - 1].id : 0;
+
+  const updateComposer = (sid, fn) => {
+    setComposers((prev) => {
+      const cur = prev[sid] || emptyComposer();
+      const next = fn(cur);
+      if (next === cur) return prev;
+      composersRef.current = { ...prev, [sid]: next };
+      return composersRef.current;
+    });
+  };
+
+  const cleanupComposer = (sid) => {
+    setComposers((prev) => {
+      if (!prev[sid]) return prev;
+      revokeAttachments(prev[sid].attachments);
+      const next = { ...prev };
+      delete next[sid];
+      composersRef.current = next;
+      return next;
+    });
+  };
 
   const toggleTheme = () => {
     const next = theme === "dark" ? "light" : "dark";
@@ -323,10 +299,14 @@ function App() {
       .catch((e) => alive && setBannerErr(e.message));
 
     const ctrl = new AbortController();
+    let seenGlobalReady = false;
     connectSse("/events", {
       signal: ctrl.signal,
       onEvent: (name, data) => {
-        if (name === "session.created") {
+        if (name === "ready") {
+          if (seenGlobalReady) loadSessions().catch(() => {});
+          seenGlobalReady = true;
+        } else if (name === "session.created") {
           setSessions((prev) => (prev.some((s) => s.id === data.id) ? prev : [...prev, data]));
         } else if (name === "session.updated") {
           setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
@@ -339,6 +319,7 @@ function App() {
             )
           );
         } else if (name === "session.deleted") {
+          cleanupComposer(data.id);
           setSessions((prev) => prev.filter((s) => s.id !== data.id));
           setActiveId((cur) => (cur === data.id ? null : cur));
         } else if (name === "resync") {
@@ -389,16 +370,20 @@ function App() {
     setHasMore(false);
     setBannerErr("");
 
-    Promise.all([
-      apiFetch(`/sessions/${sid}/history?tail=true&limit=50`),
-      refreshSessionSidecars(sid),
-    ])
-      .then(([hist]) => {
-        if (activeIdRef.current !== sid) return;
-        setItems(hist);
-        setHasMore(hist.length === 50);
-      })
-      .catch((e) => activeIdRef.current === sid && setBannerErr(e.message));
+    let initialLoaded = false;
+    const closedCalls = new Set();
+    const closedItems = new Set();
+
+    const catchUp = async (afterId) => {
+      let cursor = afterId;
+      while (activeIdRef.current === sid) {
+        const page = await apiFetch(`/sessions/${sid}/history?after=${cursor}&limit=200`);
+        if (activeIdRef.current !== sid || !page.length) break;
+        setItems((prev) => mergeItems(prev, page));
+        cursor = page[page.length - 1].id;
+        if (page.length < 200) break;
+      }
+    };
 
     const ctrl = new AbortController();
     connectSse(`/sessions/${sid}/events`, {
@@ -408,21 +393,58 @@ function App() {
         if (activeIdRef.current !== sid) return;
         if (name === "ready") {
           setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
+          setDraft(null);
+          setRetryNotice(null);
+          if (!initialLoaded) {
+            initialLoaded = true;
+            Promise.all([
+              apiFetch(`/sessions/${sid}/history?tail=true&limit=50`),
+              refreshSessionSidecars(sid),
+            ])
+              .then(([hist]) => {
+                if (activeIdRef.current !== sid) return;
+                setItems((prev) => mergeItems(prev, hist));
+                setHasMore(hist.length === 50);
+              })
+              .catch((e) => activeIdRef.current === sid && setBannerErr(e.message));
+          } else {
+            Promise.all([catchUp(lastItemIdRef.current), refreshSessionSidecars(sid)]).catch(
+              () => {}
+            );
+          }
         } else if (name === "stream.snapshot") {
-          setDraft(data);
+          if (!closedCalls.has(data.llm_call_id)) {
+            setDraft(data);
+          }
         } else if (name === "item.started") {
+          if (closedCalls.has(data.llm_call_id) || closedItems.has(`${data.llm_call_id}:${data.output_index}`)) {
+            return;
+          }
           setDraft((prev) => applyDraftStarted(prev, data));
         } else if (name === "item.delta") {
+          if (closedCalls.has(data.llm_call_id) || closedItems.has(`${data.llm_call_id}:${data.output_index}`)) {
+            return;
+          }
           setRetryNotice(null);
           setDraft((prev) => applyDraftDelta(prev, data));
         } else if (name === "stream.clear") {
+          if (data?.llm_call_id != null) closedCalls.add(data.llm_call_id);
           setDraft((prev) => (prev?.llm_call_id === data?.llm_call_id ? null : prev));
         } else if (name === "attempt.retry") {
-          setDraft(null);
+          setDraft((prev) => {
+            if (prev?.llm_call_id != null) closedCalls.add(prev.llm_call_id);
+            return null;
+          });
           setRetryNotice(data);
         } else if (name === "item.saved") {
-          setItems((prev) => (prev.some((x) => x.id === data.id) ? prev : [...prev, data]));
-          setDraft((prev) => dropDraftForSaved(prev, data));
+          setItems((prev) => mergeItems(prev, [data]));
+          setDraft((prev) => {
+            const { next, droppedIndex } = dropDraftForSaved(prev, data);
+            if (droppedIndex !== null && data.llm_call_id != null) {
+              closedItems.add(`${data.llm_call_id}:${droppedIndex}`);
+            }
+            return next;
+          });
           if (data.kind === "user_message") {
             setQueuedIds((prev) => new Set([...prev, data.id]));
           } else if (data.kind === "withdrawal" && data.target_id) {
@@ -436,7 +458,12 @@ function App() {
           }
         } else if (name === "session.status") {
           setRetryNotice(null);
-          if (data.status === "idle" || data.status === "paused") setDraft(null);
+          if (data.status === "idle" || data.status === "paused") {
+            setDraft((prev) => {
+              if (prev?.llm_call_id != null) closedCalls.add(prev.llm_call_id);
+              return null;
+            });
+          }
           setSessions((prev) =>
             prev.map((s) =>
               s.id === sid
@@ -448,22 +475,15 @@ function App() {
         } else if (name === "session.updated") {
           setSessions((prev) => prev.map((s) => (s.id === data.id ? data : s)));
         } else if (name === "resync") {
-          const after = lastItemIdRef.current;
-          const path = after
-            ? `/sessions/${sid}/history?after=${after}&limit=200`
-            : `/sessions/${sid}/history?tail=true&limit=50`;
-          Promise.all([apiFetch(`/sessions/${sid}`), apiFetch(path), refreshSessionSidecars(sid)])
-            .then(([sess, more]) => {
-              if (activeIdRef.current !== sid) return;
-              setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
-              if (more.length) {
-                setItems((prev) => {
-                  const seen = new Set(prev.map((x) => x.id));
-                  return [...prev, ...more.filter((x) => !seen.has(x.id))];
-                });
+          Promise.all([
+            apiFetch(`/sessions/${sid}`).then((sess) => {
+              if (activeIdRef.current === sid) {
+                setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
               }
-            })
-            .catch(() => {});
+            }),
+            catchUp(lastItemIdRef.current),
+            refreshSessionSidecars(sid),
+          ]).catch(() => {});
         }
       },
     });
@@ -508,6 +528,7 @@ function App() {
     setBannerErr("");
     try {
       await apiFetch(`/sessions/${sid}`, { method: "DELETE" });
+      cleanupComposer(sid);
       setSessions((prev) => prev.filter((s) => s.id !== sid));
       if (activeId === sid) setActiveId(null);
     } catch (e) {
@@ -533,10 +554,7 @@ function App() {
     try {
       const older = await apiFetch(`/sessions/${sid}/history?before=${firstId}&limit=50`);
       if (activeIdRef.current !== sid) return;
-      setItems((prev) => {
-        const seen = new Set(prev.map((x) => x.id));
-        return [...older.filter((x) => !seen.has(x.id)), ...prev];
-      });
+      setItems((prev) => mergeItems(prev, older));
       setHasMore(older.length === 50);
     } catch (e) {
       setBannerErr(e.message);
@@ -545,15 +563,129 @@ function App() {
     }
   };
 
-  const sendMessage = async (content, startRun) => {
-    const sid = activeId;
-    await apiFetch(`/sessions/${sid}/messages`, {
-      method: "POST",
-      headers: { "Idempotency-Key": makeIdempotencyKey() },
-      body: { content },
+  const onChangeText = (sid, text) => {
+    updateComposer(sid, (c) => ({ ...c, text, pending: null, error: "" }));
+  };
+
+  const onRemoveAttachment = (sid, aid) => {
+    updateComposer(sid, (c) => {
+      const target = c.attachments.find((a) => a.id === aid);
+      if (target?.preview) URL.revokeObjectURL(target.preview);
+      return {
+        ...c,
+        attachments: c.attachments.filter((a) => a.id !== aid),
+        pending: null,
+        error: "",
+      };
     });
-    if (startRun) {
-      await apiFetch(`/sessions/${sid}/run`, { method: "PUT" });
+  };
+
+  const onUploadFiles = async (targetSid, files) => {
+    const list = Array.from(files || []).filter((f) => /^(image|audio|video)\//.test(f.type));
+    if (!list.length) {
+      updateComposer(targetSid, (c) => ({
+        ...c,
+        error: "Only image, audio, or video files are supported.",
+      }));
+      return;
+    }
+    updateComposer(targetSid, (c) => ({ ...c, error: "" }));
+    setUploadingBySid((prev) => ({ ...prev, [targetSid]: (prev[targetSid] || 0) + 1 }));
+    try {
+      for (const file of list) {
+        const res = await apiFetch("/attachments", {
+          method: "POST",
+          headers: { "Content-Type": file.type },
+          body: file,
+        });
+        const kind = file.type.split("/")[0];
+        const preview = kind === "image" ? URL.createObjectURL(file) : null;
+        if (!sessionsRef.current.some((s) => s.id === targetSid)) {
+          if (preview) URL.revokeObjectURL(preview);
+          return;
+        }
+        updateComposer(targetSid, (c) => ({
+          ...c,
+          pending: null,
+          attachments: [
+            ...c.attachments,
+            { id: res.id, kind, name: file.name || `${kind}-${res.id}`, preview },
+          ],
+        }));
+      }
+    } catch (e) {
+      updateComposer(targetSid, (c) => ({ ...c, error: e.message }));
+    } finally {
+      setUploadingBySid((prev) => {
+        const nextCount = (prev[targetSid] || 1) - 1;
+        if (nextCount <= 0) {
+          const copy = { ...prev };
+          delete copy[targetSid];
+          return copy;
+        }
+        return { ...prev, [targetSid]: nextCount };
+      });
+    }
+  };
+
+  const onSubmitComposer = async (targetSid, startRun) => {
+    if (sendingRef.current[targetSid]) return;
+    const cur = composersRef.current[targetSid] || emptyComposer();
+    const content = buildContentBlocks(cur);
+
+    if (content.length === 0) {
+      if (!startRun) return;
+      setSendingBySid((prev) => ({ ...prev, [targetSid]: true }));
+      updateComposer(targetSid, (c) => ({ ...c, error: "" }));
+      try {
+        await apiFetch(`/sessions/${targetSid}/run`, { method: "PUT" });
+      } catch (e) {
+        updateComposer(targetSid, (c) => ({ ...c, error: e.message }));
+      } finally {
+        setSendingBySid((prev) => ({ ...prev, [targetSid]: false }));
+      }
+      return;
+    }
+
+    const contentJson = JSON.stringify(content);
+    const key = cur.pending?.contentJson === contentJson ? cur.pending.key : makeIdempotencyKey();
+    updateComposer(targetSid, (c) => ({ ...c, pending: { key, contentJson }, error: "" }));
+    setSendingBySid((prev) => ({ ...prev, [targetSid]: true }));
+
+    try {
+      try {
+        await apiFetch(`/sessions/${targetSid}/messages`, {
+          method: "POST",
+          headers: { "Idempotency-Key": key },
+          body: { content },
+        });
+      } catch (e) {
+        const clientRejected = e.status >= 400 && e.status < 500;
+        updateComposer(targetSid, (c) => ({
+          ...c,
+          pending: clientRejected ? null : c.pending,
+          error: e.message,
+        }));
+        return;
+      }
+
+      updateComposer(targetSid, (c) => {
+        revokeAttachments(c.attachments);
+        return emptyComposer();
+      });
+
+      if (startRun) {
+        try {
+          await apiFetch(`/sessions/${targetSid}/run`, { method: "PUT" });
+        } catch (e) {
+          updateComposer(targetSid, (c) => ({
+            ...c,
+            error: `Message queued, but failed to start run: ${e.message}`,
+          }));
+        }
+      }
+    } finally {
+      setSendingBySid((prev) => ({ ...prev, [targetSid]: false }));
     }
   };
 
@@ -614,12 +746,25 @@ function App() {
             />
             <Composer
               session={activeSession}
+              draft={composers[activeSession.id] || emptyComposer()}
+              uploading={Boolean(uploadingBySid[activeSession.id])}
+              sending={Boolean(sendingBySid[activeSession.id])}
               tasks={tasks}
               queuedCount={queuedIds.size}
-              onSend={sendMessage}
-              onRun={() => apiFetch(`/sessions/${activeSession.id}/run`, { method: "PUT" })}
-              onPause={(mode) => apiFetch(`/sessions/${activeSession.id}/run?mode=${mode}`, { method: "DELETE" })}
-              onKillTask={(tid) => apiFetch(`/sessions/${activeSession.id}/tasks/${tid}`, { method: "DELETE" })}
+              onChangeText={onChangeText}
+              onUploadFiles={onUploadFiles}
+              onRemoveAttachment={onRemoveAttachment}
+              onSubmit={onSubmitComposer}
+              onPause={(mode) =>
+                apiFetch(`/sessions/${activeSession.id}/run?mode=${mode}`, { method: "DELETE" }).catch((e) =>
+                  setBannerErr(e.message)
+                )
+              }
+              onKillTask={(tid) =>
+                apiFetch(`/sessions/${activeSession.id}/tasks/${tid}`, { method: "DELETE" }).catch((e) =>
+                  setBannerErr(e.message)
+                )
+              }
             />
           </>
         ) : (

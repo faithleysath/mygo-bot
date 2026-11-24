@@ -1,5 +1,29 @@
 import { useState } from "preact/hooks";
 
+const TABLE_SEP_RE = /^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
+const HR_RE = /^(\*\s*\*\s*\*|-{3,}|_{3,})\s*$/;
+const FENCE_OPEN_RE = /^```(.*)$/;
+const HEADING_RE = /^(#{1,6})(?:\s+(.*)|\s*)$/;
+const UL_RE = /^\s*[-*+]\s+(.*)$/;
+const OL_RE = /^\s*\d+\.\s+(.*)$/;
+
+function isTableStart(line, nextLine) {
+  return Boolean(line && nextLine && line.includes("|") && TABLE_SEP_RE.test(nextLine));
+}
+
+function isBlockStart(line, nextLine) {
+  if (!line.trim()) return true;
+  return (
+    FENCE_OPEN_RE.test(line) ||
+    HEADING_RE.test(line) ||
+    HR_RE.test(line) ||
+    line.startsWith(">") ||
+    UL_RE.test(line) ||
+    OL_RE.test(line) ||
+    isTableStart(line, nextLine)
+  );
+}
+
 function safeUrl(raw) {
   try {
     const u = new URL(raw, "https://invalid.local");
@@ -85,9 +109,9 @@ export function Markdown({ text }) {
       continue;
     }
 
-    const fence = line.match(/^```([a-zA-Z0-9_+-]*)\s*$/);
+    const fence = line.match(FENCE_OPEN_RE);
     if (fence) {
-      const lang = fence[1];
+      const lang = fence[1].trim().split(/\s+/)[0] || "";
       const buf = [];
       i += 1;
       while (i < lines.length && !lines[i].match(/^```\s*$/)) {
@@ -99,15 +123,15 @@ export function Markdown({ text }) {
       continue;
     }
 
-    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    const heading = line.match(HEADING_RE);
     if (heading) {
       const Tag = `h${heading[1].length}`;
-      blocks.push(<Tag key={`b${i}`}>{renderInline(heading[2], `h${i}`)}</Tag>);
+      blocks.push(<Tag key={`b${i}`}>{renderInline(heading[2] || "", `h${i}`)}</Tag>);
       i += 1;
       continue;
     }
 
-    if (line.match(/^(\*\s*\*\s*\*|-{3,}|_{3,})\s*$/)) {
+    if (HR_RE.test(line)) {
       blocks.push(<hr key={`b${i}`} />);
       i += 1;
       continue;
@@ -127,11 +151,7 @@ export function Markdown({ text }) {
       continue;
     }
 
-    if (
-      line.includes("|") &&
-      i + 1 < lines.length &&
-      lines[i + 1].match(/^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/)
-    ) {
+    if (isTableStart(line, lines[i + 1])) {
       const parseRow = (r) =>
         r
           .trim()
@@ -171,16 +191,14 @@ export function Markdown({ text }) {
       continue;
     }
 
-    const ulMatch = line.match(/^\s*[-*+]\s+(.*)$/);
-    const olMatch = line.match(/^\s*\d+\.\s+(.*)$/);
+    const ulMatch = line.match(UL_RE);
+    const olMatch = line.match(OL_RE);
     if (ulMatch || olMatch) {
       const ordered = Boolean(olMatch);
       const Tag = ordered ? "ol" : "ul";
       const items = [];
       while (i < lines.length) {
-        const m = ordered
-          ? lines[i].match(/^\s*\d+\.\s+(.*)$/)
-          : lines[i].match(/^\s*[-*+]\s+(.*)$/);
+        const m = ordered ? lines[i].match(OL_RE) : lines[i].match(UL_RE);
         if (!m) break;
         items.push(m[1]);
         i += 1;
@@ -196,14 +214,11 @@ export function Markdown({ text }) {
     }
 
     const para = [];
-    while (
-      i < lines.length &&
-      lines[i].trim() &&
-      !lines[i].match(/^(```|#{1,6}\s|>|\s*[-*+]\s|\s*\d+\.\s|(\*\s*\*\s*\*|-{3,}|_{3,})\s*$)/)
-    ) {
+    do {
       para.push(lines[i]);
       i += 1;
-    }
+    } while (i < lines.length && !isBlockStart(lines[i], lines[i + 1]));
+
     blocks.push(
       <p key={`b${i}`}>
         {para.map((p, pi) => (

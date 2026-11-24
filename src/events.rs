@@ -9,16 +9,24 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     convert::Infallible,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
-use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::broadcast::{
+    self,
+    error::{RecvError, TryRecvError},
+};
 
 const MAX_DRAFT_FIELD_BYTES: usize = 256 * 1024;
 const GLOBAL_CHANNEL_CAPACITY: usize = 256;
 const EPHEMERAL_CHANNEL_CAPACITY: usize = 256;
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct Notice {
+    seq: u64,
     name: &'static str,
     data: Arc<str>,
 }
@@ -27,10 +35,15 @@ impl Notice {
     pub fn publish(channel: &broadcast::Sender<Self>, name: &'static str, data: Value) {
         if channel.receiver_count() > 0 {
             let _ = channel.send(Self {
+                seq: NEXT_SEQ.fetch_add(1, Ordering::AcqRel),
                 name,
                 data: data.to_string().into(),
             });
         }
+    }
+
+    fn into_event(self) -> Event {
+        Event::default().event(self.name).data(self.data.as_ref())
     }
 }
 
@@ -106,6 +119,7 @@ impl Hub {
         broadcast::Sender<Notice>,
         broadcast::Receiver<Notice>,
         Option<Value>,
+        u64,
     ) {
         let mut sessions = self.0.sessions.lock().unwrap();
         let entry = sessions.entry(sid).or_default();
@@ -118,6 +132,7 @@ impl Hub {
             }
         };
         let rx = tx.subscribe();
+        let snapshot_seq = NEXT_SEQ.load(Ordering::Acquire);
         let snapshot = entry
             .draft
             .as_ref()
@@ -128,12 +143,21 @@ impl Hub {
                     "items": d.items.values().collect::<Vec<_>>(),
                 })
             });
-        (tx, rx, snapshot)
+        (tx, rx, snapshot, snapshot_seq)
     }
 
-    fn emit_ephemeral(sessions: &Mutex<HashMap<i64, SessionStream>>, sid: i64, name: &'static str, data: Value) {
+    fn emit_ephemeral(
+        sessions: &Mutex<HashMap<i64, SessionStream>>,
+        sid: i64,
+        name: &'static str,
+        data: Value,
+    ) {
         let map = sessions.lock().unwrap();
-        if let Some(tx) = map.get(&sid).and_then(|s| s.tx.as_ref()).and_then(|w| w.upgrade()) {
+        if let Some(tx) = map
+            .get(&sid)
+            .and_then(|s| s.tx.as_ref())
+            .and_then(|w| w.upgrade())
+        {
             Notice::publish(&tx, name, data);
         }
     }
@@ -299,13 +323,42 @@ pub async fn subscribe_global(
                 msg = rx.recv() => msg,
             };
             match received {
-                Ok(msg) => yield Ok(Event::default().event(msg.name).data(msg.data.as_ref())),
+                Ok(msg) => yield Ok(msg.into_event()),
                 Err(RecvError::Lagged(_)) => yield Ok(Event::default().event("resync").data("{}")),
                 Err(RecvError::Closed) => break,
             }
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn take_older_deltas(
+    buffered_delta: &mut Option<Notice>,
+    delta_rx: &mut broadcast::Receiver<Notice>,
+    delta_open: &mut bool,
+    snapshot_seq: u64,
+    before_seq: u64,
+) -> Vec<Notice> {
+    let mut ready = Vec::new();
+    if let Some(b) = buffered_delta.as_ref()
+        && b.seq < before_seq
+    {
+        let b = buffered_delta.take().unwrap();
+        if b.seq > snapshot_seq {
+            ready.push(b);
+        }
+    }
+    while buffered_delta.is_none() && *delta_open {
+        match delta_rx.try_recv() {
+            Ok(m) if m.seq <= snapshot_seq => continue,
+            Ok(m) if m.seq < before_seq => ready.push(m),
+            Ok(m) => *buffered_delta = Some(m),
+            Err(TryRecvError::Lagged(_)) => continue,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Closed) => *delta_open = false,
+        }
+    }
+    ready
 }
 
 pub async fn subscribe(
@@ -321,7 +374,7 @@ pub async fn subscribe(
             Ok((channel, rx, initial))
         })
         .await?;
-    let (delta_tx, mut delta_rx, snapshot) = app.streams.subscribe_delta(sid);
+    let (delta_tx, mut delta_rx, snapshot, snapshot_seq) = app.streams.subscribe_delta(sid);
     let stream = async_stream::stream! {
         let _channel = channel;
         let _delta = delta_tx;
@@ -329,8 +382,43 @@ pub async fn subscribe(
         if let Some(snap) = snapshot {
             yield Ok(Event::default().event("stream.snapshot").data(snap.to_string()));
         }
+        let mut buffered_delta: Option<Notice> = None;
         let mut delta_open = true;
         loop {
+            while buffered_delta.is_some() {
+                match rx.try_recv() {
+                    Ok(d) => {
+                        for m in take_older_deltas(
+                            &mut buffered_delta,
+                            &mut delta_rx,
+                            &mut delta_open,
+                            snapshot_seq,
+                            d.seq,
+                        ) {
+                            yield Ok(m.into_event());
+                        }
+                        yield Ok(d.into_event());
+                    }
+                    Err(TryRecvError::Lagged(_)) => {
+                        buffered_delta = None;
+                        yield Ok(Event::default().event("resync").data("{}"));
+                    }
+                    Err(TryRecvError::Closed) => {
+                        if let Some(b) = buffered_delta.take()
+                            && b.seq > snapshot_seq
+                        {
+                            yield Ok(b.into_event());
+                        }
+                        return;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        let b = buffered_delta.take().unwrap();
+                        if b.seq > snapshot_seq {
+                            yield Ok(b.into_event());
+                        }
+                    }
+                }
+            }
             enum Incoming {
                 Durable(std::result::Result<Notice, RecvError>),
                 Delta(std::result::Result<Notice, RecvError>),
@@ -342,15 +430,27 @@ pub async fn subscribe(
                 msg = delta_rx.recv(), if delta_open => Incoming::Delta(msg),
             };
             match received {
-                Incoming::Durable(Ok(msg)) => {
-                    yield Ok(Event::default().event(msg.name).data(msg.data.as_ref()));
+                Incoming::Durable(Ok(d)) => {
+                    for m in take_older_deltas(
+                        &mut buffered_delta,
+                        &mut delta_rx,
+                        &mut delta_open,
+                        snapshot_seq,
+                        d.seq,
+                    ) {
+                        yield Ok(m.into_event());
+                    }
+                    yield Ok(d.into_event());
                 }
                 Incoming::Durable(Err(RecvError::Lagged(_))) => {
+                    buffered_delta = None;
                     yield Ok(Event::default().event("resync").data("{}"));
                 }
                 Incoming::Durable(Err(RecvError::Closed)) => break,
-                Incoming::Delta(Ok(msg)) => {
-                    yield Ok(Event::default().event(msg.name).data(msg.data.as_ref()));
+                Incoming::Delta(Ok(m)) => {
+                    if m.seq > snapshot_seq {
+                        buffered_delta = Some(m);
+                    }
                 }
                 Incoming::Delta(Err(RecvError::Lagged(_))) => continue,
                 Incoming::Delta(Err(RecvError::Closed)) => delta_open = false,

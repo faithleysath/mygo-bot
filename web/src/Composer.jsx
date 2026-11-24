@@ -1,5 +1,4 @@
-import { useRef, useState } from "preact/hooks";
-import { apiFetch } from "./api.js";
+import { useLayoutEffect, useRef, useState } from "preact/hooks";
 
 function formatRem(sec) {
   if (sec == null) return "";
@@ -10,124 +9,52 @@ function formatRem(sec) {
 
 export function Composer({
   session,
+  draft,
+  uploading,
+  sending,
   tasks,
   queuedCount,
-  onSend,
-  onRun,
+  onChangeText,
+  onUploadFiles,
+  onRemoveAttachment,
+  onSubmit,
   onPause,
   onKillTask,
 }) {
-  const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState([]);
-  const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState("");
   const [tasksOpen, setTasksOpen] = useState(false);
   const fileRef = useRef(null);
   const taRef = useRef(null);
 
   const running = session?.status === "running" || session?.status === "pausing";
+  const text = draft?.text || "";
+  const attachments = draft?.attachments || [];
+  const error = draft?.error || "";
   const hasPayload = Boolean(text.trim() || attachments.length > 0);
+  const busy = uploading || sending;
 
-  const resize = () => {
+  useLayoutEffect(() => {
     const el = taRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  };
-
-  const uploadFiles = async (files) => {
-    const list = Array.from(files || []).filter((f) =>
-      /^(image|audio|video)\//.test(f.type)
-    );
-    if (!list.length) {
-      setError("Only image, audio, or video files are supported.");
-      return;
-    }
-    setError("");
-    setUploading(true);
-    try {
-      for (const file of list) {
-        const res = await apiFetch("/attachments", {
-          method: "POST",
-          headers: { "Content-Type": file.type },
-          body: file,
-        });
-        const kind = file.type.split("/")[0];
-        const preview = kind === "image" ? URL.createObjectURL(file) : null;
-        setAttachments((prev) => [
-          ...prev,
-          { id: res.id, kind, name: file.name || `${kind}-${res.id}`, preview },
-        ]);
-      }
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const removeAttachment = (id) => {
-    setAttachments((prev) => {
-      const target = prev.find((a) => a.id === id);
-      if (target?.preview) URL.revokeObjectURL(target.preview);
-      return prev.filter((a) => a.id !== id);
-    });
-  };
-
-  const buildContent = () => {
-    const blocks = [];
-    if (text.trim()) blocks.push({ type: "text", text });
-    for (const a of attachments) {
-      blocks.push({ type: a.kind, attachment_id: a.id });
-    }
-    return blocks;
-  };
-
-  const clearDraft = () => {
-    setText("");
-    setAttachments((prev) => {
-      for (const a of prev) if (a.preview) URL.revokeObjectURL(a.preview);
-      return [];
-    });
-    if (taRef.current) taRef.current.style.height = "auto";
-  };
-
-  const submit = async (startRun) => {
-    if (!hasPayload && startRun && !running) {
-      setError("");
-      try {
-        await onRun();
-      } catch (e) {
-        setError(e.message);
-      }
-      return;
-    }
-    if (!hasPayload) return;
-    setError("");
-    try {
-      await onSend(buildContent(), startRun);
-      clearDraft();
-    } catch (e) {
-      setError(e.message);
-    }
-  };
+  }, [session?.id, text]);
 
   const onKeyDown = (e) => {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (hasPayload) submit(!running);
+      if (hasPayload && !busy) onSubmit(session.id, !running);
     }
   };
 
   const onPaste = (e) => {
     const files = e.clipboardData?.files;
-    if (files?.length) uploadFiles(files);
+    if (files?.length) onUploadFiles(session.id, files);
   };
 
   const onDrop = (e) => {
     e.preventDefault();
-    if (e.dataTransfer?.files?.length) uploadFiles(e.dataTransfer.files);
+    if (e.dataTransfer?.files?.length) onUploadFiles(session.id, e.dataTransfer.files);
   };
 
   return (
@@ -189,7 +116,7 @@ export function Composer({
               <div key={a.id} class="attach-chip">
                 {a.preview ? <img src={a.preview} alt={a.name} /> : <span>{a.kind}</span>}
                 <span class="truncate">{a.name}</span>
-                <button type="button" onClick={() => removeAttachment(a.id)}>×</button>
+                <button type="button" onClick={() => onRemoveAttachment(session.id, a.id)}>×</button>
               </div>
             ))}
           </div>
@@ -200,10 +127,7 @@ export function Composer({
           rows={1}
           value={text}
           placeholder={running ? "Steer running session (queues for next step)…" : "Message MyGo… (Enter to send, Shift+Enter for newline)"}
-          onInput={(e) => {
-            setText(e.target.value);
-            resize();
-          }}
+          onInput={(e) => onChangeText(session.id, e.target.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
         />
@@ -217,7 +141,7 @@ export function Composer({
               multiple
               hidden
               onChange={(e) => {
-                uploadFiles(e.target.files);
+                onUploadFiles(session.id, e.target.files);
                 e.target.value = "";
               }}
             />
@@ -237,10 +161,10 @@ export function Composer({
                 <button
                   type="button"
                   class="btn-ghost btn-sm"
-                  disabled={!hasPayload || uploading}
-                  onClick={() => submit(false)}
+                  disabled={!hasPayload || busy}
+                  onClick={() => onSubmit(session.id, false)}
                 >
-                  Steer
+                  {sending ? "Sending…" : "Steer"}
                 </button>
                 <button
                   type="button"
@@ -264,19 +188,25 @@ export function Composer({
                   <button
                     type="button"
                     class="btn-ghost btn-sm"
-                    disabled={uploading}
-                    onClick={() => submit(false)}
+                    disabled={busy}
+                    onClick={() => onSubmit(session.id, false)}
                   >
-                    Queue
+                    {sending ? "Sending…" : "Queue"}
                   </button>
                 )}
                 <button
                   type="button"
                   class="btn-primary btn-sm"
-                  disabled={uploading || (!hasPayload && session?.status !== "paused" && queuedCount === 0)}
-                  onClick={() => submit(true)}
+                  disabled={busy || (!hasPayload && session?.status !== "paused" && queuedCount === 0)}
+                  onClick={() => onSubmit(session.id, true)}
                 >
-                  {hasPayload ? "Send & Run" : session?.status === "paused" ? "Resume" : "Run"}
+                  {sending
+                    ? "Sending…"
+                    : hasPayload
+                      ? "Send & Run"
+                      : session?.status === "paused"
+                        ? "Resume"
+                        : "Run"}
                 </button>
               </>
             )}

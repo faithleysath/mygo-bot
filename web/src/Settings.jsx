@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { apiFetch, formatCost, formatTokens } from "./api.js";
+import { buildMcpPayload } from "./state.js";
 
 function ModelsTab({ config, providers, models, onRefresh }) {
   const [showArchived, setShowArchived] = useState(false);
@@ -327,39 +328,25 @@ function McpTab() {
 
   const save = (e) => {
     e.preventDefault();
-    const f = form;
-    const body = {
-      description: f.description,
-      enabled: f.enabled,
-      transport: f.transport,
-      timeout_ms: Number(f.timeout_ms) || 60000,
-      allowed_tools: f.allowedTools.trim()
-        ? f.allowedTools.split(",").map((s) => s.trim()).filter(Boolean)
-        : null,
-    };
-    if (!f.id) body.name = f.name;
+    let body;
     try {
-      if (f.transport === "streamable-http") {
-        body.url = f.url;
-        if (f.headersJson.trim()) body.headers = JSON.parse(f.headersJson);
-        if (f.useOAuth) body.oauth = f.oauthJson.trim() ? JSON.parse(f.oauthJson) : {};
-        else if (f.id) body.oauth = null;
-      } else {
-        body.command = f.command;
-        body.args = f.argsText.trim() ? f.argsText.split("\n").filter(Boolean) : [];
-        if (f.envJson.trim()) body.env = JSON.parse(f.envJson);
-        body.cwd = f.cwd.trim() || null;
-      }
-    } catch {
-      setErr("Invalid JSON in headers, env, or OAuth config");
+      body = buildMcpPayload(form);
+    } catch (ex) {
+      setErr(ex.message);
+      return;
+    }
+    if (form.id && Object.keys(body).length === 0) {
+      setForm(null);
       return;
     }
     run(async () => {
-      if (f.id) await apiFetch(`/mcp/servers/${f.id}`, { method: "PATCH", body });
+      if (form.id) await apiFetch(`/mcp/servers/${form.id}`, { method: "PATCH", body });
       else await apiFetch("/mcp/servers", { method: "POST", body });
       setForm(null);
     });
   };
+
+  const editingSameTransport = form?.id && form.transport === form.orig?.transport;
 
   return (
     <div class="tab-stack">
@@ -372,18 +359,24 @@ function McpTab() {
           onClick={() =>
             setForm({
               id: null,
+              orig: null,
               name: "",
               description: "",
               enabled: true,
               transport: "streamable-http",
               url: "",
+              replaceUrl: true,
+              headersAction: "keep",
               headersJson: "",
-              useOAuth: false,
+              oauthAction: "keep",
               oauthJson: "",
               command: "",
+              argsAction: "replace",
               argsText: "",
+              envAction: "keep",
               envJson: "",
               cwd: "",
+              toolPolicy: "all",
               allowedTools: "",
               timeout_ms: 60000,
             })
@@ -402,7 +395,17 @@ function McpTab() {
             </label>
             <label class="field">
               <span>Transport</span>
-              <select value={form.transport} onChange={(e) => setForm({ ...form, transport: e.target.value })}>
+              <select
+                value={form.transport}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setForm({
+                    ...form,
+                    transport: next,
+                    argsAction: form.id && next === form.orig?.transport ? "keep" : "replace",
+                  });
+                }}
+              >
                 <option value="streamable-http">streamable-http</option>
                 <option value="stdio">stdio</option>
               </select>
@@ -416,21 +419,72 @@ function McpTab() {
               <input type="number" min="1" value={form.timeout_ms} onInput={(e) => setForm({ ...form, timeout_ms: e.target.value })} />
             </label>
           </div>
+
           {form.transport === "streamable-http" ? (
             <>
-              <label class="field">
-                <span>URL</span>
-                <input required value={form.url} onInput={(e) => setForm({ ...form, url: e.target.value })} />
-              </label>
-              <label class="field">
-                <span>Headers JSON (optional)</span>
-                <textarea rows={2} placeholder='{"Authorization":"Bearer ..."}' value={form.headersJson} onInput={(e) => setForm({ ...form, headersJson: e.target.value })} />
-              </label>
-              <label class="check-row">
-                <input type="checkbox" checked={form.useOAuth} onChange={(e) => setForm({ ...form, useOAuth: e.target.checked })} />
-                Enable OAuth 2.1
-              </label>
-              {form.useOAuth && (
+              {editingSameTransport && form.orig?.has_url_query && !form.replaceUrl ? (
+                <div class="field">
+                  <span>URL (query parameters hidden)</span>
+                  <div class="row gap-2">
+                    <span class="mono small truncate">{form.orig.url}?…</span>
+                    <label class="check-row">
+                      <input type="checkbox" checked={form.replaceUrl} onChange={(e) => setForm({ ...form, replaceUrl: e.target.checked })} />
+                      Replace URL
+                    </label>
+                  </div>
+                </div>
+              ) : (
+                <label class="field">
+                  <span>URL</span>
+                  <div class="row gap-2">
+                    <input required value={form.url} onInput={(e) => setForm({ ...form, url: e.target.value })} style="flex:1" />
+                    {editingSameTransport && form.orig?.has_url_query && (
+                      <label class="check-row">
+                        <input type="checkbox" checked={form.replaceUrl} onChange={(e) => setForm({ ...form, replaceUrl: e.target.checked, url: form.orig.url || "" })} />
+                        Replace URL
+                      </label>
+                    )}
+                  </div>
+                </label>
+              )}
+
+              {form.id ? (
+                <div class="grid-2">
+                  <label class="field">
+                    <span>Headers</span>
+                    <select value={form.headersAction} onChange={(e) => setForm({ ...form, headersAction: e.target.value })}>
+                      <option value="keep">{form.orig?.has_headers ? "Keep existing headers" : "None (unchanged)"}</option>
+                      <option value="replace">Replace headers (JSON)</option>
+                      <option value="clear">Clear headers</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>OAuth 2.1</span>
+                    <select value={form.oauthAction} onChange={(e) => setForm({ ...form, oauthAction: e.target.value })}>
+                      <option value="keep">{form.orig?.has_oauth ? "Keep existing OAuth config" : "Disabled (unchanged)"}</option>
+                      <option value="replace">{form.orig?.has_oauth ? "Replace OAuth config" : "Enable / set OAuth config"}</option>
+                      {form.orig?.has_oauth && <option value="disable">Disable OAuth</option>}
+                    </select>
+                  </label>
+                </div>
+              ) : (
+                <label class="check-row">
+                  <input
+                    type="checkbox"
+                    checked={form.oauthAction === "replace"}
+                    onChange={(e) => setForm({ ...form, oauthAction: e.target.checked ? "replace" : "keep" })}
+                  />
+                  Enable OAuth 2.1
+                </label>
+              )}
+
+              {(!form.id || form.headersAction === "replace") && (
+                <label class="field">
+                  <span>Headers JSON {form.id ? "" : "(optional)"}</span>
+                  <textarea rows={2} placeholder='{"Authorization":"Bearer ..."}' value={form.headersJson} onInput={(e) => setForm({ ...form, headersJson: e.target.value })} />
+                </label>
+              )}
+              {form.oauthAction === "replace" && (
                 <label class="field">
                   <span>OAuth Config JSON (optional)</span>
                   <textarea rows={2} placeholder="{}" value={form.oauthJson} onInput={(e) => setForm({ ...form, oauthJson: e.target.value })} />
@@ -449,20 +503,58 @@ function McpTab() {
                   <input value={form.cwd} onInput={(e) => setForm({ ...form, cwd: e.target.value })} />
                 </label>
               </div>
-              <label class="field">
-                <span>Args (one per line)</span>
-                <textarea rows={2} value={form.argsText} onInput={(e) => setForm({ ...form, argsText: e.target.value })} />
-              </label>
-              <label class="field">
-                <span>Env JSON (optional)</span>
-                <textarea rows={2} value={form.envJson} onInput={(e) => setForm({ ...form, envJson: e.target.value })} />
-              </label>
+              {form.id ? (
+                <div class="grid-2">
+                  <label class="field">
+                    <span>Args</span>
+                    <select value={form.argsAction} onChange={(e) => setForm({ ...form, argsAction: e.target.value })}>
+                      <option value="keep">Keep existing ({form.orig?.arg_count || 0} args)</option>
+                      <option value="replace">Replace args</option>
+                      <option value="clear">Clear args</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Env</span>
+                    <select value={form.envAction} onChange={(e) => setForm({ ...form, envAction: e.target.value })}>
+                      <option value="keep">{form.orig?.has_env ? "Keep existing env" : "None (unchanged)"}</option>
+                      <option value="replace">Replace env (JSON)</option>
+                      <option value="clear">Clear env</option>
+                    </select>
+                  </label>
+                </div>
+              ) : null}
+              {(!form.id || form.argsAction === "replace") && (
+                <label class="field">
+                  <span>Args (one per line)</span>
+                  <textarea rows={2} value={form.argsText} onInput={(e) => setForm({ ...form, argsText: e.target.value })} />
+                </label>
+              )}
+              {(!form.id || form.envAction === "replace") && (
+                <label class="field">
+                  <span>Env JSON {form.id ? "" : "(optional)"}</span>
+                  <textarea rows={2} value={form.envJson} onInput={(e) => setForm({ ...form, envJson: e.target.value })} />
+                </label>
+              )}
             </>
           )}
-          <label class="field">
-            <span>Allowed Tools (comma-separated, empty = all)</span>
-            <input value={form.allowedTools} onInput={(e) => setForm({ ...form, allowedTools: e.target.value })} />
-          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Tool Policy</span>
+              <select value={form.toolPolicy} onChange={(e) => setForm({ ...form, toolPolicy: e.target.value })}>
+                <option value="all">Allow all tools</option>
+                <option value="none">Deny all tools</option>
+                <option value="allowlist">Allow listed tools only</option>
+              </select>
+            </label>
+            {form.toolPolicy === "allowlist" && (
+              <label class="field">
+                <span>Allowed Tools (comma-separated)</span>
+                <input required value={form.allowedTools} onInput={(e) => setForm({ ...form, allowedTools: e.target.value })} />
+              </label>
+            )}
+          </div>
+
           <label class="check-row">
             <input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} />
             Enabled
@@ -481,6 +573,11 @@ function McpTab() {
               <div>
                 <strong>{s.name}</strong> <span class="pill">{s.transport}</span>{" "}
                 {!s.enabled && <span class="pill">disabled</span>}
+                {s.allowed_tools !== null && (
+                  <span class="pill">
+                    {s.allowed_tools.length === 0 ? "tools: none" : `tools: ${s.allowed_tools.length}`}
+                  </span>
+                )}
                 {s.has_oauth && <span class="pill">oauth: {oauth[s.id] || "?"}</span>}
                 <div class="muted small">{s.description || s.url || s.command}</div>
               </div>
@@ -522,18 +619,29 @@ function McpTab() {
                   onClick={() =>
                     setForm({
                       id: s.id,
+                      orig: s,
                       name: s.name,
                       description: s.description,
                       enabled: s.enabled,
                       transport: s.transport,
                       url: s.url || "",
+                      replaceUrl: false,
+                      headersAction: "keep",
                       headersJson: "",
-                      useOAuth: s.has_oauth,
+                      oauthAction: "keep",
                       oauthJson: "",
                       command: s.command || "",
+                      argsAction: "keep",
                       argsText: "",
+                      envAction: "keep",
                       envJson: "",
                       cwd: s.cwd || "",
+                      toolPolicy:
+                        s.allowed_tools === null
+                          ? "all"
+                          : s.allowed_tools.length === 0
+                            ? "none"
+                            : "allowlist",
                       allowedTools: (s.allowed_tools || []).join(", "),
                       timeout_ms: s.timeout_ms,
                     })

@@ -82,6 +82,14 @@ impl Db {
         } else if !tx.column_exists(None, "sessions", "input_queue_cursor")?
             || !tx.column_exists(None, "sessions", "title")?
             || !tx.column_exists(None, "sessions", "updated_at")?
+            || !tx
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='sessions'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some_and(|sql| sql.contains("AUTOINCREMENT"))
             || !tx.column_exists(None, "items", "codemode_call_item_id")?
             || !tx.table_exists(None, "mcp_oauth")?
             || !tx.column_exists(None, "mcp_servers", "allowed_tools")?

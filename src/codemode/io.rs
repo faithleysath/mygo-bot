@@ -223,12 +223,13 @@ async fn mygo_request(
             None => std::future::pending().await,
         }
     };
+    let stream_deadline = deadline.map(|at| (at, "timeout: mygo.request"));
     let dispatch = async {
         let response = router
             .oneshot(request)
             .await
             .unwrap_or_else(|e| match e {});
-        receive_axum(response, slot).await
+        receive_axum(response, slot, stream_deadline).await
     };
     tokio::select! {
         biased;
@@ -259,6 +260,7 @@ async fn receive_body<E>(
     content_length: Option<u64>,
     mut stream: impl futures_util::Stream<Item = Result<axum::body::Bytes, E>> + Send + Unpin + 'static,
     slot: Option<Reservation<'_>>,
+    stream_deadline: Option<(tokio::time::Instant, &'static str)>,
     map_err: impl Fn(E) -> String,
 ) -> Result<Reply, HostError>
 where
@@ -271,7 +273,7 @@ where
     let headers = collect_headers(header_map);
     if let Some(slot) = slot {
         let reader = StreamReader::new(stream.map_err(io::Error::other));
-        let id = slot.insert(Resource::Reader(Box::pin(reader)));
+        let id = slot.insert_with_deadline(Resource::Reader(Box::pin(reader)), stream_deadline);
         return Ok(Reply::value(
             json!({"status":status, "headers":headers, "body":id}),
         ));
@@ -303,6 +305,7 @@ async fn receive(
         content_length,
         Box::pin(response.bytes_stream()),
         slot,
+        None,
         network_error,
     )
     .await
@@ -311,6 +314,7 @@ async fn receive(
 async fn receive_axum(
     response: axum::http::Response<Body>,
     slot: Option<Reservation<'_>>,
+    stream_deadline: Option<(tokio::time::Instant, &'static str)>,
 ) -> Result<Reply, HostError> {
     let is_sse = response
         .headers()
@@ -338,6 +342,7 @@ async fn receive_axum(
         content_length,
         Box::pin(response.into_body().into_data_stream()),
         slot,
+        stream_deadline,
         |e| format!("mygo.request: {e}"),
     )
     .await
