@@ -47,14 +47,14 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 图片、音频、视频动辄几兆甚至几十兆，MyGo-Bot 坚决不把原始二进制直接塞进 `items` 表的 JSON 里，而是用 `attachments` 表单独托管（[src/media.rs](../src/media.rs)）：
 
 1. **上传与下载的防线**：
-   - 客户端先调 `POST /attachments`，Body 直接传原始二进制（上限 **50 MiB**），请求头必须带单个具体、无 `*` 通配符的 `image/*`、`audio/*` 或 `video/*` `Content-Type`，落库后拿到整数 `id`。
+   - 客户端先调 `POST /attachments`，Body 直接传原始二进制（上限 **50 MiB**），请求头必须带单个具体、无 `*` 通配符的 `image/*`、`audio/*` 或 `video/*` `Content-Type`，落库后拿到 `att_<26位后缀>` 格式的 TypeID。
    - 下载接口 `GET /attachments/{id}` 会原样吐出存储的 `mime_type` 和字节流，但强制加上 `Content-Disposition: attachment` 和 `X-Content-Type-Options: nosniff`，防止浏览器把恶意文件当成同源网页或脚本执行。
 2. **轻量账本引用 vs 上游实时展开**：
-   - 写进 `user_message`、`function_call_output` 或 `codemode_event` 的媒体块，只留一个干净的小指针：`{"type":"image","attachment_id":123}`。
+   - 写进 `user_message`、`function_call_output` 或 `codemode_event` 的媒体块，只留一个干净的小指针：`{"type":"image","attachment_id":"att_<26位后缀>"}`。
    - 只有当第 2 篇讲的 `JsonRows::ModelInput` 接力拼装上游 HTTP 请求体时，`media::wire_message` 才现从 `attachments` 里捞出二进制并编成 `data:{essence};base64,...`：
      - **`image`**：转成 OpenAI Responses API 的 `{"type":"input_image","image_url":"data:...","detail":"auto"}`；
      - **`audio` / `video`**：转成 `{"type":"input_file","filename":"attachment-{id}.{ext}","file_data":"data:..."}`，内部贴心把 `audio/mpeg`、`audio/x-wav`、`audio/mp4`、`video/quicktime` 等分别映射成 `.mp3`、`.wav`、`.m4a`、`.mov`；
-     - **`codemode_event`**：在内容数组最前面自动插一块文本身份牌（`"Codemode <event> event from cm_42 (sequence 1)."`），再把整条包成 `role: "user"` 消息喂给模型。
+     - **`codemode_event`**：在内容数组最前面自动插一块文本身份牌（`"Codemode <event> event from cm_<26位后缀> (sequence 1)."`），再把整条包成 `role: "user"` 消息喂给模型。
 3. **精准检查不误伤（`media::check_session`）**：
    - 无论是点火开跑前（`calls::begin`）还是给会话换模型时，`check_session` 只翻**真正会送进模型输入槽位**的三处东西：① 已进 `context_items` 的消息/推理/图像生成结果；② 刚跑完还没归进上下文的 `function_call_output`；③ 门外还没收进来的有效 `pending` 输入。
    - 它**绝不乱翻工具名称、参数或普通 JSON 字符串**——脚本里打印了一句 `"image_url"` 纯文本，不会误判成会话带了图片模态。

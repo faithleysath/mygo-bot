@@ -13,7 +13,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 - **供应商与模型目录（`llm_providers` 与 `llm_models`）**：模型的上游地址 `base_url`、密钥 `api_key`、模型代号 `model_key`、上下文窗口大小、支持的输入模态（`text`、`image`、`audio`、`video`）、推理强度档位以及价格表，都登记在独立的目录表里。
 - **全局默认表 `config`**：`config` 表只有一行（`id = 1`），只存两样东西——默认模型 ID（`default_model_id`）和默认推理强度（`default_reasoning_effort`）。它不存提示词，也不直接存 URL 和密钥。
 - **会话怎么继承配置**：调 `POST /sessions` 可以先建一个空会话；如果没单独指定模型和推理强度，程序就把 `config` 里**当时**的默认值抄进新建的 `sessions` 行。以后再改全局默认值，只影响**之后新建**的会话；已有会话可以随时通过 `PATCH /sessions/{sid}` 单独调整。
-- **什么时候必须有可用模型**：建空会话时 `model_id` 可以暂时是空的；但真想往会话里投信（`POST /sessions/{sid}/messages`）或者点火开工（`PUT /sessions/{sid}/run`），会话必须已经选定一个**可用**（自己和所属供应商都没有被归档）的模型。发给上游时，除了在 `input` 最前面实时拼入一条静态英文 `role: "developer"` 指南消息（位于 [src/model.rs](../src/model.rs#L54-L106)；内含编译期静态写入的宿主 OS/架构，不含动态环境信息、不写进流水账，同时可稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
+- **什么时候必须有可用模型**：建空会话时 `model_id` 可以暂时是空的；但真想往会话里投信（`POST /sessions/{sid}/messages`）或者点火开工（`PUT /sessions/{sid}/run`），会话必须已经选定一个**可用**（自己和所属供应商都没有被归档）的模型。发给上游时，除了在 `input` 最前面实时拼入一条静态英文 `role: "developer"` 指南消息（位于 [src/model.rs](../src/model.rs#L55-L107)；内含编译期静态写入的宿主 OS/架构，不含动态环境信息、不写进流水账，同时可稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
 
 ---
 
@@ -30,7 +30,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 2. 排着队被你撤回的消息，以及撤回单本身，模型压根不该看见；
 3. 模型同一回合可能一口气并发派出好几个工具，谁先跑完谁后跑完说不准，工具结果的落账顺序可能是乱的，喂给模型前必须按当初发起调用的顺序重新排齐。
 
-所以程序另外备了一张 `context_items` 表，里面按单调递增的 `position` 列指着 `items.id`。这张单子专门记着**模型下一问该读哪几笔、按什么顺序读**——**这份排好序的材料，就叫上下文。**
+所以程序另外备了一张 `context_items` 表，里面按每个会话各自从 `1` 开始单调递增的 `position` 列指着 `items.id`（主键为 `(session_id, position)`）。这张单子专门记着**模型下一问该读哪几笔、按什么顺序读**——**这份排好序的材料，就叫上下文。**
 
 ```
 流水账 items（按发生顺序只增不删）          上下文 context_items（按 position 排齐喂模型）
@@ -45,7 +45,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
   #9  function_call_output (A后完)  ───┴─▶  pos 4 -> #4, pos 5 -> #9, pos 6 -> #3?（先 A 后 B：#3->#9, #4->#5）
 ```
 
-> **类型防伪边界**：流水账里的 `kind` 分为两类——模型产出的项（如 `assistant_message`、`reasoning`、`function_call`、`image_generation_call`）和宿主系统写入的项（`user_message`、`withdrawal`、`function_call_output`、`codemode_event`）。[src/model.rs](../src/model.rs#L412-L428) 在接收模型输出时，会自动把 `type="message"` 且 `role="assistant"` 归档为 `assistant_message`，同时明确拒收任何冒充系统保留类型的输出项，防止上游异常响应污染账本语义。
+> **类型防伪边界**：流水账里的 `kind` 分为两类——模型产出的项（如 `assistant_message`、`reasoning`、`function_call`、`image_generation_call`）和宿主系统写入的项（`user_message`、`withdrawal`、`function_call_output`、`codemode_event`）。[src/model.rs](../src/model.rs#L452-L468) 在接收模型输出时，会自动把 `type="message"` 且 `role="assistant"` 归档为 `assistant_message`，同时明确拒收任何冒充系统保留类型的输出项，防止上游异常响应污染账本语义。
 
 ---
 
@@ -82,7 +82,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 只要循环允许暂停、允许重开、允许中途插话，记账时如果只存对话记录就一定会漏情况。所以 `sessions` 表里专门留了两个小书签：
 
-1. **`input_queue_cursor`（整型）**：**它只管一件事——门外排队的输入（`user_message` 和后台任务投来的 `codemode_event`）已经扫描处理到哪一个 `items.id` 了。** 每次把门外新信收进上下文，或者检查门外发现只剩废单时，游标就向前推进到当前最大的队列条目 ID，绝不回头反复扫描。
+1. **`input_queue_cursor`（TypeID 字符串，初值为 `""`）**：**它只管一件事——门外排队的输入（`user_message` 和后台任务投来的 `codemode_event`）已经扫描处理到哪一个 `items.id` 了。** `items.id` 使用 `itm_` 前缀的局部单调 UUIDv7 TypeID，字符串字典序就等价于发生先后；每次把门外新信收进上下文，或者检查门外发现只剩废单时，游标就向前推进到当前最大的队列条目 ID，绝不回头反复扫描。
 2. **`needs_model`（布尔 `0/1`）**：**它只管一件事——已经收进上下文里的材料，还欠不欠模型看一眼。**
 
 很多同学会问：有了上下文，也有了门外游标，为什么非得再留一个 `needs_model` 书签，省掉它会漏掉什么？
@@ -159,12 +159,12 @@ stateDiagram-v2
 2. 5 秒后如果还有会话或前台脚本没退完，立刻切第二步：把剩下的所有任务和会话全部按**硬暂停**掐断，再等最多 **5 秒**让工作协程把进程组和工具账结清；
 3. 最后关闭全部 MCP 连接；外层 HTTP 服务器还有 **6 秒**宽限排空在途请求，Tokio 运行时离开前再兜底等 **1 秒**（专门防挂在无响应网络磁盘上的阻塞文件读写拖死进程退出）。
 
-### 3. 崩溃恢复与 Schema 守门（`src/store.rs:74-105` + `src/codemode/ledger.rs:257-295`）
+### 3. 崩溃恢复与 Schema 守门（`src/store.rs:71-101` + `src/codemode/ledger.rs:266-304`）
 
 **崩溃恢复专门拿来跟硬暂停做对照：硬暂停是程序还醒着，能自己把残局结清；`SIGKILL` 强杀或直接断电，是连最后一次结账的机会都没给。**
 
 所以进程重新拉起、打开数据库 `Db::open` 时，只认 SQLite WAL 最后一次提交的事务，在一个启动事务里做三件事：
-1. **验库**：如果库不是空库，会检查一系列关键表和列是否齐备（[src/store.rs](../src/store.rs#L82-L101)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容表结构，直接拒绝启动并报错提示换新目录建库。
+1. **验库**：如果库不是空库，会校验 `PRAGMA user_version` 是否等于当前版本 `2`（[src/store.rs](../src/store.rs#L83-L97)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
 2. **截停状态**：把所有还挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`），把所有原先是 `'running'` 或 `'pausing'` 的会话统一标成 `'paused'`，同时交给 `codemode::ledger::recover` 处理未结清的后台任务与过期租期提醒（详见 [第 5 篇](05-codemode-lifecycle.md)）。
 3. **等人工重开才补未果工具**：注意启动恢复时**绝不会擅自重跑上次没回来的普通工具调用**——因为账上没记 `function_call_output`，只说明**结果没落盘**，推不出**工具当时没执行过**（比如发邮件、扣款）。重启后这些工具的空缺先留着，等你下次手动调 `PUT /sessions/{sid}/run` 恢复会话时，程序再翻流水账收残局，调用 `publish_tools(..., recovering=true)` 补上 `"Execution interrupted; result unknown."`。补齐残局后要不要接着问模型，又稳稳地回到前面那两个书签：先看 `needs_model`，再看 `pending` 队列，有活接着跑，没活切回 `idle`。
 

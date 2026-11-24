@@ -17,24 +17,24 @@
 | **`codemode`** | 模型工具 | 启动一段异步 JS 脚本 | `code` 必填（<= 256 KiB），可选 `background`（默认 `false`）、`label`（<= 256 B） |
 | **`codemode_wait`** | 模型工具 | 在当前 `step` 原地等动静，或派一次性探针赛跑 | 传 `{}` 纯等信/等任务；可选 `trigger_code`（<= 256 KiB） |
 | **`codemode_task_list`** | 模型工具 | 列出本会话仍在跑（含正在停止）的任务 | 无参数 `{}`，按原调用 `id` 升序返回 |
-| **`codemode_task_status`** | 模型工具 | 查单个任务的实时透视快照或已完工摘要 | 必填 `id`（严格格式 `cm_<正整数>`，拒绝前导零等变形） |
+| **`codemode_task_status`** | 模型工具 | 查单个任务的实时透视快照或已完工摘要 | 必填 `id`（严格格式 `cm_<26位小写 Crockford Base32 后缀>`，共 29 字符） |
 | **`codemode_task_renew`** | 模型工具 | 把活任务剩余租期从现在起重置为指定秒数 | 必填 `id` 和 `duration_seconds`（**1 到 86400 秒**） |
 | **`codemode_task_kill`** | 模型工具 | 停掉任务及其受管进程组，最多原地等 **3 秒**遗言 | 必填 `id` |
 | `GET /sessions/{sid}/tasks` | HTTP API | 供 WebUI 任务栏每 2 秒拉取本会话活跃任务全量快照 | 绕过“无变化去重”，总是返回最新完整文本尾部 |
 | `DELETE /sessions/{sid}/tasks/{tid}` | HTTP API | 人工从页面点 Stop 掐断指定任务 | 等同触发停止（超时标 `expired`，否则 `killed`），返回 `stopping` |
 
-每个脚本开跑时，都会以它那笔 `function_call` 在 `items` 表里的行号 `origin` 命名，任务编号就是 **`cm_<origin>`**。为了护住机器内存和 JS 线程池，系统锁死了两道并发配额：**全进程最多同时跑 256 个虚拟机任务，单个会话最多 32 个**——不仅记账员的 `s.tasks` 算这个数，连后面 `codemode_wait` 临时拉起来的 `trigger_code` 探针也会占一个 `VmSlot`（直到工人线程把进程组完全清场释放才摘名额）。
+每个脚本开跑时，都会从它那笔 `function_call` 在 `items` 表里的 TypeID 主键 `origin`（形如 `itm_<26位后缀>`）直接换前缀命名，任务编号就是 **`cm_<26位后缀>`**。为了护住机器内存和 JS 线程池，系统锁死了两道并发配额：**全进程最多同时跑 256 个虚拟机任务，单个会话最多 32 个**——不仅记账员的 `s.tasks` 算这个数，连后面 `codemode_wait` 临时拉起来的 `trigger_code` 探针也会占一个 `VmSlot`（直到工人线程把进程组完全清场释放才摘名额）。
 
 ---
 
 ## 快活当场结清，慢活打欠条转后台
 
-车间跑起来后，第一件事是跟当前 `step` 对账。模型发起一次 `codemode` 之后，在**怎么交还 `function_call_output`** 这一步一分为二（[src/codemode/mod.rs](../src/codemode/mod.rs#L758-L879)）：
+车间跑起来后，第一件事是跟当前 `step` 对账。模型发起一次 `codemode` 之后，在**怎么交还 `function_call_output`** 这一步一分为二（[src/codemode/mod.rs](../src/codemode/mod.rs#L759-L880)）：
 
 - **快活走前台**：默认（`background: false`）在当前 `step` 里先等等看。只要 **90 秒**（`FRONT_WAIT`）内跑完，最终输出直接写进配对的 `function_call_output`（此时 `codemode_call_item_id` 留空 `NULL`），当前 `step` 拿着完整答卷直接进下一轮，跟普通同步工具一模一样。
-- **慢活打欠条转后台**：只要满足“模型显式传了 `background: true`”或者“前台等满 **90 秒**还没交卷（且当前会话没收到硬暂停、进程没在关闭）”，程序就不再让当前 `step` 干陪着了——当场先写一张**后台收据**顶上 `function_call_output` 的坑位（告诉模型 `cm_42` 已转后台，状态 `background`，可以先干别的独立工作，要等结果就传 `{}` 调 `codemode_wait`），同时在这条结果行上盖一个特殊印章：**`codemode_call_item_id = 42`**。
+- **慢活打欠条转后台**：只要满足“模型显式传了 `background: true`”或者“前台等满 **90 秒**还没交卷（且当前会话没收到硬暂停、进程没在关闭）”，程序就不再让当前 `step` 干陪着了——当场先写一张**后台收据**顶上 `function_call_output` 的坑位（告诉模型 `cm_<26位后缀>` 已转后台，状态 `background`，可以先干别的独立工作，要等结果就传 `{}` 调 `codemode_wait`），同时在这条结果行上盖一个特殊印章：**`codemode_call_item_id = "itm_<26位后缀>"`**。
 
-**`function_call_output` 上的 `codemode_call_item_id` 只管一件事：区分这笔工具结果交的是“最终答卷”，还是只打了张“后台欠条”。** 前台结清时它是 `NULL`；转后台打欠条时它指回原调用 `42`。省掉这个印章，后面收到迟到结果或者崩溃重启翻账本时，光看见“已经有了一条 `function_call_output`”，程序根本分不清这单活是早就办完了，还是只打过欠条、还欠着真正的完工答卷！
+**`function_call_output` 上的 `codemode_call_item_id` 只管一件事：区分这笔工具结果交的是“最终答卷”，还是只打了张“后台欠条”。** 前台结清时它是 `NULL`；转后台打欠条时它指回原调用 `itm_<26位后缀>`。省掉这个印章，后面收到迟到结果或者崩溃重启翻账本时，光看见“已经有了一条 `function_call_output`”，程序根本分不清这单活是早就办完了，还是只打过欠条、还欠着真正的完工答卷！
 
 既然每个 `function_call` 唯一的 `function_call_output` 坑位已经被欠条占住了，退居后台的任务再想跟模型说话，就不能回头篡改旧收据，而是往 `items` 流水账里新记一种条目，叫 **`codemode_event`**（[schema.sql](../schema.sql#L102-L129)）。每笔事件用 `codemode_call_item_id` 指回原调用，带着递增序号 `sequence`（`1, 2, 3…`）和唯一索引防重，一共只记三类事：
 
@@ -53,7 +53,7 @@
 **共通的前半截**：
 - 都不去打断半路正在流式输出的 `step`，而是老老实实落进 `items` 流水账、排在 `input_queue_cursor` 后面等着；
 - 等当前 `step` 收尾开下一轮时，由 `take_pending` 从 `pending` 视图按 `items.id` 发生先后一视同仁地收进 `context_items` 上下文；
-- 在 [第 3 篇](03-catalog-media-and-billing.md) 的 `wire_message` 里，`codemode_event` 会在内容开头自动插一块身份牌（`"Codemode <event> event from cm_42 (sequence N)."`），然后包装成一条 `role: "user"` 消息送去上游模型；
+- 在 [第 3 篇](03-catalog-media-and-billing.md) 的 `wire_message` 里，`codemode_event` 会在内容开头自动插一块身份牌（`"Codemode <event> event from cm_<26位后缀> (sequence N)."`），然后包装成一条 `role: "user"` 消息送去上游模型；
 - 要是门外剩下的全是被撤回的消息或作废的提醒、`has_pending` 检查一圈发现没活可取，也会顺手把 `input_queue_cursor` 往前推过这批废单，省得次次重扫。
 
 **从哪一步开始分叉？分叉在两处：**
@@ -71,7 +71,7 @@
 
 拿它跟前面“前台 `codemode` 默认等 90 秒”并排对比：
 - **前半截完全共通**：都是在当前 `step` 里先扣住一条 `function_call_output` 不交账。只要它还没交账，整个 Agent 循环（`run_loop`）就稳稳停在当前 `step` 原地不动；会话状态照旧维持 `running`——**根本不需要给 `sessions.status` 硬造第五个 `waiting` 状态**，因为等待期间用户插话照样在门外排队、点暂停照样能停、崩溃重启照样按未完工具收残局，所有转移规矩跟 `running` 严丝合缝！
-- **它真正分叉在“进门查什么”和“什么信号能叫醒它”**（[src/codemode/mod.rs](../src/codemode/mod.rs#L504-L691)）：
+- **它真正分叉在“进门查什么”和“什么信号能叫醒它”**（[src/codemode/mod.rs](../src/codemode/mod.rs#L503-L692)）：
 
 ```
 进入 Wait::poll（在 SQLite 记账线程上原子判定，严格按以下优先级）：
@@ -117,7 +117,7 @@
 
 ## 限时工位、续命催单与“三秒等遗言”
 
-允许脚本常驻后台，就必须防它写个死循环永远赖在车间里。所以每个 `codemode` 任务出生自带 **2 小时（7200 秒）** 租期（[src/codemode/mod.rs](../src/codemode/mod.rs#L37-L43)）：
+允许脚本常驻后台，就必须防它写个死循环永远赖在车间里。所以每个 `codemode` 任务出生自带 **2 小时（7200 秒）** 租期（[src/codemode/mod.rs](../src/codemode/mod.rs#L38-L44)）：
 
 - **双档催单提醒**：看门协程的 `tick()` 盯着到期表，离到期只剩 **1 小时（3600s）** 和 **15 分钟（900s）** 时各往门外投一封 `lease_warning`（带着触发的 `threshold_seconds`）叫醒模型：
   - 模型觉得还需要跑，就调 **`codemode_task_renew`** 把剩余租期从当下重置成 **1 秒到 24 小时（86400s）**（系统自动按新剩余时长重新计算下一个提醒档位）；
