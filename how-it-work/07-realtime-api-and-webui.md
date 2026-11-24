@@ -43,15 +43,15 @@
 | **调用与计费**（3） | `GET /calls`，`GET /calls/summary`，`GET /calls/{id}` | 查询每轮上游调用明细、token、最新上下文长度与 `cost_nano_usd` 费用 |
 | **MCP 与 OAuth**（10） | `GET/POST /mcp/servers`，`GET/PATCH/DELETE /mcp/servers/{id}`，`POST .../test`<br>`GET/DELETE .../oauth`，`POST .../oauth/login`，`POST .../oauth/callback` | 注册传输配置、并发 4 体检探测、启动/手动完成/撤销 OAuth 2.1 |
 
-### 三条不同的路由出口（[src/main.rs](../src/main.rs#L503-L537)、[src/api.rs](../src/api.rs#L51-L78)）
+### 三条不同的路由出口（[src/main.rs](../src/main.rs#L503-L541)、[src/api.rs](../src/api.rs#L51-L78)）
 
 虽然核心业务逻辑都在同一套 `api::routes` 里，但程序故意把**外网/本机 TCP**、**本机 Unix Socket** 和 **Codemode 内部自省**三条入口的权限与页面切得清清楚楚：
 
-| 入口 | 业务 API (`/sessions` 等) | WebUI (`/`、`/ui/*`) | `/openapi.json` | `/docs` 页面 |
-| :--- | :--- | :--- | :--- | :--- |
-| **TCP 监听** | **必须带 Bearer Token**（`authorize_tcp` 拒绝多 `Authorization` 头，大小写不敏感 `Bearer` + `subtle::ConstantTimeEq` 恒定时间比对） | 放行（免 Token，因为页面 JS 自己弹输入门禁） | **仅当监听在回环地址**（如 `127.0.0.1`）时挂出且免 Token；非回环地址直接 404 | 同左，仅回环地址可见 |
-| **Unix Socket**（限 Unix） | **免 Token 放行**（靠文件权限 `0600` 拦人） | 放行 | 不挂载 | 不挂载 |
-| **进程内 `mygo.request`** | **免 Token 直调**（不经网络栈） | 不挂载 | **挂载且免 Token**（供脚本查全部接口） | 不挂载 |
+| 入口 | 业务 API (`/sessions` 等) | WebUI (`/`、`/ui/*`) | `/openapi.json` | `/docs` 页面 | `/_runtime`（运行时地址与 Token） |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **TCP 监听** | **必须带 Bearer Token**（`authorize_tcp` 拒绝多 `Authorization` 头，大小写不敏感 `Bearer` + `subtle::ConstantTimeEq` 恒定时间比对） | 放行（免 Token，因为页面 JS 自己弹输入门禁） | **仅当监听在回环地址**（如 `127.0.0.1`）时挂出且免 Token；非回环地址直接 404 | 同左，仅回环地址可见 | 不挂载（无论有无 Token 均 404） |
+| **Unix Socket**（限 Unix） | **免 Token 放行**（靠文件权限 `0600` 拦人） | 放行 | 不挂载 | 不挂载 | **挂载且免 Token**（带 `Cache-Control: no-store` 返回 `{ pid, listen, token }`，供 `service status` 查询） |
+| **进程内 `mygo.request`** | **免 Token 直调**（不经网络栈） | 不挂载 | **挂载且免 Token**（供脚本查全部接口） | 不挂载 | 不挂载 |
 
 `/docs` 页面（[src/docs.rs](../src/docs.rs)）是一个极简 HTML 加载页，以 SRI 子资源完整性校验（`credentials: 'omit'`）从 jsDelivr（8 秒超时自动回退 npmmirror 20 秒）加载 Scalar API Reference UI 渲染 `/openapi.json`，同时禁用所有开发者工具与遥测上报。
 

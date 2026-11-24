@@ -43,7 +43,7 @@
 
 ### 2. macOS `launchd` 与 Linux `systemd` 对照（`mygo service <action>`）
 
-支持 `install`、`start`、`stop`、`restart`、`status`、`logs [-f] [-n COUNT]`、`uninstall`（其中 `status` 和 `logs` 允许普通用户直接查询 `--system` 服务，碰到权限不足时会主动提示加上 `sudo`）：
+支持 `install`、`start`、`stop`、`restart`、`status`、`logs [-f] [-n COUNT]`、`uninstall`。其中 `status` 和 `logs` 允许普通用户直接查询 `--system` 服务（碰到权限不足时会主动提示加上 `sudo`）；当服务处于运行态时，`status` 会拿着服务管理器给出的 PID 通过对应私有 Unix Socket 查询 `/_runtime`（刚启动绑定中最多每 50ms 重试一次、共 10 次），核对 PID 一致后实时打印当前 `Listen` 地址端口和 Bearer `Token`（不把 Token 写入磁盘；若普通用户无权连系统级 `0600` socket 则提示加 `sudo`）：
 
 | 对比项 | macOS (`launchd`) | Linux (`systemd`) |
 | :--- | :--- | :--- |
