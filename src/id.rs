@@ -8,7 +8,7 @@ use std::{
 };
 
 use rusqlite::{
-    ToSql,
+    Connection, ToSql,
     types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -170,6 +170,62 @@ fn valid_suffix(suffix: &[u8]) -> bool {
     suffix.len() == 26
         && DECODE[suffix[0] as usize] < 8
         && suffix[1..].iter().all(|&b| DECODE[b as usize] < 32)
+}
+
+fn decode_base32(suffix: &[u8]) -> Option<[u8; 16]> {
+    if !valid_suffix(suffix) {
+        return None;
+    }
+    let mut v = 0u128;
+    for &b in suffix {
+        v = (v << 5) | u128::from(DECODE[b as usize]);
+    }
+    Some(v.to_be_bytes())
+}
+
+fn observe_id_str(id: &str) -> Result<()> {
+    let b = id.as_bytes();
+    let Some(raw) = (b.len() == 30 && b[3] == b'_')
+        .then(|| decode_base32(&b[4..]))
+        .flatten()
+    else {
+        return Err(Error::internal(format!("invalid TypeID in database: {id}")));
+    };
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes[2..8].copy_from_slice(&raw[0..6]);
+    let ts_ms = u64::from_be_bytes(ts_bytes);
+    let seq = match raw[6] >> 4 {
+        7 => (u16::from(raw[6] & 0x0f) << 8) | u16::from(raw[7]),
+        8..=15 => 0x0fff,
+        _ => 0,
+    };
+    let mut state = CLOCK.lock().unwrap();
+    if (ts_ms, seq) > (state.last_ms, state.seq) {
+        state.last_ms = ts_ms;
+        state.seq = seq;
+    }
+    Ok(())
+}
+
+/// Advances the monotonic UUIDv7 generator past all TypeIDs and cursors already committed in SQLite.
+pub fn seed_from_db(conn: &Connection) -> Result<()> {
+    const QUERIES: [&str; 8] = [
+        "SELECT max(id) FROM llm_providers",
+        "SELECT max(id) FROM llm_models",
+        "SELECT max(id) FROM mcp_servers",
+        "SELECT max(id) FROM sessions",
+        "SELECT max(input_queue_cursor) FROM sessions WHERE input_queue_cursor != ''",
+        "SELECT max(id) FROM llm_calls",
+        "SELECT max(id) FROM attachments",
+        "SELECT max(id) FROM items",
+    ];
+    for sql in QUERIES {
+        let max_id: Option<String> = conn.query_row(sql, [], |r| r.get(0))?;
+        if let Some(id) = max_id {
+            observe_id_str(&id)?;
+        }
+    }
+    Ok(())
 }
 
 impl<K: Prefix> Id<K> {

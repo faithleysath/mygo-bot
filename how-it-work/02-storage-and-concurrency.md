@@ -78,10 +78,10 @@
 
 搞定了写，再看读。假如某个长会话已经在 `items` 和 `context_items` 里攒了好几千条记录（甚至夹着几兆的多模态图片附件），这时候前端来翻 `/history` 或 `/context`，或者 Agent 循环准备把整本上下文拼成 JSON 喂给上游模型——如果让记账员一口气全读出来拼成几十兆的字符串再交出去，不仅当场撑爆内存，记账员窗口还会被死死占住好久，别人连一封小信都投不进来。
 
-所以程序在**对外翻页接口**（`/sessions/{sid}/history`、`/sessions/{sid}/context`，每页默认 **50 条**、最多 **200 条**）和**对上喂模型**（`JsonRows::ModelInput`）上，直接复用了同一套 **`JsonRows` 流式分块读法**（[src/store.rs](../src/store.rs#L605-L815)）：
+所以程序在**对外翻页接口**（`/sessions/{sid}/history`、`/sessions/{sid}/context`，每页默认 **50 条**、最多 **200 条**）和**对上喂模型**（`JsonRows::ModelInput`）上，直接复用了同一套 **`JsonRows` 流式分块读法**（[src/store.rs](../src/store.rs#L606-L817)）：
 
 1. **三选一翻页与先钉死终点**：
-   - 对外分页支持三种游标参数：`after`、`before`、`tail=true`（三者互斥，最多传一个，`limit` 限制在 `1..=200`）。**两类接口的游标类型不同**：查流水账 `/history`（以及 `/sessions`、`/calls` 等实体列表接口）的 `after` / `before` 传的是对应前缀的 **TypeID 字符串**（如 `itm_...`）；而查上下文 `/context` 的 `after` / `before` 传的是该会话内从 `1` 开始连续递增的整型 `position`（其中 `after >= 0`、`before > 0`）。
+   - **先分清两类分页接口**（`limit` 统一限制在 `1..=200`）：只有 `/sessions/{sid}/history` 和 `/sessions/{sid}/context` 完整支持 `after`、`before`、`tail=true` 三种互斥游标模式（最多传一个），其中 `/history` 传 `itm_...` 形式的 **TypeID 字符串**，而 `/context` 传该会话内从 `1` 开始连续递增的整型 `position`（`after >= 0`、`before > 0`）。至于 `/sessions`、`/calls` 和 `/sessions/{sid}/messages` 列表接口，**仅支持向后翻页的 `after` 游标**（分别传 `ses_...`、`cal_...`、`itm_...` TypeID 字符串），不接受 `before` 或 `tail`。
    - 真正取数据前，记账员先花一瞬间的读操作把本次范围 `(start, end)` **钉死**：查流水账 `/history` 钉的是 `items.id`，查上下文 `/context` 和喂模型钉的是 `context_items.position`。（注意两边游标**绝不能混用**，因为并发工具归进上下文的 `position` 顺序和原 `items.id` 顺序可能不同。）终点一钉死，哪怕下一毫秒门外又新落盘了几十条记录，编号也全都落在 `end` 外面，留给下次再翻。
 2. **一瓢一瓢往外舀**：
    - 接着从 `start` 到 `end`，每次只请记账员舀**一小瓢**：最多 **256 行**，或者字节攒到大约 **64 KiB** 就立刻打住（如果单条记录本身超过 64 KiB，也会完整放行这一条不卡死）；
@@ -105,7 +105,7 @@
 
 ## 查询、撤回与安全删除会话
 
-最后补全会话日常管理里的几个小机关（[src/api.rs](../src/api.rs#L284-L482)）：
+最后补全会话日常管理里的几个小机关（[src/api.rs](../src/api.rs#L284-L510)）：
 
 - **查排队信件 `GET /sessions/{sid}/messages`**：通过左连接撤回单 `withdrawal` 和上下文 `context_items`，实时把每条 `user_message` 算出 `queued`、`included`、`withdrawn` 三种状态，支持按 `id` 和 `status` 过滤及游标分页。
 - **撤回消息 `DELETE /sessions/{sid}/messages/{mid}`**：只能撤回还没被 `take_pending` 收进上下文的 `user_message`。如果已经进上下文，直接返回 `409 Conflict`（`"message already included"`）；如果已经撤回过再点撤回，直接幂等返回 `204 No Content`，不会写第二张撤回单（`UNIQUE(kind, target_id)` 也兜底锁死了这一点）。

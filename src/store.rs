@@ -94,6 +94,7 @@ impl Db {
                     "incompatible database schema; select a new database directory",
                 ));
             }
+            crate::id::seed_from_db(&tx)?;
         }
         tx.execute("UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE status='in_flight'", [])?;
         tx.execute("UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE status IN ('running','pausing')", [])?;

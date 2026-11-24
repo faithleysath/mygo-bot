@@ -412,6 +412,36 @@ struct Filter {
     limit: i64,
 }
 
+macro_rules! messages_sql {
+    ($filter:literal) => {
+        concat!(
+            "SELECT i.id, json_extract(i.payload,'$.content'),
+                    CASE WHEN w.id IS NOT NULL THEN 'withdrawn'
+                         WHEN c.item_id IS NOT NULL THEN 'included' ELSE 'queued' END AS status
+             FROM items i
+             LEFT JOIN items w ON w.target_id=i.id AND w.kind='withdrawal'
+             LEFT JOIN context_items c ON c.item_id=i.id ",
+            $filter
+        )
+    };
+}
+
+fn query_messages(
+    conn: &Connection,
+    sql: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> rusqlite::Result<Vec<QueuedMessage>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    stmt.query_map(args, |r| {
+        Ok(QueuedMessage {
+            id: r.get(0)?,
+            content: r.get(1)?,
+            status: r.get(2)?,
+        })
+    })?
+    .collect()
+}
+
 async fn messages(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
@@ -431,28 +461,26 @@ async fn messages(
     app.db
         .call(move |s| {
             session(&s.conn, sid)?;
-            let sql = "SELECT i.id, json_extract(i.payload,'$.content'),
-                     CASE WHEN w.id IS NOT NULL THEN 'withdrawn'
-                          WHEN c.item_id IS NOT NULL THEN 'included' ELSE 'queued' END AS status
-                   FROM items i
-                   LEFT JOIN items w ON w.target_id=i.id AND w.kind='withdrawal'
-                   LEFT JOIN context_items c ON c.item_id=i.id
-                   WHERE i.session_id=?1 AND i.kind='user_message'
-                     AND (?2 IS NULL OR i.id=?2) AND i.id>?3
-                     AND (?4 IS NULL OR status=?4)
-                   ORDER BY i.id LIMIT ?5";
-            let mut stmt = s.conn.prepare_cached(sql)?;
             let after = q.after.as_ref().map_or("", ItemId::as_str);
-            let args = params![sid, q.id, after, q.status, q.limit];
-            let data = stmt
-                .query_map(args, |r| {
-                    Ok(QueuedMessage {
-                        id: r.get(0)?,
-                        content: r.get(1)?,
-                        status: r.get(2)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let (sql, args): (&str, &[&dyn rusqlite::ToSql]) = if let Some(ref id) = q.id {
+                (
+                    messages_sql!(
+                        "WHERE i.id=?1 AND i.session_id=?2 AND i.kind='user_message'
+                           AND i.id>?3 AND (?4 IS NULL OR status=?4)"
+                    ),
+                    &[id, &sid, &after, &q.status],
+                )
+            } else {
+                (
+                    messages_sql!(
+                        "WHERE i.session_id=?1 AND i.kind='user_message'
+                           AND i.id>?2 AND (?3 IS NULL OR status=?3)
+                         ORDER BY i.id LIMIT ?4"
+                    ),
+                    &[&sid, &after, &q.status, &q.limit],
+                )
+            };
+            let data = query_messages(&s.conn, sql, args)?;
             Ok(Json(data))
         })
         .await
