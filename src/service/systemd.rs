@@ -94,6 +94,16 @@ impl Service {
     pub(super) fn running(&self) -> io::Result<bool> {
         Ok(self.property("ActiveState")? == "active")
     }
+    pub(super) fn running_pid(&self) -> io::Result<Option<u32>> {
+        if !self.running()? {
+            return Ok(None);
+        }
+        Ok(self
+            .property("MainPID")?
+            .parse::<u32>()
+            .ok()
+            .filter(|&pid| pid > 0))
+    }
     pub(super) fn register(&self) -> io::Result<()> {
         let (network, wanted) = match self.scope {
             Scope::User => ("", "default.target"),

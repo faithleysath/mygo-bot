@@ -2,12 +2,75 @@ use rustix::{
     fs::Mode,
     process::{geteuid, umask},
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::io::{Read, Write};
 use std::{
     env, fs, io,
+    net::SocketAddr,
     os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::{os::unix::net::UnixStream, time::Duration};
 use tokio::net::UnixListener;
+
+pub const RUNTIME_PATH: &str = "/_runtime";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RuntimeInfo {
+    pub pid: u32,
+    pub listen: SocketAddr,
+    pub token: String,
+}
+
+pub fn runtime_route(listen: SocketAddr, token: Arc<str>) -> axum::Router {
+    axum::Router::new().route(
+        RUNTIME_PATH,
+        axum::routing::get(move || {
+            let token = token.clone();
+            async move {
+                (
+                    [(axum::http::header::CACHE_CONTROL, "no-store")],
+                    axum::Json(RuntimeInfo {
+                        pid: std::process::id(),
+                        listen,
+                        token: token.to_string(),
+                    }),
+                )
+            }
+        }),
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn query_runtime(path: &Path) -> io::Result<Option<RuntimeInfo>> {
+    let mut stream = UnixStream::connect(path)?;
+    let timeout = Some(Duration::from_secs(1));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    write!(
+        stream,
+        "GET {RUNTIME_PATH} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut buf = Vec::new();
+    (&stream).take(8192).read_to_end(&mut buf)?;
+    let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed HTTP response",
+        ));
+    };
+    let head = std::str::from_utf8(&buf[..split])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let status = head.lines().next().unwrap_or_default();
+    if !(status.starts_with("HTTP/1.0 200") || status.starts_with("HTTP/1.1 200")) {
+        return Ok(None);
+    }
+    let info: RuntimeInfo = serde_json::from_slice(&buf[split + 4..])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(info))
+}
 
 fn runtime_dir(uid: u32) -> io::Result<PathBuf> {
     let dir = env::temp_dir().join(format!("mygo-{uid}"));

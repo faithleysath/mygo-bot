@@ -33,7 +33,7 @@ const SERVICE_HELP: &str = "Usage: mygo service [--system] <ACTION> [OPTIONS]
   install    Register automatic startup
   start      Start the service
   stop       Stop the service
-  status     Show service state and paths, including the Unix socket
+  status     Show service state, paths, TCP address, and Bearer token
   restart    Reload the definition and restart
   logs       Show recent log lines
   uninstall  Remove the service definition
@@ -168,6 +168,28 @@ fn checked(command: &mut Command) -> io::Result<()> {
     Ok(())
 }
 
+fn query_service_runtime(
+    path: &Path,
+    pid: u32,
+) -> io::Result<Option<crate::socket::RuntimeInfo>> {
+    for attempt in 0..10 {
+        match crate::socket::query_runtime(path) {
+            Ok(info) => return Ok(info.filter(|info| info.pid == pid)),
+            Err(err)
+                if attempt < 9
+                    && matches!(
+                        err.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(None)
+}
+
 fn terminal(command: &mut Command) -> io::Result<ExitCode> {
     let status = command
         .status()
@@ -283,6 +305,17 @@ pub fn run(scope: Scope, action: Action) -> io::Result<ExitCode> {
                 svc.socket_path().display(),
                 svc.log_source()
             );
+            if let Ok(Some(pid)) = svc.running_pid() {
+                match query_service_runtime(&svc.socket_path(), pid) {
+                    Ok(Some(info)) => {
+                        println!("Listen: http://{}\nToken: {}", info.listen, info.token);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                        println!("Listen: permission denied (try with sudo)");
+                    }
+                    _ => (),
+                }
+            }
             return svc.status();
         }
         Action::Logs { lines, follow } => return svc.logs(lines, follow),

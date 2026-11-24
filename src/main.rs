@@ -513,10 +513,11 @@ async fn serve(
         token: generated.then(|| token.clone()),
     }
     .announce(parent)?;
+    let token = Arc::<str>::from(token);
     let mut tcp_routes = routes
         .clone()
         .layer(axum::middleware::from_fn_with_state(
-            Arc::<str>::from(token),
+            token.clone(),
             api::authorize_tcp,
         ))
         .merge(web.clone());
@@ -528,8 +529,11 @@ async fn serve(
     let server = async {
         #[cfg(unix)]
         if let Some((listener, _socket_file)) = unix {
-            let unix_server = axum::serve(listener, routes.merge(web))
-                .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
+            let unix_server = axum::serve(
+                listener,
+                routes.merge(web).merge(socket::runtime_route(listen, token)),
+            )
+            .with_graceful_shutdown(app.stopping.clone().cancelled_owned());
             return tokio::try_join!(tcp_server.into_future(), unix_server.into_future())
                 .map(|_| ());
         }

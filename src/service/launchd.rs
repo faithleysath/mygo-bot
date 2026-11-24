@@ -129,6 +129,13 @@ impl Service {
     pub(super) fn running(&self) -> io::Result<bool> {
         Ok(self.job()?.is_some_and(|job| job.state == "running"))
     }
+    pub(super) fn running_pid(&self) -> io::Result<Option<u32>> {
+        Ok(self
+            .job()?
+            .filter(|job| job.state == "running")
+            .and_then(|job| job.pid?.parse::<u32>().ok())
+            .filter(|&pid| pid > 0))
+    }
 
     pub(super) fn register(&self) -> io::Result<()> {
         self.prepare_log()?;
