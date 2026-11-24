@@ -15,6 +15,7 @@ const result = await Bun.build({
   jsx: {
     runtime: "automatic",
     importSource: "preact",
+    development: false,
   },
 });
 

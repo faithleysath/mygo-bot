@@ -4,7 +4,7 @@ import { apiFetch, errorMessage, formatTokens } from "./api.ts";
 import { HighlightedCode } from "./highlight.tsx";
 import { formatBytes, useI18n } from "./i18n.ts";
 import { Icon } from "./Icons.tsx";
-import { ContentBlocks, CopyBtn, extractMessageText } from "./Timeline.tsx";
+import { ContentBlocks, CopyBtn, extractMessageText, extractReasoningText } from "./Timeline.tsx";
 import type {
   ActiveDraft,
   CallsSummary,
@@ -63,16 +63,7 @@ function summarizePayload(kind: string, p: HistoryPayload): string {
     return media.length ? `${head} · ${media.map((b) => `[${b.type}#${b.attachment_id}]`).join(" ")}` : head;
   }
   if (kind === "reasoning") {
-    const parts: string[] = [];
-    for (const k of ["summary", "content"] as const) {
-      const arr = p[k];
-      if (Array.isArray(arr)) {
-        for (const chunk of arr) {
-          if (chunk && typeof chunk === "object" && typeof chunk.text === "string") parts.push(chunk.text);
-        }
-      }
-    }
-    return parts.join(" ").replace(/\s+/g, " ").trim();
+    return extractReasoningText(p).replace(/\s+/g, " ").trim();
   }
   if (kind === "withdrawal") return "";
   const txt = extractMessageText(p.content).replace(/\s+/g, " ").trim();

@@ -9,6 +9,7 @@ import type {
   ActiveDraft,
   ContentBlock,
   HistoryItem,
+  HistoryPayload,
   LlmCallInfo,
   MediaKind,
   RetryNotice,
@@ -59,6 +60,21 @@ export function extractMessageText(blocks: string | ContentBlock[] | undefined):
     if (!b || typeof b !== "object") continue;
     if (typeof b.text === "string" && b.text) parts.push(b.text);
     else if (typeof b.refusal === "string" && b.refusal) parts.push(b.refusal);
+  }
+  return parts.join("\n\n");
+}
+
+export function extractReasoningText(p: HistoryPayload): string {
+  const parts: string[] = [];
+  for (const key of ["summary", "content"] as const) {
+    const chunks = p[key];
+    if (Array.isArray(chunks)) {
+      for (const chunk of chunks) {
+        if (chunk && typeof chunk === "object" && "text" in chunk && typeof chunk.text === "string" && chunk.text) {
+          parts.push(chunk.text);
+        }
+      }
+    }
   }
   return parts.join("\n\n");
 }
@@ -343,22 +359,7 @@ function ReasoningBlock({
   const bodyRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
 
-  let body = text;
-  if (!streaming && item) {
-    const p = item.payload || {};
-    const parts: string[] = [];
-    for (const key of ["summary", "content"] as const) {
-      const chunks = p[key];
-      if (Array.isArray(chunks)) {
-        for (const chunk of chunks) {
-          if (chunk && typeof chunk === "object" && "text" in chunk && typeof chunk.text === "string" && chunk.text) {
-            parts.push(chunk.text);
-          }
-        }
-      }
-    }
-    body = parts.join("\n\n");
-  }
+  const body = !streaming && item ? extractReasoningText(item.payload || {}) : text;
 
   useLayoutEffect(() => {
     const el = bodyRef.current;
