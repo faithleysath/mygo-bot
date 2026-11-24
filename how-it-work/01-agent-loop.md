@@ -13,7 +13,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 - **供应商与模型目录（`llm_providers` 与 `llm_models`）**：模型的上游地址 `base_url`、密钥 `api_key`、模型代号 `model_key`、上下文窗口大小、支持的输入模态（`text`、`image`、`audio`、`video`）、推理强度档位以及价格表，都登记在独立的目录表里。
 - **全局默认表 `config`**：`config` 表只有一行（`id = 1`），只存两样东西——默认模型 ID（`default_model_id`）和默认推理强度（`default_reasoning_effort`）。它不存提示词，也不直接存 URL 和密钥。
 - **会话怎么继承配置**：调 `POST /sessions` 可以先建一个空会话；如果没单独指定模型和推理强度，程序就把 `config` 里**当时**的默认值抄进新建的 `sessions` 行。以后再改全局默认值，只影响**之后新建**的会话；已有会话可以随时通过 `PATCH /sessions/{sid}` 单独调整。
-- **什么时候必须有可用模型**：建空会话时 `model_id` 可以暂时是空的；但真想往会话里投信（`POST /sessions/{sid}/messages`）或者点火开工（`PUT /sessions/{sid}/run`），会话必须已经选定一个**可用**（自己和所属供应商都没有被归档）的模型。发给上游时，除了在请求顶层固定附带一段静态英文操作指南 `instructions`（位于 [src/model.rs](../src/model.rs#L54-L74)，不含任何动态环境信息、也不写进流水账）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
+- **什么时候必须有可用模型**：建空会话时 `model_id` 可以暂时是空的；但真想往会话里投信（`POST /sessions/{sid}/messages`）或者点火开工（`PUT /sessions/{sid}/run`），会话必须已经选定一个**可用**（自己和所属供应商都没有被归档）的模型。发给上游时，除了在 `input` 最前面实时拼入一条静态英文 `role: "developer"` 指南消息（位于 [src/model.rs](../src/model.rs#L54-L96)；不含动态环境信息、不写进流水账，同时可稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
 
 ---
 

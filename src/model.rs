@@ -74,19 +74,22 @@ const INSTRUCTIONS: &str = concat!(
 );
 
 async fn body(db: Db, sid: i64, input: &Input) -> Result<reqwest::Body> {
-    let mut header = json!({
-        "model": input.model,
-        "instructions": INSTRUCTIONS,
-        "tools": tools::definitions(),
-        "stream": true,
-        "store": false
-    });
+    let mut header =
+        json!({"model":input.model,"tools":tools::definitions(),"stream":true,"store":false});
     if let Some(e) = &input.effort {
         header["reasoning"] = json!({"effort":e});
     }
     let mut prefix = header.to_string().into_bytes();
     prefix.pop();
     prefix.extend_from_slice(b",\"input\":[");
+    prefix.extend_from_slice(
+        json!({"role":"developer","content":[{"type":"input_text","text":INSTRUCTIONS}]})
+            .to_string()
+            .as_bytes(),
+    );
+    if input.end > 0 {
+        prefix.push(b',');
+    }
     store::JsonRows::ModelInput
         .body(db, sid, 0, input.end, prefix, b"]}")
         .await

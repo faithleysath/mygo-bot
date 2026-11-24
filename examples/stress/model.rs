@@ -102,8 +102,25 @@ fn user_text(message: &Value) -> Result<&str> {
     Ok(block["text"].as_str().ok_or("missing user text")?)
 }
 
+fn developer_text(message: &Value) -> Result<&str> {
+    check(message["role"] == "developer", "expected a developer message")?;
+    let Some([block]) = message["content"].as_array().map(Vec::as_slice) else {
+        return Err("expected one developer content block".into());
+    };
+    check(block["type"] == "input_text", "expected input_text block")?;
+    let text = block["text"].as_str().ok_or("missing developer text")?;
+    check(!text.trim().is_empty(), "empty developer text")?;
+    Ok(text)
+}
+
 async fn reply(model: Model, request: Value) -> Result<Response> {
-    let input = request["input"].as_array().ok_or("missing input")?;
+    check(
+        request.get("instructions").is_none(),
+        "unexpected top-level instructions",
+    )?;
+    let raw_input = request["input"].as_array().ok_or("missing input")?;
+    developer_text(raw_input.first().ok_or("missing developer message")?)?;
+    let input = &raw_input[1..];
     let key = user_text(input.first().ok_or("missing user message")?)?;
     let control = model
         .0
