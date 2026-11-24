@@ -13,23 +13,10 @@ import {
   setUnauthorizedHandler,
 } from "./api.ts";
 import { Composer } from "./Composer.tsx";
-import { ContextView } from "./ContextView.tsx";
-import { I18nContext, readLocalePref, resolveLocale, saveLocalePref, statusText, translate, useI18n } from "./i18n.ts";
-import type { LocalePref } from "./i18n.ts";
-import {
-  BrandMark,
-  IconActivity,
-  IconAlert,
-  IconChat,
-  IconEye,
-  IconEyeOff,
-  IconLayers,
-  IconPlay,
-  IconPlus,
-  IconSettings,
-  IconSidebar,
-  IconX,
-} from "./Icons.tsx";
+import { I18nContext, readLocalePref, resolveLocale, saveLocalePref, statusText, tr, useI18n } from "./i18n.ts";
+import type { LocalePref, Msg } from "./i18n.ts";
+import { BrandMark, Icon } from "./Icons.tsx";
+import { ContextView, TraceView } from "./Inspector.tsx";
 import { Settings } from "./Settings.tsx";
 import type { SettingsTabId } from "./Settings.tsx";
 import { Sidebar } from "./Sidebar.tsx";
@@ -48,7 +35,6 @@ import {
 } from "./state.ts";
 import type { GlobalSessionSync } from "./state.ts";
 import { Timeline } from "./Timeline.tsx";
-import { TraceView } from "./TraceView.tsx";
 import type {
   ActiveDraft,
   ActiveTask,
@@ -104,7 +90,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
       setToken(token);
       onSuccess();
     } catch (ex) {
-      setErr(errorMessage(ex) || t("invalidToken"));
+      setErr(errorMessage(ex) || t("Invalid Bearer token"));
     } finally {
       setBusy(false);
     }
@@ -118,14 +104,14 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
           <span class="brand-name">MyGo</span>
           <span class="brand-tag">BOT</span>
         </div>
-        <p class="muted">{t("gatePrompt")}</p>
+        <p class="muted">{t("Enter the daemon TCP Bearer token to connect.")}</p>
         {err && <div class="err-inline">{err}</div>}
         <div class="token-input-wrap">
           {show ? (
             <input
               key="tok"
               type="text"
-              placeholder={t("tokenPlaceholder")}
+              placeholder={t("Bearer token")}
               autoFocus
               value={value}
               onInput={(e) => setValue(e.currentTarget.value)}
@@ -134,7 +120,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
             <input
               key="tok"
               type="password"
-              placeholder={t("tokenPlaceholder")}
+              placeholder={t("Bearer token")}
               autoFocus
               value={value}
               onInput={(e) => setValue(e.currentTarget.value)}
@@ -143,18 +129,18 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
           <button
             type="button"
             class="btn-icon"
-            title={show ? t("hideToken") : t("showToken")}
-            aria-label={show ? t("hideToken") : t("showToken")}
+            title={show ? t("Hide token") : t("Show token")}
+            aria-label={show ? t("Hide token") : t("Show token")}
             onClick={() => setShow((v) => !v)}
           >
-            {show ? <IconEyeOff size={15} /> : <IconEye size={15} />}
+            <Icon n={show ? "eyeOff" : "eye"} />
           </button>
         </div>
         <button type="submit" class="btn-primary" disabled={busy || !value.trim()}>
-          {busy ? t("verifying") : t("connect")}
+          {busy ? t("Verifying…") : t("Connect")}
         </button>
         <div class="muted small">
-          {t("tokenHintBefore")} <code class="md-inline-code">mygo service status</code> {t("tokenHintAfter")}
+          {t("Run")} <code class="md-inline-code">mygo service status</code> {t("on the host to view the token.")}
         </div>
       </form>
     </div>
@@ -206,15 +192,15 @@ function TopBar({
           <button
             type="button"
             class={`btn-icon ${sidebarCollapsed ? "" : "mobile-only"}`}
-            title={t("showSessions")}
-            aria-label={t("showSessions")}
+            title={t("Show sessions")}
+            aria-label={t("Show sessions")}
             onClick={onOpenSidebar}
           >
-            <IconSidebar size={16} />
+            <Icon n="sidebar" s={16} />
           </button>
           <input
             class="title-input"
-            placeholder={`${t("sessionPrefix")} #${session.id}`}
+            placeholder={`${t("Session")} #${session.id}`}
             value={title}
             onInput={(e) => setTitle(e.currentTarget.value)}
             onBlur={commitTitle}
@@ -235,11 +221,11 @@ function TopBar({
           <button
             type="button"
             class="btn-icon"
-            title={t("settings")}
-            aria-label={t("settings")}
+            title={t("Settings")}
+            aria-label={t("Settings")}
             onClick={onOpenSettings}
           >
-            <IconSettings size={15} />
+            <Icon n="settings" />
           </button>
         </div>
       </div>
@@ -250,16 +236,16 @@ function TopBar({
           class={`view-tab ${activeTab === "chat" ? "active" : ""}`}
           onClick={() => onSelectTab("chat")}
         >
-          <IconChat size={14} />
-          <span>{t("tabChat")}</span>
+          <Icon n="chat" s={14} />
+          <span>{t("Chat")}</span>
         </button>
         <button
           type="button"
           class={`view-tab ${activeTab === "trace" ? "active" : ""}`}
           onClick={() => onSelectTab("trace")}
         >
-          <IconActivity size={14} />
-          <span>{t("tabTrace")}</span>
+          <Icon n="activity" s={14} />
+          <span>{t("Trace")}</span>
           {itemCount > 0 && <span class="tab-count mono">{itemCount}</span>}
         </button>
         <button
@@ -267,8 +253,8 @@ function TopBar({
           class={`view-tab ${activeTab === "context" ? "active" : ""}`}
           onClick={() => onSelectTab("context")}
         >
-          <IconLayers size={14} />
-          <span>{t("tabContext")}</span>
+          <Icon n="layers" s={14} />
+          <span>{t("Context")}</span>
         </button>
       </nav>
     </header>
@@ -286,6 +272,8 @@ function App() {
   const [themePref, setThemePrefState] = useState<ThemePref>(readThemePref);
   const [localePref, setLocalePrefState] = useState<LocalePref>(readLocalePref);
   const locale = useMemo(() => resolveLocale(localePref), [localePref]);
+  const t = (s: Msg) => tr(locale, s);
+
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
@@ -632,20 +620,14 @@ function App() {
           sessionSync.onReady();
         } else if (name === "stream.snapshot") {
           const snap = data as ActiveDraft;
-          if (!closedCalls.has(snap.llm_call_id)) {
-            setDraft(snap);
-          }
+          if (!closedCalls.has(snap.llm_call_id)) setDraft(snap);
         } else if (name === "item.started") {
           const ev = data as DraftStartedEvent;
-          if (closedCalls.has(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) {
-            return;
-          }
+          if (closedCalls.has(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) return;
           setDraft((prev) => applyDraftStarted(prev, ev));
         } else if (name === "item.delta") {
           const ev = data as DraftDeltaEvent;
-          if (closedCalls.has(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) {
-            return;
-          }
+          if (closedCalls.has(ev.llm_call_id) || closedItems.has(`${ev.llm_call_id}:${ev.output_index}`)) return;
           setRetryNotice(null);
           setDraft((prev) => applyDraftDelta(prev, ev));
         } else if (name === "stream.clear") {
@@ -839,7 +821,7 @@ function App() {
     if (!list.length) {
       updateComposer(targetSid, (c) => ({
         ...c,
-        error: translate(locale, "unsupportedMedia"),
+        error: t("Only image, audio, or video files are supported."),
       }));
       return;
     }
@@ -948,7 +930,7 @@ function App() {
           if (!sessionsRef.current.some((s) => s.id === targetSid)) return;
           updateComposer(targetSid, (c) => ({
             ...c,
-            error: `${translate(locale, "queuedRunFailed")} ${errorMessage(e)}`,
+            error: `${t("Message queued, but failed to start run:")} ${errorMessage(e)}`,
           }));
         }
       }
@@ -965,358 +947,220 @@ function App() {
     setSidebarOpen(true);
   };
 
+  const openSettings = (tab: SettingsTabId, sid = "") =>
+    setSettingsState({ open: true, tab, sessionFilter: sid });
+
   const activeModel = activeSession?.model_id ? modelsById.get(activeSession.model_id) : undefined;
+  const withdrawMsg = (mid: number) => {
+    if (!activeSession) return;
+    void apiFetch(`/sessions/${activeSession.id}/messages/${mid}`, { method: "DELETE" }).catch((e) =>
+      setBannerErr(errorMessage(e))
+    );
+  };
 
   return (
     <I18nContext.Provider value={locale}>
-      <AppView
-        authed={authed}
-        locale={locale}
-        themePref={themePref}
-        localePref={localePref}
-        sessions={sessions}
-        activeId={activeId}
-        activeSession={activeSession}
-        activeModel={activeModel}
-        activeTab={activeTab}
-        providers={providers}
-        models={models}
-        config={config}
-        sidebarOpen={sidebarOpen}
-        sidebarCollapsed={sidebarCollapsed}
-        searchOpen={searchOpen}
-        searchInputRef={searchInputRef}
-        items={items}
-        hasMore={hasMore}
-        loadingMore={loadingMore}
-        queuedIds={queuedIds}
-        draft={draft}
-        retryNotice={retryNotice}
-        tasks={tasks}
-        summary={summary}
-        callsById={callsById}
-        contextRefreshNonce={contextRefreshNonce}
-        sseStatus={sseStatus}
-        bannerErr={bannerErr}
-        composers={composers}
-        uploadingBySid={uploadingBySid}
-        sendingBySid={sendingBySid}
-        settingsState={settingsState}
-        onAuthed={() => setAuthed(true)}
-        onSelectSession={setActiveId}
-        onSelectTab={setActiveTab}
-        onCreateSession={createSession}
-        onDeleteSession={deleteSession}
-        onPatchSession={patchSession}
-        onCycleTheme={cycleTheme}
-        onSetThemePref={setThemePrefState}
-        onSetLocalePref={setLocalePrefState}
-        onToggleSidebarCollapse={toggleSidebarCollapse}
-        onOpenSidebar={openSidebar}
-        onCloseSidebar={() => setSidebarOpen(false)}
-        onSetSearchOpen={setSearchOpen}
-        onOpenSettingsTab={(tab, sid = "") =>
-          setSettingsState({ open: true, tab, sessionFilter: sid })
-        }
-        onCloseSettings={() => setSettingsState((s) => ({ ...s, open: false }))}
-        onSignOut={() => {
-          setToken("");
-          setSettingsState({ open: false, tab: "models", sessionFilter: "" });
-          setAuthed(false);
-        }}
-        onRefreshCatalog={loadCatalog}
-        onLoadMore={loadMore}
-        onWithdraw={(mid) => {
-          if (!activeSession) return;
-          void apiFetch(`/sessions/${activeSession.id}/messages/${mid}`, { method: "DELETE" }).catch((e) =>
-            setBannerErr(errorMessage(e))
-          );
-        }}
-        onClearBannerErr={() => setBannerErr("")}
-        onResumePaused={() => {
-          if (!activeSession) return;
-          void apiFetch(`/sessions/${activeSession.id}/run`, { method: "PUT" }).catch((e) =>
-            setBannerErr(errorMessage(e))
-          );
-        }}
-        onChangeText={onChangeText}
-        onUploadFiles={onUploadFiles}
-        onRemoveAttachment={onRemoveAttachment}
-        onSubmitComposer={onSubmitComposer}
-        onPause={(mode) => {
-          if (!activeSession) return;
-          void apiFetch(`/sessions/${activeSession.id}/run?mode=${mode}`, { method: "DELETE" }).catch((e) =>
-            setBannerErr(errorMessage(e))
-          );
-        }}
-        onKillTask={(tid) => {
-          if (!activeSession) return;
-          void apiFetch(`/sessions/${activeSession.id}/tasks/${tid}`, { method: "DELETE" }).catch((e) =>
-            setBannerErr(errorMessage(e))
-          );
-        }}
-      />
-    </I18nContext.Provider>
-  );
-}
+      {authed === null ? (
+        <div class="gate-wrap"><div class="muted">{t("Connecting…")}</div></div>
+      ) : !authed ? (
+        <TokenGate onSuccess={() => setAuthed(true)} />
+      ) : (
+        <div class="layout">
+          <Sidebar
+            sessions={sessions}
+            activeId={activeId}
+            open={sidebarOpen}
+            collapsed={sidebarCollapsed}
+            searchOpen={searchOpen}
+            themePref={themePref}
+            searchInputRef={searchInputRef}
+            onSelect={setActiveId}
+            onCreate={createSession}
+            onDelete={deleteSession}
+            onCycleTheme={cycleTheme}
+            onOpenSettingsTab={(tab) => openSettings(tab)}
+            onToggleCollapse={toggleSidebarCollapse}
+            onSetSearchOpen={setSearchOpen}
+            onClose={() => setSidebarOpen(false)}
+          />
 
-function AppView(props: {
-  authed: boolean | null;
-  locale: "zh" | "en";
-  themePref: ThemePref;
-  localePref: LocalePref;
-  sessions: SessionInfo[];
-  activeId: number | null;
-  activeSession: SessionInfo | null;
-  activeModel: ModelInfo | undefined;
-  activeTab: MainTab;
-  providers: ProviderInfo[];
-  models: ModelInfo[];
-  config: AppConfig | null;
-  sidebarOpen: boolean;
-  sidebarCollapsed: boolean;
-  searchOpen: boolean;
-  searchInputRef: preact.RefObject<HTMLInputElement | null>;
-  items: HistoryItem[];
-  hasMore: boolean;
-  loadingMore: boolean;
-  queuedIds: Set<number>;
-  draft: ActiveDraft | null;
-  retryNotice: RetryNotice | null;
-  tasks: ActiveTask[];
-  summary: CallsSummary | null;
-  callsById: Map<number, LlmCallInfo>;
-  contextRefreshNonce: number;
-  sseStatus: SseStatus;
-  bannerErr: string;
-  composers: Record<number, ComposerDraft>;
-  uploadingBySid: Record<number, number>;
-  sendingBySid: Record<number, boolean>;
-  settingsState: { open: boolean; tab: SettingsTabId; sessionFilter: string };
-  onAuthed: () => void;
-  onSelectSession: (id: number) => void;
-  onSelectTab: (tab: MainTab) => void;
-  onCreateSession: () => void;
-  onDeleteSession: (id: number) => void;
-  onPatchSession: (
-    sid: number,
-    patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort">>
-  ) => void;
-  onCycleTheme: () => void;
-  onSetThemePref: (pref: ThemePref) => void;
-  onSetLocalePref: (pref: LocalePref) => void;
-  onToggleSidebarCollapse: () => void;
-  onOpenSidebar: () => void;
-  onCloseSidebar: () => void;
-  onSetSearchOpen: (open: boolean) => void;
-  onOpenSettingsTab: (tab: SettingsTabId, sid?: string) => void;
-  onCloseSettings: () => void;
-  onSignOut: () => void;
-  onRefreshCatalog: () => Promise<void>;
-  onLoadMore: () => void;
-  onWithdraw: (mid: number) => void;
-  onClearBannerErr: () => void;
-  onResumePaused: () => void;
-  onChangeText: (sid: number, text: string) => void;
-  onUploadFiles: (sid: number, files: FileList | null) => void;
-  onRemoveAttachment: (sid: number, aid: number) => void;
-  onSubmitComposer: (sid: number, startRun: boolean) => void;
-  onPause: (mode: "soft" | "hard") => void;
-  onKillTask: (tid: string) => void;
-}) {
-  const { t } = useI18n();
-  if (props.authed === null) {
-    return <div class="gate-wrap"><div class="muted">{t("connecting")}</div></div>;
-  }
-  if (!props.authed) {
-    return <TokenGate onSuccess={props.onAuthed} />;
-  }
-
-  return (
-    <div class="layout">
-      <Sidebar
-        sessions={props.sessions}
-        activeId={props.activeId}
-        open={props.sidebarOpen}
-        collapsed={props.sidebarCollapsed}
-        searchOpen={props.searchOpen}
-        themePref={props.themePref}
-        searchInputRef={props.searchInputRef}
-        onSelect={props.onSelectSession}
-        onCreate={props.onCreateSession}
-        onDelete={props.onDeleteSession}
-        onCycleTheme={props.onCycleTheme}
-        onOpenSettingsTab={(tab) => props.onOpenSettingsTab(tab, "")}
-        onToggleCollapse={props.onToggleSidebarCollapse}
-        onSetSearchOpen={props.onSetSearchOpen}
-        onClose={props.onCloseSidebar}
-      />
-
-      <main class="main">
-        {props.activeSession ? (
-          <>
-            <TopBar
-              session={props.activeSession}
-              sseStatus={props.sseStatus}
-              sidebarCollapsed={props.sidebarCollapsed}
-              activeTab={props.activeTab}
-              itemCount={props.items.length}
-              onSelectTab={props.onSelectTab}
-              onOpenSidebar={props.onOpenSidebar}
-              onOpenSettings={() => props.onOpenSettingsTab("models", "")}
-              onPatchSession={props.onPatchSession}
-            />
-            {(props.bannerErr || props.activeSession.last_error) && (
-              <div class="status-banner">
-                <div class="row gap-1">
-                  <IconAlert size={15} />
-                  <span>{props.bannerErr || props.activeSession.last_error}</span>
-                </div>
-                <div class="row gap-1">
-                  {props.activeSession.status === "paused" &&
-                    props.activeSession.last_error &&
-                    !props.bannerErr && (
-                      <button
-                        type="button"
-                        class="btn-ghost btn-xs"
-                        onClick={props.onResumePaused}
-                      >
-                        <IconPlay size={11} />
-                        <span>{t("resume")}</span>
-                      </button>
-                    )}
-                  {props.bannerErr && (
-                    <button
-                      type="button"
-                      class="btn-icon"
-                      aria-label={t("dismiss")}
-                      onClick={props.onClearBannerErr}
-                    >
-                      <IconX size={14} />
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {props.activeTab === "chat" && (
+          <main class="main">
+            {activeSession ? (
               <>
-                <Timeline
-                  session={props.activeSession}
-                  items={props.items}
-                  hasMore={props.hasMore}
-                  loadingMore={props.loadingMore}
-                  queuedIds={props.queuedIds}
-                  draft={props.draft}
-                  retryNotice={props.retryNotice}
-                  callsById={props.callsById}
-                  modelLabel={props.activeModel?.model_key ?? null}
-                  effortLabel={props.activeSession.reasoning_effort}
-                  onLoadMore={props.onLoadMore}
-                  onWithdraw={props.onWithdraw}
-                  onOpenSettings={() => props.onOpenSettingsTab("models", "")}
+                <TopBar
+                  session={activeSession}
+                  sseStatus={sseStatus}
+                  sidebarCollapsed={sidebarCollapsed}
+                  activeTab={activeTab}
+                  itemCount={items.length}
+                  onSelectTab={setActiveTab}
+                  onOpenSidebar={openSidebar}
+                  onOpenSettings={() => openSettings("models")}
+                  onPatchSession={patchSession}
                 />
-                <Composer
-                  session={props.activeSession}
-                  providers={props.providers}
-                  models={props.models}
-                  draft={props.composers[props.activeSession.id] || emptyComposer()}
-                  uploading={Boolean(props.uploadingBySid[props.activeSession.id])}
-                  sending={Boolean(props.sendingBySid[props.activeSession.id])}
-                  tasks={props.tasks}
-                  queuedCount={props.queuedIds.size}
-                  summary={props.summary}
-                  onChangeText={props.onChangeText}
-                  onUploadFiles={props.onUploadFiles}
-                  onRemoveAttachment={props.onRemoveAttachment}
-                  onSubmit={props.onSubmitComposer}
-                  onPause={props.onPause}
-                  onKillTask={props.onKillTask}
-                  onPatchSession={props.onPatchSession}
-                  onOpenUsage={(sid) => props.onOpenSettingsTab("usage", String(sid))}
-                />
+                {(bannerErr || activeSession.last_error) && (
+                  <div class="status-banner">
+                    <div class="row gap-1">
+                      <Icon n="alert" />
+                      <span>{bannerErr || activeSession.last_error}</span>
+                    </div>
+                    <div class="row gap-1">
+                      {activeSession.status === "paused" && activeSession.last_error && !bannerErr && (
+                        <button
+                          type="button"
+                          class="btn-ghost btn-xs"
+                          onClick={() =>
+                            void apiFetch(`/sessions/${activeSession.id}/run`, { method: "PUT" }).catch((e) =>
+                              setBannerErr(errorMessage(e))
+                            )
+                          }
+                        >
+                          <Icon n="play" s={11} />
+                          <span>{t("Resume")}</span>
+                        </button>
+                      )}
+                      {bannerErr && (
+                        <button
+                          type="button"
+                          class="btn-icon"
+                          aria-label={t("Dismiss")}
+                          onClick={() => setBannerErr("")}
+                        >
+                          <Icon n="x" s={14} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {activeTab === "chat" && (
+                  <>
+                    <Timeline
+                      session={activeSession}
+                      items={items}
+                      hasMore={hasMore}
+                      loadingMore={loadingMore}
+                      queuedIds={queuedIds}
+                      draft={draft}
+                      retryNotice={retryNotice}
+                      callsById={callsById}
+                      modelLabel={activeModel?.model_key ?? null}
+                      effortLabel={activeSession.reasoning_effort}
+                      onLoadMore={loadMore}
+                      onWithdraw={withdrawMsg}
+                      onOpenSettings={() => openSettings("models")}
+                    />
+                    <Composer
+                      session={activeSession}
+                      providers={providers}
+                      models={models}
+                      draft={composers[activeSession.id] || emptyComposer()}
+                      uploading={Boolean(uploadingBySid[activeSession.id])}
+                      sending={Boolean(sendingBySid[activeSession.id])}
+                      tasks={tasks}
+                      queuedCount={queuedIds.size}
+                      summary={summary}
+                      onChangeText={onChangeText}
+                      onUploadFiles={onUploadFiles}
+                      onRemoveAttachment={onRemoveAttachment}
+                      onSubmit={onSubmitComposer}
+                      onPause={(mode) =>
+                        void apiFetch(`/sessions/${activeSession.id}/run?mode=${mode}`, { method: "DELETE" }).catch((e) =>
+                          setBannerErr(errorMessage(e))
+                        )
+                      }
+                      onKillTask={(tid) =>
+                        void apiFetch(`/sessions/${activeSession.id}/tasks/${tid}`, { method: "DELETE" }).catch((e) =>
+                          setBannerErr(errorMessage(e))
+                        )
+                      }
+                      onPatchSession={patchSession}
+                      onOpenUsage={(sid) => openSettings("usage", String(sid))}
+                    />
+                  </>
+                )}
+
+                {activeTab === "trace" && (
+                  <TraceView
+                    items={items}
+                    hasMore={hasMore}
+                    loadingMore={loadingMore}
+                    queuedIds={queuedIds}
+                    draft={draft}
+                    onLoadMore={loadMore}
+                    onWithdraw={withdrawMsg}
+                  />
+                )}
+
+                {activeTab === "context" && (
+                  <ContextView
+                    session={activeSession}
+                    items={items}
+                    summary={summary}
+                    ctxLimit={activeModel?.context_window_tokens}
+                    refreshNonce={contextRefreshNonce}
+                  />
+                )}
               </>
-            )}
-
-            {props.activeTab === "trace" && (
-              <TraceView
-                items={props.items}
-                hasMore={props.hasMore}
-                loadingMore={props.loadingMore}
-                queuedIds={props.queuedIds}
-                draft={props.draft}
-                onLoadMore={props.onLoadMore}
-                onWithdraw={props.onWithdraw}
-              />
-            )}
-
-            {props.activeTab === "context" && (
-              <ContextView
-                session={props.activeSession}
-                items={props.items}
-                summary={props.summary}
-                ctxLimit={props.activeModel?.context_window_tokens}
-                refreshNonce={props.contextRefreshNonce}
-              />
-            )}
-          </>
-        ) : (
-          <div class="welcome">
-            <button
-              type="button"
-              class={`btn-icon welcome-menu ${props.sidebarCollapsed ? "" : "mobile-only"}`}
-              aria-label={t("showSessions")}
-              onClick={props.onOpenSidebar}
-            >
-              <IconSidebar size={16} />
-            </button>
-            <div class="welcome-card">
-              <div class="brand">
-                <BrandMark size={28} />
-                <span class="brand-name">MyGo</span>
-                <span class="brand-tag">BOT</span>
-              </div>
-              <p class="muted">{t("welcomePrompt")}</p>
-              {props.models.filter((m) => !m.archived_at && !m.provider_archived_at).length === 0 && (
-                <p class="muted small">{t("noModelsNotice")}</p>
-              )}
-              <div class="row gap-2">
-                <button type="button" class="btn-primary" onClick={props.onCreateSession}>
-                  <IconPlus size={15} />
-                  <span>{t("newSession")}</span>
-                </button>
+            ) : (
+              <div class="welcome">
                 <button
                   type="button"
-                  class="btn-ghost"
-                  onClick={() => props.onOpenSettingsTab("models", "")}
+                  class={`btn-icon welcome-menu ${sidebarCollapsed ? "" : "mobile-only"}`}
+                  aria-label={t("Show sessions")}
+                  onClick={openSidebar}
                 >
-                  <IconSettings size={15} />
-                  <span>{t("settings")}</span>
+                  <Icon n="sidebar" s={16} />
                 </button>
+                <div class="welcome-card">
+                  <div class="brand">
+                    <BrandMark size={28} />
+                    <span class="brand-name">MyGo</span>
+                    <span class="brand-tag">BOT</span>
+                  </div>
+                  <p class="muted">{t("Select a session from the sidebar or create a new one.")}</p>
+                  {models.filter((m) => !m.archived_at && !m.provider_archived_at).length === 0 && (
+                    <p class="muted small">{t("No available models configured yet — open Settings to add a provider and model.")}</p>
+                  )}
+                  <div class="row gap-2">
+                    <button type="button" class="btn-primary" onClick={createSession}>
+                      <Icon n="plus" />
+                      <span>{t("New Session")}</span>
+                    </button>
+                    <button type="button" class="btn-ghost" onClick={() => openSettings("models")}>
+                      <Icon n="settings" />
+                      <span>{t("Settings")}</span>
+                    </button>
+                  </div>
+                </div>
               </div>
-            </div>
-          </div>
-        )}
-      </main>
+            )}
+          </main>
 
-      {props.settingsState.open && (
-        <Settings
-          config={props.config}
-          providers={props.providers}
-          models={props.models}
-          sessions={props.sessions}
-          themePref={props.themePref}
-          localePref={props.localePref}
-          initialTab={props.settingsState.tab}
-          initialSessionFilter={props.settingsState.sessionFilter}
-          onSetThemePref={props.onSetThemePref}
-          onSetLocalePref={props.onSetLocalePref}
-          onRefreshCatalog={props.onRefreshCatalog}
-          onSignOut={props.onSignOut}
-          onClose={props.onCloseSettings}
-        />
+          {settingsState.open && (
+            <Settings
+              config={config}
+              providers={providers}
+              models={models}
+              sessions={sessions}
+              themePref={themePref}
+              localePref={localePref}
+              initialTab={settingsState.tab}
+              initialSessionFilter={settingsState.sessionFilter}
+              onSetThemePref={setThemePrefState}
+              onSetLocalePref={setLocalePrefState}
+              onRefreshCatalog={loadCatalog}
+              onSignOut={() => {
+                setToken("");
+                setSettingsState({ open: false, tab: "models", sessionFilter: "" });
+                setAuthed(false);
+              }}
+              onClose={() => setSettingsState((s) => ({ ...s, open: false }))}
+            />
+          )}
+        </div>
       )}
-    </div>
+    </I18nContext.Provider>
   );
 }
 

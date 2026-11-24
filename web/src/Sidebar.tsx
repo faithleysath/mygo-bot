@@ -1,22 +1,8 @@
 import type { RefObject } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { dateGroupLabelLoc, formatRelTimeLoc, statusText, useI18n } from "./i18n.ts";
 import { formatAbsTime } from "./api.ts";
-import {
-  BrandMark,
-  IconChart,
-  IconMonitor,
-  IconMoon,
-  IconPlug,
-  IconPlus,
-  IconSearch,
-  IconSettings,
-  IconSidebar,
-  IconSliders,
-  IconSun,
-  IconTrash,
-  IconX,
-} from "./Icons.tsx";
+import { dateGroupLabelLoc, formatRelTimeLoc, statusText, useI18n } from "./i18n.ts";
+import { BrandMark, Icon } from "./Icons.tsx";
 import type { SettingsTabId } from "./Settings.tsx";
 import type { SessionInfo, ThemePref } from "./types.ts";
 
@@ -72,7 +58,7 @@ export function Sidebar({
   const q = query.trim().toLowerCase();
   const filtered = q
     ? sorted.filter((s) => {
-        const title = (s.title || `${t("sessionPrefix")} #${s.id}`).toLowerCase();
+        const title = (s.title || `${t("Session")} #${s.id}`).toLowerCase();
         return title.includes(q) || `#${s.id}`.includes(q) || String(s.id).includes(q);
       })
     : sorted;
@@ -82,7 +68,8 @@ export function Sidebar({
   let lastGroup = "";
 
   const themeLabel =
-    themePref === "system" ? t("themeSystem") : themePref === "dark" ? t("themeDark") : t("themeLight");
+    themePref === "system" ? t("System") : themePref === "dark" ? t("Dark") : t("Light");
+  const themeIcon = themePref === "system" ? "monitor" : themePref === "dark" ? "moon" : "sun";
 
   return (
     <>
@@ -98,20 +85,20 @@ export function Sidebar({
             <button
               type="button"
               class="btn-icon desktop-only"
-              title={t("collapseSidebar")}
-              aria-label={t("collapseSidebar")}
+              title={t("Collapse sidebar")}
+              aria-label={t("Collapse sidebar")}
               onClick={onToggleCollapse}
             >
-              <IconSidebar size={15} />
+              <Icon n="sidebar" />
             </button>
             <button
               type="button"
               class="btn-icon mobile-only"
-              title={t("closeSidebar")}
-              aria-label={t("closeSidebar")}
+              title={t("Close sidebar")}
+              aria-label={t("Close sidebar")}
               onClick={onClose}
             >
-              <IconX size={15} />
+              <Icon n="x" />
             </button>
           </div>
         </div>
@@ -125,59 +112,56 @@ export function Sidebar({
               onClose();
             }}
           >
-            <IconPlus size={15} />
-            <span>{t("newSession")}</span>
+            <Icon n="plus" />
+            <span>{t("New Session")}</span>
           </button>
 
           <nav class="sidebar-nav">
             <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("models"); onClose(); }}>
-              <IconSliders size={15} />
-              <span>{t("navModels")}</span>
+              <Icon n="sliders" />
+              <span>{t("Models & Providers")}</span>
             </button>
             <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("mcp"); onClose(); }}>
-              <IconPlug size={15} />
-              <span>{t("navMcp")}</span>
+              <Icon n="plug" />
+              <span>{t("MCP Servers")}</span>
             </button>
             <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("usage"); onClose(); }}>
-              <IconChart size={15} />
-              <span>{t("navUsage")}</span>
+              <Icon n="chart" />
+              <span>{t("Usage & Cost")}</span>
             </button>
           </nav>
         </div>
 
         <div class="sessions-head">
-          <span class="sessions-label">{t("sessions")}</span>
+          <span class="sessions-label">{t("Sessions")}</span>
           <div class="row gap-1">
             {sessions.length > 0 && (
               <button
                 type="button"
                 class={`btn-icon btn-xs ${searchOpen || query ? "active-icon" : ""}`}
-                title={t("searchSessions")}
-                aria-label={t("searchSessions")}
+                title={t("Search sessions")}
+                aria-label={t("Search sessions")}
                 onClick={() => {
                   const next = !(searchOpen || Boolean(query));
                   onSetSearchOpen(next);
-                  if (!next) {
-                    setQuery("");
-                  } else {
-                    requestAnimationFrame(() => searchInputRef.current?.focus());
-                  }
+                  if (!next) setQuery("");
+                  else requestAnimationFrame(() => searchInputRef.current?.focus());
                 }}
               >
-                <IconSearch size={13} />
+                <Icon n="search" s={13} />
               </button>
             )}
             <button
               type="button"
               class="btn-icon btn-xs"
-              title={t("newSession")}
-              aria-label={t("newSession")}
+              title={t("New Session")}
+              aria-label={t("New Session")}
               onClick={() => {
                 onCreate();
                 onClose();
               }}
             >
-              <IconPlus size={13} />
+              <Icon n="plus" s={13} />
             </button>
           </div>
         </div>
@@ -185,12 +169,12 @@ export function Sidebar({
         {(searchOpen || query) && sessions.length > 0 && (
           <div class="search-wrap">
             <div class="search-box">
-              <IconSearch size={13} />
+              <Icon n="search" s={13} />
               <input
                 ref={searchInputRef}
                 type="text"
                 value={query}
-                placeholder={t("filterSessions")}
+                placeholder={t("Filter sessions… (⌘K)")}
                 onInput={(e) => setQuery(e.currentTarget.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Escape") {
@@ -204,10 +188,10 @@ export function Sidebar({
                 <button
                   type="button"
                   class="search-clear"
-                  aria-label={t("clearFilter")}
+                  aria-label={t("Clear filter")}
                   onClick={() => setQuery("")}
                 >
-                  <IconX size={12} />
+                  <Icon n="x" s={12} />
                 </button>
               )}
             </div>
@@ -215,9 +199,9 @@ export function Sidebar({
         )}
 
         <div class="session-list">
-          {sorted.length === 0 && <div class="empty-hint">{t("noSessions")}</div>}
+          {sorted.length === 0 && <div class="empty-hint">{t("No sessions yet.")}</div>}
           {sorted.length > 0 && filtered.length === 0 && (
-            <div class="empty-hint">{t("noMatchingSessions")}</div>
+            <div class="empty-hint">{t("No matching sessions")}</div>
           )}
           {filtered.map((s) => {
             const active = s.id === activeId;
@@ -228,7 +212,9 @@ export function Sidebar({
             const group = dateGroupLabelLoc(s.updated_at || s.created_at, locale);
             const showGroup = showGroups && group !== lastGroup;
             lastGroup = group;
-            const tip = s.last_error ? `${statusText(s.status, locale)}: ${s.last_error}` : statusText(s.status, locale);
+            const tip = s.last_error
+              ? `${statusText(s.status, locale)}: ${s.last_error}`
+              : statusText(s.status, locale);
 
             return (
               <div key={s.id}>
@@ -241,7 +227,7 @@ export function Sidebar({
                   }}
                 >
                   <span class={`status-dot ${dotClass}`} title={tip} />
-                  <span class="session-title">{s.title || `${t("sessionPrefix")} #${s.id}`}</span>
+                  <span class="session-title">{s.title || `${t("Session")} #${s.id}`}</span>
                   <span class="session-time" title={formatAbsTime(s.updated_at)}>
                     {formatRelTimeLoc(s.updated_at, locale)}
                   </span>
@@ -249,8 +235,8 @@ export function Sidebar({
                     <button
                       type="button"
                       class={`session-del ${confirming ? "confirm" : ""}`}
-                      title={confirming ? t("confirmDelete") : t("deleteSession")}
-                      aria-label={confirming ? t("confirmDelete") : t("deleteSession")}
+                      title={confirming ? t("Click again to delete") : t("Delete session")}
+                      aria-label={confirming ? t("Click again to delete") : t("Delete session")}
                       onClick={(e) => {
                         e.stopPropagation();
                         if (confirming) {
@@ -261,7 +247,7 @@ export function Sidebar({
                         }
                       }}
                     >
-                      {confirming ? t("deleteShort") : <IconTrash size={13} />}
+                      {confirming ? t("Delete?") : <Icon n="trash" s={13} />}
                     </button>
                   )}
                 </div>
@@ -271,24 +257,13 @@ export function Sidebar({
         </div>
 
         <div class="sidebar-foot">
-          <button
-            type="button"
-            class="foot-btn"
-            title={themeLabel}
-            onClick={onCycleTheme}
-          >
-            {themePref === "system" ? (
-              <IconMonitor size={14} />
-            ) : themePref === "dark" ? (
-              <IconMoon size={14} />
-            ) : (
-              <IconSun size={14} />
-            )}
+          <button type="button" class="foot-btn" title={themeLabel} onClick={onCycleTheme}>
+            <Icon n={themeIcon} s={14} />
             <span>{themeLabel}</span>
           </button>
           <button type="button" class="foot-btn" onClick={() => { onOpenSettingsTab("general"); onClose(); }}>
-            <IconSettings size={14} />
-            <span>{t("settings")}</span>
+            <Icon n="settings" s={14} />
+            <span>{t("Settings")}</span>
           </button>
         </div>
       </aside>

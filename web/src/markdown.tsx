@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { copyText } from "./api.ts";
 import { HighlightedCode } from "./highlight.tsx";
 import { useI18n } from "./i18n.ts";
-import { IconCheck, IconCopy, IconWrap } from "./Icons.tsx";
+import { Icon } from "./Icons.tsx";
 
 const TABLE_SEP_RE = /^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
 const HR_RE = /^(\*\s*\*\s*\*|-{3,}|_{3,})\s*$/;
@@ -109,20 +109,20 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   return (
     <div class="md-code-wrap">
       <div class="md-code-head">
-        <span class="md-code-lang mono">{lang || t("codeBlock")}</span>
+        <span class="md-code-lang mono">{lang || t("Code")}</span>
         <div class="row gap-1">
           <button
             type="button"
             class={`copy-btn ${wrap ? "active" : ""}`}
-            title={t("toggleWrap")}
-            aria-label={t("toggleWrap")}
+            title={t("Toggle line wrap")}
+            aria-label={t("Toggle line wrap")}
             onClick={() => setWrap((w) => !w)}
           >
-            <IconWrap size={12} />
+            <Icon n="wrap" s={12} />
           </button>
           <button type="button" class="copy-btn" onClick={copy}>
-            {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
-            <span>{copied ? t("copied") : t("copy")}</span>
+            <Icon n={copied ? "check" : "copy"} s={12} />
+            <span>{copied ? t("Copied") : t("Copy")}</span>
           </button>
         </div>
       </div>
@@ -251,7 +251,7 @@ export function Markdown({ text }: { text: string }) {
               return (
                 <li key={j} class="md-task-item">
                   <span class={`md-checkbox ${checked ? "checked" : ""}`} aria-hidden="true">
-                    {checked && <IconCheck size={11} />}
+                    {checked && <Icon n="check" s={11} />}
                   </span>
                   <span>{renderInline(tm[2], `li${start}-${j}`)}</span>
                 </li>

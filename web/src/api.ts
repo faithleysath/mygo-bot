@@ -254,15 +254,6 @@ export function formatTokens(n: number | null | undefined): string {
   return String(n);
 }
 
-export function formatRelTime(ms: number | null | undefined): string {
-  if (!ms) return "";
-  const diff = Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  if (diff < 60) return "now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
-  return `${Math.floor(diff / 86400)}d`;
-}
-
 export function formatDuration(ms: number | null | undefined): string {
   if (ms == null || ms < 0) return "";
   if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -280,18 +271,6 @@ export function formatAbsTime(ms: number | null | undefined): string {
   } catch {
     return "";
   }
-}
-
-export type DateGroupLabel = "Today" | "Yesterday" | "Previous 7 days" | "Older";
-
-export function dateGroupLabel(ms: number | null | undefined): DateGroupLabel {
-  if (!ms) return "Older";
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  if (ms >= startOfToday) return "Today";
-  if (ms >= startOfToday - 86400_000) return "Yesterday";
-  if (ms >= startOfToday - 7 * 86400_000) return "Previous 7 days";
-  return "Older";
 }
 
 export async function copyText(text: string): Promise<boolean> {

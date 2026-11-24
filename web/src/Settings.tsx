@@ -3,19 +3,7 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 import { apiFetch, errorMessage, formatAbsTime, formatCost, formatDuration, formatTokens } from "./api.ts";
 import { formatRelTimeLoc, statusText, useI18n } from "./i18n.ts";
 import type { LocalePref } from "./i18n.ts";
-import {
-  IconChart,
-  IconExternal,
-  IconGlobe,
-  IconKey,
-  IconMonitor,
-  IconMoon,
-  IconPlug,
-  IconSettings,
-  IconSliders,
-  IconSun,
-  IconX,
-} from "./Icons.tsx";
+import { Icon } from "./Icons.tsx";
 import { buildMcpPayload, createMcpForm } from "./state.ts";
 import type {
   AppConfig,
@@ -113,7 +101,7 @@ function ModelsTab({
       try {
         pricing = JSON.parse(f.pricingText);
       } catch {
-        setErr(t("pricingInvalidJson"));
+        setErr(t("Pricing must be valid JSON"));
         return;
       }
     }
@@ -141,15 +129,15 @@ function ModelsTab({
 
       <section class="panel">
         <div class="panel-head">
-          <h4>{t("defaultSelection")}</h4>
+          <h4>{t("Default Selection")}</h4>
           <label class="check-row">
             <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.currentTarget.checked)} />
-            {t("showArchived")}
+            {t("Show archived")}
           </label>
         </div>
         <div class="grid-2">
           <label class="field">
-            <span>{t("defaultModel")}</span>
+            <span>{t("Default Model")}</span>
             <select
               value={config?.default_model_id ?? ""}
               onChange={(e) =>
@@ -158,7 +146,7 @@ function ModelsTab({
                 })
               }
             >
-              <option value="">{t("none")}</option>
+              <option value="">{t("None")}</option>
               {availableModels.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.model_key} (#{m.id})
@@ -167,7 +155,7 @@ function ModelsTab({
             </select>
           </label>
           <label class="field">
-            <span>{t("defaultEffort")}</span>
+            <span>{t("Default Effort")}</span>
             <select
               disabled={!selectedDefault || selectedDefault.reasoning_efforts.length === 0}
               value={config?.default_reasoning_effort ?? ""}
@@ -175,7 +163,7 @@ function ModelsTab({
                 void saveDefault({ default_reasoning_effort: e.currentTarget.value || null })
               }
             >
-              <option value="">{t("defaultOpt")}</option>
+              <option value="">{t("Default")}</option>
               {(selectedDefault?.reasoning_efforts || []).map((ef) => (
                 <option key={ef} value={ef}>{ef}</option>
               ))}
@@ -186,65 +174,65 @@ function ModelsTab({
 
       <section class="panel">
         <div class="panel-head">
-          <h4>{t("providers")}</h4>
+          <h4>{t("Providers")}</h4>
           <button
             type="button"
             class="btn-ghost btn-xs"
             onClick={() => setProvForm({ id: null, name: "", base_url: "", api_key: "", clearKey: false })}
           >
-            {t("addProvider")}
+            {t("+ Provider")}
           </button>
         </div>
         {provForm && (
           <form class="form-box" onSubmit={saveProvider}>
             <div class="grid-2">
               <label class="field">
-                <span>{t("name")}</span>
+                <span>{t("Name")}</span>
                 <input required value={provForm.name} onInput={(e) => setProvForm({ ...provForm, name: e.currentTarget.value })} />
               </label>
               <label class="field">
-                <span>{t("baseUrl")}</span>
+                <span>{t("Base URL")}</span>
                 <input required placeholder="https://api.openai.com/v1" value={provForm.base_url} onInput={(e) => setProvForm({ ...provForm, base_url: e.currentTarget.value })} />
               </label>
             </div>
             <label class="field">
-              <span>{t("apiKey")} {provForm.id ? t("leaveBlankKeep") : ""}</span>
+              <span>{t("API Key")} {provForm.id ? t("(leave blank to keep)") : ""}</span>
               <input type="password" value={provForm.api_key} onInput={(e) => setProvForm({ ...provForm, api_key: e.currentTarget.value })} />
             </label>
             {provForm.id && (
               <label class="check-row">
                 <input type="checkbox" checked={provForm.clearKey} onChange={(e) => setProvForm({ ...provForm, clearKey: e.currentTarget.checked })} />
-                {t("clearKey")}
+                {t("Clear stored key")}
               </label>
             )}
             <div class="row gap-1">
-              <button type="submit" class="btn-primary btn-xs">{t("save")}</button>
-              <button type="button" class="btn-ghost btn-xs" onClick={() => setProvForm(null)}>{t("cancel")}</button>
+              <button type="submit" class="btn-primary btn-xs">{t("Save")}</button>
+              <button type="button" class="btn-ghost btn-xs" onClick={() => setProvForm(null)}>{t("Cancel")}</button>
             </div>
           </form>
         )}
         <div class="item-list">
           {visibleProviders.length === 0 && (
-            <div class="empty-hint small">{t("noProviders")}</div>
+            <div class="empty-hint small">{t("No providers configured yet.")}</div>
           )}
           {visibleProviders.map((p) => (
             <div key={p.id} class="list-row">
               <div>
                 <strong>{p.name}</strong>{" "}
                 {p.archived_at && <span class="pill">{t("archived")}</span>}
-                <div class="muted small">{p.base_url} · {p.has_api_key ? t("keySet") : t("noKey")}</div>
+                <div class="muted small">{p.base_url} · {p.has_api_key ? t("key set") : t("no key")}</div>
               </div>
               <div class="row gap-1">
                 <button type="button" class="btn-ghost btn-xs" onClick={() => setProvForm({ id: p.id, name: p.name, base_url: p.base_url, api_key: "", clearKey: false })}>
-                  {t("edit")}
+                  {t("Edit")}
                 </button>
                 {p.archived_at ? (
                   <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/providers/${p.id}/restore`, { method: "POST" }).then(() => undefined))}>
-                    {t("restore")}
+                    {t("Restore")}
                   </button>
                 ) : (
                   <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/providers/${p.id}`, { method: "DELETE" }).then(() => undefined))}>
-                    {t("archive")}
+                    {t("Archive")}
                   </button>
                 )}
               </div>
@@ -255,7 +243,7 @@ function ModelsTab({
 
       <section class="panel">
         <div class="panel-head">
-          <h4>{t("models")}</h4>
+          <h4>{t("Models")}</h4>
           <button
             type="button"
             class="btn-ghost btn-xs"
@@ -272,14 +260,14 @@ function ModelsTab({
               })
             }
           >
-            {t("addModel")}
+            {t("+ Model")}
           </button>
         </div>
         {modelForm && (
           <form class="form-box" onSubmit={saveModel}>
             <div class="grid-2">
               <label class="field">
-                <span>{t("provider")}</span>
+                <span>{t("Provider")}</span>
                 <select value={modelForm.provider_id} onChange={(e) => setModelForm({ ...modelForm, provider_id: e.currentTarget.value })}>
                   {visibleProviders.filter((p) => !p.archived_at).map((p) => (
                     <option key={p.id} value={p.id}>{p.name}</option>
@@ -287,15 +275,15 @@ function ModelsTab({
                 </select>
               </label>
               <label class="field">
-                <span>{t("modelKey")}</span>
+                <span>{t("Model Key")}</span>
                 <input required value={modelForm.model_key} onInput={(e) => setModelForm({ ...modelForm, model_key: e.currentTarget.value })} />
               </label>
               <label class="field">
-                <span>{t("contextWindow")}</span>
+                <span>{t("Context Window")}</span>
                 <input type="number" min="1" placeholder={t("optional")} value={modelForm.context_window_tokens} onInput={(e) => setModelForm({ ...modelForm, context_window_tokens: e.currentTarget.value })} />
               </label>
               <label class="field">
-                <span>{t("effortsCsv")}</span>
+                <span>{t("Efforts (comma-separated)")}</span>
                 <input value={modelForm.reasoning_efforts} onInput={(e) => setModelForm({ ...modelForm, reasoning_efforts: e.currentTarget.value })} />
               </label>
             </div>
@@ -317,18 +305,18 @@ function ModelsTab({
               ))}
             </div>
             <label class="field">
-              <span>{t("pricingJson")}</span>
+              <span>{t("Pricing JSON (optional)")}</span>
               <textarea rows={2} value={modelForm.pricingText} onInput={(e) => setModelForm({ ...modelForm, pricingText: e.currentTarget.value })} />
             </label>
             <div class="row gap-1">
-              <button type="submit" class="btn-primary btn-xs">{t("save")}</button>
-              <button type="button" class="btn-ghost btn-xs" onClick={() => setModelForm(null)}>{t("cancel")}</button>
+              <button type="submit" class="btn-primary btn-xs">{t("Save")}</button>
+              <button type="button" class="btn-ghost btn-xs" onClick={() => setModelForm(null)}>{t("Cancel")}</button>
             </div>
           </form>
         )}
         <div class="item-list">
           {visibleModels.length === 0 && (
-            <div class="empty-hint small">{t("noModels")}</div>
+            <div class="empty-hint small">{t("No models configured yet.")}</div>
           )}
           {visibleModels.map((m) => {
             const prov = providersById.get(m.provider_id);
@@ -342,7 +330,7 @@ function ModelsTab({
                     {(m.archived_at || m.provider_archived_at) && <span class="pill">{t("archived")}</span>}
                   </div>
                   <div class="muted small">
-                    {m.input_modalities.join(", ")} · ctx {m.context_window_tokens ? formatTokens(m.context_window_tokens) : "—"} · {t("efforts")} [{m.reasoning_efforts.join(", ") || t("none")}]
+                    {m.input_modalities.join(", ")} · ctx {m.context_window_tokens ? formatTokens(m.context_window_tokens) : "—"} · {t("efforts")} [{m.reasoning_efforts.join(", ") || t("None")}]
                   </div>
                 </div>
                 <div class="row gap-1">
@@ -361,15 +349,15 @@ function ModelsTab({
                       })
                     }
                   >
-                    {t("edit")}
+                    {t("Edit")}
                   </button>
                   {m.archived_at ? (
                     <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}/restore`, { method: "POST" }).then(() => undefined))}>
-                      {t("restore")}
+                      {t("Restore")}
                     </button>
                   ) : (
                     <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}`, { method: "DELETE" }).then(() => undefined))}>
-                      {t("archive")}
+                      {t("Archive")}
                     </button>
                   )}
                 </div>
@@ -475,13 +463,9 @@ function McpTab() {
     <div class="tab-stack">
       {err && <div class="err-inline">{err}</div>}
       <div class="panel-head">
-        <h4>{t("mcpServers")}</h4>
-        <button
-          type="button"
-          class="btn-primary btn-xs"
-          onClick={() => setForm(createMcpForm())}
-        >
-          {t("addServer")}
+        <h4>{t("MCP Servers")}</h4>
+        <button type="button" class="btn-primary btn-xs" onClick={() => setForm(createMcpForm())}>
+          {t("+ Server")}
         </button>
       </div>
 
@@ -489,11 +473,11 @@ function McpTab() {
         <form class="form-box" onSubmit={save}>
           <div class="grid-2">
             <label class="field">
-              <span>{t("name")} {form.id ? t("immutable") : ""}</span>
+              <span>{t("Name")} {form.id ? t("(immutable)") : ""}</span>
               <input required disabled={Boolean(form.id)} value={form.name} onInput={(e) => setForm({ ...form, name: e.currentTarget.value })} />
             </label>
             <label class="field">
-              <span>{t("transport")}</span>
+              <span>{t("Transport")}</span>
               <select
                 value={form.transport}
                 onChange={(e) => {
@@ -510,11 +494,11 @@ function McpTab() {
               </select>
             </label>
             <label class="field">
-              <span>{t("description")}</span>
+              <span>{t("Description")}</span>
               <input value={form.description} onInput={(e) => setForm({ ...form, description: e.currentTarget.value })} />
             </label>
             <label class="field">
-              <span>{t("timeoutMs")}</span>
+              <span>{t("Timeout (ms)")}</span>
               <input type="number" min="1" value={form.timeout_ms} onInput={(e) => setForm({ ...form, timeout_ms: e.currentTarget.value })} />
             </label>
           </div>
@@ -523,18 +507,18 @@ function McpTab() {
             <>
               {editingSameTransport && form.orig?.has_url_query && !form.replaceUrl ? (
                 <div class="field">
-                  <span>{t("urlHidden")}</span>
+                  <span>{t("URL (query parameters hidden)")}</span>
                   <div class="row gap-2">
                     <span class="mono small truncate">{form.orig.url}?…</span>
                     <label class="check-row">
                       <input type="checkbox" checked={form.replaceUrl} onChange={(e) => setForm({ ...form, replaceUrl: e.currentTarget.checked })} />
-                      {t("replaceUrl")}
+                      {t("Replace URL")}
                     </label>
                   </div>
                 </div>
               ) : (
                 <label class="field">
-                  <span>{t("url")}</span>
+                  <span>{t("URL")}</span>
                   <div class="row gap-2">
                     <input required value={form.url} onInput={(e) => setForm({ ...form, url: e.currentTarget.value })} style="flex:1" />
                     {editingSameTransport && form.orig?.has_url_query && (
@@ -550,7 +534,7 @@ function McpTab() {
                             })
                           }
                         />
-                        {t("replaceUrl")}
+                        {t("Replace URL")}
                       </label>
                     )}
                   </div>
@@ -560,19 +544,19 @@ function McpTab() {
               {form.id ? (
                 <div class="grid-2">
                   <label class="field">
-                    <span>{t("headers")}</span>
+                    <span>{t("Headers")}</span>
                     <select value={form.headersAction} onChange={(e) => setForm({ ...form, headersAction: e.currentTarget.value as McpSecretAction })}>
-                      <option value="keep">{form.orig?.has_headers ? t("keepHeaders") : t("noHeaders")}</option>
-                      <option value="replace">{t("replaceHeaders")}</option>
-                      <option value="clear">{t("clearHeaders")}</option>
+                      <option value="keep">{form.orig?.has_headers ? t("Keep existing headers") : t("None (unchanged)")}</option>
+                      <option value="replace">{t("Replace headers (JSON)")}</option>
+                      <option value="clear">{t("Clear headers")}</option>
                     </select>
                   </label>
                   <label class="field">
-                    <span>{t("oauth21")}</span>
+                    <span>{t("OAuth 2.1")}</span>
                     <select value={form.oauthAction} onChange={(e) => setForm({ ...form, oauthAction: e.currentTarget.value as McpOAuthAction })}>
-                      <option value="keep">{form.orig?.has_oauth ? t("keepOauth") : t("oauthDisabled")}</option>
-                      <option value="replace">{t("replaceOauth")}</option>
-                      {form.orig?.has_oauth && <option value="disable">{t("disableOauth")}</option>}
+                      <option value="keep">{form.orig?.has_oauth ? t("Keep existing OAuth config") : t("Disabled (unchanged)")}</option>
+                      <option value="replace">{t("Replace / enable OAuth config")}</option>
+                      {form.orig?.has_oauth && <option value="disable">{t("Disable OAuth")}</option>}
                     </select>
                   </label>
                 </div>
@@ -583,19 +567,19 @@ function McpTab() {
                     checked={form.oauthAction === "replace"}
                     onChange={(e) => setForm({ ...form, oauthAction: e.currentTarget.checked ? "replace" : "keep" })}
                   />
-                  {t("enableOauthCheck")}
+                  {t("Enable OAuth 2.1")}
                 </label>
               )}
 
               {(!form.id || form.headersAction === "replace") && (
                 <label class="field">
-                  <span>{t("headersJson")} {form.id ? "" : `(${t("optional")})`}</span>
+                  <span>{t("Headers JSON")} {form.id ? "" : `(${t("optional")})`}</span>
                   <textarea rows={2} placeholder='{"Authorization":"Bearer ..."}' value={form.headersJson} onInput={(e) => setForm({ ...form, headersJson: e.currentTarget.value })} />
                 </label>
               )}
               {form.oauthAction === "replace" && (
                 <label class="field">
-                  <span>{t("oauthJson")}</span>
+                  <span>{t("OAuth Config JSON (optional)")}</span>
                   <textarea rows={2} placeholder="{}" value={form.oauthJson} onInput={(e) => setForm({ ...form, oauthJson: e.currentTarget.value })} />
                 </label>
               )}
@@ -604,43 +588,43 @@ function McpTab() {
             <>
               <div class="grid-2">
                 <label class="field">
-                  <span>{t("command")}</span>
+                  <span>{t("Command")}</span>
                   <input required value={form.command} onInput={(e) => setForm({ ...form, command: e.currentTarget.value })} />
                 </label>
                 <label class="field">
-                  <span>{t("workingDir")}</span>
+                  <span>{t("Working Dir (optional)")}</span>
                   <input value={form.cwd} onInput={(e) => setForm({ ...form, cwd: e.currentTarget.value })} />
                 </label>
               </div>
               {form.id ? (
                 <div class="grid-2">
                   <label class="field">
-                    <span>{t("args")}</span>
+                    <span>{t("Args")}</span>
                     <select value={form.argsAction} onChange={(e) => setForm({ ...form, argsAction: e.currentTarget.value as McpSecretAction })}>
-                      <option value="keep">{t("keepArgs")} ({form.orig?.arg_count || 0})</option>
-                      <option value="replace">{t("replaceArgs")}</option>
-                      <option value="clear">{t("clearArgs")}</option>
+                      <option value="keep">{t("Keep existing")} ({form.orig?.arg_count || 0})</option>
+                      <option value="replace">{t("Replace args")}</option>
+                      <option value="clear">{t("Clear args")}</option>
                     </select>
                   </label>
                   <label class="field">
-                    <span>{t("env")}</span>
+                    <span>{t("Env")}</span>
                     <select value={form.envAction} onChange={(e) => setForm({ ...form, envAction: e.currentTarget.value as McpSecretAction })}>
-                      <option value="keep">{form.orig?.has_env ? t("keepEnv") : t("noEnv")}</option>
-                      <option value="replace">{t("replaceEnv")}</option>
-                      <option value="clear">{t("clearEnv")}</option>
+                      <option value="keep">{form.orig?.has_env ? t("Keep existing env") : t("None (unchanged)")}</option>
+                      <option value="replace">{t("Replace env (JSON)")}</option>
+                      <option value="clear">{t("Clear env")}</option>
                     </select>
                   </label>
                 </div>
               ) : null}
               {(!form.id || form.argsAction === "replace") && (
                 <label class="field">
-                  <span>{t("argsPerLine")}</span>
+                  <span>{t("Args (one per line)")}</span>
                   <textarea rows={2} value={form.argsText} onInput={(e) => setForm({ ...form, argsText: e.currentTarget.value })} />
                 </label>
               )}
               {(!form.id || form.envAction === "replace") && (
                 <label class="field">
-                  <span>{t("envJson")} {form.id ? "" : `(${t("optional")})`}</span>
+                  <span>{t("Env JSON")} {form.id ? "" : `(${t("optional")})`}</span>
                   <textarea rows={2} value={form.envJson} onInput={(e) => setForm({ ...form, envJson: e.currentTarget.value })} />
                 </label>
               )}
@@ -648,16 +632,16 @@ function McpTab() {
           )}
 
           <label class="field">
-            <span>{t("toolPolicy")}</span>
+            <span>{t("Tool Policy")}</span>
             <select value={form.toolPolicy} onChange={(e) => setForm({ ...form, toolPolicy: e.currentTarget.value as McpToolPolicy })}>
-              <option value="all">{t("allowAllTools")}</option>
-              <option value="none">{t("denyAllTools")}</option>
-              <option value="allowlist">{t("allowlistTools")}</option>
+              <option value="all">{t("Allow all tools")}</option>
+              <option value="none">{t("Deny all tools")}</option>
+              <option value="allowlist">{t("Allow listed tools only")}</option>
             </select>
           </label>
           {form.toolPolicy === "allowlist" && (
             <div class="field">
-              <span>{t("allowedTools")}</span>
+              <span>{t("Allowed Tools (exact names)")}</span>
               {form.allowedTools.length > 0 && (
                 <div class="attach-strip">
                   {form.allowedTools.map((name) => (
@@ -670,7 +654,7 @@ function McpTab() {
               )}
               <div class="row gap-1">
                 <input
-                  placeholder={t("exactToolName")}
+                  placeholder={t("Exact tool name…")}
                   value={form.newAllowedTool}
                   onInput={(e) => setForm({ ...form, newAllowedTool: e.currentTarget.value })}
                   onKeyDown={(e) => {
@@ -682,7 +666,7 @@ function McpTab() {
                   style="flex:1"
                 />
                 <button type="button" class="btn-ghost btn-xs" onClick={addAllowedTool}>
-                  {t("add")}
+                  {t("+ Add")}
                 </button>
               </div>
             </div>
@@ -690,18 +674,18 @@ function McpTab() {
 
           <label class="check-row">
             <input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.currentTarget.checked })} />
-            {t("enabled")}
+            {t("Enabled")}
           </label>
           <div class="row gap-1">
-            <button type="submit" class="btn-primary btn-xs">{t("save")}</button>
-            <button type="button" class="btn-ghost btn-xs" onClick={() => setForm(null)}>{t("cancel")}</button>
+            <button type="submit" class="btn-primary btn-xs">{t("Save")}</button>
+            <button type="button" class="btn-ghost btn-xs" onClick={() => setForm(null)}>{t("Cancel")}</button>
           </div>
         </form>
       )}
 
       <div class="item-list">
         {servers.length === 0 && !form && (
-          <div class="empty-hint small">{t("noServers")}</div>
+          <div class="empty-hint small">{t("No MCP servers configured yet.")}</div>
         )}
         {servers.map((s) => {
           const testing = busyTestId === s.id;
@@ -715,7 +699,7 @@ function McpTab() {
                   {!s.enabled && <span class="pill">{t("disabled")}</span>}
                   {s.allowed_tools !== null && (
                     <span class="pill">
-                      {s.allowed_tools.length === 0 ? t("toolsNone") : `tools: ${s.allowed_tools.length}`}
+                      {s.allowed_tools.length === 0 ? t("tools: none") : `tools: ${s.allowed_tools.length}`}
                     </span>
                   )}
                   {s.has_oauth && <span class="pill">oauth: {oauth[s.id] || "?"}</span>}
@@ -738,7 +722,7 @@ function McpTab() {
                       });
                     }}
                   >
-                    {testing ? t("testing") : t("test")}
+                    {testing ? t("Testing…") : t("Test")}
                   </button>
                   {s.has_oauth && (
                     <>
@@ -754,7 +738,7 @@ function McpTab() {
                           })
                         }
                       >
-                        {t("login")}
+                        {t("Login")}
                       </button>
                       <button
                         type="button"
@@ -763,16 +747,12 @@ function McpTab() {
                           void run(() => apiFetch(`/mcp/servers/${s.id}/oauth`, { method: "DELETE" }).then(() => undefined))
                         }
                       >
-                        {t("logout")}
+                        {t("Logout")}
                       </button>
                     </>
                   )}
-                  <button
-                    type="button"
-                    class="btn-ghost btn-xs"
-                    onClick={() => setForm(createMcpForm(s))}
-                  >
-                    {t("edit")}
+                  <button type="button" class="btn-ghost btn-xs" onClick={() => setForm(createMcpForm(s))}>
+                    {t("Edit")}
                   </button>
                   <button
                     type="button"
@@ -786,7 +766,7 @@ function McpTab() {
                       }
                     }}
                   >
-                    {confirmingDel ? t("confirm") : t("del")}
+                    {confirmingDel ? t("Confirm?") : t("Delete")}
                   </button>
                 </div>
               </div>
@@ -806,7 +786,7 @@ function McpTab() {
                     </div>
                   ) : (
                     <div class="small">
-                      <strong>{t("failedAt")}</strong> <span class="mono">{pr.stage}</span>: {pr.error}
+                      <strong>{t("FAILED at")}</strong> <span class="mono">{pr.stage}</span>: {pr.error}
                     </div>
                   )}
                 </div>
@@ -815,14 +795,14 @@ function McpTab() {
               {loginInfo[s.id] && (
                 <div class="form-box">
                   <div class="small">
-                    {t("authorizeHere")}{" "}
+                    {t("Authorize here:")}{" "}
                     <a href={loginInfo[s.id]?.authorization_url} target="_blank" rel="noopener noreferrer">
-                      {t("openOauthLogin")}
+                      {t("Open OAuth Login")}
                     </a>
                   </div>
                   <div class="row gap-1">
                     <input
-                      placeholder={t("pasteRedirectUrl")}
+                      placeholder={t("Paste redirect URL if remote…")}
                       value={callbackUrl[s.id] || ""}
                       onInput={(e) => setCallbackUrl((c) => ({ ...c, [s.id]: e.currentTarget.value }))}
                     />
@@ -839,7 +819,7 @@ function McpTab() {
                         })
                       }
                     >
-                      {t("submitCallback")}
+                      {t("Submit Callback")}
                     </button>
                   </div>
                 </div>
@@ -911,15 +891,15 @@ function UsageTab({
             void load(0, false, val);
           }}
         >
-          <option value="">{t("allSessions")}</option>
+          <option value="">{t("All sessions")}</option>
           {sessions.map((s) => (
             <option key={s.id} value={String(s.id)}>
-              #{s.id} · {s.title || t("untitled")}
+              #{s.id} · {s.title || t("Untitled")}
             </option>
           ))}
         </select>
         <input
-          placeholder={t("sessionIdPlaceholder")}
+          placeholder={t("Session ID…")}
           style="width:110px"
           value={sessionId}
           onInput={(e) => setSessionId(e.currentTarget.value)}
@@ -928,29 +908,29 @@ function UsageTab({
           }}
         />
         <button type="button" class="btn-ghost btn-sm" disabled={loading} onClick={() => void load(0, false)}>
-          {loading ? t("loading") : t("refresh")}
+          {loading ? t("Loading…") : t("Refresh")}
         </button>
       </div>
 
       {summary && (
         <div class="kpi-grid">
           <div class="kpi">
-            <span>{t("totalCost")}</span>
+            <span>{t("Total Cost")}</span>
             <strong>{formatCost(summary.cost_nano_usd)}</strong>
           </div>
           <div class="kpi">
-            <span>{t("calls")}</span>
+            <span>{t("Calls")}</span>
             <strong>
               {summary.succeeded_count} / {summary.call_count}
               {summary.failed_count > 0 && <small class="err-text"> ({summary.failed_count} err)</small>}
             </strong>
           </div>
           <div class="kpi">
-            <span>{t("inputLabel")} ({cacheRate}% {t("cachedWord")})</span>
+            <span>{t("Input")} ({cacheRate}% {t("cached")})</span>
             <strong>{formatTokens(totalInput)}</strong>
           </div>
           <div class="kpi">
-            <span>{t("outputLabel")}</span>
+            <span>{t("Output")}</span>
             <strong>{formatTokens(summary.output_tokens)}</strong>
           </div>
         </div>
@@ -958,7 +938,7 @@ function UsageTab({
 
       <div class="item-list">
         {calls.length === 0 && !loading && (
-          <div class="empty-hint small">{t("noCalls")}</div>
+          <div class="empty-hint small">{t("No calls recorded for this filter.")}</div>
         )}
         {calls.map((c) => {
           const model = modelsById.get(c.model_id);
@@ -990,7 +970,7 @@ function UsageTab({
               {expanded && (
                 <div class="call-detail small">
                   <div>
-                    <span class="muted">{t("started")}:</span> <span class="mono">{formatAbsTime(c.started_at)}</span>
+                    <span class="muted">{t("Started")}:</span> <span class="mono">{formatAbsTime(c.started_at)}</span>
                     {c.http_status != null && (
                       <> · <span class="muted">HTTP:</span> <span class="mono">{c.http_status}</span></>
                     )}
@@ -1008,7 +988,7 @@ function UsageTab({
         })}
         {calls.length > 0 && calls.length % 50 === 0 && (
           <button type="button" class="btn-ghost btn-sm" onClick={() => void load(calls[calls.length - 1].id, true)}>
-            {t("loadMore")}
+            {t("Load more")}
           </button>
         )}
       </div>
@@ -1061,10 +1041,10 @@ export function Settings({
   }, [onClose]);
 
   const tabs = [
-    { id: "models" as const, label: t("tabModels"), icon: <IconSliders size={14} /> },
-    { id: "mcp" as const, label: t("tabMcp"), icon: <IconPlug size={14} /> },
-    { id: "usage" as const, label: t("tabUsage"), icon: <IconChart size={14} /> },
-    { id: "general" as const, label: t("tabGeneral"), icon: <IconSettings size={14} /> },
+    { id: "models" as const, label: t("Models"), icon: "sliders" as const },
+    { id: "mcp" as const, label: t("MCP"), icon: "plug" as const },
+    { id: "usage" as const, label: t("Usage"), icon: "chart" as const },
+    { id: "general" as const, label: t("General"), icon: "settings" as const },
   ];
 
   return (
@@ -1079,13 +1059,13 @@ export function Settings({
                 class={`tab-btn ${tab === tb.id ? "active" : ""}`}
                 onClick={() => setTab(tb.id)}
               >
-                {tb.icon}
+                <Icon n={tb.icon} s={14} />
                 <span>{tb.label}</span>
               </button>
             ))}
           </div>
-          <button type="button" class="btn-icon" aria-label={t("closeSettings")} onClick={onClose}>
-            <IconX size={16} />
+          <button type="button" class="btn-icon" aria-label={t("Close settings")} onClick={onClose}>
+            <Icon n="x" s={16} />
           </button>
         </div>
         <div class="modal-body">
@@ -1100,24 +1080,24 @@ export function Settings({
             <div class="tab-stack">
               <div class="panel list-row">
                 <div>
-                  <strong>{t("language")}</strong>
-                  <div class="muted small">{t("languageDesc")}</div>
+                  <strong>{t("Language")}</strong>
+                  <div class="muted small">{t("Interface display language")}</div>
                 </div>
                 <div class="segmented">
                   {(
                     [
-                      ["auto", t("langAuto"), <IconGlobe size={13} />],
-                      ["zh", t("langZh"), null],
-                      ["en", t("langEn"), null],
+                      ["auto", t("Auto"), true],
+                      ["zh", "中文", false],
+                      ["en", "English", false],
                     ] as const
-                  ).map(([val, label, icon]) => (
+                  ).map(([val, label, hasIcon]) => (
                     <button
                       key={val}
                       type="button"
                       class={`seg-btn ${localePref === val ? "active" : ""}`}
                       onClick={() => onSetLocalePref(val)}
                     >
-                      {icon}
+                      {hasIcon && <Icon n="globe" s={13} />}
                       <span>{label}</span>
                     </button>
                   ))}
@@ -1125,15 +1105,15 @@ export function Settings({
               </div>
               <div class="panel list-row">
                 <div>
-                  <strong>{t("appearance")}</strong>
-                  <div class="muted small">{t("appearanceDesc")}</div>
+                  <strong>{t("Appearance")}</strong>
+                  <div class="muted small">{t("Theme preference across sessions")}</div>
                 </div>
                 <div class="segmented">
                   {(
                     [
-                      ["system", t("themeSystem"), <IconMonitor size={13} />],
-                      ["light", t("themeLight"), <IconSun size={13} />],
-                      ["dark", t("themeDark"), <IconMoon size={13} />],
+                      ["system", t("System"), "monitor"],
+                      ["light", t("Light"), "sun"],
+                      ["dark", t("Dark"), "moon"],
                     ] as const
                   ).map(([val, label, icon]) => (
                     <button
@@ -1142,7 +1122,7 @@ export function Settings({
                       class={`seg-btn ${themePref === val ? "active" : ""}`}
                       onClick={() => onSetThemePref(val)}
                     >
-                      {icon}
+                      <Icon n={icon} s={13} />
                       <span>{label}</span>
                     </button>
                   ))}
@@ -1150,28 +1130,28 @@ export function Settings({
               </div>
               <div class="panel list-row">
                 <div>
-                  <strong>{t("apiDocs")}</strong>
-                  <div class="muted small">{t("apiDocsDesc")}</div>
+                  <strong>{t("API Documentation")}</strong>
+                  <div class="muted small">{t("Scalar interactive reference & OpenAPI schema (loopback only)")}</div>
                 </div>
                 <div class="row gap-1">
                   <a class="btn-ghost btn-sm row gap-1" href="/docs" target="_blank" rel="noopener noreferrer">
                     <span>/docs</span>
-                    <IconExternal size={12} />
+                    <Icon n="external" s={12} />
                   </a>
                   <a class="btn-ghost btn-sm row gap-1" href="/openapi.json" target="_blank" rel="noopener noreferrer">
                     <span>/openapi.json</span>
-                    <IconExternal size={12} />
+                    <Icon n="external" s={12} />
                   </a>
                 </div>
               </div>
               <div class="panel list-row">
                 <div>
-                  <strong>{t("auth")}</strong>
-                  <div class="muted small">{t("authDesc")}</div>
+                  <strong>{t("Authentication")}</strong>
+                  <div class="muted small">{t("Clear stored Bearer token from this browser")}</div>
                 </div>
                 <button type="button" class="btn-danger btn-sm" onClick={onSignOut}>
-                  <IconKey size={13} />
-                  <span>{t("signOut")}</span>
+                  <Icon n="key" s={13} />
+                  <span>{t("Sign out")}</span>
                 </button>
               </div>
             </div>

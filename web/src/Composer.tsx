@@ -2,17 +2,7 @@ import type { TargetedClipboardEvent, TargetedDragEvent, TargetedKeyboardEvent }
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { formatCost, formatTokens } from "./api.ts";
 import { useI18n } from "./i18n.ts";
-import {
-  IconArrowUp,
-  IconChevron,
-  IconClock,
-  IconDatabase,
-  IconPause,
-  IconPlay,
-  IconPlus,
-  IconStop,
-  IconX,
-} from "./Icons.tsx";
+import { Icon } from "./Icons.tsx";
 import type {
   ActiveTask,
   CallsSummary,
@@ -160,11 +150,11 @@ export function Composer({
           >
             <span class="pulse-dot" />
             <span>
-              {tasks.length} {t("activeTasks")} {tasks.length === 1 ? t("taskWord") : t("tasksWord")}
+              {tasks.length} {t("active codemode")} {tasks.length === 1 ? t("task") : t("tasks")}
             </span>
             <span class="card-spacer" />
-            <span class="muted small">{tasksOpen ? t("hide") : t("inspect")}</span>
-            <IconChevron size={14} cls={`chev ${tasksOpen ? "open" : ""}`} />
+            <span class="muted small">{tasksOpen ? t("Hide") : t("Inspect")}</span>
+            <Icon n="chevron" s={14} cls={`chev ${tasksOpen ? "open" : ""}`} />
           </button>
           {tasksOpen && (
             <div class="tasks-list">
@@ -175,7 +165,7 @@ export function Composer({
                     {task.label && <span>{task.label}</span>}
                     <span class="pill">{task.delivery}</span>
                     <span class="pill mono task-ttl">
-                      <IconClock size={11} />
+                      <Icon n="clock" s={11} />
                       <span>{formatRem(task.remaining_seconds)}</span>
                     </span>
                     <button
@@ -184,8 +174,8 @@ export function Composer({
                       disabled={task.state === "stopping"}
                       onClick={() => onKillTask(task.id)}
                     >
-                      <IconStop size={11} />
-                      <span>{task.state === "stopping" ? t("stopping") : t("kill")}</span>
+                      <Icon n="stop" s={11} />
+                      <span>{task.state === "stopping" ? t("Stopping…") : t("Kill")}</span>
                     </button>
                   </div>
                   {task.running_commands?.map((c) => (
@@ -199,7 +189,7 @@ export function Composer({
                     <div>
                       {task.console.truncated && (
                         <div class="muted small">
-                          {t("consoleTail")} ({task.console.total_bytes || 0} B)
+                          {t("Console tail")} ({task.console.total_bytes || 0} B)
                         </div>
                       )}
                       <pre class="code-box">{task.console.output}</pre>
@@ -221,7 +211,7 @@ export function Composer({
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
-        {dragging && <div class="drop-overlay">{t("dropPrompt")}</div>}
+        {dragging && <div class="drop-overlay">{t("Drop image, audio, or video to attach")}</div>}
 
         {attachments.length > 0 && (
           <div class="attach-strip">
@@ -238,7 +228,7 @@ export function Composer({
                   aria-label={`Remove ${a.name}`}
                   onClick={() => onRemoveAttachment(session.id, a.id)}
                 >
-                  <IconX size={12} />
+                  <Icon n="x" s={12} />
                 </button>
               </div>
             ))}
@@ -249,7 +239,11 @@ export function Composer({
           ref={taRef}
           rows={1}
           value={text}
-          placeholder={running ? t("placeholderRun") : t("placeholderIdle")}
+          placeholder={
+            running
+              ? t("Steer running session (queues for next step)…")
+              : t("Message MyGo… (Enter to send, Shift+Enter for newline)")
+          }
           onInput={(e) => onChangeText(session.id, e.currentTarget.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
@@ -272,16 +266,16 @@ export function Composer({
               type="button"
               class="composer-icon-btn"
               disabled={uploading}
-              title={uploading ? t("uploading") : t("uploadMedia")}
-              aria-label={t("uploadMedia")}
+              title={uploading ? t("Uploading…") : t("Add media")}
+              aria-label={t("Add media")}
               onClick={() => fileRef.current?.click()}
             >
-              <IconPlus size={16} />
+              <Icon n="plus" s={16} />
             </button>
 
             {queuedCount > 0 && (
               <span class="pill pill-queued">
-                {queuedCount} {t("queuedSuffix")}
+                {queuedCount} {t("queued")}
               </span>
             )}
 
@@ -290,10 +284,10 @@ export function Composer({
                 type="button"
                 class="composer-chip-btn"
                 disabled={busy}
-                title={t("queueTip")}
+                title={t("Add message to queue without starting a run")}
                 onClick={() => onSubmit(session.id, false)}
               >
-                {sending ? t("sending") : t("queue")}
+                {sending ? t("Sending…") : t("Queue")}
               </button>
             )}
 
@@ -303,21 +297,21 @@ export function Composer({
                   type="button"
                   class="composer-chip-btn"
                   disabled={session.status === "pausing"}
-                  title={t("pauseTip")}
+                  title={t("Pause after the current step finishes")}
                   onClick={() => onPause("soft")}
                 >
-                  <IconPause size={12} />
-                  <span>{session.status === "pausing" ? t("pausing") : t("pause")}</span>
+                  <Icon n="pause" s={12} />
+                  <span>{session.status === "pausing" ? t("Pausing…") : t("Pause")}</span>
                 </button>
                 {hasPayload && (
                   <button
                     type="button"
                     class="composer-chip-btn danger"
-                    title={t("stopTip")}
+                    title={t("Stop the active run immediately")}
                     onClick={() => onPause("hard")}
                   >
-                    <IconStop size={11} />
-                    <span>{t("stop")}</span>
+                    <Icon n="stop" s={11} />
+                    <span>{t("Stop")}</span>
                   </button>
                 )}
               </>
@@ -327,14 +321,14 @@ export function Composer({
           <div class="row gap-1 composer-right">
             <select
               class="composer-select"
-              title={t("sessionModel")}
+              title={t("Session Model")}
               value={session.model_id ?? ""}
               onChange={(e) => {
                 const val = e.currentTarget.value ? Number(e.currentTarget.value) : null;
                 onPatchSession(session.id, { model_id: val, reasoning_effort: null });
               }}
             >
-              <option value="">{t("noModel")}</option>
+              <option value="">{t("No model")}</option>
               {activeProviders.length > 1
                 ? activeProviders.map((p) => {
                     const groupMods = availableModels.filter((m) => m.provider_id === p.id);
@@ -358,13 +352,13 @@ export function Composer({
             {efforts.length > 0 && (
               <select
                 class="composer-select"
-                title={t("reasoningEffort")}
+                title={t("Reasoning Effort")}
                 value={session.reasoning_effort ?? ""}
                 onChange={(e) =>
                   onPatchSession(session.id, { reasoning_effort: e.currentTarget.value || null })
                 }
               >
-                <option value="">{t("autoEffort")}</option>
+                <option value="">{t("auto")}</option>
                 {efforts.map((ef) => (
                   <option key={ef} value={ef}>{ef}</option>
                 ))}
@@ -375,44 +369,44 @@ export function Composer({
               <button
                 type="button"
                 class="send-circle stop"
-                title={t("stopTip")}
-                aria-label={t("stop")}
+                title={t("Stop the active run immediately")}
+                aria-label={t("Stop")}
                 onClick={() => onPause("hard")}
               >
-                <IconStop size={14} />
+                <Icon n="stop" s={14} />
               </button>
             ) : running ? (
               <button
                 type="button"
                 class="send-circle"
                 disabled={busy}
-                title={t("steerTip")}
-                aria-label={t("steer")}
+                title={t("Queue message for the next step")}
+                aria-label={t("Steer")}
                 onClick={() => onSubmit(session.id, false)}
               >
-                <IconArrowUp size={15} />
+                <Icon n="arrowUp" />
               </button>
             ) : hasPayload ? (
               <button
                 type="button"
                 class="send-circle"
                 disabled={busy}
-                title={t("sendAndRun")}
-                aria-label={t("sendAndRun")}
+                title={t("Send & Run")}
+                aria-label={t("Send & Run")}
                 onClick={() => onSubmit(session.id, true)}
               >
-                <IconArrowUp size={15} />
+                <Icon n="arrowUp" />
               </button>
             ) : (
               <button
                 type="button"
                 class="send-circle"
                 disabled={busy || (session.status !== "paused" && queuedCount === 0)}
-                title={session.status === "paused" ? t("resume") : t("run")}
-                aria-label={session.status === "paused" ? t("resume") : t("run")}
+                title={session.status === "paused" ? t("Resume") : t("Run")}
+                aria-label={session.status === "paused" ? t("Resume") : t("Run")}
                 onClick={() => onSubmit(session.id, true)}
               >
-                <IconPlay size={14} />
+                <Icon n="play" s={14} />
               </button>
             )}
           </div>
@@ -420,18 +414,14 @@ export function Composer({
       </div>
 
       {summary && (
-        <button
-          type="button"
-          class="telemetry-bar"
-          onClick={() => onOpenUsage(session.id)}
-        >
-          <span>{summary.call_count} {t("callsSuffix")}</span>
+        <button type="button" class="telemetry-bar" onClick={() => onOpenUsage(session.id)}>
+          <span>{summary.call_count} {t("calls")}</span>
           <span class="sep">·</span>
           <span class="row gap-1">
-            <IconDatabase size={12} />
+            <Icon n="database" s={12} />
             <span>
               {formatTokens(totalTokens)} tok
-              {cachePct != null ? ` · ${t("cacheHit")} ${cachePct}%` : ""}
+              {cachePct != null ? ` · ${t("cache hit")} ${cachePct}%` : ""}
             </span>
           </span>
           <span class="sep">·</span>

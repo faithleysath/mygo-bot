@@ -1,15 +1,50 @@
-import type { ComponentChildren } from "preact";
+const PATHS = {
+  plus: "M12 5v14M5 12h14",
+  sun: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41",
+  moon: "M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z",
+  monitor: "M4 3h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM8 21h8M12 17v4",
+  settings: "M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6ZM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z",
+  sidebar: "M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2ZM9 3v18",
+  search: "M11 3a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM21 21l-4.35-4.35",
+  x: "M18 6L6 18M6 6l12 12",
+  trash: "M3 6h18M8 6V4h8v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6",
+  copy: "M11 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2ZM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1",
+  check: "M20 6L9 17l-5-5",
+  chevron: "M9 18l6-6-6-6",
+  arrowUp: "M12 19V5M5 12l7-7 7 7",
+  arrowDown: "M12 5v14M19 12l-7 7-7-7",
+  play: "M6 4l14 8-14 8z",
+  pause: "M7 4h2a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1ZM15 4h2a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z",
+  stop: "M7 5h10a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z",
+  spark: "M12 3l1.9 5.8L20 12l-6.1 3.2L12 21l-1.9-5.8L4 12l6.1-3.2L12 3z",
+  terminal: "M4 17l6-6-6-6M12 19h8",
+  bolt: "M13 2L3 14h9l-1 8 10-12h-9l1-8z",
+  alert: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20ZM12 8v4M12 16h.01",
+  external: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3",
+  eye: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z",
+  eyeOff: "M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22",
+  sliders: "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
+  plug: "M12 22v-5M9 8V2M15 8V2M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z",
+  chart: "M18 20V10M12 20V4M6 20v-6",
+  key: "M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4",
+  clock: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20ZM12 6v6l4 2",
+  wrap: "M3 6h18M3 12h15a3 3 0 1 1 0 6h-4M16 16l-2 2 2 2M3 18h7",
+  refresh: "M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15",
+  layers: "M12 2L2 7l10 5 10-5-10-5ZM2 17l10 5 10-5M2 12l10 5 10-5",
+  activity: "M22 12h-4l-3 9L9 3l-3 9H2",
+  chat: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
+  database: "M12 2c4.97 0 9 1.34 9 3s-4.03 3-9 3-9-1.34-9-3 4.03-3 9-3ZM21 12c0 1.66-4 3-9 3s-9-1.34-9-3M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5",
+  globe: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20ZM2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z",
+  expand: "M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7",
+} as const;
 
-interface IconProps {
-  size?: number;
-  cls?: string;
-}
+export type IconName = keyof typeof PATHS;
 
-function Svg({ size = 15, cls, children }: IconProps & { children: ComponentChildren }) {
+export function Icon({ n, s = 15, cls }: { n: IconName; s?: number; cls?: string }) {
   return (
     <svg
-      width={size}
-      height={size}
+      width={s}
+      height={s}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -19,7 +54,7 @@ function Svg({ size = 15, cls, children }: IconProps & { children: ComponentChil
       class={cls}
       aria-hidden="true"
     >
-      {children}
+      <path d={PATHS[n]} />
     </svg>
   );
 }
@@ -37,287 +72,5 @@ export function BrandMark({ size = 24 }: { size?: number }) {
         stroke-linejoin="round"
       />
     </svg>
-  );
-}
-
-export function IconPlus({ size }: IconProps) {
-  return <Svg size={size}><path d="M12 5v14M5 12h14" /></Svg>;
-}
-
-export function IconSun({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <circle cx="12" cy="12" r="4" />
-      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
-    </Svg>
-  );
-}
-
-export function IconMoon({ size }: IconProps) {
-  return <Svg size={size}><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></Svg>;
-}
-
-export function IconMonitor({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <rect x="2" y="3" width="20" height="14" rx="2" />
-      <path d="M8 21h8M12 17v4" />
-    </Svg>
-  );
-}
-
-export function IconSettings({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </Svg>
-  );
-}
-
-export function IconSidebar({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <rect x="3" y="3" width="18" height="18" rx="2" />
-      <path d="M9 3v18" />
-    </Svg>
-  );
-}
-
-export function IconSearch({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <circle cx="11" cy="11" r="8" />
-      <path d="M21 21l-4.35-4.35" />
-    </Svg>
-  );
-}
-
-export function IconX({ size }: IconProps) {
-  return <Svg size={size}><path d="M18 6L6 18M6 6l12 12" /></Svg>;
-}
-
-export function IconTrash({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M3 6h18M8 6V4h8v2M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-    </Svg>
-  );
-}
-
-export function IconCopy({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <rect x="9" y="9" width="13" height="13" rx="2" />
-      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-    </Svg>
-  );
-}
-
-export function IconCheck({ size }: IconProps) {
-  return <Svg size={size}><path d="M20 6L9 17l-5-5" /></Svg>;
-}
-
-export function IconChevron({ size = 14, cls }: IconProps) {
-  return <Svg size={size} cls={cls}><path d="M9 18l6-6-6-6" /></Svg>;
-}
-
-export function IconPaperclip({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-    </Svg>
-  );
-}
-
-export function IconArrowUp({ size }: IconProps) {
-  return <Svg size={size}><path d="M12 19V5M5 12l7-7 7 7" /></Svg>;
-}
-
-export function IconArrowDown({ size }: IconProps) {
-  return <Svg size={size}><path d="M12 5v14M19 12l-7 7-7-7" /></Svg>;
-}
-
-export function IconPlay({ size }: IconProps) {
-  return <Svg size={size}><polygon points="6 4 20 12 6 20 6 4" /></Svg>;
-}
-
-export function IconPause({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <rect x="6" y="4" width="4" height="16" rx="1" />
-      <rect x="14" y="4" width="4" height="16" rx="1" />
-    </Svg>
-  );
-}
-
-export function IconStop({ size }: IconProps) {
-  return <Svg size={size}><rect x="5" y="5" width="14" height="14" rx="2" /></Svg>;
-}
-
-export function IconSpark({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M12 3l1.9 5.8L20 12l-6.1 3.2L12 21l-1.9-5.8L4 12l6.1-3.2L12 3z" />
-    </Svg>
-  );
-}
-
-export function IconTerminal({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M4 17l6-6-6-6M12 19h8" />
-    </Svg>
-  );
-}
-
-export function IconBolt({ size }: IconProps) {
-  return <Svg size={size}><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></Svg>;
-}
-
-export function IconAlert({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <circle cx="12" cy="12" r="10" />
-      <path d="M12 8v4M12 16h.01" />
-    </Svg>
-  );
-}
-
-export function IconExternal({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" />
-    </Svg>
-  );
-}
-
-export function IconEye({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-      <circle cx="12" cy="12" r="3" />
-    </Svg>
-  );
-}
-
-export function IconEyeOff({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22" />
-    </Svg>
-  );
-}
-
-export function IconSliders({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6" />
-    </Svg>
-  );
-}
-
-export function IconPlug({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M12 22v-5M9 8V2M15 8V2M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z" />
-    </Svg>
-  );
-}
-
-export function IconChart({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M18 20V10M12 20V4M6 20v-6" />
-    </Svg>
-  );
-}
-
-export function IconKey({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
-    </Svg>
-  );
-}
-
-export function IconClock({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <circle cx="12" cy="12" r="10" />
-      <path d="M12 6v6l4 2" />
-    </Svg>
-  );
-}
-
-export function IconWrap({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-4M16 16l-2 2 2 2M3 18h7" />
-    </Svg>
-  );
-}
-
-export function IconRefresh({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M23 4v6h-6M1 20v-6h6" />
-      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-    </Svg>
-  );
-}
-
-export function IconLayers({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <polygon points="12 2 2 7 12 12 22 7 12 2" />
-      <path d="M2 17l10 5 10-5M2 12l10 5 10-5" />
-    </Svg>
-  );
-}
-
-export function IconActivity({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-    </Svg>
-  );
-}
-
-export function IconChat({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-    </Svg>
-  );
-}
-
-export function IconDatabase({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <ellipse cx="12" cy="5" rx="9" ry="3" />
-      <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
-      <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
-    </Svg>
-  );
-}
-
-export function IconGlobe({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <circle cx="12" cy="12" r="10" />
-      <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-    </Svg>
-  );
-}
-
-export function IconExpand({ size }: IconProps) {
-  return (
-    <Svg size={size}>
-      <polyline points="15 3 21 3 21 9" />
-      <polyline points="9 21 3 21 3 15" />
-      <line x1="21" y1="3" x2="14" y2="10" />
-      <line x1="3" y1="21" x2="10" y2="14" />
-    </Svg>
   );
 }

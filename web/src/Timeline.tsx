@@ -2,19 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { copyText, errorMessage, fetchMediaUrl, formatDuration, formatTokens } from "./api.ts";
 import { HighlightedCode } from "./highlight.tsx";
 import { formatShortTimeLoc, statusText, useI18n } from "./i18n.ts";
-import {
-  BrandMark,
-  IconAlert,
-  IconArrowDown,
-  IconBolt,
-  IconCheck,
-  IconChevron,
-  IconCopy,
-  IconDatabase,
-  IconSpark,
-  IconTerminal,
-  IconX,
-} from "./Icons.tsx";
+import { BrandMark, Icon } from "./Icons.tsx";
+import { Lightbox } from "./Inspector.tsx";
 import { Markdown } from "./markdown.tsx";
 import type {
   ActiveDraft,
@@ -52,12 +41,12 @@ export function CopyBtn({ text, label }: { text: string; label?: string }) {
     <button
       type="button"
       class="copy-btn"
-      title={copied ? t("copied") : t("copy")}
-      aria-label={t("copy")}
+      title={copied ? t("Copied") : t("Copy")}
+      aria-label={t("Copy")}
       onClick={onCopy}
     >
-      {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
-      {label && <span>{copied ? t("copied") : label}</span>}
+      <Icon n={copied ? "check" : "copy"} s={12} />
+      {label && <span>{copied ? t("Copied") : label}</span>}
     </button>
   );
 }
@@ -102,14 +91,14 @@ function AuthMedia({
   }, [attachmentId]);
 
   if (err) return <div class="media-err">#{attachmentId}: {err}</div>;
-  if (!url) return <div class="media-loading">{t("loadingAttach")} {kind} #{attachmentId}…</div>;
+  if (!url) return <div class="media-loading">{t("Loading")} {kind} #{attachmentId}…</div>;
   if (kind === "image") {
     return (
       <img
         class="media-img"
         src={url}
         alt={`#${attachmentId}`}
-        title={t("clickEnlarge")}
+        title={t("Click to enlarge")}
         onClick={() => onPreviewImage?.(url)}
       />
     );
@@ -210,18 +199,18 @@ function SummaryBody({
   return (
     <div class="tool-out">
       <div class="section-bar">
-        <span class="section-label">{t("result")}</span>
+        <span class="section-label">{t("Result")}</span>
         {outText ? (
-          <CopyBtn text={outText} label={t("copy")} />
+          <CopyBtn text={outText} label={t("Copy")} />
         ) : restJson ? (
-          <CopyBtn text={restJson} label={t("copy")} />
+          <CopyBtn text={restJson} label={t("Copy")} />
         ) : rawFallback ? (
-          <CopyBtn text={rawFallback} label={t("copy")} />
+          <CopyBtn text={rawFallback} label={t("Copy")} />
         ) : null}
       </div>
       {typeof summary?.error === "string" && summary.error && (
         <div class="err-inline row gap-1">
-          <IconAlert size={14} />
+          <Icon n="alert" s={14} />
           <span>{summary.error}</span>
         </div>
       )}
@@ -234,7 +223,7 @@ function SummaryBody({
       )}
       {rawFallback && <pre class="code-box">{rawFallback}</pre>}
       {!outText && !restJson && !hasExtra && !rawFallback && !summary?.error && (
-        <div class="muted small">{t("noOutput")}</div>
+        <div class="muted small">{t("No output")}</div>
       )}
     </div>
   );
@@ -280,7 +269,7 @@ function ToolCard({
       : typeof args?.trigger_code === "string"
         ? args.trigger_code
         : null;
-  const codeLabel = typeof args?.trigger_code === "string" ? t("triggerCode") : t("code");
+  const codeLabel = typeof args?.trigger_code === "string" ? t("Trigger code") : t("Code");
   const formattedArgs = args
     ? JSON.stringify(args, null, 2)
     : typeof payload.arguments === "string"
@@ -292,8 +281,8 @@ function ToolCard({
   return (
     <details class="card tool-card">
       <summary class="card-head">
-        <IconChevron size={13} cls="chev" />
-        <IconTerminal size={13} />
+        <Icon n="chevron" s={13} cls="chev" />
+        <Icon n="terminal" s={13} />
         <span class="mono tool-name">{name}</span>
         {label && <span class="muted truncate">{label}</span>}
         <span class="card-spacer" />
@@ -309,7 +298,7 @@ function ToolCard({
           <>
             <div class="section-bar">
               <span class="section-label">{codeLabel}</span>
-              <CopyBtn text={code} label={t("copy")} />
+              <CopyBtn text={code} label={t("Copy")} />
             </div>
             <pre class="code-box">
               <code><HighlightedCode code={code} lang="js" /></code>
@@ -318,15 +307,15 @@ function ToolCard({
         ) : hasArgs ? (
           <>
             <div class="section-bar">
-              <span class="section-label">{t("arguments")}</span>
-              <CopyBtn text={formattedArgs} label={t("copy")} />
+              <span class="section-label">{t("Arguments")}</span>
+              <CopyBtn text={formattedArgs} label={t("Copy")} />
             </div>
             <pre class="code-box">
               <code><HighlightedCode code={formattedArgs} lang={args ? "json" : undefined} /></code>
             </pre>
           </>
         ) : (
-          <div class="muted small">{t("noArguments")}</div>
+          <div class="muted small">{t("No arguments")}</div>
         )}
         {outputItem && (
           <SummaryBody
@@ -373,9 +362,7 @@ function ReasoningBlock({
 
   useLayoutEffect(() => {
     const el = bodyRef.current;
-    if (streaming && el && stickRef.current) {
-      el.scrollTop = el.scrollHeight;
-    }
+    if (streaming && el && stickRef.current) el.scrollTop = el.scrollHeight;
   }, [streaming, body]);
 
   if (!body && !streaming) return null;
@@ -390,9 +377,9 @@ function ReasoningBlock({
   return (
     <details class="thought" open={streaming}>
       <summary>
-        <IconChevron size={13} cls="chev" />
-        {streaming ? <span class="pulse-dot" /> : <IconSpark size={13} />}
-        <span>{streaming ? t("thinking") : t("thoughtProcess")}</span>
+        <Icon n="chevron" s={13} cls="chev" />
+        {streaming ? <span class="pulse-dot" /> : <Icon n="spark" s={13} />}
+        <span>{streaming ? t("Thinking…") : t("Thought process")}</span>
         {!streaming && body && <span class="thought-meta">{lenHint}</span>}
       </summary>
       <div class="thought-body" ref={bodyRef} onScroll={onBodyScroll}>
@@ -437,8 +424,8 @@ function EventCard({
   return (
     <details class="card event-card">
       <summary class="card-head">
-        <IconChevron size={13} cls="chev" />
-        <IconBolt size={13} />
+        <Icon n="chevron" s={13} cls="chev" />
+        <Icon n="bolt" s={13} />
         <span class="pill mono">{p.task_id || "task"}</span>
         <span class="mono">{p.event}</span>
         {p.sequence != null && <span class="muted small">#{p.sequence}</span>}
@@ -506,15 +493,6 @@ export function Timeline({
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!lightboxSrc) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setLightboxSrc(null);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [lightboxSrc]);
-
-  useEffect(() => {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
@@ -543,9 +521,7 @@ export function Timeline({
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
     stickRef.current = nearBottom;
     setShowJump(!nearBottom);
-    if (!rafRef.current) {
-      rafRef.current = requestAnimationFrame(updateActiveTurn);
-    }
+    if (!rafRef.current) rafRef.current = requestAnimationFrame(updateActiveTurn);
   };
 
   useLayoutEffect(() => {
@@ -583,9 +559,7 @@ export function Timeline({
 
   const handleLoadMore = () => {
     stickRef.current = false;
-    if (scrollRef.current) {
-      prevScrollHeightRef.current = scrollRef.current.scrollHeight;
-    }
+    if (scrollRef.current) prevScrollHeightRef.current = scrollRef.current.scrollHeight;
     onLoadMore();
   };
 
@@ -600,13 +574,10 @@ export function Timeline({
   const withdrawn = new Set<number>();
   const callsSet = new Set<number>();
   const outputsByTarget = new Map<number, HistoryItem>();
-
   for (const item of items) {
     if (item.kind === "withdrawal" && item.target_id) withdrawn.add(item.target_id);
     if (item.kind === "function_call") callsSet.add(item.id);
-    if (item.kind === "function_call_output" && item.target_id) {
-      outputsByTarget.set(item.target_id, item);
-    }
+    if (item.kind === "function_call_output" && item.target_id) outputsByTarget.set(item.target_id, item);
   }
 
   const turns: Array<{ id: number; role: "user" | "assistant"; label: string }> = [];
@@ -635,7 +606,7 @@ export function Timeline({
           {hasMore && (
             <div class="load-more">
               <button type="button" class="btn-ghost btn-sm" disabled={loadingMore} onClick={handleLoadMore}>
-                {loadingMore ? t("loading") : t("loadEarlier")}
+                {loadingMore ? t("Loading…") : t("Load earlier")}
               </button>
             </div>
           )}
@@ -643,7 +614,7 @@ export function Timeline({
           {items.length === 0 && !draft && !showWorking && (
             <div class="empty-chat">
               <BrandMark size={36} />
-              <h3>{session?.title || `${t("sessionPrefix")} #${session?.id}`}</h3>
+              <h3>{session?.title || `${t("Session")} #${session?.id}`}</h3>
               <div class="empty-badges">
                 {modelLabel ? (
                   <>
@@ -652,22 +623,22 @@ export function Timeline({
                   </>
                 ) : (
                   <>
-                    <span class="pill pill-paused">{t("noModelSelected")}</span>
+                    <span class="pill pill-paused">{t("No model selected")}</span>
                     {onOpenSettings && (
                       <button type="button" class="link-btn" onClick={onOpenSettings}>
-                        {t("configureModel")}
+                        {t("Configure model")}
                       </button>
                     )}
                   </>
                 )}
               </div>
-              <p>{t("emptyChatDesc")}</p>
+              <p>{t("Send a message below to queue input and run the model, or queue multiple inputs before starting.")}</p>
               <div class="empty-hints">
-                <span>{t("hintSend")}</span>
+                <span>{t("Enter send")}</span>
                 <span>·</span>
-                <span>{t("hintNewline")}</span>
+                <span>{t("Shift+Enter newline")}</span>
                 <span>·</span>
-                <span>{t("hintMedia")}</span>
+                <span>{t("Paste or drop media")}</span>
               </div>
             </div>
           )}
@@ -703,7 +674,7 @@ export function Timeline({
                           <>
                             <span class="pill pill-queued">{t("queued")}</span>
                             <button type="button" class="link-btn" onClick={() => onWithdraw(item.id)}>
-                              {t("withdraw")}
+                              {t("Withdraw")}
                             </button>
                           </>
                         )}
@@ -734,8 +705,8 @@ export function Timeline({
                           class="meta-chip"
                           title={`#${call.id}: in ${call.input_uncached_tokens ?? 0} + cache ${call.cache_read_tokens ?? 0} → out ${call.output_tokens ?? 0}`}
                         >
-                          <IconDatabase size={12} />
-                          <span>{t("usageLabel")} {formatTokens(callTokens)} tok</span>
+                          <Icon n="database" s={12} />
+                          <span>{t("Usage")} {formatTokens(callTokens)} tok</span>
                         </span>
                       )}
                       {callTime && <span class="meta-time">{callTime}</span>}
@@ -745,9 +716,7 @@ export function Timeline({
               );
             }
 
-            if (item.kind === "reasoning") {
-              return <ReasoningBlock key={item.id} item={item} />;
-            }
+            if (item.kind === "reasoning") return <ReasoningBlock key={item.id} item={item} />;
             if (item.kind === "function_call") {
               return (
                 <ToolCard
@@ -764,7 +733,7 @@ export function Timeline({
             return (
               <details key={item.id} class="card">
                 <summary class="card-head">
-                  <IconChevron size={13} cls="chev" />
+                  <Icon n="chevron" s={13} cls="chev" />
                   <span class="mono">{item.kind}</span>
                   <span class="muted">#{item.id}</span>
                 </summary>
@@ -783,7 +752,7 @@ export function Timeline({
               return (
                 <div key={`d-${d.output_index}`} class="card tool-card streaming">
                   <div class="card-head">
-                    <IconTerminal size={13} />
+                    <Icon n="terminal" s={13} />
                     <span class="mono tool-name">{d.name || "tool"}</span>
                     <span class="card-spacer" />
                     <span class="pill pill-running">
@@ -814,14 +783,14 @@ export function Timeline({
                 <i />
                 <i />
               </span>
-              <span>{session?.status === "pausing" ? t("pausingStep") : t("working")}</span>
+              <span>{session?.status === "pausing" ? t("Pausing after current step…") : t("Working…")}</span>
             </div>
           )}
 
           {retryNotice && (
             <div class="retry-banner">
-              <IconAlert size={14} />
-              <span>{t("upstreamRetry")} #{retryNotice.attempt}: {retryNotice.reason}</span>
+              <Icon n="alert" s={14} />
+              <span>{t("Upstream retry")} #{retryNotice.attempt}: {retryNotice.reason}</span>
             </div>
           )}
         </div>
@@ -848,24 +817,12 @@ export function Timeline({
       {showJump && (
         <button type="button" class="jump-btn" onClick={jumpBottom}>
           {Boolean(draft?.items?.length) && <span class="pulse-dot" />}
-          <IconArrowDown size={13} />
-          <span>{t("latest")}</span>
+          <Icon n="arrowDown" s={13} />
+          <span>{t("Latest")}</span>
         </button>
       )}
 
-      {lightboxSrc && (
-        <div class="lightbox" onClick={() => setLightboxSrc(null)}>
-          <button
-            type="button"
-            class="lightbox-close"
-            aria-label={t("closePreview")}
-            onClick={() => setLightboxSrc(null)}
-          >
-            <IconX size={18} />
-          </button>
-          <img src={lightboxSrc} alt="Preview" onClick={(e) => e.stopPropagation()} />
-        </div>
-      )}
+      <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />
     </div>
   );
 }
