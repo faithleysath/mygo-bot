@@ -1,4 +1,5 @@
 export type Theme = "light" | "dark";
+export type ThemePref = "system" | "light" | "dark";
 export type SseStatus = "open" | "reconnecting";
 export type SessionStatus = "idle" | "running" | "pausing" | "paused";
 
@@ -232,6 +233,8 @@ export interface ActiveTask {
   label?: string;
   delivery: string;
   remaining_seconds?: number | null;
+  started_at?: string;
+  expires_at?: string;
   state?: string;
   running_commands?: RunningCommand[];
   console?: {

@@ -15,7 +15,19 @@ import {
   setUnauthorizedHandler,
 } from "./api.ts";
 import { Composer } from "./Composer.tsx";
+import {
+  BrandMark,
+  IconAlert,
+  IconEye,
+  IconEyeOff,
+  IconPlay,
+  IconPlus,
+  IconSettings,
+  IconSidebar,
+  IconX,
+} from "./Icons.tsx";
 import { Settings } from "./Settings.tsx";
+import type { SettingsTabId } from "./Settings.tsx";
 import { Sidebar } from "./Sidebar.tsx";
 import {
   applyDraftDelta,
@@ -51,11 +63,25 @@ import type {
   SessionStatusEvent,
   SseStatus,
   SubmittedComposerSnapshot,
-  Theme,
+  ThemePref,
 } from "./types.ts";
+
+function readThemePref(): ThemePref {
+  try {
+    const v = localStorage.getItem("mygo_theme");
+    if (v === "light" || v === "dark") return v;
+  } catch {}
+  return "system";
+}
+
+function resolveTheme(pref: ThemePref): "light" | "dark" {
+  if (pref === "light" || pref === "dark") return pref;
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
 
 function TokenGate({ onSuccess }: { onSuccess: () => void }) {
   const [value, setValue] = useState("");
+  const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -80,21 +106,47 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
     <div class="gate-wrap">
       <form class="gate-card" onSubmit={submit}>
         <div class="brand">
-          <span class="brand-mark">M</span>
+          <BrandMark size={26} />
           <span>MyGo-Bot</span>
         </div>
         <p class="muted">Enter the daemon TCP Bearer token to connect.</p>
         {err && <div class="err-inline">{err}</div>}
-        <input
-          type="password"
-          placeholder="Bearer token"
-          autoFocus
-          value={value}
-          onInput={(e) => setValue(e.currentTarget.value)}
-        />
+        <div class="token-input-wrap">
+          {show ? (
+            <input
+              key="tok"
+              type="text"
+              placeholder="Bearer token"
+              autoFocus
+              value={value}
+              onInput={(e) => setValue(e.currentTarget.value)}
+            />
+          ) : (
+            <input
+              key="tok"
+              type="password"
+              placeholder="Bearer token"
+              autoFocus
+              value={value}
+              onInput={(e) => setValue(e.currentTarget.value)}
+            />
+          )}
+          <button
+            type="button"
+            class="btn-icon"
+            title={show ? "Hide token" : "Show token"}
+            aria-label={show ? "Hide token" : "Show token"}
+            onClick={() => setShow((v) => !v)}
+          >
+            {show ? <IconEyeOff size={15} /> : <IconEye size={15} />}
+          </button>
+        </div>
         <button type="submit" class="btn-primary" disabled={busy || !value.trim()}>
           {busy ? "Verifying…" : "Connect"}
         </button>
+        <div class="muted small">
+          Run <code class="md-inline-code">mygo status</code> on the host to view the token.
+        </div>
       </form>
     </div>
   );
@@ -102,17 +154,23 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
 
 function TopBar({
   session,
+  providers,
   models,
   summary,
   sseStatus,
+  sidebarCollapsed,
   onOpenSidebar,
+  onOpenUsage,
   onPatchSession,
 }: {
   session: SessionInfo | null;
+  providers: ProviderInfo[];
   models: ModelInfo[];
   summary: CallsSummary | null;
   sseStatus: SseStatus;
+  sidebarCollapsed: boolean;
   onOpenSidebar: () => void;
+  onOpenUsage: (sid: number) => void;
   onPatchSession: (sid: number, patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort">>) => void;
 }) {
   const [title, setTitle] = useState(session?.title || "");
@@ -123,10 +181,24 @@ function TopBar({
   if (!session) return null;
 
   const availableModels = models.filter((m) => !m.archived_at && !m.provider_archived_at);
+  const activeProviders = providers.filter((p) => !p.archived_at);
   const currentModel = models.find((m) => m.id === session.model_id);
   const efforts = currentModel?.reasoning_efforts || [];
   const ctxLimit = currentModel?.context_window_tokens;
   const lastIn = summary?.last_input_tokens;
+  const ctxPct =
+    lastIn != null && ctxLimit ? Math.min(100, Math.round((lastIn / ctxLimit) * 100)) : null;
+  const meterLevel = ctxPct == null ? "" : ctxPct >= 90 ? "danger" : ctxPct >= 75 ? "warn" : "";
+
+  const metricsTip = summary
+    ? [
+        ctxPct != null ? `Context: ${formatTokens(lastIn)} / ${formatTokens(ctxLimit)} (${ctxPct}%)` : lastIn != null ? `Last input: ${formatTokens(lastIn)}` : "",
+        `Uncached: ${formatTokens(summary.input_uncached_tokens)} · Cached: ${formatTokens(summary.cache_read_tokens)} · Output: ${formatTokens(summary.output_tokens)}`,
+        `Calls: ${summary.succeeded_count}/${summary.call_count} · Cost: ${formatCost(summary.cost_nano_usd)} (click for Usage)`,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    : "";
 
   const commitTitle = () => {
     const next = title.trim();
@@ -140,8 +212,14 @@ function TopBar({
   return (
     <header class="topbar">
       <div class="topbar-left">
-        <button type="button" class="btn-icon mobile-only" onClick={onOpenSidebar}>
-          ☰
+        <button
+          type="button"
+          class={`btn-icon ${sidebarCollapsed ? "" : "mobile-only"}`}
+          title="Show sessions"
+          aria-label="Show sessions"
+          onClick={onOpenSidebar}
+        >
+          <IconSidebar size={16} />
         </button>
         <input
           class="title-input"
@@ -153,8 +231,11 @@ function TopBar({
             if (e.key === "Enter" && !e.isComposing) e.currentTarget.blur();
           }}
         />
-        <span class={`pill pill-${session.status}`}>{session.status}</span>
-        {sseStatus === "reconnecting" && <span class="pill">reconnecting</span>}
+        <span class={`pill pill-${session.status}`}>
+          {(session.status === "running" || session.status === "pausing") && <span class="pulse-dot" />}
+          {session.status}
+        </span>
+        {sseStatus === "reconnecting" && <span class="pill pill-paused">reconnecting</span>}
       </div>
 
       <div class="topbar-right">
@@ -168,9 +249,21 @@ function TopBar({
           }}
         >
           <option value="">No model</option>
-          {availableModels.map((m) => (
-            <option key={m.id} value={m.id}>{m.model_key}</option>
-          ))}
+          {activeProviders.length > 1
+            ? activeProviders.map((p) => {
+                const groupMods = availableModels.filter((m) => m.provider_id === p.id);
+                if (groupMods.length === 0) return null;
+                return (
+                  <optgroup key={p.id} label={p.name}>
+                    {groupMods.map((m) => (
+                      <option key={m.id} value={m.id}>{m.model_key}</option>
+                    ))}
+                  </optgroup>
+                );
+              })
+            : availableModels.map((m) => (
+                <option key={m.id} value={m.id}>{m.model_key}</option>
+              ))}
           {currentModel && (currentModel.archived_at || currentModel.provider_archived_at) && (
             <option value={currentModel.id}>{currentModel.model_key} (archived)</option>
           )}
@@ -191,15 +284,25 @@ function TopBar({
         )}
 
         {summary && (
-          <div class="metrics-pill mono" title="Context tokens / total session cost">
+          <button
+            type="button"
+            class="metrics-pill mono"
+            title={metricsTip}
+            onClick={() => onOpenUsage(session.id)}
+          >
             {lastIn != null && (
               <span>
                 {formatTokens(lastIn)}
                 {ctxLimit ? `/${formatTokens(ctxLimit)}` : " tok"}
               </span>
             )}
+            {ctxPct != null && (
+              <span class="ctx-meter" aria-hidden="true">
+                <i class={meterLevel} style={{ width: `${ctxPct}%` }} />
+              </span>
+            )}
             <span>{formatCost(summary.cost_nano_usd)}</span>
-          </div>
+          </button>
         )}
       </div>
     </header>
@@ -214,11 +317,20 @@ function revokeAttachments(attachments: ComposerAttachment[]): void {
 
 function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
-  const [theme, setTheme] = useState<Theme>(() =>
-    document.documentElement.dataset.theme === "dark" ? "dark" : "light"
-  );
+  const [themePref, setThemePrefState] = useState<ThemePref>(readThemePref);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("mygo_sidebar_collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [settingsState, setSettingsState] = useState<{
+    open: boolean;
+    tab: SettingsTabId;
+    sessionFilter: string;
+  }>({ open: false, tab: "models", sessionFilter: "" });
 
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -241,6 +353,7 @@ function App() {
   const [uploadingBySid, setUploadingBySid] = useState<Record<number, number>>({});
   const [sendingBySid, setSendingBySid] = useState<Record<number, boolean>>({});
 
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const activeIdRef = useRef<number | null>(null);
   activeIdRef.current = activeId;
   const sessionsRef = useRef<SessionInfo[]>([]);
@@ -272,14 +385,57 @@ function App() {
     });
   };
 
-  const toggleTheme = () => {
-    const next: Theme = theme === "dark" ? "light" : "dark";
-    setTheme(next);
-    document.documentElement.dataset.theme = next === "dark" ? "dark" : "";
+  useEffect(() => {
+    const apply = () => {
+      const resolved = resolveTheme(themePref);
+      document.documentElement.dataset.theme = resolved === "dark" ? "dark" : "";
+    };
+    apply();
     try {
-      localStorage.setItem("mygo_theme", next);
+      if (themePref === "system") localStorage.removeItem("mygo_theme");
+      else localStorage.setItem("mygo_theme", themePref);
     } catch {}
+    if (themePref !== "system") return;
+    const mq = matchMedia("(prefers-color-scheme: dark)");
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
+  }, [themePref]);
+
+  const cycleTheme = () => {
+    setThemePrefState((cur) => (cur === "system" ? "light" : cur === "light" ? "dark" : "system"));
   };
+
+  const toggleSidebarCollapse = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        if (next) localStorage.setItem("mygo_sidebar_collapsed", "1");
+        else localStorage.removeItem("mygo_sidebar_collapsed");
+      } catch {}
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!authed) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        if (settingsState.open) return;
+        setSidebarCollapsed(false);
+        try {
+          localStorage.removeItem("mygo_sidebar_collapsed");
+        } catch {}
+        setSidebarOpen(true);
+        requestAnimationFrame(() => {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        });
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [authed, settingsState.open]);
 
   useEffect(() => {
     setUnauthorizedHandler(() => setAuthed(false));
@@ -795,6 +951,16 @@ function App() {
     return <TokenGate onSuccess={() => setAuthed(true)} />;
   }
 
+  const openSidebar = () => {
+    setSidebarCollapsed(false);
+    try {
+      localStorage.removeItem("mygo_sidebar_collapsed");
+    } catch {}
+    setSidebarOpen(true);
+  };
+
+  const activeModel = activeSession?.model_id ? modelsById.get(activeSession.model_id) : undefined;
+
   return (
     <div class="layout">
       <Sidebar
@@ -802,12 +968,15 @@ function App() {
         activeId={activeId}
         modelsById={modelsById}
         open={sidebarOpen}
-        theme={theme}
+        collapsed={sidebarCollapsed}
+        themePref={themePref}
+        searchInputRef={searchInputRef}
         onSelect={setActiveId}
         onCreate={createSession}
         onDelete={deleteSession}
-        onToggleTheme={toggleTheme}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onCycleTheme={cycleTheme}
+        onOpenSettings={() => setSettingsState({ open: true, tab: "models", sessionFilter: "" })}
+        onToggleCollapse={toggleSidebarCollapse}
         onClose={() => setSidebarOpen(false)}
       />
 
@@ -816,20 +985,49 @@ function App() {
           <>
             <TopBar
               session={activeSession}
+              providers={providers}
               models={models}
               summary={summary}
               sseStatus={sseStatus}
-              onOpenSidebar={() => setSidebarOpen(true)}
+              sidebarCollapsed={sidebarCollapsed}
+              onOpenSidebar={openSidebar}
+              onOpenUsage={(sid) =>
+                setSettingsState({ open: true, tab: "usage", sessionFilter: String(sid) })
+              }
               onPatchSession={patchSession}
             />
             {(bannerErr || activeSession.last_error) && (
               <div class="status-banner">
-                <span>{bannerErr || activeSession.last_error}</span>
-                {bannerErr && (
-                  <button type="button" class="link-btn" onClick={() => setBannerErr("")}>
-                    Dismiss
-                  </button>
-                )}
+                <div class="row gap-1">
+                  <IconAlert size={15} />
+                  <span>{bannerErr || activeSession.last_error}</span>
+                </div>
+                <div class="row gap-1">
+                  {activeSession.status === "paused" && activeSession.last_error && !bannerErr && (
+                    <button
+                      type="button"
+                      class="btn-ghost btn-xs"
+                      onClick={() =>
+                        void apiFetch(`/sessions/${activeSession.id}/run`, { method: "PUT" }).catch((e) =>
+                          setBannerErr(errorMessage(e))
+                        )
+                      }
+                    >
+                      <IconPlay size={11} />
+                      <span>Resume</span>
+                    </button>
+                  )}
+                  {bannerErr && (
+                    <button
+                      type="button"
+                      class="btn-icon"
+                      aria-label="Dismiss error"
+                      onClick={() => setBannerErr("")}
+                    >
+                      <IconX size={14} />
+                    </button>
+                  )}
+                </div>
               </div>
             )}
             <Timeline
@@ -840,12 +1038,15 @@ function App() {
               queuedIds={queuedIds}
               draft={draft}
               retryNotice={retryNotice}
+              modelLabel={activeModel?.model_key ?? null}
+              effortLabel={activeSession.reasoning_effort}
               onLoadMore={loadMore}
               onWithdraw={(mid) =>
                 void apiFetch(`/sessions/${activeSession.id}/messages/${mid}`, { method: "DELETE" }).catch((e) =>
                   setBannerErr(errorMessage(e))
                 )
               }
+              onOpenSettings={() => setSettingsState({ open: true, tab: "models", sessionFilter: "" })}
             />
             <Composer
               session={activeSession}
@@ -872,24 +1073,37 @@ function App() {
           </>
         ) : (
           <div class="welcome">
-            <button type="button" class="btn-icon mobile-only welcome-menu" onClick={() => setSidebarOpen(true)}>
-              ☰
+            <button
+              type="button"
+              class={`btn-icon welcome-menu ${sidebarCollapsed ? "" : "mobile-only"}`}
+              aria-label="Show sessions"
+              onClick={openSidebar}
+            >
+              <IconSidebar size={16} />
             </button>
             <div class="welcome-card">
               <div class="brand">
-                <span class="brand-mark">M</span>
+                <BrandMark size={28} />
                 <span>MyGo-Bot</span>
               </div>
               <p class="muted">Select a session from the sidebar or create a new one.</p>
               {models.filter((m) => !m.archived_at && !m.provider_archived_at).length === 0 && (
-                <p class="muted small">No available models configured yet — open Settings to add a provider and model.</p>
+                <p class="muted small">
+                  No available models configured yet — open Settings to add a provider and model.
+                </p>
               )}
               <div class="row gap-2">
                 <button type="button" class="btn-primary" onClick={createSession}>
-                  + New Session
+                  <IconPlus size={15} />
+                  <span>New Session</span>
                 </button>
-                <button type="button" class="btn-ghost" onClick={() => setSettingsOpen(true)}>
-                  Settings
+                <button
+                  type="button"
+                  class="btn-ghost"
+                  onClick={() => setSettingsState({ open: true, tab: "models", sessionFilter: "" })}
+                >
+                  <IconSettings size={15} />
+                  <span>Settings</span>
                 </button>
               </div>
             </div>
@@ -897,20 +1111,23 @@ function App() {
         )}
       </main>
 
-      {settingsOpen && (
+      {settingsState.open && (
         <Settings
           config={config}
           providers={providers}
           models={models}
-          theme={theme}
-          onToggleTheme={toggleTheme}
+          sessions={sessions}
+          themePref={themePref}
+          initialTab={settingsState.tab}
+          initialSessionFilter={settingsState.sessionFilter}
+          onSetThemePref={setThemePrefState}
           onRefreshCatalog={loadCatalog}
           onSignOut={() => {
             setToken("");
-            setSettingsOpen(false);
+            setSettingsState({ open: false, tab: "models", sessionFilter: "" });
             setAuthed(false);
           }}
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => setSettingsState((s) => ({ ...s, open: false }))}
         />
       )}
     </div>

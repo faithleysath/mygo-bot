@@ -1,6 +1,18 @@
 import type { TargetedSubmitEvent } from "preact";
-import { useEffect, useState } from "preact/hooks";
-import { apiFetch, errorMessage, formatCost, formatTokens } from "./api.ts";
+import { useEffect, useMemo, useState } from "preact/hooks";
+import { apiFetch, errorMessage, formatAbsTime, formatCost, formatDuration, formatRelTime, formatTokens } from "./api.ts";
+import {
+  IconChart,
+  IconExternal,
+  IconKey,
+  IconMonitor,
+  IconMoon,
+  IconPlug,
+  IconSettings,
+  IconSliders,
+  IconSun,
+  IconX,
+} from "./Icons.tsx";
 import { buildMcpPayload, createMcpForm } from "./state.ts";
 import type {
   AppConfig,
@@ -17,7 +29,8 @@ import type {
   McpTransport,
   ModelInfo,
   ProviderInfo,
-  Theme,
+  SessionInfo,
+  ThemePref,
 } from "./types.ts";
 
 interface ProviderFormState {
@@ -54,6 +67,7 @@ function ModelsTab({
   const [provForm, setProvForm] = useState<ProviderFormState | null>(null);
   const [modelForm, setModelForm] = useState<ModelFormState | null>(null);
 
+  const providersById = useMemo(() => new Map(providers.map((p) => [p.id, p])), [providers]);
   const visibleProviders = showArchived ? providers : providers.filter((p) => !p.archived_at);
   const visibleModels = showArchived ? models : models.filter((m) => !m.archived_at && !m.provider_archived_at);
   const availableModels = models.filter((m) => !m.archived_at && !m.provider_archived_at);
@@ -206,10 +220,14 @@ function ModelsTab({
           </form>
         )}
         <div class="item-list">
+          {visibleProviders.length === 0 && (
+            <div class="empty-hint small">No providers configured yet.</div>
+          )}
           {visibleProviders.map((p) => (
             <div key={p.id} class="list-row">
               <div>
-                <strong>{p.name}</strong> {p.archived_at && <span class="pill">archived</span>}
+                <strong>{p.name}</strong>{" "}
+                {p.archived_at && <span class="pill">archived</span>}
                 <div class="muted small">{p.base_url} · {p.has_api_key ? "key set" : "no key"}</div>
               </div>
               <div class="row gap-1">
@@ -305,44 +323,55 @@ function ModelsTab({
           </form>
         )}
         <div class="item-list">
-          {visibleModels.map((m) => (
-            <div key={m.id} class="list-row">
-              <div>
-                <strong>{m.model_key}</strong> {(m.archived_at || m.provider_archived_at) && <span class="pill">archived</span>}
-                <div class="muted small">
-                  {m.input_modalities.join(", ")} · ctx {m.context_window_tokens || "—"} · efforts [{m.reasoning_efforts.join(", ")}]
+          {visibleModels.length === 0 && (
+            <div class="empty-hint small">No models configured yet.</div>
+          )}
+          {visibleModels.map((m) => {
+            const prov = providersById.get(m.provider_id);
+            return (
+              <div key={m.id} class="list-row">
+                <div>
+                  <div class="row gap-1" style="flex-wrap:wrap">
+                    <strong class="mono">{m.model_key}</strong>
+                    {prov && <span class="pill">{prov.name}</span>}
+                    {m.pricing && <span class="pill pill-succeeded">priced</span>}
+                    {(m.archived_at || m.provider_archived_at) && <span class="pill">archived</span>}
+                  </div>
+                  <div class="muted small">
+                    {m.input_modalities.join(", ")} · ctx {m.context_window_tokens ? formatTokens(m.context_window_tokens) : "—"} · efforts [{m.reasoning_efforts.join(", ") || "none"}]
+                  </div>
+                </div>
+                <div class="row gap-1">
+                  <button
+                    type="button"
+                    class="btn-ghost btn-xs"
+                    onClick={() =>
+                      setModelForm({
+                        id: m.id,
+                        provider_id: m.provider_id,
+                        model_key: m.model_key,
+                        context_window_tokens: m.context_window_tokens || "",
+                        input_modalities: m.input_modalities,
+                        reasoning_efforts: m.reasoning_efforts.join(", "),
+                        pricingText: m.pricing ? JSON.stringify(m.pricing) : "",
+                      })
+                    }
+                  >
+                    Edit
+                  </button>
+                  {m.archived_at ? (
+                    <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}/restore`, { method: "POST" }).then(() => undefined))}>
+                      Restore
+                    </button>
+                  ) : (
+                    <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}`, { method: "DELETE" }).then(() => undefined))}>
+                      Archive
+                    </button>
+                  )}
                 </div>
               </div>
-              <div class="row gap-1">
-                <button
-                  type="button"
-                  class="btn-ghost btn-xs"
-                  onClick={() =>
-                    setModelForm({
-                      id: m.id,
-                      provider_id: m.provider_id,
-                      model_key: m.model_key,
-                      context_window_tokens: m.context_window_tokens || "",
-                      input_modalities: m.input_modalities,
-                      reasoning_efforts: m.reasoning_efforts.join(", "),
-                      pricingText: m.pricing ? JSON.stringify(m.pricing) : "",
-                    })
-                  }
-                >
-                  Edit
-                </button>
-                {m.archived_at ? (
-                  <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}/restore`, { method: "POST" }).then(() => undefined))}>
-                    Restore
-                  </button>
-                ) : (
-                  <button type="button" class="btn-ghost btn-xs" onClick={() => void run(() => apiFetch(`/models/${m.id}`, { method: "DELETE" }).then(() => undefined))}>
-                    Archive
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </section>
     </div>
@@ -353,10 +382,18 @@ function McpTab() {
   const [servers, setServers] = useState<McpServerInfo[]>([]);
   const [oauth, setOauth] = useState<Record<number, string>>({});
   const [probe, setProbe] = useState<Record<number, McpProbeResult>>({});
+  const [busyTestId, setBusyTestId] = useState<number | null>(null);
+  const [confirmDelId, setConfirmDelId] = useState<number | null>(null);
   const [loginInfo, setLoginInfo] = useState<Record<number, McpOAuthLoginInfo | null>>({});
   const [callbackUrl, setCallbackUrl] = useState<Record<number, string>>({});
   const [form, setForm] = useState<McpFormState | null>(null);
   const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (confirmDelId == null) return;
+    const t = setTimeout(() => setConfirmDelId(null), 3000);
+    return () => clearTimeout(t);
+  }, [confirmDelId]);
 
   const load = async () => {
     const list = await apiFetch<McpServerInfo[]>("/mcp/servers");
@@ -658,136 +695,182 @@ function McpTab() {
       )}
 
       <div class="item-list">
-        {servers.map((s) => (
-          <div key={s.id} class="panel">
-            <div class="list-row">
-              <div>
-                <strong>{s.name}</strong> <span class="pill">{s.transport}</span>{" "}
-                {!s.enabled && <span class="pill">disabled</span>}
-                {s.allowed_tools !== null && (
-                  <span class="pill">
-                    {s.allowed_tools.length === 0 ? "tools: none" : `tools: ${s.allowed_tools.length}`}
-                  </span>
-                )}
-                {s.has_oauth && <span class="pill">oauth: {oauth[s.id] || "?"}</span>}
-                <div class="muted small">{s.description || s.url || s.command}</div>
-              </div>
-              <div class="row gap-1">
-                <button
-                  type="button"
-                  class="btn-ghost btn-xs"
-                  onClick={() =>
-                    void run(async () => {
-                      const res = await apiFetch<McpProbeResult>(`/mcp/servers/${s.id}/test`, { method: "POST" });
-                      setProbe((p) => ({ ...p, [s.id]: res }));
-                    })
-                  }
-                >
-                  Test
-                </button>
-                {s.has_oauth && (
-                  <>
-                    <button
-                      type="button"
-                      class="btn-ghost btn-xs"
-                      onClick={() =>
-                        void run(async () => {
-                          const res = await apiFetch<McpOAuthLoginInfo>(`/mcp/servers/${s.id}/oauth/login`, {
-                            method: "POST",
-                          });
-                          setLoginInfo((l) => ({ ...l, [s.id]: res }));
-                        })
-                      }
-                    >
-                      Login
-                    </button>
-                    <button
-                      type="button"
-                      class="btn-ghost btn-xs"
-                      onClick={() =>
-                        void run(() => apiFetch(`/mcp/servers/${s.id}/oauth`, { method: "DELETE" }).then(() => undefined))
-                      }
-                    >
-                      Logout
-                    </button>
-                  </>
-                )}
-                <button
-                  type="button"
-                  class="btn-ghost btn-xs"
-                  onClick={() => setForm(createMcpForm(s))}
-                >
-                  Edit
-                </button>
-                <button
-                  type="button"
-                  class="btn-danger btn-xs"
-                  onClick={() =>
-                    void run(() => apiFetch(`/mcp/servers/${s.id}`, { method: "DELETE" }).then(() => undefined))
-                  }
-                >
-                  Delete
-                </button>
-              </div>
-            </div>
-
-            {probe[s.id] && (
-              <pre class="code-box small">
-                {probe[s.id].ok
-                  ? `OK (${probe[s.id].elapsed_ms}ms, v=${probe[s.id].protocol_version || "?"}) ` +
-                    probe[s.id].lists.map((l) => `${l.operation}:${l.count}${l.has_more ? "+" : ""}`).join(", ")
-                  : `FAILED at ${probe[s.id].stage}: ${probe[s.id].error}`}
-              </pre>
-            )}
-
-            {loginInfo[s.id] && (
-              <div class="form-box">
-                <div class="small">
-                  Authorize here:{" "}
-                  <a href={loginInfo[s.id]?.authorization_url} target="_blank" rel="noopener noreferrer">
-                    Open OAuth Login
-                  </a>
+        {servers.length === 0 && !form && (
+          <div class="empty-hint small">No MCP servers configured yet.</div>
+        )}
+        {servers.map((s) => {
+          const testing = busyTestId === s.id;
+          const confirmingDel = confirmDelId === s.id;
+          const pr = probe[s.id];
+          return (
+            <div key={s.id} class="panel">
+              <div class="list-row">
+                <div>
+                  <strong>{s.name}</strong> <span class="pill">{s.transport}</span>{" "}
+                  {!s.enabled && <span class="pill">disabled</span>}
+                  {s.allowed_tools !== null && (
+                    <span class="pill">
+                      {s.allowed_tools.length === 0 ? "tools: none" : `tools: ${s.allowed_tools.length}`}
+                    </span>
+                  )}
+                  {s.has_oauth && <span class="pill">oauth: {oauth[s.id] || "?"}</span>}
+                  <div class="muted small">{s.description || s.url || s.command}</div>
                 </div>
                 <div class="row gap-1">
-                  <input
-                    placeholder="Paste redirect URL if remote…"
-                    value={callbackUrl[s.id] || ""}
-                    onInput={(e) => setCallbackUrl((c) => ({ ...c, [s.id]: e.currentTarget.value }))}
-                  />
                   <button
                     type="button"
-                    class="btn-primary btn-xs"
-                    onClick={() =>
+                    class="btn-ghost btn-xs"
+                    disabled={testing}
+                    onClick={() => {
+                      setBusyTestId(s.id);
                       void run(async () => {
-                        await apiFetch(`/mcp/servers/${s.id}/oauth/callback`, {
-                          method: "POST",
-                          body: { url: callbackUrl[s.id] || "" },
-                        });
-                        setLoginInfo((l) => ({ ...l, [s.id]: null }));
-                      })
-                    }
+                        try {
+                          const res = await apiFetch<McpProbeResult>(`/mcp/servers/${s.id}/test`, { method: "POST" });
+                          setProbe((p) => ({ ...p, [s.id]: res }));
+                        } finally {
+                          setBusyTestId(null);
+                        }
+                      });
+                    }}
                   >
-                    Submit Callback
+                    {testing ? "Testing…" : "Test"}
+                  </button>
+                  {s.has_oauth && (
+                    <>
+                      <button
+                        type="button"
+                        class="btn-ghost btn-xs"
+                        onClick={() =>
+                          void run(async () => {
+                            const res = await apiFetch<McpOAuthLoginInfo>(`/mcp/servers/${s.id}/oauth/login`, {
+                              method: "POST",
+                            });
+                            setLoginInfo((l) => ({ ...l, [s.id]: res }));
+                          })
+                        }
+                      >
+                        Login
+                      </button>
+                      <button
+                        type="button"
+                        class="btn-ghost btn-xs"
+                        onClick={() =>
+                          void run(() => apiFetch(`/mcp/servers/${s.id}/oauth`, { method: "DELETE" }).then(() => undefined))
+                        }
+                      >
+                        Logout
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    class="btn-ghost btn-xs"
+                    onClick={() => setForm(createMcpForm(s))}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-danger btn-xs"
+                    onClick={() => {
+                      if (confirmingDel) {
+                        setConfirmDelId(null);
+                        void run(() => apiFetch(`/mcp/servers/${s.id}`, { method: "DELETE" }).then(() => undefined));
+                      } else {
+                        setConfirmDelId(s.id);
+                      }
+                    }}
+                  >
+                    {confirmingDel ? "Confirm?" : "Delete"}
                   </button>
                 </div>
               </div>
-            )}
-          </div>
-        ))}
+
+              {pr && (
+                <div class={`probe-box ${pr.ok ? "probe-ok" : "probe-err"}`}>
+                  {pr.ok ? (
+                    <div class="row gap-1" style="flex-wrap:wrap">
+                      <span class="pill pill-succeeded">OK</span>
+                      <span class="mono small">{pr.elapsed_ms}ms</span>
+                      <span class="mono small">v={pr.protocol_version || "?"}</span>
+                      {pr.lists.map((l) => (
+                        <span key={l.operation} class="pill mono">
+                          {l.operation}: {l.count}{l.has_more ? "+" : ""}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div class="small">
+                      <strong>FAILED</strong> at <span class="mono">{pr.stage}</span>: {pr.error}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {loginInfo[s.id] && (
+                <div class="form-box">
+                  <div class="small">
+                    Authorize here:{" "}
+                    <a href={loginInfo[s.id]?.authorization_url} target="_blank" rel="noopener noreferrer">
+                      Open OAuth Login
+                    </a>
+                  </div>
+                  <div class="row gap-1">
+                    <input
+                      placeholder="Paste redirect URL if remote…"
+                      value={callbackUrl[s.id] || ""}
+                      onInput={(e) => setCallbackUrl((c) => ({ ...c, [s.id]: e.currentTarget.value }))}
+                    />
+                    <button
+                      type="button"
+                      class="btn-primary btn-xs"
+                      onClick={() =>
+                        void run(async () => {
+                          await apiFetch(`/mcp/servers/${s.id}/oauth/callback`, {
+                            method: "POST",
+                            body: { url: callbackUrl[s.id] || "" },
+                          });
+                          setLoginInfo((l) => ({ ...l, [s.id]: null }));
+                        })
+                      }
+                    >
+                      Submit Callback
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
 }
 
-function UsageTab() {
+function UsageTab({
+  models,
+  sessions,
+  initialSessionId,
+}: {
+  models: ModelInfo[];
+  sessions: SessionInfo[];
+  initialSessionId?: string;
+}) {
   const [summary, setSummary] = useState<CallsSummary | null>(null);
   const [calls, setCalls] = useState<LlmCallInfo[]>([]);
-  const [sessionId, setSessionId] = useState("");
+  const [sessionId, setSessionId] = useState(initialSessionId || "");
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
 
-  const load = async (after = 0, append = false) => {
+  const modelsById = useMemo(() => new Map(models.map((m) => [m.id, m])), [models]);
+  const sessionsById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
+
+  const load = async (after = 0, append = false, sidOverride?: string) => {
     setErr("");
-    const q = sessionId.trim() ? `?session_id=${encodeURIComponent(sessionId.trim())}` : "";
+    setLoading(true);
+    const sid = (sidOverride !== undefined ? sidOverride : sessionId).trim();
+    const q = sid ? `?session_id=${encodeURIComponent(sid)}` : "";
     const sep = q ? "&" : "?";
     try {
       const [sum, list] = await Promise.all([
@@ -798,24 +881,48 @@ function UsageTab() {
       setCalls((prev) => (append ? [...prev, ...list] : list));
     } catch (e) {
       setErr(errorMessage(e));
+    } finally {
+      setLoading(false);
     }
   };
 
   useEffect(() => {
-    void load(0, false);
+    void load(0, false, initialSessionId || "");
   }, []);
+
+  const totalInput = summary ? summary.input_uncached_tokens + summary.cache_read_tokens : 0;
+  const cacheRate = totalInput > 0 && summary ? Math.round((summary.cache_read_tokens / totalInput) * 100) : 0;
 
   return (
     <div class="tab-stack">
       {err && <div class="err-inline">{err}</div>}
-      <div class="row gap-1">
+      <div class="row gap-1" style="flex-wrap:wrap">
+        <select
+          value={sessionsById.has(Number(sessionId)) ? sessionId : ""}
+          onChange={(e) => {
+            const val = e.currentTarget.value;
+            setSessionId(val);
+            void load(0, false, val);
+          }}
+        >
+          <option value="">All sessions</option>
+          {sessions.map((s) => (
+            <option key={s.id} value={String(s.id)}>
+              #{s.id} · {s.title || "Untitled"}
+            </option>
+          ))}
+        </select>
         <input
-          placeholder="Filter by session ID…"
+          placeholder="Session ID…"
+          style="width:110px"
           value={sessionId}
           onInput={(e) => setSessionId(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void load(0, false);
+          }}
         />
-        <button type="button" class="btn-ghost btn-sm" onClick={() => void load(0, false)}>
-          Filter
+        <button type="button" class="btn-ghost btn-sm" disabled={loading} onClick={() => void load(0, false)}>
+          {loading ? "Loading…" : "Refresh"}
         </button>
       </div>
 
@@ -827,11 +934,14 @@ function UsageTab() {
           </div>
           <div class="kpi">
             <span>Calls</span>
-            <strong>{summary.succeeded_count} / {summary.call_count}</strong>
+            <strong>
+              {summary.succeeded_count} / {summary.call_count}
+              {summary.failed_count > 0 && <small class="err-text"> ({summary.failed_count} err)</small>}
+            </strong>
           </div>
           <div class="kpi">
-            <span>Input / Cached</span>
-            <strong>{formatTokens(summary.input_uncached_tokens)} / {formatTokens(summary.cache_read_tokens)}</strong>
+            <span>Input ({cacheRate}% cached)</span>
+            <strong>{formatTokens(totalInput)}</strong>
           </div>
           <div class="kpi">
             <span>Output</span>
@@ -841,19 +951,55 @@ function UsageTab() {
       )}
 
       <div class="item-list">
-        {calls.map((c) => (
-          <div key={c.id} class="list-row small">
-            <div>
-              <span class="mono">#{c.id}</span>{" "}
-              <span class="pill">{c.status}</span>{" "}
-              <span class="muted">sess {c.session_id ?? "deleted"} · model {c.model_id}</span>
-              {c.error_summary && <div class="err-text">{c.error_summary}</div>}
+        {calls.length === 0 && !loading && (
+          <div class="empty-hint small">No calls recorded for this filter.</div>
+        )}
+        {calls.map((c) => {
+          const model = modelsById.get(c.model_id);
+          const sess = c.session_id != null ? sessionsById.get(c.session_id) : undefined;
+          const durMs = c.finished_at != null ? Math.max(0, c.finished_at - c.started_at) : null;
+          const expanded = expandedId === c.id;
+          return (
+            <div key={c.id} class="call-row">
+              <div
+                class="list-row small call-head"
+                onClick={() => setExpandedId(expanded ? null : c.id)}
+              >
+                <div>
+                  <span class="mono">#{c.id}</span>{" "}
+                  <span class={`pill pill-${c.status}`}>{c.status}</span>{" "}
+                  <span class="mono">{model ? model.model_key : `model #${c.model_id}`}</span>
+                  {c.reasoning_effort && <span class="pill">{c.reasoning_effort}</span>}{" "}
+                  <span class="muted">
+                    {c.session_id != null ? (sess?.title || `sess #${c.session_id}`) : "deleted"}
+                    {durMs != null ? ` · ${formatDuration(durMs)}` : ""}
+                    {` · ${formatRelTime(c.started_at)}`}
+                  </span>
+                  {c.error_summary && <div class="err-text">{c.error_summary}</div>}
+                </div>
+                <div class="mono">
+                  {formatTokens((c.input_uncached_tokens || 0) + (c.cache_read_tokens || 0))}→{formatTokens(c.output_tokens)} · {formatCost(c.cost_nano_usd)}
+                </div>
+              </div>
+              {expanded && (
+                <div class="call-detail small">
+                  <div>
+                    <span class="muted">Started:</span> <span class="mono">{formatAbsTime(c.started_at)}</span>
+                    {c.http_status != null && (
+                      <> · <span class="muted">HTTP:</span> <span class="mono">{c.http_status}</span></>
+                    )}
+                    {c.upstream_response_id && (
+                      <> · <span class="muted">Upstream ID:</span> <span class="mono">{c.upstream_response_id}</span></>
+                    )}
+                  </div>
+                  <div class="mono muted">
+                    uncached {c.input_uncached_tokens ?? 0} · cache_read {c.cache_read_tokens ?? 0} · cache_write {c.cache_write_tokens ?? 0} · out {c.output_tokens ?? 0}
+                  </div>
+                </div>
+              )}
             </div>
-            <div class="mono">
-              {formatTokens((c.input_uncached_tokens || 0) + (c.cache_read_tokens || 0))}→{formatTokens(c.output_tokens)} · {formatCost(c.cost_nano_usd)}
-            </div>
-          </div>
-        ))}
+          );
+        })}
         {calls.length > 0 && calls.length % 50 === 0 && (
           <button type="button" class="btn-ghost btn-sm" onClick={() => void load(calls[calls.length - 1].id, true)}>
             Load more
@@ -864,14 +1010,17 @@ function UsageTab() {
   );
 }
 
-type SettingsTabId = "models" | "mcp" | "usage" | "general";
+export type SettingsTabId = "models" | "mcp" | "usage" | "general";
 
 export interface SettingsProps {
   config: AppConfig | null;
   providers: ProviderInfo[];
   models: ModelInfo[];
-  theme: Theme;
-  onToggleTheme: () => void;
+  sessions: SessionInfo[];
+  themePref: ThemePref;
+  initialTab?: SettingsTabId;
+  initialSessionFilter?: string;
+  onSetThemePref: (pref: ThemePref) => void;
   onRefreshCatalog: () => Promise<void>;
   onSignOut: () => void;
   onClose: () => void;
@@ -881,18 +1030,30 @@ export function Settings({
   config,
   providers,
   models,
-  theme,
-  onToggleTheme,
+  sessions,
+  themePref,
+  initialTab,
+  initialSessionFilter,
+  onSetThemePref,
   onRefreshCatalog,
   onSignOut,
   onClose,
 }: SettingsProps) {
-  const [tab, setTab] = useState<SettingsTabId>("models");
-  const tabs: ReadonlyArray<readonly [SettingsTabId, string]> = [
-    ["models", "Models"],
-    ["mcp", "MCP"],
-    ["usage", "Usage"],
-    ["general", "General"],
+  const [tab, setTab] = useState<SettingsTabId>(initialTab || "models");
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const tabs = [
+    { id: "models" as const, label: "Models", icon: <IconSliders size={14} /> },
+    { id: "mcp" as const, label: "MCP", icon: <IconPlug size={14} /> },
+    { id: "usage" as const, label: "Usage", icon: <IconChart size={14} /> },
+    { id: "general" as const, label: "General", icon: <IconSettings size={14} /> },
   ];
 
   return (
@@ -900,35 +1061,56 @@ export function Settings({
       <div class="modal" onClick={(e) => e.stopPropagation()}>
         <div class="modal-head">
           <div class="tabs">
-            {tabs.map(([id, label]) => (
+            {tabs.map((t) => (
               <button
-                key={id}
+                key={t.id}
                 type="button"
-                class={`tab-btn ${tab === id ? "active" : ""}`}
-                onClick={() => setTab(id)}
+                class={`tab-btn ${tab === t.id ? "active" : ""}`}
+                onClick={() => setTab(t.id)}
               >
-                {label}
+                {t.icon}
+                <span>{t.label}</span>
               </button>
             ))}
           </div>
-          <button type="button" class="btn-icon" onClick={onClose}>×</button>
+          <button type="button" class="btn-icon" aria-label="Close settings" onClick={onClose}>
+            <IconX size={16} />
+          </button>
         </div>
         <div class="modal-body">
           {tab === "models" && (
             <ModelsTab config={config} providers={providers} models={models} onRefresh={onRefreshCatalog} />
           )}
           {tab === "mcp" && <McpTab />}
-          {tab === "usage" && <UsageTab />}
+          {tab === "usage" && (
+            <UsageTab models={models} sessions={sessions} initialSessionId={initialSessionFilter} />
+          )}
           {tab === "general" && (
             <div class="tab-stack">
               <div class="panel list-row">
                 <div>
                   <strong>Appearance</strong>
-                  <div class="muted small">Current theme: {theme}</div>
+                  <div class="muted small">Theme preference across sessions</div>
                 </div>
-                <button type="button" class="btn-ghost btn-sm" onClick={onToggleTheme}>
-                  Switch to {theme === "dark" ? "light" : "dark"}
-                </button>
+                <div class="segmented">
+                  {(
+                    [
+                      ["system", "System", <IconMonitor size={13} />],
+                      ["light", "Light", <IconSun size={13} />],
+                      ["dark", "Dark", <IconMoon size={13} />],
+                    ] as const
+                  ).map(([val, label, icon]) => (
+                    <button
+                      key={val}
+                      type="button"
+                      class={`seg-btn ${themePref === val ? "active" : ""}`}
+                      onClick={() => onSetThemePref(val)}
+                    >
+                      {icon}
+                      <span>{label}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
               <div class="panel list-row">
                 <div>
@@ -936,8 +1118,14 @@ export function Settings({
                   <div class="muted small">Scalar interactive reference & OpenAPI schema (loopback only)</div>
                 </div>
                 <div class="row gap-1">
-                  <a class="btn-ghost btn-sm" href="/docs" target="_blank" rel="noopener noreferrer">/docs</a>
-                  <a class="btn-ghost btn-sm" href="/openapi.json" target="_blank" rel="noopener noreferrer">/openapi.json</a>
+                  <a class="btn-ghost btn-sm row gap-1" href="/docs" target="_blank" rel="noopener noreferrer">
+                    <span>/docs</span>
+                    <IconExternal size={12} />
+                  </a>
+                  <a class="btn-ghost btn-sm row gap-1" href="/openapi.json" target="_blank" rel="noopener noreferrer">
+                    <span>/openapi.json</span>
+                    <IconExternal size={12} />
+                  </a>
                 </div>
               </div>
               <div class="panel list-row">
@@ -946,7 +1134,8 @@ export function Settings({
                   <div class="muted small">Clear stored Bearer token from this browser</div>
                 </div>
                 <button type="button" class="btn-danger btn-sm" onClick={onSignOut}>
-                  Sign out
+                  <IconKey size={13} />
+                  <span>Sign out</span>
                 </button>
               </div>
             </div>

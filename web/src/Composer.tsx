@@ -1,5 +1,15 @@
 import type { TargetedClipboardEvent, TargetedDragEvent, TargetedKeyboardEvent } from "preact";
-import { useLayoutEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import {
+  IconArrowUp,
+  IconChevron,
+  IconClock,
+  IconPaperclip,
+  IconPause,
+  IconPlay,
+  IconStop,
+  IconX,
+} from "./Icons.tsx";
 import type { ActiveTask, ComposerDraft, SessionInfo } from "./types.ts";
 
 function formatRem(sec: number | null | undefined): string {
@@ -39,6 +49,8 @@ export function Composer({
   onKillTask,
 }: ComposerProps) {
   const [tasksOpen, setTasksOpen] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const dragDepthRef = useRef(0);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
@@ -48,6 +60,11 @@ export function Composer({
   const error = draft.error || "";
   const hasPayload = Boolean(text.trim() || attachments.length > 0);
   const busy = uploading || sending;
+
+  useEffect(() => {
+    dragDepthRef.current = 0;
+    setDragging(false);
+  }, [session.id]);
 
   useLayoutEffect(() => {
     const el = taRef.current;
@@ -69,8 +86,24 @@ export function Composer({
     if (files?.length) onUploadFiles(session.id, files);
   };
 
+  const onDragEnter = (e: TargetedDragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragging(true);
+  };
+
+  const onDragLeave = (e: TargetedDragEvent<HTMLDivElement>) => {
+    if (dragDepthRef.current === 0) return;
+    e.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragging(false);
+  };
+
   const onDrop = (e: TargetedDragEvent<HTMLDivElement>) => {
     e.preventDefault();
+    dragDepthRef.current = 0;
+    setDragging(false);
     if (e.dataTransfer?.files?.length) onUploadFiles(session.id, e.dataTransfer.files);
   };
 
@@ -85,7 +118,9 @@ export function Composer({
           >
             <span class="pulse-dot" />
             <span>{tasks.length} active codemode {tasks.length === 1 ? "task" : "tasks"}</span>
-            <span class="muted">{tasksOpen ? "Hide" : "Inspect"}</span>
+            <span class="card-spacer" />
+            <span class="muted small">{tasksOpen ? "Hide" : "Inspect"}</span>
+            <IconChevron size={14} cls={`chev ${tasksOpen ? "open" : ""}`} />
           </button>
           {tasksOpen && (
             <div class="tasks-list">
@@ -95,24 +130,35 @@ export function Composer({
                     <span class="mono">{t.id}</span>
                     {t.label && <span>{t.label}</span>}
                     <span class="pill">{t.delivery}</span>
-                    <span class="muted">TTL {formatRem(t.remaining_seconds)}</span>
+                    <span class="pill mono task-ttl">
+                      <IconClock size={11} />
+                      <span>{formatRem(t.remaining_seconds)}</span>
+                    </span>
                     <button
                       type="button"
                       class="btn-danger btn-xs"
                       disabled={t.state === "stopping"}
                       onClick={() => onKillTask(t.id)}
                     >
-                      {t.state === "stopping" ? "Stopping…" : "Kill"}
+                      <IconStop size={11} />
+                      <span>{t.state === "stopping" ? "Stopping…" : "Kill"}</span>
                     </button>
                   </div>
                   {t.running_commands?.map((c) => (
                     <div key={c.id} class="task-cmd">
-                      <div class="mono muted">$ {c.program} {(c.args || []).join(" ")}</div>
+                      <div class="mono muted small">$ {c.program} {(c.args || []).join(" ")}</div>
                       {c.stdout && <pre class="code-box">{c.stdout}</pre>}
                       {c.stderr && <pre class="code-box err-text">{c.stderr}</pre>}
                     </div>
                   ))}
-                  {t.console?.output && <pre class="code-box">{t.console.output}</pre>}
+                  {t.console?.output && (
+                    <div>
+                      {t.console.truncated && (
+                        <div class="muted small">Console tail ({t.console.total_bytes || 0} B total)</div>
+                      )}
+                      <pre class="code-box">{t.console.output}</pre>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -123,17 +169,31 @@ export function Composer({
       {error && <div class="composer-err">{error}</div>}
 
       <div
-        class="composer-box"
+        class={`composer-box ${dragging ? "dragging" : ""}`}
+        onDragEnter={onDragEnter}
         onDragOver={(e) => e.preventDefault()}
+        onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
+        {dragging && <div class="drop-overlay">Drop image, audio, or video to attach</div>}
+
         {attachments.length > 0 && (
           <div class="attach-strip">
             {attachments.map((a) => (
               <div key={a.id} class="attach-chip">
-                {a.preview ? <img src={a.preview} alt={a.name} /> : <span>{a.kind}</span>}
+                {a.preview ? (
+                  <img src={a.preview} alt={a.name} />
+                ) : (
+                  <span class="attach-kind mono">{a.kind}</span>
+                )}
                 <span class="truncate">{a.name}</span>
-                <button type="button" onClick={() => onRemoveAttachment(session.id, a.id)}>×</button>
+                <button
+                  type="button"
+                  aria-label={`Remove ${a.name}`}
+                  onClick={() => onRemoveAttachment(session.id, a.id)}
+                >
+                  <IconX size={12} />
+                </button>
               </div>
             ))}
           </div>
@@ -143,7 +203,11 @@ export function Composer({
           ref={taRef}
           rows={1}
           value={text}
-          placeholder={running ? "Steer running session (queues for next step)…" : "Message MyGo… (Enter to send, Shift+Enter for newline)"}
+          placeholder={
+            running
+              ? "Steer running session (queues for next step)…"
+              : "Message MyGo… (Enter to send, Shift+Enter for newline)"
+          }
           onInput={(e) => onChangeText(session.id, e.currentTarget.value)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
@@ -168,8 +232,12 @@ export function Composer({
               disabled={uploading}
               onClick={() => fileRef.current?.click()}
             >
-              {uploading ? "Uploading…" : "+ Media"}
+              <IconPaperclip size={14} />
+              <span>{uploading ? "Uploading…" : "Media"}</span>
             </button>
+            {queuedCount > 0 && (
+              <span class="pill pill-queued">{queuedCount} queued</span>
+            )}
           </div>
 
           <div class="row gap-1">
@@ -179,24 +247,30 @@ export function Composer({
                   type="button"
                   class="btn-ghost btn-sm"
                   disabled={!hasPayload || busy}
+                  title="Queue message for the next step"
                   onClick={() => onSubmit(session.id, false)}
                 >
-                  {sending ? "Sending…" : "Steer"}
+                  <IconArrowUp size={13} />
+                  <span>{sending ? "Sending…" : "Steer"}</span>
                 </button>
                 <button
                   type="button"
                   class="btn-ghost btn-sm"
                   disabled={session.status === "pausing"}
+                  title="Pause after the current step finishes"
                   onClick={() => onPause("soft")}
                 >
-                  {session.status === "pausing" ? "Pausing…" : "Pause"}
+                  <IconPause size={13} />
+                  <span>{session.status === "pausing" ? "Pausing…" : "Pause"}</span>
                 </button>
                 <button
                   type="button"
                   class="btn-danger btn-sm"
+                  title="Stop the active run immediately"
                   onClick={() => onPause("hard")}
                 >
-                  Stop
+                  <IconStop size={13} />
+                  <span>Stop</span>
                 </button>
               </>
             ) : (
@@ -206,6 +280,7 @@ export function Composer({
                     type="button"
                     class="btn-ghost btn-sm"
                     disabled={busy}
+                    title="Add message to queue without starting a run"
                     onClick={() => onSubmit(session.id, false)}
                   >
                     {sending ? "Sending…" : "Queue"}
@@ -217,13 +292,16 @@ export function Composer({
                   disabled={busy || (!hasPayload && session.status !== "paused" && queuedCount === 0)}
                   onClick={() => onSubmit(session.id, true)}
                 >
-                  {sending
-                    ? "Sending…"
-                    : hasPayload
-                      ? "Send & Run"
-                      : session.status === "paused"
-                        ? "Resume"
-                        : "Run"}
+                  {hasPayload ? <IconArrowUp size={13} /> : <IconPlay size={13} />}
+                  <span>
+                    {sending
+                      ? "Sending…"
+                      : hasPayload
+                        ? "Send & Run"
+                        : session.status === "paused"
+                          ? "Resume"
+                          : "Run"}
+                  </span>
                 </button>
               </>
             )}
