@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { copyText, errorMessage, fetchMediaUrl, formatDuration } from "./api.ts";
+import { copyText, errorMessage, fetchMediaUrl, formatDuration, formatTokens } from "./api.ts";
 import { HighlightedCode } from "./highlight.tsx";
+import { formatShortTimeLoc, statusText, useI18n } from "./i18n.ts";
 import {
   BrandMark,
   IconAlert,
@@ -9,14 +10,24 @@ import {
   IconCheck,
   IconChevron,
   IconCopy,
+  IconDatabase,
   IconSpark,
   IconTerminal,
   IconX,
 } from "./Icons.tsx";
 import { Markdown } from "./markdown.tsx";
-import type { ActiveDraft, ContentBlock, HistoryItem, MediaKind, RetryNotice, SessionInfo } from "./types.ts";
+import type {
+  ActiveDraft,
+  ContentBlock,
+  HistoryItem,
+  LlmCallInfo,
+  MediaKind,
+  RetryNotice,
+  SessionInfo,
+} from "./types.ts";
 
-function CopyBtn({ text, label }: { text: string; label?: string }) {
+export function CopyBtn({ text, label }: { text: string; label?: string }) {
+  const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -38,14 +49,20 @@ function CopyBtn({ text, label }: { text: string; label?: string }) {
   };
 
   return (
-    <button type="button" class="copy-btn" title={copied ? "Copied" : "Copy"} aria-label="Copy" onClick={onCopy}>
+    <button
+      type="button"
+      class="copy-btn"
+      title={copied ? t("copied") : t("copy")}
+      aria-label={t("copy")}
+      onClick={onCopy}
+    >
       {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
-      {label && <span>{copied ? "Copied" : label}</span>}
+      {label && <span>{copied ? t("copied") : label}</span>}
     </button>
   );
 }
 
-function extractMessageText(blocks: string | ContentBlock[] | undefined): string {
+export function extractMessageText(blocks: string | ContentBlock[] | undefined): string {
   if (typeof blocks === "string") return blocks;
   if (!Array.isArray(blocks)) return "";
   const parts: string[] = [];
@@ -66,6 +83,7 @@ function AuthMedia({
   attachmentId: number;
   onPreviewImage?: (url: string) => void;
 }) {
+  const { t } = useI18n();
   const [url, setUrl] = useState<string | null>(null);
   const [err, setErr] = useState("");
 
@@ -83,15 +101,15 @@ function AuthMedia({
     };
   }, [attachmentId]);
 
-  if (err) return <div class="media-err">Attachment #{attachmentId}: {err}</div>;
-  if (!url) return <div class="media-loading">Loading {kind} #{attachmentId}…</div>;
+  if (err) return <div class="media-err">#{attachmentId}: {err}</div>;
+  if (!url) return <div class="media-loading">{t("loadingAttach")} {kind} #{attachmentId}…</div>;
   if (kind === "image") {
     return (
       <img
         class="media-img"
         src={url}
-        alt={`Attachment #${attachmentId}`}
-        title="Click to enlarge"
+        alt={`#${attachmentId}`}
+        title={t("clickEnlarge")}
         onClick={() => onPreviewImage?.(url)}
       />
     );
@@ -101,7 +119,7 @@ function AuthMedia({
   return null;
 }
 
-function ContentBlocks({
+export function ContentBlocks({
   blocks,
   markdown = false,
   onPreviewImage,
@@ -173,6 +191,7 @@ function SummaryBody({
   rawOut: unknown;
   onPreviewImage?: (url: string) => void;
 }) {
+  const { t } = useI18n();
   let restSummary: Record<string, unknown> | null = null;
   if (summary) {
     const entries = Object.entries(summary).filter(([k]) => !OMIT_SUMMARY_KEYS.has(k));
@@ -191,8 +210,14 @@ function SummaryBody({
   return (
     <div class="tool-out">
       <div class="section-bar">
-        <span class="section-label">Result</span>
-        {outText ? <CopyBtn text={outText} label="Copy" /> : restJson ? <CopyBtn text={restJson} label="Copy" /> : rawFallback ? <CopyBtn text={rawFallback} label="Copy" /> : null}
+        <span class="section-label">{t("result")}</span>
+        {outText ? (
+          <CopyBtn text={outText} label={t("copy")} />
+        ) : restJson ? (
+          <CopyBtn text={restJson} label={t("copy")} />
+        ) : rawFallback ? (
+          <CopyBtn text={rawFallback} label={t("copy")} />
+        ) : null}
       </div>
       {typeof summary?.error === "string" && summary.error && (
         <div class="err-inline row gap-1">
@@ -209,7 +234,7 @@ function SummaryBody({
       )}
       {rawFallback && <pre class="code-box">{rawFallback}</pre>}
       {!outText && !restJson && !hasExtra && !rawFallback && !summary?.error && (
-        <div class="muted small">No output</div>
+        <div class="muted small">{t("noOutput")}</div>
       )}
     </div>
   );
@@ -224,6 +249,7 @@ function ToolCard({
   outputItem?: HistoryItem;
   onPreviewImage?: (url: string) => void;
 }) {
+  const { locale, t } = useI18n();
   const payload = callItem.payload || {};
   const args = tryJson(payload.arguments);
   const name = payload.name || "tool";
@@ -254,7 +280,7 @@ function ToolCard({
       : typeof args?.trigger_code === "string"
         ? args.trigger_code
         : null;
-  const codeLabel = typeof args?.trigger_code === "string" ? "Trigger code" : "Code";
+  const codeLabel = typeof args?.trigger_code === "string" ? t("triggerCode") : t("code");
   const formattedArgs = args
     ? JSON.stringify(args, null, 2)
     : typeof payload.arguments === "string"
@@ -275,7 +301,7 @@ function ToolCard({
         {dur && <span class="pill mono">{dur}</span>}
         <span class={`pill pill-${status}`}>
           {status === "running" && <span class="pulse-dot" />}
-          {status}
+          {statusText(status, locale)}
         </span>
       </summary>
       <div class="card-body">
@@ -283,7 +309,7 @@ function ToolCard({
           <>
             <div class="section-bar">
               <span class="section-label">{codeLabel}</span>
-              <CopyBtn text={code} label="Copy" />
+              <CopyBtn text={code} label={t("copy")} />
             </div>
             <pre class="code-box">
               <code><HighlightedCode code={code} lang="js" /></code>
@@ -292,15 +318,15 @@ function ToolCard({
         ) : hasArgs ? (
           <>
             <div class="section-bar">
-              <span class="section-label">Arguments</span>
-              <CopyBtn text={formattedArgs} label="Copy" />
+              <span class="section-label">{t("arguments")}</span>
+              <CopyBtn text={formattedArgs} label={t("copy")} />
             </div>
             <pre class="code-box">
               <code><HighlightedCode code={formattedArgs} lang={args ? "json" : undefined} /></code>
             </pre>
           </>
         ) : (
-          <div class="muted small">No arguments</div>
+          <div class="muted small">{t("noArguments")}</div>
         )}
         {outputItem && (
           <SummaryBody
@@ -324,6 +350,7 @@ function ReasoningBlock({
   streaming?: boolean;
   text?: string;
 }) {
+  const { t } = useI18n();
   const bodyRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
 
@@ -352,7 +379,8 @@ function ReasoningBlock({
   }, [streaming, body]);
 
   if (!body && !streaming) return null;
-  const lenHint = body.length > 1000 ? `${(body.length / 1000).toFixed(1)}k chars` : `${body.length} chars`;
+  const lenHint =
+    body.length > 1000 ? `${(body.length / 1000).toFixed(1)}k ${t("chars")}` : `${body.length} ${t("chars")}`;
   const onBodyScroll = () => {
     const el = bodyRef.current;
     if (!el) return;
@@ -364,7 +392,7 @@ function ReasoningBlock({
       <summary>
         <IconChevron size={13} cls="chev" />
         {streaming ? <span class="pulse-dot" /> : <IconSpark size={13} />}
-        <span>{streaming ? "Thinking…" : "Thought process"}</span>
+        <span>{streaming ? t("thinking") : t("thoughtProcess")}</span>
         {!streaming && body && <span class="thought-meta">{lenHint}</span>}
       </summary>
       <div class="thought-body" ref={bodyRef} onScroll={onBodyScroll}>
@@ -381,6 +409,7 @@ function EventCard({
   item: HistoryItem;
   onPreviewImage?: (url: string) => void;
 }) {
+  const { locale } = useI18n();
   const p = item.payload || {};
   const content = p.content;
   let evSummary: Record<string, unknown> | null = null;
@@ -416,7 +445,7 @@ function EventCard({
         {evPreview && <span class="muted truncate">{evPreview}</span>}
         <span class="card-spacer" />
         {evDur && <span class="pill mono">{evDur}</span>}
-        {evStatus && <span class={`pill pill-${evStatus}`}>{evStatus}</span>}
+        {evStatus && <span class={`pill pill-${evStatus}`}>{statusText(evStatus, locale)}</span>}
       </summary>
       <div class="card-body">
         {evSummary ? (
@@ -442,6 +471,7 @@ export interface TimelineProps {
   queuedIds: Set<number>;
   draft: ActiveDraft | null;
   retryNotice: RetryNotice | null;
+  callsById: Map<number, LlmCallInfo>;
   modelLabel?: string | null;
   effortLabel?: string | null;
   onLoadMore: () => void;
@@ -457,18 +487,22 @@ export function Timeline({
   queuedIds,
   draft,
   retryNotice,
+  callsById,
   modelLabel,
   effortLabel,
   onLoadMore,
   onWithdraw,
   onOpenSettings,
 }: TimelineProps) {
+  const { locale, t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
+  const rafRef = useRef(0);
   const prevSessionIdRef = useRef<number | null>(null);
   const prevFirstIdRef = useRef<number | null>(null);
   const prevScrollHeightRef = useRef<number>(0);
   const [showJump, setShowJump] = useState(false);
+  const [activeTurn, setActiveTurn] = useState(0);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
 
   useEffect(() => {
@@ -480,12 +514,38 @@ export function Timeline({
     return () => window.removeEventListener("keydown", onKey);
   }, [lightboxSrc]);
 
+  useEffect(() => {
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  const updateActiveTurn = () => {
+    rafRef.current = 0;
+    const el = scrollRef.current;
+    if (!el) return;
+    const nodes = el.querySelectorAll<HTMLElement>("[data-turn-idx]");
+    if (!nodes.length) return;
+    const rectTop = el.getBoundingClientRect().top + 80;
+    let best = 0;
+    for (const n of nodes) {
+      const top = n.getBoundingClientRect().top;
+      const idx = Number(n.dataset.turnIdx);
+      if (top <= rectTop) best = idx;
+      else break;
+    }
+    setActiveTurn(best);
+  };
+
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
     stickRef.current = nearBottom;
     setShowJump(!nearBottom);
+    if (!rafRef.current) {
+      rafRef.current = requestAnimationFrame(updateActiveTurn);
+    }
   };
 
   useLayoutEffect(() => {
@@ -501,6 +561,7 @@ export function Timeline({
       stickRef.current = true;
       setShowJump(false);
       el.scrollTop = el.scrollHeight;
+      updateActiveTurn();
       return;
     }
 
@@ -517,6 +578,7 @@ export function Timeline({
       el.scrollTop = el.scrollHeight;
     }
     prevFirstIdRef.current = firstId;
+    updateActiveTurn();
   }, [session?.id, items, draft, retryNotice]);
 
   const handleLoadMore = () => {
@@ -536,14 +598,30 @@ export function Timeline({
   };
 
   const withdrawn = new Set<number>();
-  const callsById = new Set<number>();
+  const callsSet = new Set<number>();
   const outputsByTarget = new Map<number, HistoryItem>();
 
   for (const item of items) {
     if (item.kind === "withdrawal" && item.target_id) withdrawn.add(item.target_id);
-    if (item.kind === "function_call") callsById.add(item.id);
+    if (item.kind === "function_call") callsSet.add(item.id);
     if (item.kind === "function_call_output" && item.target_id) {
       outputsByTarget.set(item.target_id, item);
+    }
+  }
+
+  const turns: Array<{ id: number; role: "user" | "assistant"; label: string }> = [];
+  const turnIdxByItemId = new Map<number, number>();
+  for (const item of items) {
+    if (item.kind === "user_message" && !withdrawn.has(item.id)) {
+      const txt = extractMessageText(item.payload?.content).replace(/\s+/g, " ").trim();
+      turnIdxByItemId.set(item.id, turns.length);
+      turns.push({ id: item.id, role: "user", label: txt.slice(0, 64) || `#${item.id}` });
+    } else if (item.kind === "assistant_message") {
+      const txt = extractMessageText(item.payload?.content).replace(/\s+/g, " ").trim();
+      if (txt) {
+        turnIdxByItemId.set(item.id, turns.length);
+        turns.push({ id: item.id, role: "assistant", label: txt.slice(0, 64) });
+      }
     }
   }
 
@@ -557,7 +635,7 @@ export function Timeline({
           {hasMore && (
             <div class="load-more">
               <button type="button" class="btn-ghost btn-sm" disabled={loadingMore} onClick={handleLoadMore}>
-                {loadingMore ? "Loading…" : "Load earlier history"}
+                {loadingMore ? t("loading") : t("loadEarlier")}
               </button>
             </div>
           )}
@@ -565,46 +643,52 @@ export function Timeline({
           {items.length === 0 && !draft && !showWorking && (
             <div class="empty-chat">
               <BrandMark size={36} />
-              <h3>{session?.title || `Session #${session?.id}`}</h3>
+              <h3>{session?.title || `${t("sessionPrefix")} #${session?.id}`}</h3>
               <div class="empty-badges">
                 {modelLabel ? (
                   <>
                     <span class="pill mono">{modelLabel}</span>
-                    {effortLabel && <span class="pill">effort: {effortLabel}</span>}
+                    {effortLabel && <span class="pill">{effortLabel}</span>}
                   </>
                 ) : (
                   <>
-                    <span class="pill pill-paused">No model selected</span>
+                    <span class="pill pill-paused">{t("noModelSelected")}</span>
                     {onOpenSettings && (
                       <button type="button" class="link-btn" onClick={onOpenSettings}>
-                        Configure model
+                        {t("configureModel")}
                       </button>
                     )}
                   </>
                 )}
               </div>
-              <p>Send a message below to queue input and run the model, or queue multiple inputs before starting.</p>
+              <p>{t("emptyChatDesc")}</p>
               <div class="empty-hints">
-                <span>Enter send</span>
+                <span>{t("hintSend")}</span>
                 <span>·</span>
-                <span>Shift+Enter newline</span>
+                <span>{t("hintNewline")}</span>
                 <span>·</span>
-                <span>Paste or drop media</span>
+                <span>{t("hintMedia")}</span>
               </div>
             </div>
           )}
 
           {items.map((item) => {
             if (item.kind === "withdrawal") return null;
-            if (item.kind === "function_call_output" && item.target_id && callsById.has(item.target_id)) {
+            if (item.kind === "function_call_output" && item.target_id && callsSet.has(item.target_id)) {
               return null;
             }
+            const tIdx = turnIdxByItemId.get(item.id);
+
             if (item.kind === "user_message") {
               const isWithdrawn = withdrawn.has(item.id);
               const isQueued = !isWithdrawn && queuedIds.has(item.id);
               const msgText = extractMessageText(item.payload?.content);
               return (
-                <div key={item.id} class={`msg-row msg-user ${isWithdrawn ? "withdrawn" : ""}`}>
+                <div
+                  key={item.id}
+                  data-turn-idx={tIdx}
+                  class={`msg-row msg-user ${isWithdrawn ? "withdrawn" : ""}`}
+                >
                   <div class="user-bubble">
                     <ContentBlocks blocks={item.payload?.content} onPreviewImage={setLightboxSrc} />
                     {(isWithdrawn || isQueued || msgText) && (
@@ -614,12 +698,12 @@ export function Timeline({
                             <CopyBtn text={msgText} />
                           </span>
                         )}
-                        {isWithdrawn && <span class="pill">withdrawn</span>}
+                        {isWithdrawn && <span class="pill">{t("withdrawn")}</span>}
                         {isQueued && (
                           <>
-                            <span class="pill pill-queued">queued</span>
+                            <span class="pill pill-queued">{t("queued")}</span>
                             <button type="button" class="link-btn" onClick={() => onWithdraw(item.id)}>
-                              Withdraw
+                              {t("withdraw")}
                             </button>
                           </>
                         )}
@@ -629,19 +713,38 @@ export function Timeline({
                 </div>
               );
             }
+
             if (item.kind === "assistant_message") {
               const msgText = extractMessageText(item.payload?.content);
+              const call = item.llm_call_id != null ? callsById.get(item.llm_call_id) : undefined;
+              const callTokens = call
+                ? (call.input_uncached_tokens || 0) +
+                  (call.cache_read_tokens || 0) +
+                  (call.output_tokens || 0)
+                : 0;
+              const callTime = call ? formatShortTimeLoc(call.finished_at || call.started_at, locale) : "";
               return (
-                <div key={item.id} class="msg-row msg-assistant">
+                <div key={item.id} data-turn-idx={tIdx} class="msg-row msg-assistant">
                   <ContentBlocks blocks={item.payload?.content} markdown onPreviewImage={setLightboxSrc} />
-                  {msgText && (
-                    <div class="msg-actions">
-                      <CopyBtn text={msgText} label="Copy" />
+                  {(msgText || call) && (
+                    <div class="msg-footer-meta">
+                      {msgText && <CopyBtn text={msgText} />}
+                      {call && (
+                        <span
+                          class="meta-chip"
+                          title={`#${call.id}: in ${call.input_uncached_tokens ?? 0} + cache ${call.cache_read_tokens ?? 0} → out ${call.output_tokens ?? 0}`}
+                        >
+                          <IconDatabase size={12} />
+                          <span>{t("usageLabel")} {formatTokens(callTokens)} tok</span>
+                        </span>
+                      )}
+                      {callTime && <span class="meta-time">{callTime}</span>}
                     </div>
                   )}
                 </div>
               );
             }
+
             if (item.kind === "reasoning") {
               return <ReasoningBlock key={item.id} item={item} />;
             }
@@ -685,7 +788,7 @@ export function Timeline({
                     <span class="card-spacer" />
                     <span class="pill pill-running">
                       <span class="pulse-dot" />
-                      streaming
+                      {t("streaming")}
                     </span>
                   </div>
                   {d.arguments && (
@@ -711,24 +814,42 @@ export function Timeline({
                 <i />
                 <i />
               </span>
-              <span>{session?.status === "pausing" ? "Pausing after current step…" : "Working…"}</span>
+              <span>{session?.status === "pausing" ? t("pausingStep") : t("working")}</span>
             </div>
           )}
 
           {retryNotice && (
             <div class="retry-banner">
               <IconAlert size={14} />
-              <span>Upstream retry #{retryNotice.attempt}: {retryNotice.reason}</span>
+              <span>{t("upstreamRetry")} #{retryNotice.attempt}: {retryNotice.reason}</span>
             </div>
           )}
         </div>
       </div>
 
+      {turns.length >= 2 && (
+        <div class="turn-rail" aria-hidden="true">
+          {turns.map((turn, idx) => (
+            <button
+              key={turn.id}
+              type="button"
+              class={`turn-tick ${turn.role} ${activeTurn === idx ? "active" : ""}`}
+              title={turn.label}
+              onClick={() => {
+                scrollRef.current
+                  ?.querySelector(`[data-turn-idx="${idx}"]`)
+                  ?.scrollIntoView({ behavior: "smooth", block: "start" });
+              }}
+            />
+          ))}
+        </div>
+      )}
+
       {showJump && (
         <button type="button" class="jump-btn" onClick={jumpBottom}>
           {Boolean(draft?.items?.length) && <span class="pulse-dot" />}
           <IconArrowDown size={13} />
-          <span>Latest</span>
+          <span>{t("latest")}</span>
         </button>
       )}
 
@@ -737,12 +858,12 @@ export function Timeline({
           <button
             type="button"
             class="lightbox-close"
-            aria-label="Close preview"
+            aria-label={t("closePreview")}
             onClick={() => setLightboxSrc(null)}
           >
             <IconX size={18} />
           </button>
-          <img src={lightboxSrc} alt="Attachment preview" onClick={(e) => e.stopPropagation()} />
+          <img src={lightboxSrc} alt="Preview" onClick={(e) => e.stopPropagation()} />
         </div>
       )}
     </div>

@@ -1,5 +1,6 @@
 export type Theme = "light" | "dark";
 export type ThemePref = "system" | "light" | "dark";
+export type MainTab = "chat" | "trace" | "context";
 export type SseStatus = "open" | "reconnecting";
 export type SessionStatus = "idle" | "running" | "pausing" | "paused";
 
@@ -165,6 +166,8 @@ export interface ContentBlock {
 }
 
 export type HistoryPayload = {
+  type?: string;
+  role?: string;
   content?: string | ContentBlock[];
   name?: string;
   call_id?: string;
@@ -174,6 +177,7 @@ export type HistoryPayload = {
   task_id?: string;
   event?: string;
   sequence?: number;
+  notify?: boolean;
   [k: string]: unknown;
 };
 
@@ -183,6 +187,13 @@ export interface HistoryItem {
   payload: HistoryPayload;
   target_id: number | null;
   llm_call_id: number | null;
+}
+
+export interface ContextItem {
+  position: number;
+  item_id: number;
+  llm_call_id: number | null;
+  payload: HistoryPayload;
 }
 
 export interface DraftItem {

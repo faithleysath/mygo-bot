@@ -2,7 +2,8 @@ import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { copyText } from "./api.ts";
 import { HighlightedCode } from "./highlight.tsx";
-import { IconCheck, IconCopy } from "./Icons.tsx";
+import { useI18n } from "./i18n.ts";
+import { IconCheck, IconCopy, IconWrap } from "./Icons.tsx";
 
 const TABLE_SEP_RE = /^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/;
 const HR_RE = /^(\*\s*\*\s*\*|-{3,}|_{3,})\s*$/;
@@ -83,7 +84,9 @@ function renderInline(text: string, keyPrefix: string): ComponentChildren[] {
 }
 
 function CodeBlock({ lang, code }: { lang: string; code: string }) {
+  const { t } = useI18n();
   const [copied, setCopied] = useState(false);
+  const [wrap, setWrap] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -106,13 +109,24 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   return (
     <div class="md-code-wrap">
       <div class="md-code-head">
-        <span class="md-code-lang mono">{lang || "text"}</span>
-        <button type="button" class="copy-btn" onClick={copy}>
-          {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
-          <span>{copied ? "Copied" : "Copy"}</span>
-        </button>
+        <span class="md-code-lang mono">{lang || t("codeBlock")}</span>
+        <div class="row gap-1">
+          <button
+            type="button"
+            class={`copy-btn ${wrap ? "active" : ""}`}
+            title={t("toggleWrap")}
+            aria-label={t("toggleWrap")}
+            onClick={() => setWrap((w) => !w)}
+          >
+            <IconWrap size={12} />
+          </button>
+          <button type="button" class="copy-btn" onClick={copy}>
+            {copied ? <IconCheck size={12} /> : <IconCopy size={12} />}
+            <span>{copied ? t("copied") : t("copy")}</span>
+          </button>
+        </div>
       </div>
-      <pre class="md-pre">
+      <pre class={`md-pre ${wrap ? "wrap" : ""}`}>
         <code><HighlightedCode code={code} lang={lang} /></code>
       </pre>
     </div>

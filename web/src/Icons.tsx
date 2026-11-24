@@ -249,3 +249,75 @@ export function IconClock({ size }: IconProps) {
     </Svg>
   );
 }
+
+export function IconWrap({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M3 6h18M3 12h15a3 3 0 1 1 0 6h-4M16 16l-2 2 2 2M3 18h7" />
+    </Svg>
+  );
+}
+
+export function IconRefresh({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M23 4v6h-6M1 20v-6h6" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </Svg>
+  );
+}
+
+export function IconLayers({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <polygon points="12 2 2 7 12 12 22 7 12 2" />
+      <path d="M2 17l10 5 10-5M2 12l10 5 10-5" />
+    </Svg>
+  );
+}
+
+export function IconActivity({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </Svg>
+  );
+}
+
+export function IconChat({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </Svg>
+  );
+}
+
+export function IconDatabase({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <ellipse cx="12" cy="5" rx="9" ry="3" />
+      <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+      <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+    </Svg>
+  );
+}
+
+export function IconGlobe({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+    </Svg>
+  );
+}
+
+export function IconExpand({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <polyline points="15 3 21 3 21 9" />
+      <polyline points="9 21 3 21 3 15" />
+      <line x1="21" y1="3" x2="14" y2="10" />
+      <line x1="3" y1="21" x2="10" y2="14" />
+    </Svg>
+  );
+}

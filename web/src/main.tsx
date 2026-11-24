@@ -7,19 +7,23 @@ import {
   connectSse,
   consumeHashToken,
   errorMessage,
-  formatCost,
-  formatTokens,
   getToken,
   makeIdempotencyKey,
   setToken,
   setUnauthorizedHandler,
 } from "./api.ts";
 import { Composer } from "./Composer.tsx";
+import { ContextView } from "./ContextView.tsx";
+import { I18nContext, readLocalePref, resolveLocale, saveLocalePref, statusText, translate, useI18n } from "./i18n.ts";
+import type { LocalePref } from "./i18n.ts";
 import {
   BrandMark,
+  IconActivity,
   IconAlert,
+  IconChat,
   IconEye,
   IconEyeOff,
+  IconLayers,
   IconPlay,
   IconPlus,
   IconSettings,
@@ -44,6 +48,7 @@ import {
 } from "./state.ts";
 import type { GlobalSessionSync } from "./state.ts";
 import { Timeline } from "./Timeline.tsx";
+import { TraceView } from "./TraceView.tsx";
 import type {
   ActiveDraft,
   ActiveTask,
@@ -54,6 +59,8 @@ import type {
   DraftDeltaEvent,
   DraftStartedEvent,
   HistoryItem,
+  LlmCallInfo,
+  MainTab,
   MediaKind,
   ModelInfo,
   ProviderInfo,
@@ -80,6 +87,7 @@ function resolveTheme(pref: ThemePref): "light" | "dark" {
 }
 
 function TokenGate({ onSuccess }: { onSuccess: () => void }) {
+  const { t } = useI18n();
   const [value, setValue] = useState("");
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -96,7 +104,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
       setToken(token);
       onSuccess();
     } catch (ex) {
-      setErr(errorMessage(ex) || "Invalid Bearer token");
+      setErr(errorMessage(ex) || t("invalidToken"));
     } finally {
       setBusy(false);
     }
@@ -107,16 +115,17 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
       <form class="gate-card" onSubmit={submit}>
         <div class="brand">
           <BrandMark size={26} />
-          <span>MyGo-Bot</span>
+          <span class="brand-name">MyGo</span>
+          <span class="brand-tag">BOT</span>
         </div>
-        <p class="muted">Enter the daemon TCP Bearer token to connect.</p>
+        <p class="muted">{t("gatePrompt")}</p>
         {err && <div class="err-inline">{err}</div>}
         <div class="token-input-wrap">
           {show ? (
             <input
               key="tok"
               type="text"
-              placeholder="Bearer token"
+              placeholder={t("tokenPlaceholder")}
               autoFocus
               value={value}
               onInput={(e) => setValue(e.currentTarget.value)}
@@ -125,7 +134,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
             <input
               key="tok"
               type="password"
-              placeholder="Bearer token"
+              placeholder={t("tokenPlaceholder")}
               autoFocus
               value={value}
               onInput={(e) => setValue(e.currentTarget.value)}
@@ -134,18 +143,18 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
           <button
             type="button"
             class="btn-icon"
-            title={show ? "Hide token" : "Show token"}
-            aria-label={show ? "Hide token" : "Show token"}
+            title={show ? t("hideToken") : t("showToken")}
+            aria-label={show ? t("hideToken") : t("showToken")}
             onClick={() => setShow((v) => !v)}
           >
             {show ? <IconEyeOff size={15} /> : <IconEye size={15} />}
           </button>
         </div>
         <button type="submit" class="btn-primary" disabled={busy || !value.trim()}>
-          {busy ? "Verifying…" : "Connect"}
+          {busy ? t("verifying") : t("connect")}
         </button>
         <div class="muted small">
-          Run <code class="md-inline-code">mygo service status</code> on the host to view the token.
+          {t("tokenHintBefore")} <code class="md-inline-code">mygo service status</code> {t("tokenHintAfter")}
         </div>
       </form>
     </div>
@@ -154,51 +163,32 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
 
 function TopBar({
   session,
-  providers,
-  models,
-  summary,
   sseStatus,
   sidebarCollapsed,
+  activeTab,
+  itemCount,
+  onSelectTab,
   onOpenSidebar,
-  onOpenUsage,
+  onOpenSettings,
   onPatchSession,
 }: {
   session: SessionInfo | null;
-  providers: ProviderInfo[];
-  models: ModelInfo[];
-  summary: CallsSummary | null;
   sseStatus: SseStatus;
   sidebarCollapsed: boolean;
+  activeTab: MainTab;
+  itemCount: number;
+  onSelectTab: (tab: MainTab) => void;
   onOpenSidebar: () => void;
-  onOpenUsage: (sid: number) => void;
-  onPatchSession: (sid: number, patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort">>) => void;
+  onOpenSettings: () => void;
+  onPatchSession: (sid: number, patch: Partial<Pick<SessionInfo, "title">>) => void;
 }) {
+  const { locale, t } = useI18n();
   const [title, setTitle] = useState(session?.title || "");
   useEffect(() => {
     setTitle(session?.title || "");
   }, [session?.id, session?.title]);
 
   if (!session) return null;
-
-  const availableModels = models.filter((m) => !m.archived_at && !m.provider_archived_at);
-  const activeProviders = providers.filter((p) => !p.archived_at);
-  const currentModel = models.find((m) => m.id === session.model_id);
-  const efforts = currentModel?.reasoning_efforts || [];
-  const ctxLimit = currentModel?.context_window_tokens;
-  const lastIn = summary?.last_input_tokens;
-  const ctxPct =
-    lastIn != null && ctxLimit ? Math.min(100, Math.round((lastIn / ctxLimit) * 100)) : null;
-  const meterLevel = ctxPct == null ? "" : ctxPct >= 90 ? "danger" : ctxPct >= 75 ? "warn" : "";
-
-  const metricsTip = summary
-    ? [
-        ctxPct != null ? `Context: ${formatTokens(lastIn)} / ${formatTokens(ctxLimit)} (${ctxPct}%)` : lastIn != null ? `Last input: ${formatTokens(lastIn)}` : "",
-        `Uncached: ${formatTokens(summary.input_uncached_tokens)} · Cached: ${formatTokens(summary.cache_read_tokens)} · Output: ${formatTokens(summary.output_tokens)}`,
-        `Calls: ${summary.succeeded_count}/${summary.call_count} · Cost: ${formatCost(summary.cost_nano_usd)} (click for Usage)`,
-      ]
-        .filter(Boolean)
-        .join("\n")
-    : "";
 
   const commitTitle = () => {
     const next = title.trim();
@@ -210,101 +200,77 @@ function TopBar({
   };
 
   return (
-    <header class="topbar">
-      <div class="topbar-left">
-        <button
-          type="button"
-          class={`btn-icon ${sidebarCollapsed ? "" : "mobile-only"}`}
-          title="Show sessions"
-          aria-label="Show sessions"
-          onClick={onOpenSidebar}
-        >
-          <IconSidebar size={16} />
-        </button>
-        <input
-          class="title-input"
-          placeholder={`Session #${session.id}`}
-          value={title}
-          onInput={(e) => setTitle(e.currentTarget.value)}
-          onBlur={commitTitle}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.isComposing) e.currentTarget.blur();
-          }}
-        />
-        <span class={`pill pill-${session.status}`}>
-          {(session.status === "running" || session.status === "pausing") && <span class="pulse-dot" />}
-          {session.status}
-        </span>
-        {sseStatus === "reconnecting" && <span class="pill pill-paused">reconnecting</span>}
-      </div>
-
-      <div class="topbar-right">
-        <select
-          class="select-sm"
-          title="Session Model"
-          value={session.model_id ?? ""}
-          onChange={(e) => {
-            const val = e.currentTarget.value ? Number(e.currentTarget.value) : null;
-            onPatchSession(session.id, { model_id: val, reasoning_effort: null });
-          }}
-        >
-          <option value="">No model</option>
-          {activeProviders.length > 1
-            ? activeProviders.map((p) => {
-                const groupMods = availableModels.filter((m) => m.provider_id === p.id);
-                if (groupMods.length === 0) return null;
-                return (
-                  <optgroup key={p.id} label={p.name}>
-                    {groupMods.map((m) => (
-                      <option key={m.id} value={m.id}>{m.model_key}</option>
-                    ))}
-                  </optgroup>
-                );
-              })
-            : availableModels.map((m) => (
-                <option key={m.id} value={m.id}>{m.model_key}</option>
-              ))}
-          {currentModel && (currentModel.archived_at || currentModel.provider_archived_at) && (
-            <option value={currentModel.id}>{currentModel.model_key} (archived)</option>
-          )}
-        </select>
-
-        {efforts.length > 0 && (
-          <select
-            class="select-sm"
-            title="Reasoning Effort"
-            value={session.reasoning_effort ?? ""}
-            onChange={(e) => onPatchSession(session.id, { reasoning_effort: e.currentTarget.value || null })}
-          >
-            <option value="">auto</option>
-            {efforts.map((ef) => (
-              <option key={ef} value={ef}>{ef}</option>
-            ))}
-          </select>
-        )}
-
-        {summary && (
+    <header class="topbar-shell">
+      <div class="topbar-row">
+        <div class="topbar-left">
           <button
             type="button"
-            class="metrics-pill mono"
-            title={metricsTip}
-            onClick={() => onOpenUsage(session.id)}
+            class={`btn-icon ${sidebarCollapsed ? "" : "mobile-only"}`}
+            title={t("showSessions")}
+            aria-label={t("showSessions")}
+            onClick={onOpenSidebar}
           >
-            {lastIn != null && (
-              <span>
-                {formatTokens(lastIn)}
-                {ctxLimit ? `/${formatTokens(ctxLimit)}` : " tok"}
-              </span>
-            )}
-            {ctxPct != null && (
-              <span class="ctx-meter" aria-hidden="true">
-                <i class={meterLevel} style={{ width: `${ctxPct}%` }} />
-              </span>
-            )}
-            <span>{formatCost(summary.cost_nano_usd)}</span>
+            <IconSidebar size={16} />
           </button>
-        )}
+          <input
+            class="title-input"
+            placeholder={`${t("sessionPrefix")} #${session.id}`}
+            value={title}
+            onInput={(e) => setTitle(e.currentTarget.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.isComposing) e.currentTarget.blur();
+            }}
+          />
+          <span class={`pill pill-${session.status}`}>
+            {(session.status === "running" || session.status === "pausing") && <span class="pulse-dot" />}
+            {statusText(session.status, locale)}
+          </span>
+          {sseStatus === "reconnecting" && (
+            <span class="pill pill-paused">{t("reconnecting")}</span>
+          )}
+        </div>
+
+        <div class="topbar-right">
+          <button
+            type="button"
+            class="btn-icon"
+            title={t("settings")}
+            aria-label={t("settings")}
+            onClick={onOpenSettings}
+          >
+            <IconSettings size={15} />
+          </button>
+        </div>
       </div>
+
+      <nav class="view-tabs">
+        <button
+          type="button"
+          class={`view-tab ${activeTab === "chat" ? "active" : ""}`}
+          onClick={() => onSelectTab("chat")}
+        >
+          <IconChat size={14} />
+          <span>{t("tabChat")}</span>
+        </button>
+        <button
+          type="button"
+          class={`view-tab ${activeTab === "trace" ? "active" : ""}`}
+          onClick={() => onSelectTab("trace")}
+        >
+          <IconActivity size={14} />
+          <span>{t("tabTrace")}</span>
+          {itemCount > 0 && <span class="tab-count mono">{itemCount}</span>}
+        </button>
+        <button
+          type="button"
+          class={`view-tab ${activeTab === "context" ? "active" : ""}`}
+          onClick={() => onSelectTab("context")}
+        >
+          <IconLayers size={14} />
+          <span>{t("tabContext")}</span>
+        </button>
+      </nav>
     </header>
   );
 }
@@ -318,7 +284,10 @@ function revokeAttachments(attachments: ComposerAttachment[]): void {
 function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [themePref, setThemePrefState] = useState<ThemePref>(readThemePref);
+  const [localePref, setLocalePrefState] = useState<LocalePref>(readLocalePref);
+  const locale = useMemo(() => resolveLocale(localePref), [localePref]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem("mygo_sidebar_collapsed") === "1";
@@ -337,6 +306,7 @@ function App() {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
+  const [activeTab, setActiveTab] = useState<MainTab>("chat");
 
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -346,6 +316,8 @@ function App() {
   const [retryNotice, setRetryNotice] = useState<RetryNotice | null>(null);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [summary, setSummary] = useState<CallsSummary | null>(null);
+  const [callsById, setCallsById] = useState<Map<number, LlmCallInfo>>(() => new Map());
+  const [contextRefreshNonce, setContextRefreshNonce] = useState(0);
   const [sseStatus, setSseStatus] = useState<SseStatus>("open");
   const [bannerErr, setBannerErr] = useState("");
 
@@ -363,6 +335,7 @@ function App() {
   const sendingRef = useRef<Record<number, boolean>>({});
   sendingRef.current = sendingBySid;
   const globalSyncRef = useRef<GlobalSessionSync | null>(null);
+  const settledCallCursorRef = useRef(0);
 
   const updateComposer = (sid: number, fn: (cur: ComposerDraft) => ComposerDraft) => {
     setComposers((prev) => {
@@ -401,6 +374,11 @@ function App() {
     return () => mq.removeEventListener("change", apply);
   }, [themePref]);
 
+  useEffect(() => {
+    saveLocalePref(localePref);
+    document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+  }, [localePref, locale]);
+
   const cycleTheme = () => {
     setThemePrefState((cur) => (cur === "system" ? "light" : cur === "light" ? "dark" : "system"));
   };
@@ -427,6 +405,7 @@ function App() {
           localStorage.removeItem("mygo_sidebar_collapsed");
         } catch {}
         setSidebarOpen(true);
+        setSearchOpen(true);
         requestAnimationFrame(() => {
           searchInputRef.current?.focus();
           searchInputRef.current?.select();
@@ -558,18 +537,52 @@ function App() {
   }, [activeId]);
 
   const refreshSessionSidecars = async (sid: number): Promise<void> => {
-    const [queued, sum, tlist] = await Promise.all([
+    const fetchNewCalls = async (): Promise<LlmCallInfo[]> => {
+      const collected: LlmCallInfo[] = [];
+      let after = settledCallCursorRef.current;
+      while (true) {
+        const page = await apiFetch<LlmCallInfo[]>(`/calls?session_id=${sid}&after=${after}&limit=200`);
+        collected.push(...page);
+        if (page.length < 200) break;
+        after = page[page.length - 1].id;
+      }
+      return collected;
+    };
+
+    const [queued, sum, tlist, newCalls] = await Promise.all([
       apiFetch<HistoryItem[]>(`/sessions/${sid}/messages?status=queued&limit=200`),
       apiFetch<CallsSummary>(`/calls/summary?session_id=${sid}`),
       apiFetch<ActiveTask[]>(`/sessions/${sid}/tasks`),
+      fetchNewCalls(),
     ]);
     if (activeIdRef.current !== sid) return;
     setQueuedIds(new Set(queued.map((m) => m.id)));
     setSummary(sum);
     setTasks(tlist);
+    if (newCalls.length > 0) {
+      let nextCursor = settledCallCursorRef.current;
+      let sawInFlight = false;
+      for (const c of newCalls) {
+        if (c.status === "in_flight") {
+          nextCursor = Math.min(sawInFlight ? nextCursor : c.id - 1, c.id - 1);
+          sawInFlight = true;
+        } else if (!sawInFlight) {
+          nextCursor = Math.max(nextCursor, c.id);
+        }
+      }
+      settledCallCursorRef.current = Math.max(0, nextCursor);
+      setCallsById((prev) => {
+        const next = new Map(prev);
+        for (const c of newCalls) next.set(c.id, c);
+        return next;
+      });
+    }
+    setContextRefreshNonce((n) => n + 1);
   };
 
   useEffect(() => {
+    settledCallCursorRef.current = 0;
+    setCallsById(new Map());
     if (!authed || !activeId) {
       setItems([]);
       setDraft(null);
@@ -826,7 +839,7 @@ function App() {
     if (!list.length) {
       updateComposer(targetSid, (c) => ({
         ...c,
-        error: "Only image, audio, or video files are supported.",
+        error: translate(locale, "unsupportedMedia"),
       }));
       return;
     }
@@ -935,7 +948,7 @@ function App() {
           if (!sessionsRef.current.some((s) => s.id === targetSid)) return;
           updateComposer(targetSid, (c) => ({
             ...c,
-            error: `Message queued, but failed to start run: ${errorMessage(e)}`,
+            error: `${translate(locale, "queuedRunFailed")} ${errorMessage(e)}`,
           }));
         }
       }
@@ -943,13 +956,6 @@ function App() {
       setSendingBySid((prev) => ({ ...prev, [targetSid]: false }));
     }
   };
-
-  if (authed === null) {
-    return <div class="gate-wrap"><div class="muted">Connecting…</div></div>;
-  }
-  if (!authed) {
-    return <TokenGate onSuccess={() => setAuthed(true)} />;
-  }
 
   const openSidebar = () => {
     setSidebarCollapsed(false);
@@ -962,67 +968,229 @@ function App() {
   const activeModel = activeSession?.model_id ? modelsById.get(activeSession.model_id) : undefined;
 
   return (
-    <div class="layout">
-      <Sidebar
+    <I18nContext.Provider value={locale}>
+      <AppView
+        authed={authed}
+        locale={locale}
+        themePref={themePref}
+        localePref={localePref}
         sessions={sessions}
         activeId={activeId}
-        modelsById={modelsById}
-        open={sidebarOpen}
-        collapsed={sidebarCollapsed}
-        themePref={themePref}
+        activeSession={activeSession}
+        activeModel={activeModel}
+        activeTab={activeTab}
+        providers={providers}
+        models={models}
+        config={config}
+        sidebarOpen={sidebarOpen}
+        sidebarCollapsed={sidebarCollapsed}
+        searchOpen={searchOpen}
         searchInputRef={searchInputRef}
-        onSelect={setActiveId}
-        onCreate={createSession}
-        onDelete={deleteSession}
+        items={items}
+        hasMore={hasMore}
+        loadingMore={loadingMore}
+        queuedIds={queuedIds}
+        draft={draft}
+        retryNotice={retryNotice}
+        tasks={tasks}
+        summary={summary}
+        callsById={callsById}
+        contextRefreshNonce={contextRefreshNonce}
+        sseStatus={sseStatus}
+        bannerErr={bannerErr}
+        composers={composers}
+        uploadingBySid={uploadingBySid}
+        sendingBySid={sendingBySid}
+        settingsState={settingsState}
+        onAuthed={() => setAuthed(true)}
+        onSelectSession={setActiveId}
+        onSelectTab={setActiveTab}
+        onCreateSession={createSession}
+        onDeleteSession={deleteSession}
+        onPatchSession={patchSession}
         onCycleTheme={cycleTheme}
-        onOpenSettings={() => setSettingsState({ open: true, tab: "models", sessionFilter: "" })}
-        onToggleCollapse={toggleSidebarCollapse}
-        onClose={() => setSidebarOpen(false)}
+        onSetThemePref={setThemePrefState}
+        onSetLocalePref={setLocalePrefState}
+        onToggleSidebarCollapse={toggleSidebarCollapse}
+        onOpenSidebar={openSidebar}
+        onCloseSidebar={() => setSidebarOpen(false)}
+        onSetSearchOpen={setSearchOpen}
+        onOpenSettingsTab={(tab, sid = "") =>
+          setSettingsState({ open: true, tab, sessionFilter: sid })
+        }
+        onCloseSettings={() => setSettingsState((s) => ({ ...s, open: false }))}
+        onSignOut={() => {
+          setToken("");
+          setSettingsState({ open: false, tab: "models", sessionFilter: "" });
+          setAuthed(false);
+        }}
+        onRefreshCatalog={loadCatalog}
+        onLoadMore={loadMore}
+        onWithdraw={(mid) => {
+          if (!activeSession) return;
+          void apiFetch(`/sessions/${activeSession.id}/messages/${mid}`, { method: "DELETE" }).catch((e) =>
+            setBannerErr(errorMessage(e))
+          );
+        }}
+        onClearBannerErr={() => setBannerErr("")}
+        onResumePaused={() => {
+          if (!activeSession) return;
+          void apiFetch(`/sessions/${activeSession.id}/run`, { method: "PUT" }).catch((e) =>
+            setBannerErr(errorMessage(e))
+          );
+        }}
+        onChangeText={onChangeText}
+        onUploadFiles={onUploadFiles}
+        onRemoveAttachment={onRemoveAttachment}
+        onSubmitComposer={onSubmitComposer}
+        onPause={(mode) => {
+          if (!activeSession) return;
+          void apiFetch(`/sessions/${activeSession.id}/run?mode=${mode}`, { method: "DELETE" }).catch((e) =>
+            setBannerErr(errorMessage(e))
+          );
+        }}
+        onKillTask={(tid) => {
+          if (!activeSession) return;
+          void apiFetch(`/sessions/${activeSession.id}/tasks/${tid}`, { method: "DELETE" }).catch((e) =>
+            setBannerErr(errorMessage(e))
+          );
+        }}
+      />
+    </I18nContext.Provider>
+  );
+}
+
+function AppView(props: {
+  authed: boolean | null;
+  locale: "zh" | "en";
+  themePref: ThemePref;
+  localePref: LocalePref;
+  sessions: SessionInfo[];
+  activeId: number | null;
+  activeSession: SessionInfo | null;
+  activeModel: ModelInfo | undefined;
+  activeTab: MainTab;
+  providers: ProviderInfo[];
+  models: ModelInfo[];
+  config: AppConfig | null;
+  sidebarOpen: boolean;
+  sidebarCollapsed: boolean;
+  searchOpen: boolean;
+  searchInputRef: preact.RefObject<HTMLInputElement | null>;
+  items: HistoryItem[];
+  hasMore: boolean;
+  loadingMore: boolean;
+  queuedIds: Set<number>;
+  draft: ActiveDraft | null;
+  retryNotice: RetryNotice | null;
+  tasks: ActiveTask[];
+  summary: CallsSummary | null;
+  callsById: Map<number, LlmCallInfo>;
+  contextRefreshNonce: number;
+  sseStatus: SseStatus;
+  bannerErr: string;
+  composers: Record<number, ComposerDraft>;
+  uploadingBySid: Record<number, number>;
+  sendingBySid: Record<number, boolean>;
+  settingsState: { open: boolean; tab: SettingsTabId; sessionFilter: string };
+  onAuthed: () => void;
+  onSelectSession: (id: number) => void;
+  onSelectTab: (tab: MainTab) => void;
+  onCreateSession: () => void;
+  onDeleteSession: (id: number) => void;
+  onPatchSession: (
+    sid: number,
+    patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort">>
+  ) => void;
+  onCycleTheme: () => void;
+  onSetThemePref: (pref: ThemePref) => void;
+  onSetLocalePref: (pref: LocalePref) => void;
+  onToggleSidebarCollapse: () => void;
+  onOpenSidebar: () => void;
+  onCloseSidebar: () => void;
+  onSetSearchOpen: (open: boolean) => void;
+  onOpenSettingsTab: (tab: SettingsTabId, sid?: string) => void;
+  onCloseSettings: () => void;
+  onSignOut: () => void;
+  onRefreshCatalog: () => Promise<void>;
+  onLoadMore: () => void;
+  onWithdraw: (mid: number) => void;
+  onClearBannerErr: () => void;
+  onResumePaused: () => void;
+  onChangeText: (sid: number, text: string) => void;
+  onUploadFiles: (sid: number, files: FileList | null) => void;
+  onRemoveAttachment: (sid: number, aid: number) => void;
+  onSubmitComposer: (sid: number, startRun: boolean) => void;
+  onPause: (mode: "soft" | "hard") => void;
+  onKillTask: (tid: string) => void;
+}) {
+  const { t } = useI18n();
+  if (props.authed === null) {
+    return <div class="gate-wrap"><div class="muted">{t("connecting")}</div></div>;
+  }
+  if (!props.authed) {
+    return <TokenGate onSuccess={props.onAuthed} />;
+  }
+
+  return (
+    <div class="layout">
+      <Sidebar
+        sessions={props.sessions}
+        activeId={props.activeId}
+        open={props.sidebarOpen}
+        collapsed={props.sidebarCollapsed}
+        searchOpen={props.searchOpen}
+        themePref={props.themePref}
+        searchInputRef={props.searchInputRef}
+        onSelect={props.onSelectSession}
+        onCreate={props.onCreateSession}
+        onDelete={props.onDeleteSession}
+        onCycleTheme={props.onCycleTheme}
+        onOpenSettingsTab={(tab) => props.onOpenSettingsTab(tab, "")}
+        onToggleCollapse={props.onToggleSidebarCollapse}
+        onSetSearchOpen={props.onSetSearchOpen}
+        onClose={props.onCloseSidebar}
       />
 
       <main class="main">
-        {activeSession ? (
+        {props.activeSession ? (
           <>
             <TopBar
-              session={activeSession}
-              providers={providers}
-              models={models}
-              summary={summary}
-              sseStatus={sseStatus}
-              sidebarCollapsed={sidebarCollapsed}
-              onOpenSidebar={openSidebar}
-              onOpenUsage={(sid) =>
-                setSettingsState({ open: true, tab: "usage", sessionFilter: String(sid) })
-              }
-              onPatchSession={patchSession}
+              session={props.activeSession}
+              sseStatus={props.sseStatus}
+              sidebarCollapsed={props.sidebarCollapsed}
+              activeTab={props.activeTab}
+              itemCount={props.items.length}
+              onSelectTab={props.onSelectTab}
+              onOpenSidebar={props.onOpenSidebar}
+              onOpenSettings={() => props.onOpenSettingsTab("models", "")}
+              onPatchSession={props.onPatchSession}
             />
-            {(bannerErr || activeSession.last_error) && (
+            {(props.bannerErr || props.activeSession.last_error) && (
               <div class="status-banner">
                 <div class="row gap-1">
                   <IconAlert size={15} />
-                  <span>{bannerErr || activeSession.last_error}</span>
+                  <span>{props.bannerErr || props.activeSession.last_error}</span>
                 </div>
                 <div class="row gap-1">
-                  {activeSession.status === "paused" && activeSession.last_error && !bannerErr && (
-                    <button
-                      type="button"
-                      class="btn-ghost btn-xs"
-                      onClick={() =>
-                        void apiFetch(`/sessions/${activeSession.id}/run`, { method: "PUT" }).catch((e) =>
-                          setBannerErr(errorMessage(e))
-                        )
-                      }
-                    >
-                      <IconPlay size={11} />
-                      <span>Resume</span>
-                    </button>
-                  )}
-                  {bannerErr && (
+                  {props.activeSession.status === "paused" &&
+                    props.activeSession.last_error &&
+                    !props.bannerErr && (
+                      <button
+                        type="button"
+                        class="btn-ghost btn-xs"
+                        onClick={props.onResumePaused}
+                      >
+                        <IconPlay size={11} />
+                        <span>{t("resume")}</span>
+                      </button>
+                    )}
+                  {props.bannerErr && (
                     <button
                       type="button"
                       class="btn-icon"
-                      aria-label="Dismiss error"
-                      onClick={() => setBannerErr("")}
+                      aria-label={t("dismiss")}
+                      onClick={props.onClearBannerErr}
                     >
                       <IconX size={14} />
                     </button>
@@ -1030,80 +1198,100 @@ function App() {
                 </div>
               </div>
             )}
-            <Timeline
-              session={activeSession}
-              items={items}
-              hasMore={hasMore}
-              loadingMore={loadingMore}
-              queuedIds={queuedIds}
-              draft={draft}
-              retryNotice={retryNotice}
-              modelLabel={activeModel?.model_key ?? null}
-              effortLabel={activeSession.reasoning_effort}
-              onLoadMore={loadMore}
-              onWithdraw={(mid) =>
-                void apiFetch(`/sessions/${activeSession.id}/messages/${mid}`, { method: "DELETE" }).catch((e) =>
-                  setBannerErr(errorMessage(e))
-                )
-              }
-              onOpenSettings={() => setSettingsState({ open: true, tab: "models", sessionFilter: "" })}
-            />
-            <Composer
-              session={activeSession}
-              draft={composers[activeSession.id] || emptyComposer()}
-              uploading={Boolean(uploadingBySid[activeSession.id])}
-              sending={Boolean(sendingBySid[activeSession.id])}
-              tasks={tasks}
-              queuedCount={queuedIds.size}
-              onChangeText={onChangeText}
-              onUploadFiles={onUploadFiles}
-              onRemoveAttachment={onRemoveAttachment}
-              onSubmit={onSubmitComposer}
-              onPause={(mode) =>
-                void apiFetch(`/sessions/${activeSession.id}/run?mode=${mode}`, { method: "DELETE" }).catch((e) =>
-                  setBannerErr(errorMessage(e))
-                )
-              }
-              onKillTask={(tid) =>
-                void apiFetch(`/sessions/${activeSession.id}/tasks/${tid}`, { method: "DELETE" }).catch((e) =>
-                  setBannerErr(errorMessage(e))
-                )
-              }
-            />
+
+            {props.activeTab === "chat" && (
+              <>
+                <Timeline
+                  session={props.activeSession}
+                  items={props.items}
+                  hasMore={props.hasMore}
+                  loadingMore={props.loadingMore}
+                  queuedIds={props.queuedIds}
+                  draft={props.draft}
+                  retryNotice={props.retryNotice}
+                  callsById={props.callsById}
+                  modelLabel={props.activeModel?.model_key ?? null}
+                  effortLabel={props.activeSession.reasoning_effort}
+                  onLoadMore={props.onLoadMore}
+                  onWithdraw={props.onWithdraw}
+                  onOpenSettings={() => props.onOpenSettingsTab("models", "")}
+                />
+                <Composer
+                  session={props.activeSession}
+                  providers={props.providers}
+                  models={props.models}
+                  draft={props.composers[props.activeSession.id] || emptyComposer()}
+                  uploading={Boolean(props.uploadingBySid[props.activeSession.id])}
+                  sending={Boolean(props.sendingBySid[props.activeSession.id])}
+                  tasks={props.tasks}
+                  queuedCount={props.queuedIds.size}
+                  summary={props.summary}
+                  onChangeText={props.onChangeText}
+                  onUploadFiles={props.onUploadFiles}
+                  onRemoveAttachment={props.onRemoveAttachment}
+                  onSubmit={props.onSubmitComposer}
+                  onPause={props.onPause}
+                  onKillTask={props.onKillTask}
+                  onPatchSession={props.onPatchSession}
+                  onOpenUsage={(sid) => props.onOpenSettingsTab("usage", String(sid))}
+                />
+              </>
+            )}
+
+            {props.activeTab === "trace" && (
+              <TraceView
+                items={props.items}
+                hasMore={props.hasMore}
+                loadingMore={props.loadingMore}
+                queuedIds={props.queuedIds}
+                draft={props.draft}
+                onLoadMore={props.onLoadMore}
+                onWithdraw={props.onWithdraw}
+              />
+            )}
+
+            {props.activeTab === "context" && (
+              <ContextView
+                session={props.activeSession}
+                items={props.items}
+                summary={props.summary}
+                ctxLimit={props.activeModel?.context_window_tokens}
+                refreshNonce={props.contextRefreshNonce}
+              />
+            )}
           </>
         ) : (
           <div class="welcome">
             <button
               type="button"
-              class={`btn-icon welcome-menu ${sidebarCollapsed ? "" : "mobile-only"}`}
-              aria-label="Show sessions"
-              onClick={openSidebar}
+              class={`btn-icon welcome-menu ${props.sidebarCollapsed ? "" : "mobile-only"}`}
+              aria-label={t("showSessions")}
+              onClick={props.onOpenSidebar}
             >
               <IconSidebar size={16} />
             </button>
             <div class="welcome-card">
               <div class="brand">
                 <BrandMark size={28} />
-                <span>MyGo-Bot</span>
+                <span class="brand-name">MyGo</span>
+                <span class="brand-tag">BOT</span>
               </div>
-              <p class="muted">Select a session from the sidebar or create a new one.</p>
-              {models.filter((m) => !m.archived_at && !m.provider_archived_at).length === 0 && (
-                <p class="muted small">
-                  No available models configured yet — open Settings to add a provider and model.
-                </p>
+              <p class="muted">{t("welcomePrompt")}</p>
+              {props.models.filter((m) => !m.archived_at && !m.provider_archived_at).length === 0 && (
+                <p class="muted small">{t("noModelsNotice")}</p>
               )}
               <div class="row gap-2">
-                <button type="button" class="btn-primary" onClick={createSession}>
+                <button type="button" class="btn-primary" onClick={props.onCreateSession}>
                   <IconPlus size={15} />
-                  <span>New Session</span>
+                  <span>{t("newSession")}</span>
                 </button>
                 <button
                   type="button"
                   class="btn-ghost"
-                  onClick={() => setSettingsState({ open: true, tab: "models", sessionFilter: "" })}
+                  onClick={() => props.onOpenSettingsTab("models", "")}
                 >
                   <IconSettings size={15} />
-                  <span>Settings</span>
+                  <span>{t("settings")}</span>
                 </button>
               </div>
             </div>
@@ -1111,23 +1299,21 @@ function App() {
         )}
       </main>
 
-      {settingsState.open && (
+      {props.settingsState.open && (
         <Settings
-          config={config}
-          providers={providers}
-          models={models}
-          sessions={sessions}
-          themePref={themePref}
-          initialTab={settingsState.tab}
-          initialSessionFilter={settingsState.sessionFilter}
-          onSetThemePref={setThemePrefState}
-          onRefreshCatalog={loadCatalog}
-          onSignOut={() => {
-            setToken("");
-            setSettingsState({ open: false, tab: "models", sessionFilter: "" });
-            setAuthed(false);
-          }}
-          onClose={() => setSettingsState((s) => ({ ...s, open: false }))}
+          config={props.config}
+          providers={props.providers}
+          models={props.models}
+          sessions={props.sessions}
+          themePref={props.themePref}
+          localePref={props.localePref}
+          initialTab={props.settingsState.tab}
+          initialSessionFilter={props.settingsState.sessionFilter}
+          onSetThemePref={props.onSetThemePref}
+          onSetLocalePref={props.onSetLocalePref}
+          onRefreshCatalog={props.onRefreshCatalog}
+          onSignOut={props.onSignOut}
+          onClose={props.onCloseSettings}
         />
       )}
     </div>
