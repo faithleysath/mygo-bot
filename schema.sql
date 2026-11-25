@@ -180,6 +180,7 @@ CREATE TABLE sync_streams (
     watched INTEGER NOT NULL DEFAULT 0 CHECK (watched IN (0,1)),
     deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0,1)),
     retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1)),
+    reset_gen INTEGER NOT NULL DEFAULT 0 CHECK (reset_gen >= 0),
     head_snapshot TEXT CHECK (head_snapshot IS NULL OR json_valid(head_snapshot)),
     updated_at INTEGER NOT NULL DEFAULT 0
 );
@@ -227,4 +228,21 @@ CREATE TABLE sync_conflicts (
     detected_at INTEGER NOT NULL
 );
 CREATE INDEX sync_conflicts_by_local ON sync_conflicts(related_local_id) WHERE related_local_id IS NOT NULL;
-PRAGMA user_version = 4;
+CREATE TABLE sync_resolutions (
+    stream_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('provider','model','mcp','session','call')),
+    chosen TEXT NOT NULL CHECK (chosen IN ('local','cluster')),
+    resolver_node_id TEXT NOT NULL,
+    local_epoch INTEGER NOT NULL,
+    local_seq INTEGER NOT NULL,
+    local_hash BLOB NOT NULL CHECK (length(local_hash) = 32),
+    remote_epoch INTEGER NOT NULL,
+    remote_seq INTEGER NOT NULL,
+    remote_hash BLOB NOT NULL CHECK (length(remote_hash) = 32),
+    winner_epoch INTEGER NOT NULL,
+    winner_seq INTEGER NOT NULL,
+    winner_hash BLOB NOT NULL CHECK (length(winner_hash) = 32),
+    resolved_at INTEGER NOT NULL
+);
+CREATE INDEX sync_resolutions_by_time ON sync_resolutions(resolved_at DESC, stream_id);
+PRAGMA user_version = 5;

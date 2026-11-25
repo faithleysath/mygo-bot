@@ -20,6 +20,7 @@ pub struct Control {
     pub soft: CancellationToken,
     pub hard: CancellationToken,
     pub epoch: i64,
+    pub run_gen: u64,
 }
 
 enum StartEffect {
@@ -143,10 +144,12 @@ impl App {
                                 .try_for_each(|id| s.item_saved(sid, id));
                             let channel = s.channel(sid);
                             s.notify_status(sid, "running", "", updated_at);
+                            let run_gen = s.bump_run_gen(sid);
                             let control = Control {
                                 soft: CancellationToken::new(),
                                 hard: CancellationToken::new(),
                                 epoch: run_epoch,
+                                run_gen,
                             };
                             s.active.insert(sid, control.clone());
                             let tracker = worker.workers.clone();
@@ -256,7 +259,15 @@ impl App {
             let settled = self
                 .db
                 .call(move |s| {
-                    s.active.remove(&sid);
+                    if s.run_gen(sid) != control.run_gen {
+                        return Ok(());
+                    }
+                    if s.active
+                        .get(&sid)
+                        .is_some_and(|c| c.run_gen == control.run_gen)
+                    {
+                        s.active.remove(&sid);
+                    }
                     let stream = crate::cluster::ledger::stream_head(&s.conn, sid.as_str())?;
                     let conflicted = crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?;
                     let epoch_ok = stream.as_ref().is_none_or(|st| {
@@ -296,14 +307,19 @@ impl App {
         let mut retries = 0;
         let mut attempt = 0u64;
         let run_epoch = control.epoch;
+        let run_gen = control.run_gen;
         loop {
             let input = self
                 .db
                 .call(move |s| {
+                    if s.run_gen(sid) != run_gen {
+                        return Err(Error::conflict("session superseded"));
+                    }
                     let Some(ctrl) = s.active.get(&sid) else {
                         return Err(Error::conflict("session superseded"));
                     };
-                    if ctrl.soft.is_cancelled() || ctrl.epoch != run_epoch {
+                    if ctrl.soft.is_cancelled() || ctrl.epoch != run_epoch || ctrl.run_gen != run_gen
+                    {
                         return Err(Error::conflict("paused"));
                     }
                     if crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?
@@ -322,7 +338,9 @@ impl App {
                     if !needed {
                         tx.commit()?;
                         s.status(sid, "idle", "")?;
-                        s.active.remove(&sid);
+                        if s.active.get(&sid).is_some_and(|c| c.run_gen == run_gen) {
+                            s.active.remove(&sid);
+                        }
                         return Ok(None);
                     }
                     let end = store::max_context_position(&tx, sid)?;
@@ -346,7 +364,7 @@ impl App {
                         .ensure_session_attachments(sid)
                         .await
                         .map_err(Failure::Fatal)?;
-                    self.stream(sid, input, &mut output, &control.hard, run_epoch)
+                    self.stream(sid, input, &mut output, &control.hard, (run_epoch, run_gen))
                         .await
                 } => result,
             };
@@ -366,7 +384,12 @@ impl App {
                     Err(Failure::Fatal(_)) => ("failed", Some("model request failed")),
                 };
                 self.db
-                    .call(move |s| report.finish(&s.conn, call_id, status, reason, finished_at))
+                    .call(move |s| {
+                        if s.run_gen(sid) != run_gen {
+                            return Ok(());
+                        }
+                        report.finish(&s.conn, call_id, status, reason, finished_at)
+                    })
                     .await?;
                 None
             };
@@ -386,6 +409,9 @@ impl App {
             if interrupted || (output.tools && streamed.is_err()) {
                 self.db
                     .call(move |s| {
+                        if s.run_gen(sid) != run_gen {
+                            return Ok(());
+                        }
                         let tx = s.conn.transaction()?;
                         if crate::cluster::ledger::has_conflict(&tx, sid.as_str())?
                             || crate::cluster::ledger::stream_head(&tx, sid.as_str())?
@@ -435,7 +461,9 @@ impl App {
             let soft = control.soft.clone();
             let stopped = self
                 .db
-                .write(
+                .write_for_run(
+                    sid,
+                    run_gen,
                     move |conn| {
                         if crate::cluster::ledger::stream_head(conn, sid.as_str())?
                             .is_some_and(|h| h.epoch != run_epoch || h.deleted || h.retired)
@@ -495,7 +523,9 @@ impl App {
                             s.item_saved(sid, id)?;
                         }
                         if state != "running" {
-                            s.active.remove(&sid);
+                            if s.active.get(&sid).is_some_and(|c| c.run_gen == run_gen) {
+                                s.active.remove(&sid);
+                            }
                             let info = session(&s.conn, sid)?;
                             s.notify_status(sid, state, &info.last_error, now);
                         }

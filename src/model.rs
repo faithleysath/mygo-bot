@@ -222,7 +222,7 @@ impl App {
         input: Input,
         out: &mut Output,
         hard: &CancellationToken,
-        run_epoch: i64,
+        (run_epoch, run_gen): (i64, u64),
     ) -> std::result::Result<(), Failure> {
         let body = body(self.db.clone(), sid, &input).await?;
         let mut request = self
@@ -370,7 +370,7 @@ impl App {
                         out.final_output_index = Some(idx);
                         return Ok(());
                     }
-                    self.accept(sid, input.call_id, item, out, hard, run_epoch)
+                    self.accept(sid, input.call_id, item, out, hard, (run_epoch, run_gen))
                         .await?;
                     self.streams.finish_item(sid, input.call_id, idx);
                 }
@@ -388,7 +388,7 @@ impl App {
         item: Value,
         out: &mut Output,
         hard: &CancellationToken,
-        run_epoch: i64,
+        (run_epoch, run_gen): (i64, u64),
     ) -> Result<()> {
         let kind = item["type"]
             .as_str()
@@ -405,7 +405,9 @@ impl App {
             let call_key = call.clone();
             let id = self
                 .db
-                .write(
+                .write_for_run(
+                    sid,
+                    run_gen,
                     move |conn| {
                         let sql =
                             "SELECT payload FROM items WHERE session_id=? AND kind='function_call'

@@ -383,16 +383,21 @@ pub async fn subscribe(
         .db
         .call(move |s| {
             let initial = session(&s.conn, sid)?;
+            let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, sid)?;
+            let mut val = serde_json::json!(initial);
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("history_rev".to_owned(), serde_json::json!(history_rev));
+            }
             let channel = s.channel(sid);
             let rx = channel.subscribe();
-            Ok((channel, rx, initial))
+            Ok((channel, rx, val))
         })
         .await?;
     let (delta_tx, mut delta_rx, snapshot, mut min_seq) = app.streams.subscribe_delta(sid);
     let stream = async_stream::stream! {
         let _channel = channel;
         let _delta = delta_tx;
-        yield Ok(Event::default().event("ready").data(serde_json::json!(initial).to_string()));
+        yield Ok(Event::default().event("ready").data(initial.to_string()));
         if let Some(snap) = snapshot {
             yield Ok(Event::default().event("stream.snapshot").data(snap.to_string()));
         }
@@ -409,7 +414,12 @@ pub async fn subscribe(
                     match rx.try_recv() {
                         Ok(d) => yield Ok(d.into_event()),
                         Err(TryRecvError::Lagged(_)) => {
-                            yield Ok(Event::default().event("resync").data("{}"));
+                            let rev = app
+                                .db
+                                .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
+                                .await
+                                .unwrap_or(0);
+                            yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
                         }
                         Err(TryRecvError::Closed) => return,
                         Err(TryRecvError::Empty) => break,
@@ -439,7 +449,12 @@ pub async fn subscribe(
                         continue;
                     }
                     Err(TryRecvError::Lagged(_)) => {
-                        yield Ok(Event::default().event("resync").data("{}"));
+                        let rev = app
+                            .db
+                            .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
+                            .await
+                            .unwrap_or(0);
+                        yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
                         continue;
                     }
                     Err(TryRecvError::Closed) => return,
@@ -483,7 +498,12 @@ pub async fn subscribe(
                     Err(TryRecvError::Lagged(_)) => {
                         buffered_delta = None;
                         delta_lagged = true;
-                        yield Ok(Event::default().event("resync").data("{}"));
+                        let rev = app
+                            .db
+                            .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
+                            .await
+                            .unwrap_or(0);
+                        yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
                         break;
                     }
                     Err(TryRecvError::Closed) => {
@@ -536,7 +556,12 @@ pub async fn subscribe(
                 Incoming::Durable(Err(RecvError::Lagged(_))) => {
                     buffered_delta = None;
                     delta_lagged = true;
-                    yield Ok(Event::default().event("resync").data("{}"));
+                    let rev = app
+                        .db
+                        .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
+                        .await
+                        .unwrap_or(0);
+                    yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
                 }
                 Incoming::Durable(Err(RecvError::Closed)) => break,
                 Incoming::Delta(Ok(m)) => {

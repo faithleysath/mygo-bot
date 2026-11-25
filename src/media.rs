@@ -399,53 +399,90 @@ pub fn check_session(conn: &Connection, sid: SessionId, modalities: &Value) -> R
     Ok(())
 }
 
-pub fn session_required_modalities(conn: &Connection, sid: SessionId) -> Result<Vec<String>> {
-    let all = json!(["text", "image", "audio", "video"]);
-    let mut mods = std::collections::BTreeSet::new();
-    let collect_parts = |parts: &Value, set: &mut std::collections::BTreeSet<String>| -> Result<()> {
-        if parts.is_string() {
-            set.insert("text".to_owned());
-            return Ok(());
-        }
-        let Some(arr) = parts.as_array() else {
-            return Ok(());
-        };
-        for part in arr {
-            match part["type"].as_str() {
-                Some("input_text" | "output_text" | "refusal" | "reasoning_text" | "summary_text" | "text") => {
-                    set.insert("text".to_owned());
+fn collect_part_modalities(
+    conn: &Connection,
+    parts: &Value,
+    set: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if parts.is_string() {
+        set.insert("text".to_owned());
+        return Ok(());
+    }
+    let Some(arr) = parts.as_array() else {
+        return Ok(());
+    };
+    for part in arr {
+        match part["type"].as_str() {
+            Some(
+                "input_text" | "output_text" | "refusal" | "reasoning_text" | "summary_text"
+                | "text",
+            ) => {
+                set.insert("text".to_owned());
+            }
+            Some("input_image" | "output_image" | "image") => {
+                set.insert("image".to_owned());
+            }
+            Some("input_audio" | "output_audio" | "audio") => {
+                set.insert("audio".to_owned());
+            }
+            Some("video") => {
+                set.insert("video".to_owned());
+            }
+            Some("input_file") => {
+                if let Some(family) = part["file_data"]
+                    .as_str()
+                    .and_then(|url| url.strip_prefix("data:"))
+                    .and_then(|data| data.split_once('/'))
+                    .map(|(f, _)| f)
+                    && matches!(family, "audio" | "video" | "image" | "text")
+                {
+                    set.insert(family.to_owned());
                 }
-                Some("input_image" | "output_image" | "image") => {
-                    set.insert("image".to_owned());
-                }
-                Some("input_audio" | "output_audio" | "audio") => {
-                    set.insert("audio".to_owned());
-                }
-                Some("video") => {
-                    set.insert("video".to_owned());
-                }
-                Some("input_file") => {
-                    if let Some(family) = part["file_data"]
-                        .as_str()
-                        .and_then(|url| url.strip_prefix("data:"))
-                        .and_then(|data| data.split_once('/'))
-                        .map(|(f, _)| f)
-                        && matches!(family, "audio" | "video" | "image" | "text")
-                    {
-                        set.insert(family.to_owned());
-                    }
-                }
-                _ => {
-                    if let Ok(block) = ContentBlock::parse(part)
-                        && let Ok(m) = block.modality(conn)
-                    {
-                        set.insert(m.to_owned());
-                    }
+            }
+            _ => {
+                if let Ok(block) = ContentBlock::parse(part)
+                    && let Ok(m) = block.modality(conn)
+                {
+                    set.insert(m.to_owned());
                 }
             }
         }
-        Ok(())
-    };
+    }
+    Ok(())
+}
+
+pub fn item_required_modalities(
+    conn: &Connection,
+    kind: &str,
+    payload: &Value,
+    mods: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    match kind {
+        "user_message" | "assistant_message" => {
+            collect_part_modalities(conn, &payload["content"], mods)?;
+        }
+        "codemode_event" => {
+            mods.insert("text".to_owned());
+            collect_part_modalities(conn, &payload["content"], mods)?;
+        }
+        "function_call_output" => collect_part_modalities(conn, &payload["output"], mods)?,
+        "reasoning" => {
+            for key in ["summary", "content"] {
+                if let Some(parts) = payload.get(key).filter(|v| !v.is_null()) {
+                    collect_part_modalities(conn, parts, mods)?;
+                }
+            }
+        }
+        "image_generation_call" if payload["result"].is_string() => {
+            mods.insert("image".to_owned());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn session_required_modalities(conn: &Connection, sid: SessionId) -> Result<Vec<String>> {
+    let mut mods = std::collections::BTreeSet::new();
     let queries = [
         "SELECT i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
          WHERE c.session_id=? AND i.kind IN ('user_message','codemode_event','assistant_message','reasoning','function_call_output','image_generation_call')
@@ -463,29 +500,9 @@ pub fn session_required_modalities(conn: &Connection, sid: SessionId) -> Result<
         while let Some(row) = rows.next()? {
             let kind: String = row.get(0)?;
             let payload: Value = row.get(1)?;
-            match kind.as_str() {
-                "user_message" => collect_parts(&payload["content"], &mut mods)?,
-                "codemode_event" => {
-                    mods.insert("text".to_owned());
-                    collect_parts(&payload["content"], &mut mods)?;
-                }
-                "assistant_message" => collect_parts(&payload["content"], &mut mods)?,
-                "function_call_output" => collect_parts(&payload["output"], &mut mods)?,
-                "reasoning" => {
-                    for key in ["summary", "content"] {
-                        if let Some(parts) = payload.get(key).filter(|v| !v.is_null()) {
-                            collect_parts(parts, &mut mods)?;
-                        }
-                    }
-                }
-                "image_generation_call" if payload["result"].is_string() => {
-                    mods.insert("image".to_owned());
-                }
-                _ => {}
-            }
+            item_required_modalities(conn, &kind, &payload, &mut mods)?;
         }
     }
-    let _ = all;
     Ok(mods.into_iter().collect())
 }
 

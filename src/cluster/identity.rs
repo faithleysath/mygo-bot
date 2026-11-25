@@ -338,6 +338,7 @@ pub fn apply_join(
             params![new_secret.as_slice(), next_gen],
         )?;
         conn.execute("DELETE FROM cluster_peers", [])?;
+        conn.execute("DELETE FROM sync_staging_commits", [])?;
         next_gen
     } else {
         local.membership_gen
@@ -345,6 +346,19 @@ pub fn apply_join(
     let now = chrono::Utc::now().timestamp_millis();
     upsert_peer(conn, &local.node_id, &peer, now, true)?;
     Ok((secret_changed, next_gen, new_secret, peer))
+}
+
+pub fn assert_membership_gen(conn: &Connection, expected_gen: i64) -> Result<()> {
+    let current_gen: i64 =
+        conn.query_row("SELECT membership_gen FROM local_node WHERE id=1", [], |r| {
+            r.get(0)
+        })?;
+    if current_gen != expected_gen {
+        return Err(Error::conflict(
+            "cluster membership changed during synchronization",
+        ));
+    }
+    Ok(())
 }
 
 pub fn upsert_peer_if_gen(

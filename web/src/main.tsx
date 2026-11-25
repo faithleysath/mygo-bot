@@ -721,12 +721,12 @@ function App() {
       onEvent: (name, data) => {
         if (activeIdRef.current !== sid || sessionEpochRef.current !== epoch) return;
         if (name === "ready") {
-          const sess = data as SessionInfo;
+          const sess = data as SessionInfo & { history_rev?: number };
           globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
           setDraft(null);
           setRetryNotice(null);
-          sessionSync.onReady();
+          sessionSync.onReady(sess.history_rev);
         } else if (name === "stream.snapshot") {
           const snap = data as ActiveDraft;
           if (!isCallClosed(snap.llm_call_id)) {
@@ -810,6 +810,7 @@ function App() {
           globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
         } else if (name === "session.reset") {
+          const ev = data as { history_rev?: number } | null;
           closedCalls.clear();
           closedItems.clear();
           clearedThroughCallId = "";
@@ -824,8 +825,9 @@ function App() {
               }
             })
             .catch(() => {});
-          sessionSync.onReset();
+          sessionSync.onReset(ev?.history_rev);
         } else if (name === "resync") {
+          const ev = data as { history_rev?: number } | null;
           setRetryNotice(null);
           globalSyncRef.current?.touchSession(sid);
           apiFetch<SessionInfo>(`/sessions/${sid}`)
@@ -836,7 +838,7 @@ function App() {
               }
             })
             .catch(() => {});
-          sessionSync.onResync();
+          sessionSync.onResync(ev?.history_rev);
         }
       },
     });

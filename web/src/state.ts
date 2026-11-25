@@ -629,9 +629,9 @@ export interface SessionSyncOptions {
 
 export interface SessionSync {
   start: () => void;
-  onReady: () => void;
-  onResync: () => void;
-  onReset: () => void;
+  onReady: (historyRev?: number) => void;
+  onResync: (historyRev?: number) => void;
+  onReset: (historyRev?: number) => void;
   onLiveItem: (item: HistoryItem) => void;
   dispose: () => void;
   getState: () => { initialLoaded: boolean; syncedThroughId: string; gapOpen: boolean };
@@ -656,6 +656,7 @@ export function createSessionSync({
   let runAgain = false;
   let replaceNext = false;
   let resetGen = 0;
+  let knownHistoryRev: number | null = null;
   let retryTimer: TimerId | null = null;
   let retryDelay = 1000;
 
@@ -746,24 +747,41 @@ export function createSessionSync({
     void runSync();
   };
 
-  const onReady = (): void => {
+  const onReady = (historyRev?: number): void => {
     if (disposed) return;
+    if (typeof historyRev === "number") {
+      if (knownHistoryRev !== null && historyRev !== knownHistoryRev) {
+        onReset(historyRev);
+        return;
+      }
+      knownHistoryRev = historyRev;
+    }
     gapOpen = true;
     retryDelay = 1000;
     clearRetry();
     void runSync();
   };
 
-  const onResync = (): void => {
+  const onResync = (historyRev?: number): void => {
     if (disposed) return;
+    if (typeof historyRev === "number") {
+      if (knownHistoryRev !== null && historyRev !== knownHistoryRev) {
+        onReset(historyRev);
+        return;
+      }
+      knownHistoryRev = historyRev;
+    }
     gapOpen = true;
     retryDelay = 1000;
     clearRetry();
     void runSync();
   };
 
-  const onReset = (): void => {
+  const onReset = (historyRev?: number): void => {
     if (disposed) return;
+    if (typeof historyRev === "number") {
+      knownHistoryRev = historyRev;
+    }
     resetGen += 1;
     initialLoaded = false;
     syncedThroughId = "";

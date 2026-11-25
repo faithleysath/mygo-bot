@@ -108,6 +108,17 @@ impl HttpClient {
                     reauth_required: true,
                 })
                 | Err(_) => return Err(McpError::AuthRequired),
+                Ok(crate::cluster::sync::RefreshCoordination::PendingConfirmation) => {
+                    if let Ok(Some((creds, rejected))) = auth.account.load_credentials().await
+                        && !storage::needs_refresh(&creds, rejected)
+                        && let Some(tr) = creds.token_response
+                    {
+                        return Ok(Some(tr.access_token));
+                    }
+                    // Never fall back to local refresh while an in-doubt delegated refresh may
+                    // have consumed a single-use refresh token on the coordinator (P1 #7).
+                    return Err(McpError::TransportClosed);
+                }
                 Ok(
                     crate::cluster::sync::RefreshCoordination::Local
                     | crate::cluster::sync::RefreshCoordination::Delegated {

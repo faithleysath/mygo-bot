@@ -16,6 +16,11 @@ use crate::{
 
 const MAX_SESSION_CHUNK_BYTES: usize = 900 * 1024;
 const MAX_SESSION_CHUNK_ITEMS: usize = 200;
+pub const MAX_INLINE_COMMIT_PAYLOAD_BYTES: usize = 1_500_000;
+pub const COMMIT_CHUNK_BYTES: usize = 512 * 1024;
+pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MCP_ANCESTOR_HASHES: usize = 8192;
+const MAX_SYNC_RESOLUTIONS: i64 = 2048;
 
 thread_local! {
     static SYNC_STAGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -93,6 +98,45 @@ pub struct CommitWire {
     pub op_type: String,
     pub payload: String,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommitMeta {
+    pub stream_id: String,
+    pub kind: StreamKind,
+    pub epoch: i64,
+    pub seq: i64,
+    pub parent_hash: [u8; 32],
+    pub commit_hash: [u8; 32],
+    pub author_node_id: String,
+    pub op_type: String,
+    pub payload_len: i64,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommitsPage {
+    pub commits: Vec<CommitWire>,
+    pub oversized_next: Option<CommitMeta>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolutionReceipt {
+    pub stream_id: String,
+    pub kind: StreamKind,
+    pub chosen: String,
+    pub resolver_node_id: String,
+    pub local_epoch: i64,
+    pub local_seq: i64,
+    pub local_hash: [u8; 32],
+    pub remote_epoch: i64,
+    pub remote_seq: i64,
+    pub remote_hash: [u8; 32],
+    pub winner_epoch: i64,
+    pub winner_seq: i64,
+    pub winner_hash: [u8; 32],
+    pub resolved_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -454,33 +498,17 @@ pub fn verify_local_prefix(
          WHERE stream_id=?1 AND epoch=?2 AND seq BETWEEN ?3 AND ?4
          ORDER BY seq ASC",
     )?;
-    let rows = stmt
-        .query_map(params![stream_id, epoch, checkpoint_seq, target_seq], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let expected_len = usize::try_from(target_seq - checkpoint_seq + 1).unwrap_or(usize::MAX);
-    if rows.len() != expected_len {
-        return Ok(false);
-    }
+    let mut rows = stmt.query(params![stream_id, epoch, checkpoint_seq, target_seq])?;
 
     let mut expected_seq = checkpoint_seq;
     let mut expected_parent = [0u8; 32];
     let mut last_hash = [0u8; 32];
-    for (idx, (seq, pvec, cvec, author, op_type, payload, created_at)) in rows.into_iter().enumerate()
-    {
-        let parent_hash = to_hash32(pvec)?;
-        let commit_hash = to_hash32(cvec)?;
-        if idx == 0 && checkpoint_seq > 1 {
+    let mut count = 0i64;
+    while let Some(r) = rows.next()? {
+        let seq: i64 = r.get(0)?;
+        let parent_hash = to_hash32(r.get::<_, Vec<u8>>(1)?)?;
+        let commit_hash = to_hash32(r.get::<_, Vec<u8>>(2)?)?;
+        if count == 0 && checkpoint_seq > 1 {
             // A terminal checkpoint may start cleanly above seq 1.
             expected_parent = parent_hash;
         }
@@ -491,10 +519,10 @@ pub fn verify_local_prefix(
             seq,
             parent_hash,
             commit_hash,
-            author_node_id: author,
-            op_type,
-            payload,
-            created_at,
+            author_node_id: r.get(3)?,
+            op_type: r.get(4)?,
+            payload: r.get(5)?,
+            created_at: r.get(6)?,
         };
         if !verify_commit(&wire, expected_seq, &expected_parent) {
             return Ok(false);
@@ -502,25 +530,74 @@ pub fn verify_local_prefix(
         expected_parent = commit_hash;
         last_hash = commit_hash;
         expected_seq += 1;
+        count += 1;
     }
-    Ok(&last_hash == target_hash)
+    let expected_len = target_seq - checkpoint_seq + 1;
+    Ok(count == expected_len && &last_hash == target_hash)
+}
+
+fn verify_local_tip_commit(conn: &Connection, st: &LocalStreamState) -> Result<bool> {
+    if st.checkpoint_seq != 1 || !st.is_body_complete() {
+        return Ok(false);
+    }
+    if st.head_seq == 0 {
+        return Ok(st.head_hash == [0u8; 32]);
+    }
+    let has_base: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=1)",
+        )?
+        .query_row(params![&st.stream_id, st.epoch], |r| r.get(0))?;
+    if !has_base {
+        return Ok(false);
+    }
+    let row = conn
+        .prepare_cached(
+            "SELECT parent_hash,commit_hash,author_node_id,op_type,payload,created_at
+             FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=?3",
+        )?
+        .query_row(params![&st.stream_id, st.epoch, st.head_seq], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+        .optional()?;
+    let Some((pvec, cvec, author_node_id, op_type, payload, created_at)) = row else {
+        return Ok(false);
+    };
+    let parent_hash = to_hash32(pvec)?;
+    let commit_hash = to_hash32(cvec)?;
+    if st.head_seq == 1 && parent_hash != [0u8; 32] {
+        return Ok(false);
+    }
+    let wire = CommitWire {
+        stream_id: st.stream_id.clone(),
+        kind: st.kind,
+        epoch: st.epoch,
+        seq: st.head_seq,
+        parent_hash,
+        commit_hash,
+        author_node_id,
+        op_type,
+        payload,
+        created_at,
+    };
+    Ok(commit_hash == st.head_hash && verify_commit(&wire, st.head_seq, &parent_hash))
 }
 
 pub fn is_session_writable_local(conn: &Connection, sid: SessionId) -> Result<bool> {
     let Some(st) = stream_head(conn, sid.as_str())? else {
         return Ok(true);
     };
-    if st.deleted || st.retired || st.checkpoint_seq != 1 || !st.is_body_complete() {
+    if st.deleted || st.retired {
         return Ok(false);
     }
-    verify_local_prefix(
-        conn,
-        &st.stream_id,
-        st.epoch,
-        st.checkpoint_seq,
-        st.head_seq,
-        &st.head_hash,
-    )
+    verify_local_tip_commit(conn, &st)
 }
 
 pub fn record_commit_with_epoch(
@@ -552,18 +629,7 @@ pub fn record_commit_with_epoch(
                         "stream {stream_id} epoch superseded; aborting stale write"
                     )));
                 }
-                if kind == StreamKind::Session
-                    && (e.checkpoint_seq != 1
-                        || !e.is_body_complete()
-                        || !verify_local_prefix(
-                            conn,
-                            stream_id,
-                            e.epoch,
-                            e.checkpoint_seq,
-                            e.head_seq,
-                            &e.head_hash,
-                        )?)
-                {
+                if kind == StreamKind::Session && !verify_local_tip_commit(conn, &e)? {
                     return Err(Error::conflict(format!(
                         "session {stream_id} history is incomplete; sync full history before writing"
                     )));
@@ -782,6 +848,46 @@ pub fn record_mcp_if_shared(conn: &Connection, id: McpServerId) -> Result<()> {
     Ok(())
 }
 
+fn collect_ancestor_hashes_hex(
+    conn: &Connection,
+    stream_id: &str,
+    epoch: i64,
+    up_to_seq: i64,
+) -> Result<(i64, Vec<String>)> {
+    if up_to_seq <= 0 {
+        return Ok((0, Vec::new()));
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq, commit_hash FROM sync_commits
+         WHERE stream_id=?1 AND epoch=?2 AND seq<=?3
+         ORDER BY seq DESC LIMIT ?4",
+    )?;
+    let mut rows = stmt.query(params![
+        stream_id,
+        epoch,
+        up_to_seq,
+        MAX_MCP_ANCESTOR_HASHES as i64
+    ])?;
+    let mut desc = Vec::new();
+    let mut expected = up_to_seq;
+    while let Some(r) = rows.next()? {
+        let seq: i64 = r.get(0)?;
+        if seq != expected {
+            break;
+        }
+        let h = to_hash32(r.get::<_, Vec<u8>>(1)?)?;
+        desc.push(hex_hash(&h));
+        expected -= 1;
+    }
+    desc.reverse();
+    let start_seq = if desc.is_empty() {
+        0
+    } else {
+        up_to_seq - i64::try_from(desc.len()).unwrap_or(0) + 1
+    };
+    Ok((start_seq, desc))
+}
+
 /// Write a higher-epoch terminal deletion checkpoint for an unshared/deleted MCP server and purge
 /// all older history commits containing sensitive configuration or OAuth credentials (P1-09).
 pub fn record_mcp_deleted(conn: &Connection, id: McpServerId) -> Result<()> {
@@ -793,12 +899,16 @@ pub fn record_mcp_deleted(conn: &Connection, id: McpServerId) -> Result<()> {
         if st.retired || st.deleted {
             return Ok(());
         }
+        let (ancestor_start_seq, ancestor_hashes_hex) =
+            collect_ancestor_hashes_hex(conn, id.as_str(), st.epoch, st.head_seq)?;
         let new_epoch = st.epoch + 1;
         let payload = json!({
             "id": id,
             "base_epoch": st.epoch,
             "base_seq": st.head_seq,
             "base_hash_hex": hex_hash(&st.head_hash),
+            "ancestor_start_seq": ancestor_start_seq,
+            "ancestor_hashes_hex": ancestor_hashes_hex,
         })
         .to_string();
         replace_stream_with_epoch_snapshot(
@@ -864,8 +974,11 @@ pub fn record_call(conn: &Connection, id: CallId) -> Result<()> {
     )
 }
 
-pub fn read_session_snapshot(conn: &Connection, sid: SessionId) -> Result<SessionSnapshot> {
-    let required_modalities = crate::media::session_required_modalities(conn, sid)?;
+fn read_session_snapshot_with_modalities(
+    conn: &Connection,
+    sid: SessionId,
+    required_modalities: Vec<String>,
+) -> Result<SessionSnapshot> {
     conn.prepare_cached(
         "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id,input_queue_cursor,needs_model
          FROM sessions WHERE id=?",
@@ -893,6 +1006,11 @@ pub fn read_session_snapshot(conn: &Connection, sid: SessionId) -> Result<Sessio
         })
     })
     .map_err(Into::into)
+}
+
+pub fn read_session_snapshot(conn: &Connection, sid: SessionId) -> Result<SessionSnapshot> {
+    let required_modalities = crate::media::session_required_modalities(conn, sid)?;
+    read_session_snapshot_with_modalities(conn, sid, required_modalities)
 }
 
 pub fn read_item_snapshot(conn: &Connection, id: ItemId) -> Result<ItemSnapshot> {
@@ -1006,7 +1124,51 @@ pub fn record_session_delta_at_epoch(
     }
     items.sort_by_key(|item| item.id);
     let attachments = load_attachment_refs(conn, &items)?;
-    let snap = read_session_snapshot(conn, sid)?;
+    let prev_snap: Option<SessionSnapshot> = if invalidated_warnings.is_empty()
+        && items.iter().all(|it| it.kind != "withdrawal")
+    {
+        conn.prepare_cached("SELECT head_snapshot FROM sync_streams WHERE stream_id=?")?
+            .query_row([sid.as_str()], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<SessionSnapshot>(&raw).ok())
+    } else {
+        None
+    };
+    let required_modalities = if let Some(prev) = prev_snap {
+        let mut mods: std::collections::BTreeSet<String> =
+            prev.required_modalities.into_iter().collect();
+        for item in &items {
+            if let Ok(payload) = serde_json::from_str::<Value>(&item.payload) {
+                if item.kind == "codemode_event"
+                    && payload.get("notify").and_then(Value::as_bool) != Some(true)
+                    && !context_items.iter().any(|c| c.item_id == item.id)
+                {
+                    continue;
+                }
+                crate::media::item_required_modalities(conn, &item.kind, &payload, &mut mods)?;
+            }
+        }
+        for ctx in &context_items {
+            if items.iter().any(|it| it.id == ctx.item_id) {
+                continue;
+            }
+            if let Some((kind, raw_payload)) = conn
+                .prepare_cached("SELECT kind, payload FROM items WHERE id=?")?
+                .query_row([ctx.item_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .optional()?
+                && let Ok(payload) = serde_json::from_str::<Value>(&raw_payload)
+            {
+                crate::media::item_required_modalities(conn, &kind, &payload, &mut mods)?;
+            }
+        }
+        mods.into_iter().collect()
+    } else {
+        crate::media::session_required_modalities(conn, sid)?
+    };
+    let snap = read_session_snapshot_with_modalities(conn, sid, required_modalities)?;
     let head_snap_json = serde_json::to_string(&snap)
         .map_err(|e| Error::internal(format!("session snapshot encode failed: {e}")))?;
     // Always include canonical normalized SessionSnapshot so author and all receivers produce the
@@ -1277,17 +1439,40 @@ pub fn read_commits_range(
     max_count: usize,
     max_bytes: usize,
 ) -> Result<(Vec<CommitWire>, bool)> {
+    let page = read_commits_page(conn, stream_id, epoch, after_seq, up_to_seq, max_count, max_bytes)?;
+    if page.oversized_next.is_some() {
+        return Err(Error::bad(
+            "commit payload exceeds inline limit; use chunked commit fetch",
+        ));
+    }
+    Ok((page.commits, page.has_more))
+}
+
+pub fn read_commits_page(
+    conn: &Connection,
+    stream_id: &str,
+    epoch: i64,
+    after_seq: i64,
+    up_to_seq: Option<i64>,
+    max_count: usize,
+    max_bytes: usize,
+) -> Result<CommitsPage> {
     let stream_kind = conn
         .prepare_cached("SELECT kind FROM sync_streams WHERE stream_id=?")?
         .query_row([stream_id], |r| r.get::<_, String>(0))
         .optional()?;
     let Some(kind_str) = stream_kind else {
-        return Ok((Vec::new(), false));
+        return Ok(CommitsPage {
+            commits: Vec::new(),
+            oversized_next: None,
+            has_more: false,
+        });
     };
     let kind = StreamKind::from_db(&kind_str)?;
     let max_count = max_count.clamp(1, 256);
-    // Do NOT prefetch count+1 rows with .collect(): stream row-by-row and enforce byte limit
-    // incrementally so bounded RPC budgets are strictly respected (P1-13).
+    let inline_single_limit = max_bytes.min(MAX_INLINE_COMMIT_PAYLOAD_BYTES);
+    // Do NOT prefetch count+1 rows with .collect(): stream row-by-row and enforce serialized byte
+    // budget incrementally so bounded RPC budgets are strictly respected (P1-03 / P1-13).
     let mut stmt = conn.prepare_cached(
         "SELECT seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
          FROM sync_commits
@@ -1297,6 +1482,7 @@ pub fn read_commits_range(
     let mut rows = stmt.query(params![stream_id, epoch, after_seq, up_to_seq])?;
 
     let mut out = Vec::new();
+    let mut oversized_next = None;
     let mut total_bytes = 0usize;
     let mut has_more = false;
     while let Some(row) = rows.next()? {
@@ -1307,12 +1493,35 @@ pub fn read_commits_range(
         let op_type: String = row.get(4)?;
         let payload: String = row.get(5)?;
         let created_at: i64 = row.get(6)?;
-        let approx = payload.len() + 256;
-        if !out.is_empty() && (out.len() >= max_count || total_bytes + approx > max_bytes) {
+        let wire_estimate = if payload.len() > 256 * 1024 {
+            serde_json::to_string(&payload)
+                .map(|s| s.len() + 256)
+                .unwrap_or_else(|_| payload.len().saturating_mul(2).saturating_add(256))
+        } else {
+            payload.len().saturating_mul(2).saturating_add(256)
+        };
+        if out.is_empty() && wire_estimate > inline_single_limit {
+            oversized_next = Some(CommitMeta {
+                stream_id: stream_id.to_owned(),
+                kind,
+                epoch,
+                seq,
+                parent_hash: to_hash32(parent_vec)?,
+                commit_hash: to_hash32(commit_vec)?,
+                author_node_id,
+                op_type,
+                payload_len: i64::try_from(payload.len())
+                    .map_err(|_| Error::internal("commit payload size overflow"))?,
+                created_at,
+            });
+            has_more = rows.next()?.is_some();
+            break;
+        }
+        if !out.is_empty() && (out.len() >= max_count || total_bytes + wire_estimate > max_bytes) {
             has_more = true;
             break;
         }
-        total_bytes += approx;
+        total_bytes += wire_estimate;
         out.push(CommitWire {
             stream_id: stream_id.to_owned(),
             kind,
@@ -1326,7 +1535,61 @@ pub fn read_commits_range(
             created_at,
         });
     }
-    Ok((out, has_more))
+    Ok(CommitsPage {
+        commits: out,
+        oversized_next,
+        has_more,
+    })
+}
+
+pub fn read_commit_payload_chunk(
+    conn: &Connection,
+    stream_id: &str,
+    epoch: i64,
+    seq: i64,
+    expected_commit_hash: &[u8; 32],
+    offset: u64,
+    max_bytes: usize,
+) -> Result<Option<(Vec<u8>, bool)>> {
+    let limit = i64::try_from(max_bytes.clamp(1, COMMIT_CHUNK_BYTES)).unwrap_or(512 * 1024);
+    let offset_i64 = i64::try_from(offset).map_err(|_| Error::bad("chunk offset overflow"))?;
+    let sql_offset = offset_i64
+        .checked_add(1)
+        .ok_or_else(|| Error::bad("chunk offset overflow"))?;
+    let row: Option<(i64, Vec<u8>)> = conn
+        .prepare_cached(
+            "SELECT length(CAST(payload AS BLOB)), substr(CAST(payload AS BLOB), ?5, ?6)
+             FROM sync_commits
+             WHERE stream_id=?1 AND epoch=?2 AND seq=?3 AND commit_hash=?4",
+        )?
+        .query_row(
+            params![
+                stream_id,
+                epoch,
+                seq,
+                expected_commit_hash.as_slice(),
+                sql_offset,
+                limit
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((total_len, chunk)) = row else {
+        return Ok(None);
+    };
+    if offset_i64 < 0 || offset_i64 > total_len {
+        return Err(Error::bad("commit chunk offset out of bounds"));
+    }
+    let end = offset_i64 + i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+    Ok(Some((chunk, end >= total_len)))
+}
+
+pub fn session_history_rev(conn: &Connection, sid: SessionId) -> Result<i64> {
+    Ok(conn
+        .prepare_cached("SELECT reset_gen FROM sync_streams WHERE stream_id=?")?
+        .query_row([sid.as_str()], |r| r.get::<_, i64>(0))
+        .optional()?
+        .unwrap_or(0))
 }
 
 pub fn read_delete_commit(
@@ -1417,6 +1680,10 @@ fn delete_session_local_rows(conn: &Connection, sid: SessionId) -> Result<()> {
 }
 
 fn clear_session_body_rows(conn: &Connection, sid: SessionId) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET status='paused' WHERE id=? AND status IN ('running','pausing')",
+        [sid],
+    )?;
     conn.execute("DELETE FROM context_items WHERE session_id=?", [sid])?;
     conn.execute(
         "DELETE FROM invalidated_warnings WHERE item_id IN (SELECT id FROM items WHERE session_id=?)",
@@ -1850,24 +2117,29 @@ pub fn apply_unwatched_session_head(
                     )?;
                     return Ok(ApplyOutcome::Conflict { newly_recorded });
                 }
-                // remote.head_seq > l.head_seq at same epoch: if common-height hash check failed, record conflict!
-                if verified_ancestor_same_epoch == Some(false) {
-                    let newly_recorded = record_conflict_row(
-                        conn,
-                        &ConflictWrite {
-                            stream_id: &remote.stream_id,
-                            kind: StreamKind::Session,
-                            local_epoch: l.epoch,
-                            local_seq: l.head_seq,
-                            local_hash: &l.head_hash,
-                            remote,
-                            remote_node_id,
-                            reason: "diverged",
-                            related_local_id: None,
-                            remote_snapshot: remote.head_snapshot.as_deref(),
-                        },
-                    )?;
-                    return Ok(ApplyOutcome::Conflict { newly_recorded });
+                if l.head_seq > 0 {
+                    match verified_ancestor_same_epoch {
+                        Some(true) => {}
+                        None => return Ok(ApplyOutcome::Ignored),
+                        Some(false) => {
+                            let newly_recorded = record_conflict_row(
+                                conn,
+                                &ConflictWrite {
+                                    stream_id: &remote.stream_id,
+                                    kind: StreamKind::Session,
+                                    local_epoch: l.epoch,
+                                    local_seq: l.head_seq,
+                                    local_hash: &l.head_hash,
+                                    remote,
+                                    remote_node_id,
+                                    reason: "diverged",
+                                    related_local_id: None,
+                                    remote_snapshot: remote.head_snapshot.as_deref(),
+                                },
+                            )?;
+                            return Ok(ApplyOutcome::Conflict { newly_recorded });
+                        }
+                    }
                 }
             } else {
                 // Higher epoch supersedes unwatched session head. (Watched sessions go through
@@ -1930,12 +2202,68 @@ pub fn apply_unwatched_session_head(
     })
 }
 
+fn mcp_local_is_ancestor_of_tombstone(
+    local: &LocalStreamState,
+    delete_payload: &str,
+    ancestor_verified: bool,
+) -> bool {
+    if local.head_seq == 0 || ancestor_verified {
+        return true;
+    }
+    let val: Value = match serde_json::from_str(delete_payload) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let base_epoch = val.get("base_epoch").and_then(Value::as_i64).unwrap_or(0);
+    let base_seq = val.get("base_seq").and_then(Value::as_i64).unwrap_or(0);
+    let base_hash_hex = val.get("base_hash_hex").and_then(Value::as_str).unwrap_or("");
+    if local.epoch != base_epoch || base_seq <= 0 || local.head_seq > base_seq {
+        return false;
+    }
+    let local_hex = hex_hash(&local.head_hash);
+    if local.head_seq == base_seq {
+        return local_hex == base_hash_hex;
+    }
+    let start_seq = val
+        .get("ancestor_start_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let Some(hashes) = val.get("ancestor_hashes_hex").and_then(Value::as_array) else {
+        return false;
+    };
+    if start_seq <= 0 || local.head_seq < start_seq {
+        return false;
+    }
+    let Ok(idx) = usize::try_from(local.head_seq - start_seq) else {
+        return false;
+    };
+    hashes
+        .get(idx)
+        .and_then(Value::as_str)
+        .is_some_and(|h| h == local_hex)
+}
+
+fn remote_matches_expected_conflict(
+    remote_head: &StreamHead,
+    exp_c: &ConflictRecord,
+    ancestor_verified: bool,
+) -> bool {
+    (remote_head.epoch == exp_c.remote_epoch
+        && remote_head.head_seq == exp_c.remote_seq
+        && remote_head.head_hash == exp_c.remote_hash)
+        || remote_head.epoch > exp_c.remote_epoch
+        || (remote_head.epoch == exp_c.remote_epoch
+            && remote_head.head_seq > exp_c.remote_seq
+            && ancestor_verified)
+}
+
 pub fn apply_terminal_session_delete(
     conn: &Connection,
     remote_head: &StreamHead,
     delete_commit: &CommitWire,
     ancestor_verified: bool,
     remote_node_id: &str,
+    expected_conflict: Option<&ConflictRecord>,
 ) -> Result<ApplyOutcome> {
     if remote_head.kind != StreamKind::Session
         || !remote_head.deleted
@@ -1958,55 +2286,77 @@ pub fn apply_terminal_session_delete(
         .parse()
         .map_err(|_| Error::bad("invalid session stream_id"))?;
     with_savepoint(conn, "terminal_ses_del", || {
+        if let Some(exp_c) = expected_conflict {
+            let current_c = get_conflict(conn, &remote_head.stream_id)?;
+            if &current_c != exp_c {
+                return Err(Error::conflict(
+                    "sync conflict state changed concurrently; retry resolution",
+                ));
+            }
+            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_verified) {
+                return Err(Error::conflict(
+                    "remote terminal delete does not match conflicted branch",
+                ));
+            }
+        }
         let local = stream_head(conn, &remote_head.stream_id)?;
         let mut session_deleted_conflict = false;
         if let Some(ref l) = local {
-            if remote_head.epoch < l.epoch {
-                return Ok(ApplyOutcome::Ignored);
-            }
-            if remote_head.epoch == l.epoch {
-                if l.deleted && l.head_seq == remote_head.head_seq && l.head_hash == remote_head.head_hash {
+            if expected_conflict.is_none() {
+                if remote_head.epoch < l.epoch {
                     return Ok(ApplyOutcome::Ignored);
                 }
-                if l.synced_seq == remote_head.head_seq && l.synced_hash == remote_head.head_hash {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                // Check whether local branch is an ancestor of remote_head.
-                let is_ancestor = l.head_seq == 0
-                    || (l.head_seq < remote_head.head_seq
-                        && (ancestor_verified
-                            || (l.head_seq + 1 == remote_head.head_seq
-                                && delete_commit.parent_hash == l.head_hash)));
-                if !is_ancestor {
-                    let newly_recorded = record_conflict_row(
-                        conn,
-                        &ConflictWrite {
-                            stream_id: &remote_head.stream_id,
-                            kind: StreamKind::Session,
-                            local_epoch: l.epoch,
-                            local_seq: l.head_seq,
-                            local_hash: &l.head_hash,
-                            remote: remote_head,
-                            remote_node_id,
-                            reason: "diverged",
-                            related_local_id: None,
-                            remote_snapshot: None,
-                        },
-                    )?;
-                    return Ok(ApplyOutcome::Conflict { newly_recorded });
+                if remote_head.epoch == l.epoch {
+                    if l.deleted
+                        && l.head_seq == remote_head.head_seq
+                        && l.head_hash == remote_head.head_hash
+                    {
+                        return Ok(ApplyOutcome::Ignored);
+                    }
+                    if l.synced_seq == remote_head.head_seq
+                        && l.synced_hash == remote_head.head_hash
+                    {
+                        return Ok(ApplyOutcome::Ignored);
+                    }
+                    // Check whether local branch is an ancestor of remote_head.
+                    let is_ancestor = l.head_seq == 0
+                        || (l.head_seq < remote_head.head_seq
+                            && (ancestor_verified
+                                || (l.head_seq + 1 == remote_head.head_seq
+                                    && delete_commit.parent_hash == l.head_hash)));
+                    if !is_ancestor {
+                        let newly_recorded = record_conflict_row(
+                            conn,
+                            &ConflictWrite {
+                                stream_id: &remote_head.stream_id,
+                                kind: StreamKind::Session,
+                                local_epoch: l.epoch,
+                                local_seq: l.head_seq,
+                                local_hash: &l.head_hash,
+                                remote: remote_head,
+                                remote_node_id,
+                                reason: "diverged",
+                                related_local_id: None,
+                                remote_snapshot: None,
+                            },
+                        )?;
+                        return Ok(ApplyOutcome::Conflict { newly_recorded });
+                    }
+                } else {
+                    session_deleted_conflict = has_conflict(conn, &remote_head.stream_id)?;
                 }
             } else {
-                session_deleted_conflict = has_conflict(conn, &remote_head.stream_id)?;
+                session_deleted_conflict = true;
             }
         }
         // Check if payload carries detached calls that might belong to us; deleting session
         // unconditionally cleans items first and sets llm_calls.session_id = NULL, avoiding FK error (P1-01).
         delete_session_local_rows(conn, sid)?;
-        let resolved_conflict = session_deleted_conflict
-            || conn.execute(
-                "DELETE FROM sync_conflicts WHERE stream_id=?",
-                [&remote_head.stream_id],
-            )? > 0;
+        let deleted_conflict_rows = conn.execute(
+            "DELETE FROM sync_conflicts WHERE stream_id=?",
+            [&remote_head.stream_id],
+        )?;
+        let resolved_conflict = session_deleted_conflict || deleted_conflict_rows > 0;
         conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [&remote_head.stream_id])?;
         conn.execute("DELETE FROM sync_staging_commits WHERE stream_id=?", [&remote_head.stream_id])?;
         conn.execute(
@@ -2039,6 +2389,29 @@ pub fn apply_terminal_session_delete(
                 delete_commit.created_at
             ],
         )?;
+        if let Some(exp_c) = expected_conflict {
+            let resolver = load_local_node(conn)?.node_id;
+            let now = chrono::Utc::now().timestamp_millis();
+            record_resolution_receipt(
+                conn,
+                &ResolutionReceipt {
+                    stream_id: remote_head.stream_id.clone(),
+                    kind: StreamKind::Session,
+                    chosen: "cluster".to_owned(),
+                    resolver_node_id: resolver,
+                    local_epoch: exp_c.local_epoch,
+                    local_seq: exp_c.local_seq,
+                    local_hash: exp_c.local_hash,
+                    remote_epoch: exp_c.remote_epoch,
+                    remote_seq: exp_c.remote_seq,
+                    remote_hash: exp_c.remote_hash,
+                    winner_epoch: remote_head.epoch,
+                    winner_seq: remote_head.head_seq,
+                    winner_hash: remote_head.head_hash,
+                    resolved_at: now,
+                },
+            )?;
+        }
         Ok(ApplyOutcome::Applied {
             updated: true,
             session_id: Some(sid),
@@ -2058,6 +2431,7 @@ pub fn apply_terminal_mcp_delete(
     delete_commit: &CommitWire,
     ancestor_verified: bool,
     remote_node_id: &str,
+    expected_conflict: Option<&ConflictRecord>,
 ) -> Result<ApplyOutcome> {
     if remote_head.kind != StreamKind::Mcp
         || !remote_head.deleted
@@ -2080,13 +2454,24 @@ pub fn apply_terminal_mcp_delete(
         .parse()
         .map_err(|_| Error::bad("invalid mcp stream_id"))?;
     with_savepoint(conn, "terminal_mcp_del", || {
+        if let Some(exp_c) = expected_conflict {
+            let current_c = get_conflict(conn, &remote_head.stream_id)?;
+            if &current_c != exp_c {
+                return Err(Error::conflict(
+                    "sync conflict state changed concurrently; retry resolution",
+                ));
+            }
+            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_verified) {
+                return Err(Error::conflict(
+                    "remote terminal MCP delete does not match conflicted branch",
+                ));
+            }
+        }
         let local = stream_head(conn, &remote_head.stream_id)?;
-        let val: Value = serde_json::from_str(&delete_commit.payload).unwrap_or_default();
-        let base_epoch = val.get("base_epoch").and_then(Value::as_i64).unwrap_or(0);
-        let base_seq = val.get("base_seq").and_then(Value::as_i64).unwrap_or(0);
-        let base_hash_hex = val.get("base_hash_hex").and_then(Value::as_str).unwrap_or("");
 
-        if let Some(ref l) = local {
+        if expected_conflict.is_none()
+            && let Some(ref l) = local
+        {
             if remote_head.epoch < l.epoch {
                 return Ok(ApplyOutcome::Ignored);
             }
@@ -2097,14 +2482,12 @@ pub fn apply_terminal_mcp_delete(
                 {
                     return Ok(ApplyOutcome::Ignored);
                 }
-            }
-            // Detect offline edits on local copy that hadn't converged with base checkpoint before retirement!
-            if l.epoch == base_epoch
-                && base_seq > 0
-                && !ancestor_verified
-                && (l.head_seq > base_seq
-                    || (l.head_seq == base_seq && hex_hash(&l.head_hash) != base_hash_hex))
-            {
+            } else if !mcp_local_is_ancestor_of_tombstone(
+                l,
+                &delete_commit.payload,
+                ancestor_verified,
+            ) {
+                // Detect any offline edits (shorter, equal, or longer) without proven ancestry.
                 let newly_recorded = record_conflict_row(
                     conn,
                     &ConflictWrite {
@@ -2148,7 +2531,8 @@ pub fn apply_terminal_mcp_delete(
         let resolved_conflict = conn.execute(
             "DELETE FROM sync_conflicts WHERE stream_id=?",
             [&remote_head.stream_id],
-        )? > 0;
+        )? > 0
+            || expected_conflict.is_some();
         let mut unblocked = collect_unblocked_conflicts(conn, &remote_head.stream_id)?;
         conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [&remote_head.stream_id])?;
         conn.execute("DELETE FROM sync_staging_commits WHERE stream_id=?", [&remote_head.stream_id])?;
@@ -2182,6 +2566,29 @@ pub fn apply_terminal_mcp_delete(
                 delete_commit.created_at
             ],
         )?;
+        if let Some(exp_c) = expected_conflict {
+            let resolver = load_local_node(conn)?.node_id;
+            let now = chrono::Utc::now().timestamp_millis();
+            record_resolution_receipt(
+                conn,
+                &ResolutionReceipt {
+                    stream_id: remote_head.stream_id.clone(),
+                    kind: StreamKind::Mcp,
+                    chosen: "cluster".to_owned(),
+                    resolver_node_id: resolver,
+                    local_epoch: exp_c.local_epoch,
+                    local_seq: exp_c.local_seq,
+                    local_hash: exp_c.local_hash,
+                    remote_epoch: exp_c.remote_epoch,
+                    remote_seq: exp_c.remote_seq,
+                    remote_hash: exp_c.remote_hash,
+                    winner_epoch: remote_head.epoch,
+                    winner_seq: remote_head.head_seq,
+                    winner_hash: remote_head.head_hash,
+                    resolved_at: now,
+                },
+            )?;
+        }
         Ok(ApplyOutcome::Applied {
             updated: true,
             session_id: None,
@@ -2743,6 +3150,29 @@ pub fn apply_remote_commits_page(
             if c.seq == fixed_target.head_seq && c.commit_hash != fixed_target.head_hash {
                 return Err(Error::bad("commit batch did not match pledged target head_hash"));
             }
+            if let Some(ref l) = local
+                && l.head_seq > 0
+                && l.synced_seq < l.head_seq
+                && c.seq == l.head_seq
+                && c.commit_hash != l.head_hash
+            {
+                let newly_recorded = record_conflict_row(
+                    conn,
+                    &ConflictWrite {
+                        stream_id: &fixed_target.stream_id,
+                        kind: fixed_target.kind,
+                        local_epoch: l.epoch,
+                        local_seq: l.head_seq,
+                        local_hash: &l.head_hash,
+                        remote: fixed_target,
+                        remote_node_id,
+                        reason: "diverged",
+                        related_local_id: None,
+                        remote_snapshot: fixed_target.head_snapshot.as_deref(),
+                    },
+                )?;
+                return Ok(ApplyOutcome::Conflict { newly_recorded });
+            }
             expected_parent = c.commit_hash;
         }
 
@@ -2828,8 +3258,12 @@ pub fn apply_remote_commits_page(
         };
         let reached_head =
             last_commit.seq == final_head_seq && last_commit.commit_hash == final_head_hash;
+        // Treat Session `watched` as persistent watch intent; body readiness is tracked via
+        // is_body_complete() using synced_epoch/synced_seq/synced_hash.
         let watched = match fixed_target.kind {
-            StreamKind::Session => reached_head && (mark_watched || local.as_ref().is_some_and(|l| l.watched) || deleted),
+            StreamKind::Session => {
+                mark_watched || local.as_ref().is_some_and(|l| l.watched) || deleted
+            }
             _ => reached_head,
         };
         let checkpoint_seq = local
@@ -2917,6 +3351,14 @@ pub fn apply_remote_commits_page(
     })
 }
 
+pub fn mark_session_watched(conn: &Connection, stream_id: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE sync_streams SET watched=1 WHERE stream_id=? AND kind='session' AND watched=0",
+        [stream_id],
+    )?;
+    Ok(changed > 0)
+}
+
 pub fn pin_session_target_head(
     conn: &Connection,
     remote: &StreamHead,
@@ -2942,7 +3384,7 @@ pub fn pin_session_target_head(
             }
             conn.execute(
                 "UPDATE sync_streams
-                 SET head_seq=?2, head_hash=?3, watched=0,
+                 SET head_seq=?2, head_hash=?3,
                      head_snapshot=coalesce(?4, head_snapshot), updated_at=?5
                  WHERE stream_id=?1",
                 params![
@@ -3314,12 +3756,13 @@ pub fn commit_staged_epoch(
             true
         };
         conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?3,?4,?5,1,?6,?7,?8,?9,?10)
+            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,reset_gen,head_snapshot,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?3,?4,?5,1,?6,?7,?8,0,?9,?10)
              ON CONFLICT(stream_id) DO UPDATE SET
                epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
                synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
                checkpoint_seq=1,watched=excluded.watched,deleted=excluded.deleted,retired=excluded.retired,
+               reset_gen=CASE WHEN excluded.kind='session' AND NOT excluded.deleted THEN sync_streams.reset_gen+1 ELSE sync_streams.reset_gen END,
                head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
             params![
                 target_head.stream_id,
@@ -3344,6 +3787,30 @@ pub fn commit_staged_epoch(
             "DELETE FROM sync_staging_commits WHERE stream_id=?",
             [&target_head.stream_id],
         )?;
+
+        if let Some(exp_c) = expected_conflict {
+            let resolver = load_local_node(conn)?.node_id;
+            let now = chrono::Utc::now().timestamp_millis();
+            record_resolution_receipt(
+                conn,
+                &ResolutionReceipt {
+                    stream_id: target_head.stream_id.clone(),
+                    kind: target_head.kind,
+                    chosen: "cluster".to_owned(),
+                    resolver_node_id: resolver,
+                    local_epoch: exp_c.local_epoch,
+                    local_seq: exp_c.local_seq,
+                    local_hash: exp_c.local_hash,
+                    remote_epoch: exp_c.remote_epoch,
+                    remote_seq: exp_c.remote_seq,
+                    remote_hash: exp_c.remote_hash,
+                    winner_epoch: target_head.epoch,
+                    winner_seq: target_head.head_seq,
+                    winner_hash: target_head.head_hash,
+                    resolved_at: now,
+                },
+            )?;
+        }
 
         let mut unblocked_conflicts = Vec::new();
         if matches!(target_head.kind, StreamKind::Provider | StreamKind::Model | StreamKind::Mcp) {
@@ -3390,37 +3857,145 @@ pub fn record_fork_conflict(
     )
 }
 
-pub fn clear_resolved_conflict_from_peer(
+fn record_resolution_receipt(conn: &Connection, r: &ResolutionReceipt) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_resolutions(stream_id,kind,chosen,resolver_node_id,local_epoch,local_seq,local_hash,remote_epoch,remote_seq,remote_hash,winner_epoch,winner_seq,winner_hash,resolved_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+         ON CONFLICT(stream_id) DO UPDATE SET
+           kind=excluded.kind,chosen=excluded.chosen,resolver_node_id=excluded.resolver_node_id,
+           local_epoch=excluded.local_epoch,local_seq=excluded.local_seq,local_hash=excluded.local_hash,
+           remote_epoch=excluded.remote_epoch,remote_seq=excluded.remote_seq,remote_hash=excluded.remote_hash,
+           winner_epoch=excluded.winner_epoch,winner_seq=excluded.winner_seq,winner_hash=excluded.winner_hash,
+           resolved_at=excluded.resolved_at",
+        params![
+            r.stream_id,
+            r.kind.as_str(),
+            r.chosen,
+            r.resolver_node_id,
+            r.local_epoch,
+            r.local_seq,
+            r.local_hash.as_slice(),
+            r.remote_epoch,
+            r.remote_seq,
+            r.remote_hash.as_slice(),
+            r.winner_epoch,
+            r.winner_seq,
+            r.winner_hash.as_slice(),
+            r.resolved_at,
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM sync_resolutions WHERE stream_id IN (
+            SELECT stream_id FROM sync_resolutions
+            ORDER BY resolved_at DESC, stream_id DESC
+            LIMIT -1 OFFSET ?1
+        )",
+        [MAX_SYNC_RESOLUTIONS],
+    )?;
+    Ok(())
+}
+
+pub fn list_conflict_stream_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT stream_id FROM sync_conflicts ORDER BY detected_at ASC LIMIT 256",
+    )?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn read_resolutions_for_streams(
     conn: &Connection,
-    stream_id: &str,
+    stream_ids: &[String],
+) -> Result<Vec<ResolutionReceipt>> {
+    let mut out = Vec::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT stream_id,kind,chosen,resolver_node_id,local_epoch,local_seq,local_hash,
+                remote_epoch,remote_seq,remote_hash,winner_epoch,winner_seq,winner_hash,resolved_at
+         FROM sync_resolutions WHERE stream_id=?",
+    )?;
+    for sid in stream_ids.iter().take(256) {
+        if let Some(r) = stmt
+            .query_row([sid], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Vec<u8>>(12)?,
+                    row.get::<_, i64>(13)?,
+                ))
+            })
+            .optional()?
+        {
+            out.push(ResolutionReceipt {
+                stream_id: r.0,
+                kind: StreamKind::from_db(&r.1)?,
+                chosen: r.2,
+                resolver_node_id: r.3,
+                local_epoch: r.4,
+                local_seq: r.5,
+                local_hash: to_hash32(r.6)?,
+                remote_epoch: r.7,
+                remote_seq: r.8,
+                remote_hash: to_hash32(r.9)?,
+                winner_epoch: r.10,
+                winner_seq: r.11,
+                winner_hash: to_hash32(r.12)?,
+                resolved_at: r.13,
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub fn apply_resolution_receipt(
+    conn: &Connection,
     from_peer: &str,
-    resolved_epoch: i64,
-    resolved_seq: i64,
-    resolved_hash: &[u8; 32],
-    superseded_epoch: i64,
-    superseded_seq: i64,
-    superseded_hash: &[u8; 32],
+    receipt: &ResolutionReceipt,
 ) -> Result<bool> {
-    with_savepoint(conn, "peer_clear_conflict", || {
-        let Some(c) = get_conflict_opt(conn, stream_id)? else {
+    with_savepoint(conn, "apply_res_receipt", || {
+        let Some(c) = get_conflict_opt(conn, &receipt.stream_id)? else {
             return Ok(false);
         };
-        let Some(l) = stream_head(conn, stream_id)? else {
+        let Some(l) = stream_head(conn, &receipt.stream_id)? else {
             return Ok(false);
         };
-        let local_matches_winner = l.epoch == resolved_epoch
-            && l.head_seq == resolved_seq
-            && &l.head_hash == resolved_hash;
+        let local_matches_winner = l.epoch == receipt.winner_epoch
+            && l.head_seq == receipt.winner_seq
+            && l.head_hash == receipt.winner_hash;
+        if !local_matches_winner {
+            return Ok(false);
+        }
+        let exact_pair = (c.local_epoch == receipt.local_epoch
+            && c.local_seq == receipt.local_seq
+            && c.local_hash == receipt.local_hash
+            && c.remote_epoch == receipt.remote_epoch
+            && c.remote_seq == receipt.remote_seq
+            && c.remote_hash == receipt.remote_hash)
+            || (c.local_epoch == receipt.remote_epoch
+                && c.local_seq == receipt.remote_seq
+                && c.local_hash == receipt.remote_hash
+                && c.remote_epoch == receipt.local_epoch
+                && c.remote_seq == receipt.local_seq
+                && c.remote_hash == receipt.local_hash);
         let peer_matched = c.remote_node_id == from_peer
-            && c.remote_epoch == superseded_epoch
-            && c.remote_seq == superseded_seq
-            && c.remote_hash == *superseded_hash
-            && c.local_epoch == resolved_epoch
-            && c.local_seq == resolved_seq
-            && c.local_hash == *resolved_hash;
-        if local_matches_winner && peer_matched {
+            && receipt.resolver_node_id == from_peer
+            && c.local_epoch == receipt.winner_epoch
+            && c.local_seq == receipt.winner_seq
+            && c.local_hash == receipt.winner_hash;
+        if exact_pair || peer_matched {
             let deleted =
-                conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [stream_id])? > 0;
+                conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [&receipt.stream_id])? > 0;
             return Ok(deleted);
         }
         Ok(false)
@@ -3609,12 +4184,13 @@ fn replace_session_with_chunked_epoch_snapshot(
     }
 
     conn.execute(
-        "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-         VALUES(?1,'session',?2,?3,?4,?2,?3,?4,1,1,0,0,?5,?6)
+        "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,reset_gen,head_snapshot,updated_at)
+         VALUES(?1,'session',?2,?3,?4,?2,?3,?4,1,1,0,0,0,?5,?6)
          ON CONFLICT(stream_id) DO UPDATE SET
            epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
            synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
            checkpoint_seq=1,watched=1,deleted=0,retired=0,
+           reset_gen=sync_streams.reset_gen+1,
            head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
         params![
             stream_id,
@@ -3801,235 +4377,261 @@ pub fn resolve_conflict_local(
                         },
                     )?;
                 }
-                _ => return Err(Error::bad("unexpected name conflict stream kind")),
+            _ => return Err(Error::bad("unexpected name conflict stream kind")),
             }
-            let new_head = stream_head_wire(conn, stream_id)?;
-            return Ok(ResolveLocalResult {
-                mcp_changes,
-                unblocked_conflicts: Vec::new(),
-                new_head,
-            });
-        }
-
-        // Standard fork or retired_diverged conflict -> resolve keeping local state.
-        match c.kind {
-            StreamKind::Provider => {
-                let pid: ProviderId =
-                    stream_id.parse().map_err(|_| Error::bad("invalid provider id"))?;
-                let snap = read_provider_snapshot(conn, pid)?;
-                let payload =
-                    serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                replace_stream_with_epoch_snapshot(
-                    conn,
-                    EpochSnapshot {
-                        stream_id,
-                        kind: StreamKind::Provider,
-                        new_epoch,
-                        op_type: "provider_upsert",
-                        payload,
-                        deleted: false,
-                        retired: false,
-                        head_snapshot: None,
-                    },
-                )?;
-            }
-            StreamKind::Model => {
-                let mid: ModelId =
-                    stream_id.parse().map_err(|_| Error::bad("invalid model id"))?;
-                let snap = read_model_snapshot(conn, mid)?;
-                let payload =
-                    serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                replace_stream_with_epoch_snapshot(
-                    conn,
-                    EpochSnapshot {
-                        stream_id,
-                        kind: StreamKind::Model,
-                        new_epoch,
-                        op_type: "model_upsert",
-                        payload,
-                        deleted: false,
-                        retired: false,
-                        head_snapshot: None,
-                    },
-                )?;
-            }
-            StreamKind::Mcp => {
-                let mid: McpServerId =
-                    stream_id.parse().map_err(|_| Error::bad("invalid mcp id"))?;
-                let is_remote_retired = c.reason == "retired_diverged"
-                    || c.remote_snapshot
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .is_some_and(|v| v.get("base_epoch").is_some() || v.get("server").is_none());
-                let exists_local: Option<bool> = conn
-                    .prepare_cached("SELECT shared FROM mcp_servers WHERE id=?")?
-                    .query_row([mid], |r| r.get(0))
-                    .optional()?;
-                if is_remote_retired {
-                    // P1-09: Never resurrect a retired mcp_* ID! Detach local edits to a fresh private
-                    // McpServerId and accept retirement on the old stream ID.
-                    if exists_local.is_some() {
-                        detach_conflicted_mcp_to_private(conn, mid)?;
-                    }
-                    mcp_changes.push(McpChange {
-                        id: mid,
-                        cancel_login: true,
-                    });
+        } else {
+            // Standard fork or retired_diverged conflict -> resolve keeping local state.
+            match c.kind {
+                StreamKind::Provider => {
+                    let pid: ProviderId =
+                        stream_id.parse().map_err(|_| Error::bad("invalid provider id"))?;
+                    let snap = read_provider_snapshot(conn, pid)?;
+                    let payload =
+                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
                     replace_stream_with_epoch_snapshot(
                         conn,
                         EpochSnapshot {
                             stream_id,
-                            kind: StreamKind::Mcp,
+                            kind: StreamKind::Provider,
                             new_epoch,
-                            op_type: "mcp_delete",
-                            payload: json!({
-                                "id": mid,
-                                "base_epoch": c.local_epoch,
-                                "base_seq": c.local_seq,
-                                "base_hash_hex": hex_hash(&c.local_hash),
-                            })
-                            .to_string(),
-                            deleted: true,
-                            retired: true,
-                            head_snapshot: None,
-                        },
-                    )?;
-                } else if exists_local == Some(true) {
-                    // P1-27: promote any staged OAuth refresh credentials matching current generation.
-                    promote_staged_oauth_credentials(conn, mid)?;
-                    let snap = read_mcp_snapshot(conn, mid)?;
-                    let payload = serde_json::to_string(&snap)
-                        .map_err(|e| Error::internal(e.to_string()))?;
-                    mcp_changes.push(McpChange {
-                        id: mid,
-                        cancel_login: false,
-                    });
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Mcp,
-                            new_epoch,
-                            op_type: "mcp_upsert",
+                            op_type: "provider_upsert",
                             payload,
                             deleted: false,
                             retired: false,
                             head_snapshot: None,
                         },
                     )?;
-                } else {
-                    mcp_changes.push(McpChange {
-                        id: mid,
-                        cancel_login: true,
-                    });
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Mcp,
-                            new_epoch,
-                            op_type: "mcp_delete",
-                            payload: json!({
-                                "id": mid,
-                                "base_epoch": c.local_epoch,
-                                "base_seq": c.local_seq,
-                                "base_hash_hex": hex_hash(&c.local_hash),
-                            })
-                            .to_string(),
-                            deleted: true,
-                            retired: true,
-                            head_snapshot: None,
-                        },
-                    )?;
                 }
-            }
-            StreamKind::Call => {
-                let cid: CallId =
-                    stream_id.parse().map_err(|_| Error::bad("invalid call id"))?;
-                let snap = read_call_snapshot(conn, cid)?;
-                let payload =
-                    serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                replace_stream_with_epoch_snapshot(
-                    conn,
-                    EpochSnapshot {
-                        stream_id,
-                        kind: StreamKind::Call,
-                        new_epoch,
-                        op_type: "call_upsert",
-                        payload,
-                        deleted: false,
-                        retired: false,
-                        head_snapshot: None,
-                    },
-                )?;
-            }
-            StreamKind::Session => {
-                let sid: SessionId =
-                    stream_id.parse().map_err(|_| Error::bad("invalid session id"))?;
-                let exists: bool = conn
-                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)")?
-                    .query_row([sid], |r| r.get(0))?;
-                if exists {
-                    // P0-01 CRITICAL: Refuse local resolution unless this node actually possesses
-                    // a complete, verified local commit chain matching the conflicted local head!
-                    let st = stream_head(conn, stream_id)?;
-                    let complete = st.as_ref().is_some_and(|l| {
-                        l.is_body_complete()
-                            && l.epoch == c.local_epoch
-                            && l.head_seq == c.local_seq
-                            && l.head_hash == c.local_hash
-                            && verify_local_prefix(
-                                conn,
-                                stream_id,
-                                l.epoch,
-                                l.checkpoint_seq,
-                                l.head_seq,
-                                &l.head_hash,
-                            )
-                            .unwrap_or(false)
-                    });
-                    if !complete {
-                        return Err(Error::conflict(
-                            "local node does not hold complete session history for the local branch; sync the local branch from an online holder first",
-                        ));
-                    }
-                    replace_session_with_chunked_epoch_snapshot(conn, sid, new_epoch)?;
-                } else {
-                    let st = stream_head(conn, stream_id)?;
-                    let verified_deleted = st.as_ref().is_some_and(|l| {
-                        l.deleted
-                            && l.epoch == c.local_epoch
-                            && l.head_seq == c.local_seq
-                            && l.head_hash == c.local_hash
-                    });
-                    if !verified_deleted {
-                        return Err(Error::conflict(
-                            "local branch missing verified state for conflict resolution",
-                        ));
-                    }
+                StreamKind::Model => {
+                    let mid: ModelId =
+                        stream_id.parse().map_err(|_| Error::bad("invalid model id"))?;
+                    let snap = read_model_snapshot(conn, mid)?;
+                    let payload =
+                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
                     replace_stream_with_epoch_snapshot(
                         conn,
                         EpochSnapshot {
                             stream_id,
-                            kind: StreamKind::Session,
+                            kind: StreamKind::Model,
                             new_epoch,
-                            op_type: "session_delete",
-                            payload: json!({ "id": sid }).to_string(),
-                            deleted: true,
+                            op_type: "model_upsert",
+                            payload,
+                            deleted: false,
                             retired: false,
                             head_snapshot: None,
                         },
                     )?;
                 }
+                StreamKind::Mcp => {
+                    let mid: McpServerId =
+                        stream_id.parse().map_err(|_| Error::bad("invalid mcp id"))?;
+                    let is_remote_retired = c.reason == "retired_diverged"
+                        || c.remote_snapshot
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                            .is_some_and(|v| v.get("base_epoch").is_some() || v.get("server").is_none());
+                    let exists_local: Option<bool> = conn
+                        .prepare_cached("SELECT shared FROM mcp_servers WHERE id=?")?
+                        .query_row([mid], |r| r.get(0))
+                        .optional()?;
+                    if is_remote_retired {
+                        // P1-09: Never resurrect a retired mcp_* ID! Detach local edits to a fresh private
+                        // McpServerId and accept retirement on the old stream ID.
+                        let (ancestor_start_seq, ancestor_hashes_hex) =
+                            collect_ancestor_hashes_hex(conn, stream_id, c.local_epoch, c.local_seq)?;
+                        if exists_local.is_some() {
+                            detach_conflicted_mcp_to_private(conn, mid)?;
+                        }
+                        mcp_changes.push(McpChange {
+                            id: mid,
+                            cancel_login: true,
+                        });
+                        replace_stream_with_epoch_snapshot(
+                            conn,
+                            EpochSnapshot {
+                                stream_id,
+                                kind: StreamKind::Mcp,
+                                new_epoch,
+                                op_type: "mcp_delete",
+                                payload: json!({
+                                    "id": mid,
+                                    "base_epoch": c.local_epoch,
+                                    "base_seq": c.local_seq,
+                                    "base_hash_hex": hex_hash(&c.local_hash),
+                                    "ancestor_start_seq": ancestor_start_seq,
+                                    "ancestor_hashes_hex": ancestor_hashes_hex,
+                                })
+                                .to_string(),
+                                deleted: true,
+                                retired: true,
+                                head_snapshot: None,
+                            },
+                        )?;
+                    } else if exists_local == Some(true) {
+                        // P1-27: promote any staged OAuth refresh credentials matching current generation.
+                        promote_staged_oauth_credentials(conn, mid)?;
+                        let snap = read_mcp_snapshot(conn, mid)?;
+                        let payload = serde_json::to_string(&snap)
+                            .map_err(|e| Error::internal(e.to_string()))?;
+                        mcp_changes.push(McpChange {
+                            id: mid,
+                            cancel_login: false,
+                        });
+                        replace_stream_with_epoch_snapshot(
+                            conn,
+                            EpochSnapshot {
+                                stream_id,
+                                kind: StreamKind::Mcp,
+                                new_epoch,
+                                op_type: "mcp_upsert",
+                                payload,
+                                deleted: false,
+                                retired: false,
+                                head_snapshot: None,
+                            },
+                        )?;
+                    } else {
+                        let (ancestor_start_seq, ancestor_hashes_hex) =
+                            collect_ancestor_hashes_hex(conn, stream_id, c.local_epoch, c.local_seq)?;
+                        mcp_changes.push(McpChange {
+                            id: mid,
+                            cancel_login: true,
+                        });
+                        replace_stream_with_epoch_snapshot(
+                            conn,
+                            EpochSnapshot {
+                                stream_id,
+                                kind: StreamKind::Mcp,
+                                new_epoch,
+                                op_type: "mcp_delete",
+                                payload: json!({
+                                    "id": mid,
+                                    "base_epoch": c.local_epoch,
+                                    "base_seq": c.local_seq,
+                                    "base_hash_hex": hex_hash(&c.local_hash),
+                                    "ancestor_start_seq": ancestor_start_seq,
+                                    "ancestor_hashes_hex": ancestor_hashes_hex,
+                                })
+                                .to_string(),
+                                deleted: true,
+                                retired: true,
+                                head_snapshot: None,
+                            },
+                        )?;
+                    }
+                }
+                StreamKind::Call => {
+                    let cid: CallId =
+                        stream_id.parse().map_err(|_| Error::bad("invalid call id"))?;
+                    let snap = read_call_snapshot(conn, cid)?;
+                    let payload =
+                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
+                    replace_stream_with_epoch_snapshot(
+                        conn,
+                        EpochSnapshot {
+                            stream_id,
+                            kind: StreamKind::Call,
+                            new_epoch,
+                            op_type: "call_upsert",
+                            payload,
+                            deleted: false,
+                            retired: false,
+                            head_snapshot: None,
+                        },
+                    )?;
+                }
+                StreamKind::Session => {
+                    let sid: SessionId =
+                        stream_id.parse().map_err(|_| Error::bad("invalid session id"))?;
+                    let exists: bool = conn
+                        .prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)")?
+                        .query_row([sid], |r| r.get(0))?;
+                    if exists {
+                        // P0-01 CRITICAL: Refuse local resolution unless this node actually possesses
+                        // a complete, verified local commit chain matching the conflicted local head!
+                        let st = stream_head(conn, stream_id)?;
+                        let complete = st.as_ref().is_some_and(|l| {
+                            l.is_body_complete()
+                                && l.epoch == c.local_epoch
+                                && l.head_seq == c.local_seq
+                                && l.head_hash == c.local_hash
+                                && verify_local_prefix(
+                                    conn,
+                                    stream_id,
+                                    l.epoch,
+                                    l.checkpoint_seq,
+                                    l.head_seq,
+                                    &l.head_hash,
+                                )
+                                .unwrap_or(false)
+                        });
+                        if !complete {
+                            return Err(Error::conflict(
+                                "local node does not hold complete session history for the local branch; sync the local branch from an online holder first",
+                            ));
+                        }
+                        replace_session_with_chunked_epoch_snapshot(conn, sid, new_epoch)?;
+                    } else {
+                        let st = stream_head(conn, stream_id)?;
+                        let verified_deleted = st.as_ref().is_some_and(|l| {
+                            l.deleted
+                                && l.epoch == c.local_epoch
+                                && l.head_seq == c.local_seq
+                                && l.head_hash == c.local_hash
+                        });
+                        if !verified_deleted {
+                            return Err(Error::conflict(
+                                "local branch missing verified state for conflict resolution",
+                            ));
+                        }
+                        replace_stream_with_epoch_snapshot(
+                            conn,
+                            EpochSnapshot {
+                                stream_id,
+                                kind: StreamKind::Session,
+                                new_epoch,
+                                op_type: "session_delete",
+                                payload: json!({ "id": sid }).to_string(),
+                                deleted: true,
+                                retired: false,
+                                head_snapshot: None,
+                            },
+                        )?;
+                    }
+                }
             }
         }
         let mut unblocked = Vec::new();
-        if matches!(c.kind, StreamKind::Provider | StreamKind::Model | StreamKind::Mcp) {
+        if c.reason != "name_conflict"
+            && matches!(c.kind, StreamKind::Provider | StreamKind::Model | StreamKind::Mcp)
+        {
             unblocked = collect_unblocked_conflicts(conn, stream_id)?;
             unblocked.sort();
             unblocked.dedup();
         }
         let new_head = stream_head_wire(conn, stream_id)?;
+        if let Some(ref nh) = new_head {
+            let resolver = load_local_node(conn)?.node_id;
+            record_resolution_receipt(
+                conn,
+                &ResolutionReceipt {
+                    stream_id: stream_id.to_owned(),
+                    kind: c.kind,
+                    chosen: "local".to_owned(),
+                    resolver_node_id: resolver,
+                    local_epoch: c.local_epoch,
+                    local_seq: c.local_seq,
+                    local_hash: c.local_hash,
+                    remote_epoch: c.remote_epoch,
+                    remote_seq: c.remote_seq,
+                    remote_hash: c.remote_hash,
+                    winner_epoch: nh.epoch,
+                    winner_seq: nh.head_seq,
+                    winner_hash: nh.head_hash,
+                    resolved_at: now,
+                },
+            )?;
+        }
         Ok(ResolveLocalResult {
             mcp_changes,
             unblocked_conflicts: unblocked,
@@ -4192,12 +4794,13 @@ pub fn commit_staged_branch_preserving_conflict(
         }
 
         conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-             VALUES(?1,'session',?2,?3,?4,?2,?3,?4,1,1,0,0,?5,?6)
+            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,reset_gen,head_snapshot,updated_at)
+             VALUES(?1,'session',?2,?3,?4,?2,?3,?4,1,1,0,0,0,?5,?6)
              ON CONFLICT(stream_id) DO UPDATE SET
                epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
                synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
                checkpoint_seq=1,watched=1,deleted=0,retired=0,
+               reset_gen=sync_streams.reset_gen+1,
                head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
             params![
                 stream_id,

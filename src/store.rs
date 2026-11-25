@@ -30,6 +30,7 @@ type ApplyWrite = Box<dyn FnOnce(Result<&Connection>, bool) -> (bool, Acknowledg
 
 struct Write {
     start_session: Option<SessionId>,
+    expected_run_gen: Option<(SessionId, u64)>,
     apply: ApplyWrite,
 }
 
@@ -103,7 +104,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 4 {
+            if version != 5 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
@@ -238,8 +239,24 @@ impl Db {
         apply: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
-        self.grouped_write(None, move |conn, _| apply(conn), publish)
+        self.grouped_write(None, None, move |conn, _| apply(conn), publish)
             .await
+    }
+
+    pub async fn write_for_run<T: 'static, R: Send + 'static>(
+        &self,
+        sid: SessionId,
+        expected_run_gen: u64,
+        apply: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+        publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        self.grouped_write(
+            None,
+            Some((sid, expected_run_gen)),
+            move |conn, _| apply(conn),
+            publish,
+        )
+        .await
     }
 
     pub async fn start_write<T: 'static, R: Send + 'static>(
@@ -248,18 +265,20 @@ impl Db {
         apply: impl FnOnce(&Connection, bool) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
-        self.grouped_write(Some(sid), apply, publish).await
+        self.grouped_write(Some(sid), None, apply, publish).await
     }
 
     async fn grouped_write<T: 'static, R: Send + 'static>(
         &self,
         start_session: Option<SessionId>,
+        expected_run_gen: Option<(SessionId, u64)>,
         apply: impl FnOnce(&Connection, bool) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
         self.submit(|reply| {
             Command::Write(Write {
                 start_session,
+                expected_run_gen,
                 apply: Box::new(move |conn, active| {
                     let result = conn.and_then(|conn| apply(conn, active));
                     (
@@ -364,14 +383,26 @@ impl Store {
                     "shutting down".into(),
                 ));
             }
+            let cur_gen_map = &self.session_run_gen;
+            let active_map = &self.active;
             let mut tx = self.conn.transaction()?;
             for write in pending.by_ref() {
+                if let Some((sid, expected_gen)) = write.expected_run_gen
+                    && cur_gen_map.get(&sid).copied().unwrap_or(0) != expected_gen
+                {
+                    let (_, reply) = (write.apply)(
+                        Err(Error::conflict("session superseded by cluster replacement")),
+                        false,
+                    );
+                    replies.push(reply);
+                    continue;
+                }
                 // A failed multi-statement operation must not leave part of its reply in the DB.
                 clear_staged();
                 let savepoint = tx.savepoint();
                 let active = write
                     .start_session
-                    .is_some_and(|id| self.active.contains_key(&id));
+                    .is_some_and(|id| active_map.contains_key(&id));
                 let (ok, reply) = (write.apply)(
                     savepoint
                         .as_deref()
