@@ -37,32 +37,47 @@ pub fn tool(
     output: &Value,
     background: bool,
 ) -> Result<ItemId> {
-    if let Some(id) = tool_id(conn, sid, original)? {
-        return Ok(id);
-    }
-    let id = ItemId::new()?;
-    let payload = json!({"type":"function_call_output","call_id":call,"output":output});
-    let id = conn.prepare_cached(
-        "INSERT INTO items(id,session_id,kind,payload,target_id,codemode_call_item_id)
-         SELECT ?6,session_id,'function_call_output',?4,id,?5 FROM items
-         WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.call_id')=?3
-         RETURNING id",
-    )?.query_row(params![sid, original, call, payload, background.then_some(original), id], |r| r.get(0))?;
-    let invalidated = if !background {
-        invalidate_only(conn, sid, original)?
-    } else {
-        Vec::new()
-    };
-    crate::cluster::ledger::record_session_delta(
-        conn,
-        sid,
-        "session_delta",
-        &[id],
-        Vec::new(),
-        invalidated,
-        false,
-    )?;
-    Ok(id)
+    tool_at_epoch(conn, sid, original, call, output, background, None)
+}
+
+pub fn tool_at_epoch(
+    conn: &Connection,
+    sid: SessionId,
+    original: ItemId,
+    call: &str,
+    output: &Value,
+    background: bool,
+    expected_epoch: Option<i64>,
+) -> Result<ItemId> {
+    crate::cluster::ledger::with_savepoint(conn, "codemode_tool", || {
+        if let Some(id) = tool_id(conn, sid, original)? {
+            return Ok(id);
+        }
+        let id = ItemId::new()?;
+        let payload = json!({"type":"function_call_output","call_id":call,"output":output});
+        let origin_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+        let id = conn.prepare_cached(
+            "INSERT INTO items(id,session_id,kind,payload,target_id,codemode_call_item_id,origin_node_id)
+             SELECT ?6,session_id,'function_call_output',?4,id,?5,?7 FROM items
+             WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.call_id')=?3
+             RETURNING id",
+        )?.query_row(params![sid, original, call, payload, background.then_some(original), id, origin_node_id], |r| r.get(0))?;
+        let invalidated = if !background {
+            invalidate_only(conn, sid, original)?
+        } else {
+            Vec::new()
+        };
+        crate::cluster::ledger::record_session_delta_at_epoch(
+            conn,
+            sid,
+            "session_delta",
+            &[id],
+            Vec::new(),
+            invalidated,
+            expected_epoch,
+        )?;
+        Ok(id)
+    })
 }
 
 fn invalidate_only(conn: &Connection, sid: SessionId, origin: ItemId) -> Result<Vec<ItemId>> {
@@ -79,20 +94,27 @@ fn invalidate_only(conn: &Connection, sid: SessionId, origin: ItemId) -> Result<
     Ok(ids)
 }
 
-pub fn invalidate(conn: &Connection, sid: SessionId, origin: ItemId) -> Result<()> {
-    let ids = invalidate_only(conn, sid, origin)?;
-    if !ids.is_empty() {
-        crate::cluster::ledger::record_session_delta(
-            conn,
-            sid,
-            "session_delta",
-            &[],
-            Vec::new(),
-            ids,
-            false,
-        )?;
-    }
-    Ok(())
+pub fn invalidate_at_epoch(
+    conn: &Connection,
+    sid: SessionId,
+    origin: ItemId,
+    expected_epoch: Option<i64>,
+) -> Result<()> {
+    crate::cluster::ledger::with_savepoint(conn, "codemode_invalidate", || {
+        let ids = invalidate_only(conn, sid, origin)?;
+        if !ids.is_empty() {
+            crate::cluster::ledger::record_session_delta_at_epoch(
+                conn,
+                sid,
+                "session_delta",
+                &[],
+                Vec::new(),
+                ids,
+                expected_epoch,
+            )?;
+        }
+        Ok(())
+    })
 }
 
 pub fn event(
@@ -103,63 +125,78 @@ pub fn event(
     content: &Value,
     notify: bool,
 ) -> Result<ItemId> {
+    event_at_epoch(conn, sid, origin, kind, content, notify, None)
+}
+
+pub fn event_at_epoch(
+    conn: &Connection,
+    sid: SessionId,
+    origin: ItemId,
+    kind: &str,
+    content: &Value,
+    notify: bool,
+    expected_epoch: Option<i64>,
+) -> Result<ItemId> {
     if !matches!(kind, "message" | "lease_warning" | "completed")
         || (!notify && kind != "completed")
         || !content.is_array()
     {
         return Err(Error::internal("invalid codemode event"));
     }
-    if let Some(id) = completed_id(conn, sid, origin)? {
-        return if kind == "completed" {
-            Ok(id)
+    crate::cluster::ledger::with_savepoint(conn, "codemode_event", || {
+        if let Some(id) = completed_id(conn, sid, origin)? {
+            return if kind == "completed" {
+                Ok(id)
+            } else {
+                Err(Error::conflict("codemode task already completed"))
+            };
+        }
+        let background: Option<bool> = conn
+            .prepare_cached(
+                "SELECT codemode_call_item_id IS NOT NULL FROM items
+             WHERE session_id=? AND kind='function_call_output' AND target_id=?",
+            )?
+            .query_row((sid, origin), |row| row.get(0))
+            .optional()?;
+        if background == Some(false) || (kind == "completed" && background.is_none()) {
+            return Err(Error::conflict(
+                "codemode event conflicts with tool delivery",
+            ));
+        }
+        if kind == "message" {
+            media::check_event(conn, content, &modalities(conn, sid)?)?;
+        }
+        let sequence: i64 = conn
+            .prepare_cached(
+                "SELECT coalesce(max(json_extract(payload,'$.sequence')),0)+1 FROM items
+             WHERE codemode_call_item_id=? AND kind='codemode_event'",
+            )?
+            .query_row([origin], |r| r.get(0))?;
+        let id = ItemId::new()?;
+        let payload = json!({"event":kind,"task_id":origin.task_id(),"sequence":sequence,"notify":notify,"content":content});
+        let origin_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+        let id = conn.prepare_cached(
+            "INSERT INTO items(id,session_id,kind,payload,codemode_call_item_id,origin_node_id)
+             SELECT ?4,session_id,'codemode_event',?3,id,?5 FROM items
+             WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.name')='codemode'
+             RETURNING id",
+        )?.query_row(params![sid, origin, payload, id, origin_node_id], |r| r.get(0))?;
+        let invalidated = if kind == "completed" {
+            invalidate_only(conn, sid, origin)?
         } else {
-            Err(Error::conflict("codemode task already completed"))
+            Vec::new()
         };
-    }
-    let background: Option<bool> = conn
-        .prepare_cached(
-            "SELECT codemode_call_item_id IS NOT NULL FROM items
-         WHERE session_id=? AND kind='function_call_output' AND target_id=?",
-        )?
-        .query_row((sid, origin), |row| row.get(0))
-        .optional()?;
-    if background == Some(false) || (kind == "completed" && background.is_none()) {
-        return Err(Error::conflict(
-            "codemode event conflicts with tool delivery",
-        ));
-    }
-    if kind == "message" {
-        media::check_event(conn, content, &modalities(conn, sid)?)?;
-    }
-    let sequence: i64 = conn
-        .prepare_cached(
-            "SELECT coalesce(max(json_extract(payload,'$.sequence')),0)+1 FROM items
-         WHERE codemode_call_item_id=? AND kind='codemode_event'",
-        )?
-        .query_row([origin], |r| r.get(0))?;
-    let id = ItemId::new()?;
-    let payload = json!({"event":kind,"task_id":origin.task_id(),"sequence":sequence,"notify":notify,"content":content});
-    let id = conn.prepare_cached(
-        "INSERT INTO items(id,session_id,kind,payload,codemode_call_item_id)
-         SELECT ?4,session_id,'codemode_event',?3,id FROM items
-         WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.name')='codemode'
-         RETURNING id",
-    )?.query_row(params![sid, origin, payload, id], |r| r.get(0))?;
-    let invalidated = if kind == "completed" {
-        invalidate_only(conn, sid, origin)?
-    } else {
-        Vec::new()
-    };
-    crate::cluster::ledger::record_session_delta(
-        conn,
-        sid,
-        "session_delta",
-        &[id],
-        Vec::new(),
-        invalidated,
-        false,
-    )?;
-    Ok(id)
+        crate::cluster::ledger::record_session_delta_at_epoch(
+            conn,
+            sid,
+            "session_delta",
+            &[id],
+            Vec::new(),
+            invalidated,
+            expected_epoch,
+        )?;
+        Ok(id)
+    })
 }
 
 pub fn starting_sibling(conn: &Connection, sid: SessionId, call: ItemId) -> Result<bool> {
@@ -306,38 +343,57 @@ pub fn materialize(conn: &Connection, sid: SessionId, blocks: &Blocks) -> Result
 pub fn recover(conn: &Connection) -> Result<()> {
     let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
     // Foreground tasks may have emitted lease warnings too. No lease survives a restart.
-    let invalidated_rows = {
+    let warning_candidates = {
         let mut stmt = conn.prepare(
-            "INSERT INTO invalidated_warnings(item_id)
-             SELECT i.id FROM items i INDEXED BY codemode_warnings JOIN sessions s ON s.id=i.session_id
-             WHERE i.kind='codemode_event' AND json_extract(i.payload,'$.event')='lease_warning'
+            "SELECT i.session_id, i.id
+             FROM items i INDEXED BY codemode_warnings
+             JOIN sessions s ON s.id=i.session_id
+             WHERE i.kind='codemode_event'
+               AND json_extract(i.payload,'$.event')='lease_warning'
                AND i.id>s.input_queue_cursor
-               AND coalesce((SELECT sc.author_node_id FROM sync_commits sc WHERE sc.stream_id=i.session_id AND sc.payload LIKE '%' || i.id || '%' ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1
-             ON CONFLICT(item_id) DO NOTHING RETURNING item_id",
+               AND coalesce(i.origin_node_id, ?1) = ?1
+               AND NOT EXISTS(SELECT 1 FROM invalidated_warnings iw WHERE iw.item_id=i.id)
+             ORDER BY i.session_id, i.id",
         )?;
-        stmt.query_map([&local_node_id], |r| r.get::<_, ItemId>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        stmt.query_map([&local_node_id], |r| {
+            Ok((r.get::<_, SessionId>(0)?, r.get::<_, ItemId>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    if !invalidated_rows.is_empty() {
+    if !warning_candidates.is_empty() {
         let mut by_session: std::collections::HashMap<SessionId, Vec<ItemId>> =
             std::collections::HashMap::new();
-        for item_id in invalidated_rows {
-            let sid: SessionId =
-                conn.query_row("SELECT session_id FROM items WHERE id=?", [item_id], |r| {
-                    r.get(0)
-                })?;
+        for (sid, item_id) in warning_candidates {
             by_session.entry(sid).or_default().push(item_id);
         }
-        for (sid, ids) in by_session {
-            crate::cluster::ledger::record_session_delta(
-                conn,
-                sid,
-                "session_delta",
-                &[],
-                Vec::new(),
-                ids,
-                false,
-            )?;
+        for (sid, item_ids) in by_session {
+            if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
+                || !crate::cluster::ledger::is_session_writable_local(conn, sid)?
+            {
+                continue;
+            }
+            crate::cluster::ledger::with_savepoint(conn, "recover_warnings", || {
+                let mut inserted = Vec::with_capacity(item_ids.len());
+                let mut ins_stmt = conn.prepare_cached(
+                    "INSERT INTO invalidated_warnings(item_id) VALUES(?) ON CONFLICT(item_id) DO NOTHING RETURNING item_id",
+                )?;
+                for item_id in item_ids {
+                    if let Some(id) = ins_stmt.query_row([item_id], |r| r.get::<_, ItemId>(0)).optional()? {
+                        inserted.push(id);
+                    }
+                }
+                if !inserted.is_empty() {
+                    crate::cluster::ledger::record_session_delta(
+                        conn,
+                        sid,
+                        "session_delta",
+                        &[],
+                        Vec::new(),
+                        inserted,
+                    )?;
+                }
+                Ok(())
+            })?;
         }
     }
     let mut receipts = conn.prepare(
@@ -345,29 +401,36 @@ pub fn recover(conn: &Connection) -> Result<()> {
          WHERE r.kind='function_call_output' AND r.codemode_call_item_id IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM items e WHERE e.kind='codemode_event'
                            AND e.codemode_call_item_id=r.codemode_call_item_id AND json_extract(e.payload,'$.event')='completed')
-           AND coalesce((SELECT sc.author_node_id FROM sync_commits sc WHERE sc.stream_id=r.session_id AND sc.payload LIKE '%' || r.id || '%' ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1
+           AND coalesce(r.origin_node_id, ?1) = ?1
          ORDER BY r.id",
     )?;
     let missing = receipts
         .query_map([&local_node_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<(SessionId, ItemId)>>>()?;
     for (sid, origin) in missing {
-        let status = json!({"id":origin.task_id(),"status":"interrupted","error":"Daemon restarted; result unknown."});
-        let content = json!([{"type":"text","text":status.to_string()}]);
-        event(conn, sid, origin, "completed", &content, true)?;
-        conn.execute(
-            "UPDATE sessions SET status='paused',last_error='daemon restarted' WHERE id=?",
-            [sid],
-        )?;
-        crate::cluster::ledger::record_session_delta(
-            conn,
-            sid,
-            "session_delta",
-            &[],
-            Vec::new(),
-            Vec::new(),
-            true,
-        )?;
+        if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
+            || !crate::cluster::ledger::is_session_writable_local(conn, sid)?
+        {
+            continue;
+        }
+        crate::cluster::ledger::with_savepoint(conn, "recover_receipt", || {
+            let status = json!({"id":origin.task_id(),"status":"interrupted","error":"Daemon restarted; result unknown."});
+            let content = json!([{"type":"text","text":status.to_string()}]);
+            event(conn, sid, origin, "completed", &content, true)?;
+            conn.execute(
+                "UPDATE sessions SET status='paused',last_error='daemon restarted' WHERE id=?",
+                [sid],
+            )?;
+            crate::cluster::ledger::record_session_delta(
+                conn,
+                sid,
+                "session_delta",
+                &[],
+                Vec::new(),
+                Vec::new(),
+            )?;
+            Ok(())
+        })?;
     }
     // A crash after committing an event can precede the idle worker's wake-up.
     let pending_sids = {
@@ -375,26 +438,33 @@ pub fn recover(conn: &Connection) -> Result<()> {
             "SELECT id FROM sessions WHERE status='idle' AND EXISTS (
                  SELECT 1 FROM pending p JOIN items i ON i.id=p.id
                  WHERE p.session_id=sessions.id AND i.kind='codemode_event'
-                   AND coalesce((SELECT sc.author_node_id FROM sync_commits sc WHERE sc.stream_id=i.session_id AND sc.payload LIKE '%' || i.id || '%' ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1
+                   AND coalesce(i.origin_node_id, ?1) = ?1
              )",
         )?;
         stmt.query_map([&local_node_id], |r| r.get::<_, SessionId>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for sid in pending_sids {
-        conn.execute(
-            "UPDATE sessions SET status='paused',last_error='daemon restarted with pending codemode events' WHERE id=?",
-            [sid],
-        )?;
-        crate::cluster::ledger::record_session_delta(
-            conn,
-            sid,
-            "session_delta",
-            &[],
-            Vec::new(),
-            Vec::new(),
-            true,
-        )?;
+        if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
+            || !crate::cluster::ledger::is_session_writable_local(conn, sid)?
+        {
+            continue;
+        }
+        crate::cluster::ledger::with_savepoint(conn, "recover_pending", || {
+            conn.execute(
+                "UPDATE sessions SET status='paused',last_error='daemon restarted with pending codemode events' WHERE id=?",
+                [sid],
+            )?;
+            crate::cluster::ledger::record_session_delta(
+                conn,
+                sid,
+                "session_delta",
+                &[],
+                Vec::new(),
+                Vec::new(),
+            )?;
+            Ok(())
+        })?;
     }
     Ok(())
 }

@@ -619,6 +619,7 @@ export interface SessionSyncOptions {
   fetchInitial: () => Promise<HistoryItem[]>;
   fetchAfter: (afterId: string) => Promise<HistoryItem[]>;
   onItems: (items: HistoryItem[]) => void;
+  onReplaceItems?: (items: HistoryItem[]) => void;
   onHasMore: (hasMore: boolean) => void;
   onSidecars?: () => Promise<void> | void;
   onError?: (msg: string) => void;
@@ -630,6 +631,7 @@ export interface SessionSync {
   start: () => void;
   onReady: () => void;
   onResync: () => void;
+  onReset: () => void;
   onLiveItem: (item: HistoryItem) => void;
   dispose: () => void;
   getState: () => { initialLoaded: boolean; syncedThroughId: string; gapOpen: boolean };
@@ -639,6 +641,7 @@ export function createSessionSync({
   fetchInitial,
   fetchAfter,
   onItems,
+  onReplaceItems,
   onHasMore,
   onSidecars,
   onError,
@@ -651,6 +654,8 @@ export function createSessionSync({
   let gapOpen = false;
   let inFlight = false;
   let runAgain = false;
+  let replaceNext = false;
+  let resetGen = 0;
   let retryTimer: TimerId | null = null;
   let retryDelay = 1000;
 
@@ -676,12 +681,18 @@ export function createSessionSync({
     }
     clearRetry();
     inFlight = true;
+    const myGen = resetGen;
     let shouldScheduleRetry = false;
     try {
       if (!initialLoaded) {
         const hist = await fetchInitial();
-        if (disposed) return;
-        onItems(hist);
+        if (disposed || myGen !== resetGen) return;
+        if (replaceNext && onReplaceItems) {
+          onReplaceItems(hist);
+        } else {
+          onItems(hist);
+        }
+        replaceNext = false;
         onHasMore(hist.length === 50);
         syncedThroughId = hist.length ? hist[hist.length - 1].id : "";
         initialLoaded = true;
@@ -692,7 +703,7 @@ export function createSessionSync({
       } else {
         while (!disposed) {
           const page = await fetchAfter(syncedThroughId);
-          if (disposed) return;
+          if (disposed || myGen !== resetGen) return;
           if (page.length) {
             onItems(page);
             const last = page[page.length - 1].id;
@@ -700,15 +711,15 @@ export function createSessionSync({
           }
           if (page.length < 200) break;
         }
-        if (!disposed && !runAgain) {
+        if (!disposed && myGen === resetGen && !runAgain) {
           gapOpen = false;
           retryDelay = 1000;
           onError?.("");
         }
-        if (!disposed) triggerSidecars();
+        if (!disposed && myGen === resetGen) triggerSidecars();
       }
     } catch (e) {
-      if (disposed) return;
+      if (disposed || myGen !== resetGen) return;
       if (initialLoaded) gapOpen = true;
       onError?.(errorMessage(e));
       shouldScheduleRetry = !runAgain;
@@ -751,6 +762,22 @@ export function createSessionSync({
     void runSync();
   };
 
+  const onReset = (): void => {
+    if (disposed) return;
+    resetGen += 1;
+    initialLoaded = false;
+    syncedThroughId = "";
+    gapOpen = true;
+    replaceNext = true;
+    retryDelay = 1000;
+    clearRetry();
+    if (inFlight) {
+      runAgain = true;
+    } else {
+      void runSync();
+    }
+  };
+
   const onLiveItem = (item: HistoryItem): void => {
     if (disposed) return;
     onItems([item]);
@@ -766,5 +793,5 @@ export function createSessionSync({
 
   const getState = () => ({ initialLoaded, syncedThroughId, gapOpen });
 
-  return { start, onReady, onResync, onLiveItem, dispose, getState };
+  return { start, onReady, onResync, onReset, onLiveItem, dispose, getState };
 }

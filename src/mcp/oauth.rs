@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use reqwest::Url;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -215,81 +215,276 @@ async fn logout(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<S
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(crate) struct CoordinatorRefreshOutcome {
+    pub status: crate::cluster::sync::OAuthRefreshStatus,
+    pub head: Option<crate::cluster::ledger::StreamHead>,
+    pub commits: Vec<crate::cluster::ledger::CommitWire>,
+    pub has_more: bool,
+    pub error: Option<String>,
+}
+
+fn to_wire_head(st: crate::cluster::ledger::LocalStreamState) -> crate::cluster::ledger::StreamHead {
+    let body_complete = st.is_body_complete();
+    crate::cluster::ledger::StreamHead {
+        stream_id: st.stream_id,
+        kind: st.kind,
+        epoch: st.epoch,
+        head_seq: st.head_seq,
+        head_hash: st.head_hash,
+        body_complete,
+        checkpoint_seq: st.checkpoint_seq,
+        deleted: st.deleted,
+        retired: st.retired,
+        head_snapshot: st.head_snapshot,
+        updated_at: st.updated_at,
+    }
+}
+
 pub(crate) async fn refresh_shared_as_coordinator(
     db: &Db,
     _client: &reqwest::Client,
     id: McpServerId,
     generation: &str,
-    after_epoch: i64,
-    after_seq: i64,
-) -> Result<(
-    Option<crate::cluster::ledger::StreamHead>,
-    Vec<crate::cluster::ledger::CommitWire>,
-)> {
+    expected_epoch: i64,
+    expected_seq: i64,
+    expected_hash: Option<[u8; 32]>,
+    rejected_token_hash: Option<[u8; 32]>,
+) -> Result<CoordinatorRefreshOutcome> {
+    use crate::cluster::{ledger, sync::OAuthRefreshStatus};
+
     let gen_owned = generation.to_owned();
-    let (revision, binding, endpoint, gate) = db
+    let gate = db
+        .call(move |s| Ok(s.mcp.oauth().refresh_lock(&gen_owned)))
+        .await?;
+    let _guard = gate.lock_owned().await;
+
+    let gen_owned = generation.to_owned();
+    enum Precheck {
+        Early(CoordinatorRefreshOutcome),
+        Proceed {
+            revision: i64,
+            binding: Binding,
+            endpoint: String,
+            reject_token: Option<String>,
+            needs_refresh: bool,
+        },
+    }
+
+    let pre = db
         .call(move |s| {
-            let sql = format!(
-                "SELECT m.revision, o.binding, json_extract(m.config_json,'$.url')
-                 FROM mcp_servers m JOIN mcp_oauth o ON o.server_id=m.id
-                 WHERE m.id=?1 AND m.shared=1 AND o.generation=?2 AND {}",
-                storage::AUTHORIZED_SQL
-            );
-            let (revision, raw, endpoint): (i64, String, String) = s
+            let local_st = ledger::stream_head(&s.conn, id.as_str())?;
+            if ledger::has_conflict(&s.conn, id.as_str())? {
+                return Ok(Precheck::Early(CoordinatorRefreshOutcome {
+                    status: OAuthRefreshStatus::Conflicted,
+                    head: local_st.map(to_wire_head),
+                    commits: Vec::new(),
+                    has_more: false,
+                    error: Some("MCP stream conflicted on coordinator".into()),
+                }));
+            }
+            if let Some(st) = &local_st
+                && expected_epoch > 0
+            {
+                if st.epoch < expected_epoch || (st.epoch == expected_epoch && st.head_seq < expected_seq)
+                {
+                    return Ok(Precheck::Early(CoordinatorRefreshOutcome {
+                        status: OAuthRefreshStatus::UpToDate,
+                        head: None,
+                        commits: Vec::new(),
+                        has_more: false,
+                        error: None,
+                    }));
+                }
+                if st.epoch == expected_epoch && expected_seq > 0 {
+                    let local_at = ledger::commit_hash_at(
+                        &s.conn,
+                        id.as_str(),
+                        expected_epoch,
+                        expected_seq,
+                    )?;
+                    if local_at.is_some() && local_at != expected_hash {
+                        return Ok(Precheck::Early(CoordinatorRefreshOutcome {
+                            status: OAuthRefreshStatus::Conflicted,
+                            head: local_st.map(to_wire_head),
+                            commits: Vec::new(),
+                            has_more: false,
+                            error: Some(
+                                "divergent MCP OAuth history detected; resolve conflict".into(),
+                            ),
+                        }));
+                    }
+                }
+            }
+
+            let row: Option<(i64, String, String, Option<String>, bool, bool)> = s
                 .conn
-                .query_row(&sql, params![id, gen_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            let gate = s.mcp.oauth().refresh_lock(&gen_owned);
-            Ok((revision, decode::<Binding>(&raw)?, endpoint, gate))
+                .query_row(
+                    &format!(
+                        "SELECT m.revision, o.binding, json_extract(m.config_json,'$.url'),
+                                coalesce(o.staged_credentials,o.credentials), o.rejected,
+                                ({})
+                         FROM mcp_servers m JOIN mcp_oauth o ON o.server_id=m.id
+                         WHERE m.id=?1 AND m.shared=1 AND o.generation=?2",
+                        storage::AUTHORIZED_SQL
+                    ),
+                    params![id, gen_owned],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .optional()?;
+
+            let Some((revision, raw_binding, endpoint, raw_creds, rejected, authorized)) = row
+            else {
+                return Ok(Precheck::Early(CoordinatorRefreshOutcome {
+                    status: OAuthRefreshStatus::ReauthRequired,
+                    head: local_st.map(to_wire_head),
+                    commits: Vec::new(),
+                    has_more: false,
+                    error: Some("MCP OAuth login changed or missing".into()),
+                }));
+            };
+            let Some(raw_creds) = raw_creds else {
+                return Ok(Precheck::Early(CoordinatorRefreshOutcome {
+                    status: OAuthRefreshStatus::ReauthRequired,
+                    head: local_st.map(to_wire_head),
+                    commits: Vec::new(),
+                    has_more: false,
+                    error: Some("MCP OAuth credentials missing".into()),
+                }));
+            };
+            let binding = decode::<Binding>(&raw_binding)?;
+            let creds = decode::<client::StoredCredentials>(&raw_creds)?;
+            let matching_rejected = rejected_token_hash.is_some_and(|rh| {
+                creds
+                    .token_response
+                    .as_ref()
+                    .is_some_and(|t| *blake3::hash(t.access_token.as_bytes()).as_bytes() == rh)
+            });
+            let reject_token = (matching_rejected && !rejected)
+                .then(|| creds.token_response.as_ref().map(|t| t.access_token.clone()))
+                .flatten();
+            if !authorized && !matching_rejected {
+                return Ok(Precheck::Early(CoordinatorRefreshOutcome {
+                    status: OAuthRefreshStatus::ReauthRequired,
+                    head: local_st.map(to_wire_head),
+                    commits: Vec::new(),
+                    has_more: false,
+                    error: Some("MCP OAuth re-authentication required".into()),
+                }));
+            }
+            let needs_refresh = storage::needs_refresh(&creds, rejected || matching_rejected);
+            Ok(Precheck::Proceed {
+                revision,
+                binding,
+                endpoint,
+                reject_token,
+                needs_refresh,
+            })
         })
         .await?;
 
-    let _guard = gate.lock_owned().await;
-    let base = flow::discovery_base(&endpoint)?;
-    let oauth_http = client::OAuthHttp::new(&base).map_err(Error::internal)?;
-    let account = Account {
-        db: db.clone(),
-        id,
-        revision,
-        generation: generation.to_owned(),
-    };
-    storage::acquire_valid_token(&oauth_http, &binding, &account)
-        .await
-        .map_err(|reauth| {
-            if reauth {
-                Error::conflict("MCP OAuth re-authentication required")
-            } else {
-                Error::internal("MCP OAuth token refresh failed")
+    let status = match pre {
+        Precheck::Early(mut out) => {
+            if out.head.is_some() {
+                let (commits, has_more) = read_refresh_tail(db, id, expected_epoch, expected_seq).await?;
+                out.commits = commits;
+                out.has_more = has_more;
             }
-        })?;
+            return Ok(out);
+        }
+        Precheck::Proceed {
+            revision,
+            binding,
+            endpoint,
+            reject_token,
+            needs_refresh,
+        } => {
+            if !needs_refresh {
+                OAuthRefreshStatus::UpToDate
+            } else {
+                let account = Account {
+                    db: db.clone(),
+                    id,
+                    revision,
+                    generation: generation.to_owned(),
+                };
+                if let Some(tok) = reject_token {
+                    account.reject(tok).await;
+                }
+                let base = flow::discovery_base(&endpoint)?;
+                let oauth_http = client::OAuthHttp::new(&base).map_err(Error::internal)?;
+                match storage::acquire_valid_token(&oauth_http, &binding, &account).await {
+                    Ok(_) => OAuthRefreshStatus::Refreshed,
+                    Err(true) => OAuthRefreshStatus::ReauthRequired,
+                    Err(false) => {
+                        return Err(Error::internal("MCP OAuth token refresh failed"));
+                    }
+                }
+            }
+        }
+    };
 
+    let (head, commits, has_more) = db
+        .call(move |s| {
+            let Some(st) = ledger::stream_head(&s.conn, id.as_str())? else {
+                return Ok((None, Vec::new(), false));
+            };
+            if st.epoch != expected_epoch {
+                return Ok((Some(to_wire_head(st)), Vec::new(), true));
+            }
+            let start_after = if expected_seq >= 0 && expected_seq <= st.head_seq {
+                expected_seq
+            } else {
+                0
+            };
+            let (commits, has_more) = ledger::read_commits_range(
+                &s.conn,
+                &st.stream_id,
+                st.epoch,
+                start_after,
+                None,
+                256,
+                4 * 1024 * 1024,
+            )?;
+            Ok((Some(to_wire_head(st)), commits, has_more))
+        })
+        .await?;
+
+    Ok(CoordinatorRefreshOutcome {
+        status,
+        head,
+        commits,
+        has_more,
+        error: None,
+    })
+}
+
+async fn read_refresh_tail(
+    db: &Db,
+    id: McpServerId,
+    expected_epoch: i64,
+    expected_seq: i64,
+) -> Result<(Vec<crate::cluster::ledger::CommitWire>, bool)> {
     db.call(move |s| {
         let Some(st) = crate::cluster::ledger::stream_head(&s.conn, id.as_str())? else {
-            return Ok((None, Vec::new()));
+            return Ok((Vec::new(), false));
         };
-        let start_after = if st.epoch == after_epoch && after_seq >= 0 && after_seq <= st.head_seq {
-            after_seq
+        if st.epoch != expected_epoch {
+            return Ok((Vec::new(), true));
+        }
+        let start_after = if expected_seq >= 0 && expected_seq <= st.head_seq {
+            expected_seq
         } else {
             0
         };
-        let (commits, _) = crate::cluster::ledger::read_commits_range(
+        crate::cluster::ledger::read_commits_range(
             &s.conn,
             &st.stream_id,
             st.epoch,
             start_after,
+            None,
             256,
             4 * 1024 * 1024,
-        )?;
-        let head = crate::cluster::ledger::StreamHead {
-            stream_id: st.stream_id,
-            kind: st.kind,
-            epoch: st.epoch,
-            head_seq: st.head_seq,
-            head_hash: st.head_hash,
-            deleted: st.deleted,
-            head_snapshot: st.head_snapshot,
-            updated_at: st.updated_at,
-        };
-        Ok((Some(head), commits))
+        )
     })
     .await
 }

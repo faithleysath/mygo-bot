@@ -320,13 +320,16 @@ export function Composer({
             <select
               class="composer-select"
               title={t("Session Model")}
-              value={session.model_id ?? ""}
+              value={session.model_id}
               onChange={(e) => {
-                const val = e.currentTarget.value || null;
+                const val = e.currentTarget.value;
+                if (!val) return;
                 onPatchSession(session.id, { model_id: val, reasoning_effort: null });
               }}
             >
-              <option value="">{t("No model")}</option>
+              {availableModels.length === 0 && !currentModel && (
+                <option value="">{t("No available models")}</option>
+              )}
               {activeProviders.length > 1
                 ? activeProviders.map((p) => {
                     const groupMods = availableModels.filter((m) => m.provider_id === p.id);

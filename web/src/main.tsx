@@ -699,6 +699,11 @@ function App() {
           }));
         }
       },
+      onReplaceItems: (hist) => {
+        if (activeIdRef.current === sid && sessionEpochRef.current === epoch) {
+          setItemsState({ sid, list: hist });
+        }
+      },
       onHasMore: (more) => {
         if (activeIdRef.current === sid && sessionEpochRef.current === epoch) setHasMore(more);
       },
@@ -804,6 +809,22 @@ function App() {
           const updated = data as SessionInfo;
           globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
+        } else if (name === "session.reset") {
+          closedCalls.clear();
+          closedItems.clear();
+          clearedThroughCallId = "";
+          setDraft(null);
+          setRetryNotice(null);
+          globalSyncRef.current?.touchSession(sid);
+          apiFetch<SessionInfo>(`/sessions/${sid}`)
+            .then((sess) => {
+              if (activeIdRef.current === sid && sessionEpochRef.current === epoch) {
+                globalSyncRef.current?.touchSession(sid);
+                setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
+              }
+            })
+            .catch(() => {});
+          sessionSync.onReset();
         } else if (name === "resync") {
           setRetryNotice(null);
           globalSyncRef.current?.touchSession(sid);
@@ -854,21 +875,29 @@ function App() {
   const createSession = async () => {
     setBannerErr("");
     try {
-      const body: Record<string, unknown> = {};
+      const available = models.filter((x) => !x.archived_at && !x.provider_archived_at);
+      if (available.length === 0) {
+        setBannerErr(t("Add an active model before creating a session."));
+        openSettings("models");
+        return;
+      }
+      let savedModelId: string | null = null;
+      let savedEffort: string | null = null;
       try {
-        const savedModelId = localStorage.getItem("mygo_last_model_id");
-        const savedEffort = localStorage.getItem("mygo_last_reasoning_effort");
-        if (savedModelId) {
-          const m = models.find((x) => x.id === savedModelId && !x.archived_at && !x.provider_archived_at);
-          if (m) {
-            body.model_id = m.id;
-            if (savedEffort && m.reasoning_efforts.includes(savedEffort)) {
-              body.reasoning_effort = savedEffort;
-            }
-          }
-        }
+        savedModelId = localStorage.getItem("mygo_last_model_id");
+        savedEffort = localStorage.getItem("mygo_last_reasoning_effort");
       } catch {}
+      const selected =
+        (savedModelId ? available.find((x) => x.id === savedModelId) : undefined) || available[0];
+      const body: Record<string, unknown> = { model_id: selected.id };
+      if (savedEffort && selected.reasoning_efforts.includes(savedEffort)) {
+        body.reasoning_effort = savedEffort;
+      }
       const s = await apiFetch<SessionInfo>("/sessions", { method: "POST", body });
+      try {
+        localStorage.setItem("mygo_last_model_id", s.model_id);
+        if (s.reasoning_effort) localStorage.setItem("mygo_last_reasoning_effort", s.reasoning_effort);
+      } catch {}
       const added = globalSyncRef.current
         ? globalSyncRef.current.onLocalCreated(s)
         : (setSessions((prev) => applySessionEvent(prev, "session.created", s)), true);
@@ -904,8 +933,7 @@ function App() {
       const updated = await apiFetch<SessionInfo>(`/sessions/${sid}`, { method: "PATCH", body: patch });
       if (patch.model_id !== undefined || patch.reasoning_effort !== undefined) {
         try {
-          if (updated.model_id) localStorage.setItem("mygo_last_model_id", updated.model_id);
-          else localStorage.removeItem("mygo_last_model_id");
+          localStorage.setItem("mygo_last_model_id", updated.model_id);
           if (updated.reasoning_effort) {
             localStorage.setItem("mygo_last_reasoning_effort", updated.reasoning_effort);
           } else {

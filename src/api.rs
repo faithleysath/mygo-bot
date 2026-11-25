@@ -96,22 +96,17 @@ impl Selection {
     }
 
     fn apply(self, fields: Map<String, Value>) -> Result<Self> {
-        let mut data = json!(self);
         if fields.get("model_id").is_some_and(Value::is_null) {
-            data["reasoning_effort"] = Value::Null;
+            return Err(Error::bad("model_id cannot be null"));
         }
+        let mut data = json!(self);
         data.as_object_mut().unwrap().extend(fields);
         serde_json::from_value(data).map_err(|e| Error::bad(e.to_string()))
     }
 
-    fn validate(&self, conn: &Connection) -> Result<Option<Value>> {
+    fn validate(&self, conn: &Connection) -> Result<Value> {
         let Some(id) = self.model_id else {
-            if self.reasoning_effort.is_some() {
-                return Err(Error::bad(
-                    "select a model before specifying reasoning effort",
-                ));
-            }
-            return Ok(None);
+            return Err(Error::bad("model_id is required"));
         };
         let (modalities, efforts) = crate::catalog::available_capabilities(conn, id)?;
         if let Some(effort) = &self.reasoning_effort
@@ -123,7 +118,7 @@ impl Selection {
                 "model {id} does not support effort {effort}; available: {efforts}"
             )));
         }
-        Ok(Some(modalities))
+        Ok(modalities)
     }
 }
 
@@ -156,11 +151,14 @@ async fn create_session(
                 }
                 .apply(fields)?;
                 next.validate(conn)?;
+                let model_id = next
+                    .model_id
+                    .ok_or_else(|| Error::bad("model_id is required"))?;
                 let id = SessionId::new()?;
                 let now = chrono::Utc::now().timestamp_millis();
                 conn.execute(
                     "INSERT INTO sessions(id,title,created_at,updated_at,model_id,reasoning_effort) VALUES(?,?,?,?,?,?)",
-                    params![id, title, now, now, next.model_id, next.reasoning_effort],
+                    params![id, title, now, now, model_id, next.reasoning_effort],
                 )?;
                 crate::cluster::ledger::record_session_delta(
                     conn,
@@ -169,7 +167,6 @@ async fn create_session(
                     &[],
                     Vec::new(),
                     Vec::new(),
-                    true,
                 )?;
                 session(conn, id)
             },
@@ -183,6 +180,7 @@ async fn create_session(
 }
 
 async fn get_session(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Session>> {
+    app.cluster.ensure_session_watched(sid).await?;
     app.db.call(move |s| Ok(Json(session(&s.conn, sid)?))).await
 }
 
@@ -208,25 +206,15 @@ async fn patch_session(
                 let next = current.apply(fields)?;
                 let modalities = next.validate(conn)?;
                 if next.model_id != old_id {
-                    if let Some(modalities) = modalities {
-                        crate::media::check_session(conn, sid, &modalities)?;
-                    } else {
-                        let has_context: bool = conn.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM context_items WHERE session_id=?1
-                     UNION ALL SELECT 1 FROM pending WHERE session_id=?1
-                     UNION ALL SELECT 1 FROM items WHERE session_id=?1 AND kind='function_call')",
-                            [sid],
-                            |r| r.get(0),
-                        )?;
-                        if has_context {
-                            return Err(Error::conflict("only an empty session may have no model"));
-                        }
-                    }
+                    crate::media::check_session(conn, sid, &modalities)?;
                 }
+                let model_id = next
+                    .model_id
+                    .ok_or_else(|| Error::bad("model_id is required"))?;
                 let now = chrono::Utc::now().timestamp_millis();
                 conn.execute(
                     "UPDATE sessions SET model_id=?,reasoning_effort=?,title=coalesce(?,title),updated_at=? WHERE id=?",
-                    params![next.model_id, next.reasoning_effort, title, now, sid],
+                    params![model_id, next.reasoning_effort, title, now, sid],
                 )?;
                 crate::cluster::ledger::record_session_delta(
                     conn,
@@ -235,7 +223,6 @@ async fn patch_session(
                     &[],
                     Vec::new(),
                     Vec::new(),
-                    true,
                 )?;
                 session(conn, sid)
             },
@@ -285,11 +272,11 @@ async fn delete_session(
             )?;
             tx.execute("DELETE FROM items WHERE session_id=?", [sid])?;
             tx.execute("UPDATE llm_calls SET session_id=NULL WHERE session_id=?", [sid])?;
-            for cid in detached_calls {
+            for &cid in &detached_calls {
                 crate::cluster::ledger::record_call(&tx, cid)?;
             }
             tx.execute("DELETE FROM sessions WHERE id=?", [sid])?;
-            crate::cluster::ledger::record_session_deleted(&tx, sid)?;
+            crate::cluster::ledger::record_session_deleted(&tx, sid, &detached_calls)?;
             tx.commit()?;
             s.mcp.forget_session(sid);
             s.channels.remove(&sid);
@@ -474,31 +461,39 @@ async fn withdraw(
 ) -> Result<StatusCode> {
     app.cluster.ensure_session_watched(sid).await?;
     app.db
-        .call(move |s| {
-            let sql = "SELECT EXISTS(SELECT 1 FROM items WHERE kind='withdrawal' AND target_id=?2),
-                          EXISTS(SELECT 1 FROM context_items WHERE item_id=?2)
-                   FROM items WHERE session_id=?1 AND id=?2 AND kind='user_message'";
-            let (withdrawn, included) = s.conn.query_row(sql, (sid, mid), |r| {
-                Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?))
-            })?;
-            if included {
-                return Err(Error::conflict("message already included"));
-            }
-            if !withdrawn {
-                let id = store::add_item(&s.conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
-                crate::cluster::ledger::record_session_delta(
-                    &s.conn,
-                    sid,
-                    "session_delta",
-                    &[id],
-                    Vec::new(),
-                    Vec::new(),
-                    false,
-                )?;
-                s.item_saved(sid, id)?;
-            }
-            Ok(StatusCode::NO_CONTENT)
-        })
+        .write(
+            move |conn| {
+                let sql = "SELECT EXISTS(SELECT 1 FROM items WHERE kind='withdrawal' AND target_id=?2),
+                              EXISTS(SELECT 1 FROM context_items WHERE item_id=?2)
+                       FROM items WHERE session_id=?1 AND id=?2 AND kind='user_message'";
+                let (withdrawn, included) = conn.query_row(sql, (sid, mid), |r| {
+                    Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?))
+                })?;
+                if included {
+                    return Err(Error::conflict("message already included"));
+                }
+                if !withdrawn {
+                    let id = store::add_item(conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
+                    crate::cluster::ledger::record_session_delta(
+                        conn,
+                        sid,
+                        "session_delta",
+                        &[id],
+                        Vec::new(),
+                        Vec::new(),
+                    )?;
+                    Ok(Some(id))
+                } else {
+                    Ok(None)
+                }
+            },
+            move |s, created| {
+                if let Some(id) = created {
+                    s.item_saved(sid, id)?;
+                }
+                Ok(StatusCode::NO_CONTENT)
+            },
+        )
         .await
 }
 

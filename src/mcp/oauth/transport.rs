@@ -91,10 +91,30 @@ impl HttpClient {
         if let Ok(Some((creds, rejected))) = auth.account.load_credentials().await
             && storage::needs_refresh(&creds, rejected)
         {
-            let _ = auth
+            let rejected_hash = rejected
+                .then(|| creds.token_response.as_ref())
+                .flatten()
+                .map(|tr| *blake3::hash(tr.access_token.as_bytes()).as_bytes());
+            match auth
                 .cluster
-                .coordinate_mcp_oauth_refresh(auth.account.id, &auth.account.generation)
-                .await;
+                .coordinate_mcp_oauth_refresh(
+                    auth.account.id,
+                    &auth.account.generation,
+                    rejected_hash,
+                )
+                .await
+            {
+                Ok(crate::cluster::sync::RefreshCoordination::Delegated {
+                    reauth_required: true,
+                })
+                | Err(_) => return Err(McpError::AuthRequired),
+                Ok(
+                    crate::cluster::sync::RefreshCoordination::Local
+                    | crate::cluster::sync::RefreshCoordination::Delegated {
+                        reauth_required: false,
+                    },
+                ) => {}
+            }
         }
         // Queued requests recheck expiry after the previous refresh commits. Once token
         // acquisition starts, finish a possible refresh even if this MCP operation times out:

@@ -52,7 +52,7 @@ pub fn definitions() -> Value {
                 "Tasks & MyGo (task, mygo):\n",
                 "- await task.list() lists active tasks in this session; await task.status(id) returns the full live snapshot or final summary (calls share a 100ms throttle).\n",
                 "- mygo.sessionId and mygo.taskId identify the current session and task. await mygo.request({path,method,headers,body,timeout_ms,stream}) calls MyGo's own HTTP API in-process (no host or token needed; plain objects/JSON bodies serialize with application/json; stream:true is required for SSE endpoints such as /sessions/{sid}/events).\n",
-                "- Read /openapi.json via mygo.request for all routes and schemas (sessions, messages, run/pause, history, context, events, providers, models, config, mcp, calls, attachments).\n\n",
+                "- Read /openapi.json via mygo.request for all routes and schemas (sessions, messages, run/pause, history, context, events, providers, models, cluster, mcp, calls, attachments).\n\n",
                 "Output & events:\n",
                 "- Return text, JSON-serializable values, or one or more content blocks (task output budget: 52 MiB). Wrap binary data in a media block. Console output (latest 256 KiB) accompanies the result.\n",
                 "- await emitEvent(textOrBlocks) queues a separate event in this session (rate-limited: burst 8, 1/s refill, max 128 queued messages per session; nonempty).\n",

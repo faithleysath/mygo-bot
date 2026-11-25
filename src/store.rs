@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::OpenOptions, path::Path, thread};
+use std::{collections::HashMap, fs::OpenOptions, path::Path, sync::Arc, thread};
 
 use axum::body::Bytes;
 use reqwest::Body;
@@ -13,8 +13,11 @@ use crate::{
     Error, Result,
     agent::Control,
     cluster::{
-        SyncSignal,
-        ledger::{ContextPos, clear_staged, record_call, record_session_delta, take_staged},
+        ClusterSignal, SyncSignal,
+        ledger::{
+            ContextPos, clear_staged, has_conflict, is_session_writable_local, record_call,
+            record_session_delta, take_staged, with_savepoint,
+        },
     },
     events::Notice,
     id::{CallId, ItemId, ModelId, SessionId},
@@ -42,7 +45,7 @@ impl Write {
 }
 
 enum Command {
-    Call(Box<dyn FnOnce(&mut Store) + Send>),
+    Call(Box<dyn FnOnce(&mut Store) -> bool + Send>),
     Write(Write),
 }
 
@@ -67,8 +70,9 @@ pub struct Store {
     pub mcp: crate::mcp::Connections,
     pub channels: HashMap<SessionId, broadcast::WeakSender<Notice>>,
     pub wake_sequences: HashMap<SessionId, watch::Sender<u64>>,
+    pub session_run_gen: HashMap<SessionId, u64>,
     pub global_events: broadcast::Sender<Notice>,
-    pub sync_tx: mpsc::UnboundedSender<SyncSignal>,
+    pub sync_tx: Arc<ClusterSignal>,
     pub closing: bool,
 }
 
@@ -76,7 +80,7 @@ impl Db {
     pub fn open(
         path: &Path,
         global_events: broadcast::Sender<Notice>,
-        sync_tx: mpsc::UnboundedSender<SyncSignal>,
+        sync_tx: Arc<ClusterSignal>,
     ) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(false);
@@ -99,7 +103,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 3 {
+            if version != 4 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
@@ -110,9 +114,7 @@ impl Db {
         let local_node_id = crate::cluster::identity::load_local_node(&tx)?.node_id;
         let call_ids = {
             let mut stmt = tx.prepare(
-                "SELECT c.id FROM llm_calls c WHERE c.status='in_flight'
-                 AND coalesce((SELECT sc.author_node_id FROM sync_commits sc
-                               WHERE sc.stream_id=c.id ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1",
+                "SELECT id FROM llm_calls WHERE status='in_flight' AND origin_node_id=?1",
             )?;
             stmt.query_map([&local_node_id], |r| r.get::<_, CallId>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -122,7 +124,9 @@ impl Db {
                 "UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE id=?",
                 [cid],
             )?;
-            record_call(&tx, cid)?;
+            if !has_conflict(&tx, cid.as_str())? {
+                record_call(&tx, cid)?;
+            }
         }
         let running_sids = {
             let mut stmt = tx.prepare("SELECT id FROM sessions WHERE status IN ('running','pausing')")?;
@@ -134,7 +138,9 @@ impl Db {
                 "UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE id=?",
                 [sid],
             )?;
-            record_session_delta(&tx, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
+            if !has_conflict(&tx, sid.as_str())? && is_session_writable_local(&tx, sid)? {
+                record_session_delta(&tx, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+            }
         }
         crate::codemode::ledger::recover(&tx)?;
         tx.commit()?;
@@ -152,6 +158,7 @@ impl Db {
                     mcp: Default::default(),
                     channels: HashMap::new(),
                     wake_sequences: HashMap::new(),
+                    session_run_gen: HashMap::new(),
                     global_events,
                     sync_tx,
                     closing: false,
@@ -162,9 +169,12 @@ impl Db {
                     match command {
                         Command::Call(call) => {
                             clear_staged();
-                            call(&mut store);
-                            let staged = take_staged();
-                            store.notify_streams(staged);
+                            if call(&mut store) {
+                                let staged = take_staged();
+                                store.notify_streams(staged);
+                            } else {
+                                clear_staged();
+                            }
                         }
                         Command::Write(first) => {
                             batch.push(first);
@@ -194,7 +204,10 @@ impl Db {
     ) -> Result<T> {
         self.submit(|reply| {
             Command::Call(Box::new(move |store| {
-                let _ = reply.send(f(store));
+                let res = f(store);
+                let ok = res.is_ok();
+                let _ = reply.send(res);
+                ok
             }))
         })
         .await
@@ -297,33 +310,45 @@ impl Enqueue {
                 return Ok(Enqueued::Existing(id));
             }
         }
-        let model_id: Option<ModelId> = conn
+        let model_id: ModelId = conn
             .prepare_cached("SELECT model_id FROM sessions WHERE id=?")?
             .query_row([self.sid], |row| row.get(0))?;
-        let model_id = model_id
-            .ok_or_else(|| Error::conflict("select a session model before sending messages"))?;
         let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
         crate::media::validate_message(conn, &self.content, &modalities)?;
+        let origin = crate::cluster::identity::load_local_node(conn)?.node_id;
         let id = ItemId::new()?;
-        conn.prepare_cached("INSERT INTO items(id,session_id,kind,payload,idempotency_key) VALUES(?1,?2,'user_message',json_object('content',json(?3),'role','user'),?4)")?
-            .execute(params![id, self.sid, self.content, self.key])?;
+        conn.prepare_cached(
+            "INSERT INTO items(id,session_id,kind,payload,idempotency_key,origin_node_id)
+             VALUES(?1,?2,'user_message',json_object('content',json(?3),'role','user'),?4,?5)",
+        )?
+        .execute(params![id, self.sid, self.content, self.key, origin])?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute((self.sid, now))?;
-        record_session_delta(conn, self.sid, "session_delta", &[id], Vec::new(), Vec::new(), true)?;
+        record_session_delta(conn, self.sid, "session_delta", &[id], Vec::new(), Vec::new())?;
         Ok(Enqueued::Created(id))
     }
 }
 
 impl Store {
     pub fn sync_signal(&self, signal: SyncSignal) {
-        let _ = self.sync_tx.send(signal);
+        match signal {
+            SyncSignal::SelfMetaChanged => self.sync_tx.notify_self_meta(),
+        }
     }
 
     pub fn notify_streams(&self, ids: Vec<String>) {
-        if !ids.is_empty() {
-            let _ = self.sync_tx.send(SyncSignal::StreamsChanged(ids));
-        }
+        self.sync_tx.notify_streams(ids);
+    }
+
+    pub fn bump_run_gen(&mut self, sid: SessionId) -> u64 {
+        let next = self.session_run_gen.get(&sid).copied().unwrap_or(0) + 1;
+        self.session_run_gen.insert(sid, next);
+        next
+    }
+
+    pub fn run_gen(&self, sid: SessionId) -> u64 {
+        self.session_run_gen.get(&sid).copied().unwrap_or(0)
     }
 
     fn commit_batch(&mut self, batch: &mut Vec<Write>) {
@@ -432,13 +457,30 @@ impl Store {
 
     pub fn status(&mut self, sid: SessionId, state: &str, reason: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        self.conn.execute(
-            "UPDATE sessions SET status=?2,last_error=?3,updated_at=?4 WHERE id=?1",
-            (sid, state, reason, now),
-        )?;
-        if matches!(state, "idle" | "paused") {
-            record_session_delta(&self.conn, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
-        }
+        with_savepoint(&self.conn, "store_status", || {
+            has_conflict(&self.conn, sid.as_str()).and_then(|c| {
+                if c {
+                    Err(Error::conflict(format!(
+                        "sync conflict on {sid}; resolve it before modifying"
+                    )))
+                } else {
+                    Ok(())
+                }
+            })?;
+            if !is_session_writable_local(&self.conn, sid)? {
+                return Err(Error::conflict(
+                    "session history is incomplete or deleted; sync before modifying",
+                ));
+            }
+            self.conn.execute(
+                "UPDATE sessions SET status=?2,last_error=?3,updated_at=?4 WHERE id=?1",
+                (sid, state, reason, now),
+            )?;
+            if matches!(state, "idle" | "paused") {
+                record_session_delta(&self.conn, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+            }
+            Ok(())
+        })?;
         self.notify_status(sid, state, reason, now);
         Ok(())
     }
@@ -493,7 +535,7 @@ pub struct Session {
     pub status: SessionStatus,
     pub reasoning_effort: Option<String>,
     pub last_error: String,
-    pub model_id: Option<ModelId>,
+    pub model_id: ModelId,
 }
 
 #[derive(PartialEq, serde::Deserialize, serde::Serialize)]
@@ -536,8 +578,13 @@ pub fn has_pending(conn: &Connection, sid: SessionId) -> Result<bool> {
         |r| r.get(0),
     )?;
     // The caller can go idle without calling take_pending when only discarded inputs remain.
-    if !ready && advance_queue(conn, sid, false)? {
-        record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
+    if !ready {
+        with_savepoint(conn, "advance_pending", || {
+            if advance_queue(conn, sid, false)? {
+                record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+            }
+            Ok(())
+        })?;
     }
     Ok(ready)
 }
@@ -554,9 +601,12 @@ pub fn pending_reason(conn: &Connection, sid: SessionId) -> Result<Option<&'stat
         (true, false) => Ok(Some("user_message")),
         (false, true) => Ok(Some("task_event")),
         (false, false) => {
-            if advance_queue(conn, sid, false)? {
-                record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
-            }
+            with_savepoint(conn, "advance_pending_reason", || {
+                if advance_queue(conn, sid, false)? {
+                    record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+                }
+                Ok(())
+            })?;
             Ok(None)
         }
     }
@@ -592,7 +642,7 @@ pub fn take_pending(tx: &Connection, sid: SessionId) -> Result<()> {
     }
     let advanced = advance_queue(tx, sid, added > 0)?;
     if !ctx_added.is_empty() || advanced {
-        record_session_delta(tx, sid, "session_delta", &[], ctx_added, Vec::new(), true)?;
+        record_session_delta(tx, sid, "session_delta", &[], ctx_added, Vec::new())?;
     }
     Ok(())
 }
@@ -626,9 +676,10 @@ pub fn add_item(
     llm_call_id: Option<CallId>,
 ) -> Result<ItemId> {
     let id = ItemId::new()?;
+    let origin = crate::cluster::identity::load_local_node(conn)?.node_id;
     conn.execute(
-        "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id) VALUES(?,?,?,?,?,?)",
-        params![id, sid, kind, payload, target, llm_call_id],
+        "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id,origin_node_id) VALUES(?,?,?,?,?,?,?)",
+        params![id, sid, kind, payload, target, llm_call_id, origin],
     )?;
     Ok(id)
 }
@@ -655,9 +706,10 @@ pub fn add_context_item(
     kind: &str,
     item: &Value,
     call_id: CallId,
+    expected_epoch: Option<i64>,
 ) -> Result<ItemId> {
     let (id, pos) = add_context_item_raw(tx, sid, kind, item, call_id)?;
-    record_session_delta(
+    crate::cluster::ledger::record_session_delta_at_epoch(
         tx,
         sid,
         "session_delta",
@@ -667,7 +719,7 @@ pub fn add_context_item(
             item_id: id,
         }],
         Vec::new(),
-        false,
+        expected_epoch,
     )?;
     Ok(id)
 }
@@ -729,7 +781,6 @@ pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Resul
             &recovered,
             ctx_added,
             Vec::new(),
-            false,
         )?;
     }
     Ok(recovered)

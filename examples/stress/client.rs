@@ -2,7 +2,13 @@ use crate::{Result, check};
 use futures_util::TryStreamExt;
 use reqwest::{Client, Method, RequestBuilder, header};
 use serde_json::{Value, json};
-use std::{io, net::SocketAddr, pin::Pin, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
 use tokio_util::io::StreamReader;
 
@@ -15,6 +21,7 @@ pub struct Api {
     address: SocketAddr,
     client: Client,
     timeout: Duration,
+    default_model_id: Arc<OnceLock<String>>,
 }
 
 impl Api {
@@ -33,7 +40,15 @@ impl Api {
                 .connect_timeout(timeout)
                 .build()?,
             timeout,
+            default_model_id: Arc::new(OnceLock::new()),
         })
+    }
+
+    pub fn default_model_id(&self) -> Result<&str> {
+        self.default_model_id
+            .get()
+            .map(String::as_str)
+            .ok_or_else(|| "default model not configured".into())
     }
 
     pub fn request(&self, method: Method, path: &str, body: Option<Value>) -> RequestBuilder {
@@ -117,18 +132,19 @@ impl Api {
             )
             .await?;
         let model_id = model["id"].as_str().ok_or("missing model id")?;
-        self.json(
-            Method::PATCH,
-            "/config",
-            Some(json!({"default_model_id": model_id})),
-            200,
-        )
-        .await?;
+        let _ = self.default_model_id.set(model_id.to_owned());
         Ok(())
     }
 
     pub async fn session(&self) -> Result<String> {
-        let data = self.json(Method::POST, "/sessions", None, 201).await?;
+        let data = self
+            .json(
+                Method::POST,
+                "/sessions",
+                Some(json!({"model_id": self.default_model_id()?})),
+                201,
+            )
+            .await?;
         let id = data["id"].as_str().ok_or("missing session id")?;
         Ok(format!("/sessions/{id}"))
     }

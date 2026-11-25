@@ -391,7 +391,28 @@ impl Model {
                 )));
             }
             if fewer_modalities {
-                media::check_session(conn, sid, &modalities)?;
+                let head = crate::cluster::ledger::stream_head(conn, sid.as_str())?;
+                if head.as_ref().is_none_or(|st| st.is_body_complete()) {
+                    media::check_session(conn, sid, &modalities)?;
+                } else if let Some(st) = head {
+                    let supported = st
+                        .head_snapshot
+                        .as_deref()
+                        .and_then(|raw| {
+                            serde_json::from_str::<crate::cluster::ledger::SessionSnapshot>(raw)
+                                .ok()
+                        })
+                        .is_some_and(|snap| {
+                            snap.required_modalities
+                                .iter()
+                                .all(|m| self.input_modalities.contains(m))
+                        });
+                    if !supported {
+                        return Err(Error::conflict(format!(
+                            "cannot remove input modality needed by session {sid}"
+                        )));
+                    }
+                }
             }
         }
         Ok(())

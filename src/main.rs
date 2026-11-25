@@ -519,8 +519,8 @@ async fn serve(
             builder.build()
         };
         let streams = events::Hub::default();
-        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
-        let db = Db::open(Path::new("mygo.sqlite3"), streams.global_sender(), sync_tx.clone())?;
+        let signal = Arc::new(cluster::ClusterSignal::new());
+        let db = Db::open(Path::new("mygo.sqlite3"), streams.global_sender(), signal.clone())?;
         let client = make_client()?;
         let stopping = CancellationToken::new();
         let workers = TaskTracker::new();
@@ -529,8 +529,7 @@ async fn serve(
                 db: db.clone(),
                 client: client.clone(),
                 streams: streams.clone(),
-                signal_tx: sync_tx,
-                signal_rx: sync_rx,
+                signal,
                 config: cluster::ClusterConfig {
                     local_only: options.cluster_local,
                     bind_addr: options.cluster_bind,

@@ -122,9 +122,11 @@ impl Connections {
             true
         });
     }
-    pub(crate) fn reset_server(&mut self, id: McpServerId) {
-        self.oauth().cancel_login(id);
-        self.forget(id);
+    pub(crate) fn apply_sync_change(&mut self, change: crate::cluster::ledger::McpChange) {
+        if change.cancel_login {
+            self.oauth().cancel_login(change.id);
+        }
+        self.forget(change.id);
     }
     pub fn forget_session(&mut self, sid: SessionId) {
         self.slots.retain(|(session, _), (slot, _)| {

@@ -14,6 +14,7 @@ struct Grant {
 
 // Keep decoding and network errors outside the transaction so neither can undo logout.
 fn take(conn: &Connection, id: McpServerId, expected: Option<&str>, timeout: Duration) -> Result<Grant> {
+    crate::cluster::ledger::assert_no_conflict(conn, id.as_str())?;
     let (generation, grant) = conn.query_row(
         "SELECT generation,credentials,binding FROM mcp_servers
          LEFT JOIN mcp_oauth ON server_id=id WHERE id=?",
@@ -35,7 +36,9 @@ fn take(conn: &Connection, id: McpServerId, expected: Option<&str>, timeout: Dur
         ));
     }
     conn.execute("DELETE FROM mcp_oauth WHERE server_id=?", [id])?;
-    crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
+    if !crate::cluster::ledger::has_conflict(conn, id.as_str())? {
+        crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
+    }
     Ok(grant)
 }
 

@@ -388,15 +388,15 @@ fn save(
         crate::cluster::ledger::assert_no_conflict(conn, old_id.as_str())?;
         let old_oauth = if !auth_changed {
             conn.query_row(
-                "SELECT generation,binding,pending,credentials,rejected FROM mcp_oauth WHERE server_id=?",
+                "SELECT generation,binding,credentials,rejected FROM mcp_oauth
+                 WHERE server_id=? AND (credentials IS NOT NULL OR rejected=1)",
                 [old_id],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, bool>(4)?,
+                        r.get::<_, bool>(3)?,
                     ))
                 },
             )
@@ -426,11 +426,11 @@ fn save(
             }
             _ => e.into(),
         })?;
-        if let Some((generation, binding, pending, credentials, rejected)) = old_oauth {
+        if let Some((generation, binding, credentials, rejected)) = old_oauth {
             conn.execute(
-                "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,rejected)
-                 VALUES(?,?,?,?,?,?)",
-                params![new_id, generation, binding, pending, credentials, rejected],
+                "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,staged_credentials,rejected)
+                 VALUES(?,?,?,NULL,?,NULL,?)",
+                params![new_id, generation, binding, credentials, rejected],
             )?;
         }
         crate::cluster::ledger::record_mcp_deleted(conn, old_id)?;

@@ -1,6 +1,6 @@
 import type { TargetedSubmitEvent } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { apiFetch, errorMessage, formatAbsTime, formatCost, formatDuration, formatTokens, totalInputTokens } from "./api.ts";
+import { ApiError, apiFetch, errorMessage, formatAbsTime, formatCost, formatDuration, formatTokens, totalInputTokens } from "./api.ts";
 import { formatRelTimeLoc, statusText, useI18n } from "./i18n.ts";
 import type { LocalePref } from "./i18n.ts";
 import { Icon } from "./Icons.tsx";
@@ -975,6 +975,7 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
   const [selfDesc, setSelfDesc] = useState("");
   const [inviteCode, setInviteCode] = useState("");
   const [joinInvite, setJoinInvite] = useState("");
+  const [pendingForceInvite, setPendingForceInvite] = useState("");
   const [busySync, setBusySync] = useState(false);
   const [busyJoin, setBusyJoin] = useState(false);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
@@ -1047,27 +1048,35 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     }
   };
 
-  const submitJoin = async (e: TargetedSubmitEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const inv = joinInvite.trim();
-    if (!inv) return;
+  const joinWithInvite = async (inv: string, force: boolean) => {
     setErr("");
     setNotice("");
     setBusyJoin(true);
     try {
       const res = await apiFetch<{ joined: boolean; peer: { name: string; node_id: string } }>("/cluster/join", {
         method: "POST",
-        body: { invite: inv },
+        body: force ? { invite: inv, force: true } : { invite: inv },
       });
       setJoinInvite("");
+      setPendingForceInvite("");
       setNotice(`${t("Joined cluster via")} ${res.peer.name || res.peer.node_id}`);
       await load();
       onClusterChanged();
     } catch (ex) {
+      if (ex instanceof ApiError && ex.status === 409 && !force) {
+        setPendingForceInvite(inv);
+      }
       setErr(errorMessage(ex));
     } finally {
       setBusyJoin(false);
     }
+  };
+
+  const submitJoin = async (e: TargetedSubmitEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const inv = joinInvite.trim();
+    if (!inv) return;
+    await joinWithInvite(inv, false);
   };
 
   const resolveConflict = async (streamId: string, resolution: "local" | "cluster") => {
@@ -1165,12 +1174,40 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
             style="flex:1"
             placeholder={t("Paste invite code…")}
             value={joinInvite}
-            onInput={(e) => setJoinInvite(e.currentTarget.value)}
+            onInput={(e) => {
+              setJoinInvite(e.currentTarget.value);
+              if (pendingForceInvite) setPendingForceInvite("");
+            }}
           />
           <button type="submit" class="btn-primary btn-xs" disabled={busyJoin || !joinInvite.trim()}>
             {busyJoin ? t("Joining…") : t("Join")}
           </button>
         </form>
+        {pendingForceInvite && (
+          <div class="form-box">
+            <div class="small muted">
+              {t("This node already has cluster peers. Switching cluster keeps local data and replaces peer membership.")}
+            </div>
+            <div class="row gap-1">
+              <button
+                type="button"
+                class="btn-danger btn-xs"
+                disabled={busyJoin}
+                onClick={() => void joinWithInvite(pendingForceInvite, true)}
+              >
+                {busyJoin ? t("Joining…") : t("Force Switch Cluster")}
+              </button>
+              <button
+                type="button"
+                class="btn-ghost btn-xs"
+                disabled={busyJoin}
+                onClick={() => setPendingForceInvite("")}
+              >
+                {t("Cancel")}
+              </button>
+            </div>
+          </div>
+        )}
         <div class="item-list">
           {(!status || status.peers.length === 0) && (
             <div class="empty-hint small">
@@ -1244,6 +1281,23 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
                   {t("Cluster")}: epoch={c.remote_epoch} seq={c.remote_seq} ({c.remote_hash_hex.slice(0, 10)}) via{" "}
                   {c.remote_node_id.slice(0, 12)}…
                 </div>
+                {(c.related_local_id || c.remote_summary) && (
+                  <div class="small muted">
+                    {c.related_local_id && (
+                      <span>
+                        {t("Local ID")}: <code class="md-inline-code mono">{c.related_local_id}</code>{" "}
+                      </span>
+                    )}
+                    {c.remote_summary && (
+                      <span class="mono">
+                        {Object.entries(c.remote_summary)
+                          .slice(0, 6)
+                          .map(([k, v]) => `${k}=${String(v)}`)
+                          .join(" · ")}
+                      </span>
+                    )}
+                  </div>
+                )}
                 <div class="row gap-1">
                   <button
                     type="button"

@@ -293,6 +293,11 @@ const ZH = {
   "streams updated": "条流已更新",
   "conflicts": "条冲突",
   "Joined cluster via": "已通过节点加入集群：",
+  "No available models": "无可用模型",
+  "This node already has cluster peers. Switching cluster keeps local data and replaces peer membership.": "当前节点已加入其他集群。切换集群会保留本地数据并替换对等节点成员关系。",
+  "Force Switch Cluster": "强制切换集群",
+  "Local ID": "本地 ID",
+  "Add an active model before creating a session.": "请先添加可用模型后再创建会话。",
 } as const;
 
 export type Msg = keyof typeof ZH;

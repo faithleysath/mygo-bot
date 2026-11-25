@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+        atomic::{AtomicI64, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use iroh::{
@@ -13,7 +13,7 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
     cluster::{
         identity::{
             LocalNode, PeerInfo, decode_endpoint_addr, list_peers, load_local_node, self_peer_info,
-            upsert_peer,
+            upsert_peer_if_gen,
         },
         sync::SyncEngine,
     },
@@ -30,17 +30,19 @@ use crate::{
 
 pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/1";
 const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
-pub const RPC_HEADER_MAX_BYTES: usize = 80 * 1024 * 1024;
-pub const RPC_BODY_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const RPC_REQ_HEADER_MAX: usize = 2 * 1024 * 1024;
+pub const RPC_RESP_HEADER_MAX: usize = 6 * 1024 * 1024;
+pub const RPC_BODY_MAX: usize = 2 * 1024 * 1024;
+pub const RPC_BYTE_UNIT: usize = 64 * 1024;
+pub const MAX_RPC_BYTE_PERMITS: usize = 512; // 32 MiB global RPC frame budget
+pub const MAX_GLOBAL_INFLIGHT_RPC: usize = 64;
+pub const MAX_PEER_INFLIGHT_RPC: usize = 16;
+
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(15);
-
-#[derive(Clone, Debug)]
-pub enum PeerEvent {
-    Connected(String),
-    Disconnected(String),
-}
+pub const RPC_READ_DEADLINE: Duration = Duration::from_secs(15);
+pub const RPC_WRITE_DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -63,22 +65,41 @@ enum AuthMsg {
 #[derive(Clone)]
 struct PeerEntry {
     conn_id: u64,
+    membership_gen: i64,
     conn: Connection,
     is_outbound: bool,
-    established_at: Instant,
+}
+
+struct NetAuthState {
+    secret: [u8; 32],
+    membership_gen: i64,
+    gen_cancel: CancellationToken,
+}
+
+#[derive(Default)]
+struct PeerConnectState {
+    peers: HashSet<String>,
 }
 
 pub struct ClusterNet {
     db: Db,
     endpoint: Endpoint,
-    secret: Mutex<[u8; 32]>,
+    auth: Mutex<NetAuthState>,
+    membership_gen_fast: AtomicI64,
     local_node_id: String,
     peers: Mutex<HashMap<String, PeerEntry>>,
+    dialing: Mutex<HashSet<String>>,
     next_conn_id: AtomicU64,
-    handler: Mutex<Option<Arc<SyncEngine>>>,
-    peer_events: mpsc::UnboundedSender<PeerEvent>,
+    handler: Mutex<Option<Weak<SyncEngine>>>,
+    connected_peers: Mutex<PeerConnectState>,
+    connect_notify: Notify,
     dial_wake: Notify,
     local_only: bool,
+    stopping: CancellationToken,
+    tasks: TaskTracker,
+    global_rpc_sem: Arc<Semaphore>,
+    peer_rpc_sems: Mutex<HashMap<String, Weak<Semaphore>>>,
+    rpc_byte_budget: Arc<Semaphore>,
 }
 
 fn auth_mac(
@@ -99,10 +120,22 @@ fn auth_mac(
     *hasher.finalize().as_bytes()
 }
 
+pub async fn write_frame_timed(
+    send: &mut SendStream,
+    header: &[u8],
+    body: Option<&[u8]>,
+    deadline: Duration,
+) -> Result<()> {
+    tokio::time::timeout(deadline, write_frame(send, header, body))
+        .await
+        .map_err(|_| Error::internal("cluster stream write timed out"))?
+}
+
 pub async fn write_frame(send: &mut SendStream, header: &[u8], body: Option<&[u8]>) -> Result<()> {
     let h_len = u32::try_from(header.len()).map_err(|_| Error::internal("frame header too large"))?;
     let b_slice = body.unwrap_or(&[]);
-    let b_len = u32::try_from(b_slice.len()).map_err(|_| Error::internal("frame body too large"))?;
+    let b_len =
+        u32::try_from(b_slice.len()).map_err(|_| Error::internal("frame body too large"))?;
     let mut prefix = Vec::with_capacity(8 + header.len());
     prefix.extend_from_slice(&h_len.to_be_bytes());
     prefix.extend_from_slice(header);
@@ -120,37 +153,76 @@ pub async fn write_frame(send: &mut SendStream, header: &[u8], body: Option<&[u8
     Ok(())
 }
 
-pub async fn read_frame(
+pub struct FramePermits {
+    _hdr: OwnedSemaphorePermit,
+    _body: Option<OwnedSemaphorePermit>,
+}
+
+pub async fn read_frame_bounded(
     recv: &mut RecvStream,
     max_header: usize,
     max_body: usize,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| Error::internal(format!("cluster read header length failed: {e}")))?;
-    let h_len = u32::from_be_bytes(len_buf) as usize;
-    if h_len > max_header {
-        return Err(Error::bad("cluster frame header exceeds limit"));
-    }
-    let mut header = vec![0u8; h_len];
-    recv.read_exact(&mut header)
-        .await
-        .map_err(|e| Error::internal(format!("cluster read header failed: {e}")))?;
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| Error::internal(format!("cluster read body length failed: {e}")))?;
-    let b_len = u32::from_be_bytes(len_buf) as usize;
-    if b_len > max_body {
-        return Err(Error::bad("cluster frame body exceeds limit"));
-    }
-    let mut body = vec![0u8; b_len];
-    if b_len > 0 {
-        recv.read_exact(&mut body)
+    byte_budget: &Arc<Semaphore>,
+    deadline: Duration,
+) -> Result<(Vec<u8>, Vec<u8>, FramePermits)> {
+    tokio::time::timeout(deadline, async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
             .await
-            .map_err(|e| Error::internal(format!("cluster read body failed: {e}")))?;
-    }
-    Ok((header, body))
+            .map_err(|e| Error::internal(format!("cluster read header length failed: {e}")))?;
+        let h_len = u32::from_be_bytes(len_buf) as usize;
+        if h_len > max_header {
+            return Err(Error::bad("cluster frame header exceeds limit"));
+        }
+        let h_permits = u32::try_from(h_len.div_ceil(RPC_BYTE_UNIT).max(1))
+            .map_err(|_| Error::bad("frame header permit overflow"))?;
+        let hdr_permit = byte_budget
+            .clone()
+            .acquire_many_owned(h_permits)
+            .await
+            .map_err(|_| Error::internal("rpc byte budget closed"))?;
+        let mut header = vec![0u8; h_len];
+        recv.read_exact(&mut header)
+            .await
+            .map_err(|e| Error::internal(format!("cluster read header failed: {e}")))?;
+
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| Error::internal(format!("cluster read body length failed: {e}")))?;
+        let b_len = u32::from_be_bytes(len_buf) as usize;
+        if b_len > max_body {
+            return Err(Error::bad("cluster frame body exceeds limit"));
+        }
+        let body_permit = if b_len > 0 {
+            let b_permits = u32::try_from(b_len.div_ceil(RPC_BYTE_UNIT))
+                .map_err(|_| Error::bad("frame body permit overflow"))?;
+            Some(
+                byte_budget
+                    .clone()
+                    .acquire_many_owned(b_permits)
+                    .await
+                    .map_err(|_| Error::internal("rpc byte budget closed"))?,
+            )
+        } else {
+            None
+        };
+        let mut body = vec![0u8; b_len];
+        if b_len > 0 {
+            recv.read_exact(&mut body)
+                .await
+                .map_err(|e| Error::internal(format!("cluster read body failed: {e}")))?;
+        }
+        Ok((
+            header,
+            body,
+            FramePermits {
+                _hdr: hdr_permit,
+                _body: body_permit,
+            },
+        ))
+    })
+    .await
+    .map_err(|_| Error::internal("cluster frame read timed out"))?
 }
 
 async fn write_auth(send: &mut SendStream, msg: &AuthMsg) -> Result<()> {
@@ -181,12 +253,23 @@ async fn read_auth(recv: &mut RecvStream) -> Result<AuthMsg> {
     serde_json::from_slice(&buf).map_err(|_| Error::bad("invalid auth message"))
 }
 
+struct DialGuard {
+    net: Arc<ClusterNet>,
+    peer_id: String,
+}
+
+impl Drop for DialGuard {
+    fn drop(&mut self) {
+        self.net.dialing.lock().unwrap().remove(&self.peer_id);
+    }
+}
+
 impl ClusterNet {
     pub async fn bind(
         db: Db,
         local: LocalNode,
         config: crate::cluster::ClusterConfig,
-        peer_events: mpsc::UnboundedSender<PeerEvent>,
+        stopping: CancellationToken,
     ) -> Result<Arc<Self>> {
         let sk = SecretKey::from_bytes(&local.secret_key);
         let mut builder = if config.local_only {
@@ -198,6 +281,7 @@ impl ClusterNet {
         .alpns(vec![CLUSTER_ALPN.to_vec()]);
         if let Some(addr) = config.bind_addr {
             builder = builder
+                .clear_ip_transports()
                 .bind_addr(addr)
                 .map_err(|e| Error::internal(format!("invalid cluster bind addr {addr}: {e}")))?;
         }
@@ -205,21 +289,34 @@ impl ClusterNet {
             .bind()
             .await
             .map_err(|e| Error::internal(format!("failed to bind iroh endpoint: {e}")))?;
+        let gen_cancel = stopping.child_token();
         Ok(Arc::new(Self {
             db,
             endpoint,
-            secret: Mutex::new(local.cluster_secret),
+            membership_gen_fast: AtomicI64::new(local.membership_gen),
+            auth: Mutex::new(NetAuthState {
+                secret: local.cluster_secret,
+                membership_gen: local.membership_gen,
+                gen_cancel,
+            }),
             local_node_id: local.node_id,
             peers: Mutex::default(),
+            dialing: Mutex::default(),
             next_conn_id: AtomicU64::new(1),
             handler: Mutex::default(),
-            peer_events,
+            connected_peers: Mutex::default(),
+            connect_notify: Notify::new(),
             dial_wake: Notify::new(),
             local_only: config.local_only,
+            stopping,
+            tasks: TaskTracker::new(),
+            global_rpc_sem: Arc::new(Semaphore::new(MAX_GLOBAL_INFLIGHT_RPC)),
+            peer_rpc_sems: Mutex::default(),
+            rpc_byte_budget: Arc::new(Semaphore::new(MAX_RPC_BYTE_PERMITS)),
         }))
     }
 
-    pub fn attach_handler(&self, handler: Arc<SyncEngine>) {
+    pub fn attach_handler(&self, handler: Weak<SyncEngine>) {
         *self.handler.lock().unwrap() = Some(handler);
     }
 
@@ -235,18 +332,58 @@ impl ClusterNet {
         self.local_only
     }
 
+    pub fn membership_gen(&self) -> i64 {
+        self.membership_gen_fast.load(Ordering::Acquire)
+    }
+
+    fn auth_context(&self) -> (i64, [u8; 32], CancellationToken) {
+        let st = self.auth.lock().unwrap();
+        (st.membership_gen, st.secret, st.gen_cancel.clone())
+    }
+
+    pub fn rpc_byte_budget(&self) -> &Arc<Semaphore> {
+        &self.rpc_byte_budget
+    }
+
+    pub fn global_rpc_sem(&self) -> &Arc<Semaphore> {
+        &self.global_rpc_sem
+    }
+
+    pub fn peer_rpc_sem(&self, node_id: &str) -> Arc<Semaphore> {
+        let mut map = self.peer_rpc_sems.lock().unwrap();
+        map.retain(|_, w| w.strong_count() > 0);
+        if let Some(sem) = map.get(node_id).and_then(Weak::upgrade) {
+            return sem;
+        }
+        let sem = Arc::new(Semaphore::new(MAX_PEER_INFLIGHT_RPC));
+        map.insert(node_id.to_owned(), Arc::downgrade(&sem));
+        sem
+    }
+
+    pub fn take_connected_peers(&self) -> Vec<String> {
+        self.connected_peers.lock().unwrap().peers.drain().collect()
+    }
+
+    pub async fn wait_peer_connected(&self) {
+        self.connect_notify.notified().await;
+    }
+
     pub fn online_peer_ids(&self) -> Vec<String> {
+        let current_gen = self.membership_gen();
         let mut peers = self.peers.lock().unwrap();
-        peers.retain(|_, entry| entry.conn.close_reason().is_none());
+        peers.retain(|_, entry| {
+            entry.membership_gen == current_gen && entry.conn.close_reason().is_none()
+        });
         let mut ids: Vec<String> = peers.keys().cloned().collect();
         ids.sort();
         ids
     }
 
     pub fn is_peer_online(&self, node_id: &str) -> bool {
+        let current_gen = self.membership_gen();
         let mut peers = self.peers.lock().unwrap();
         if let Some(entry) = peers.get(node_id) {
-            if entry.conn.close_reason().is_none() {
+            if entry.membership_gen == current_gen && entry.conn.close_reason().is_none() {
                 return true;
             }
             peers.remove(node_id);
@@ -255,9 +392,10 @@ impl ClusterNet {
     }
 
     pub fn get_connection(&self, node_id: &str) -> Option<Connection> {
+        let current_gen = self.membership_gen();
         let mut peers = self.peers.lock().unwrap();
         let entry = peers.get(node_id)?;
-        if entry.conn.close_reason().is_none() {
+        if entry.membership_gen == current_gen && entry.conn.close_reason().is_none() {
             Some(entry.conn.clone())
         } else {
             peers.remove(node_id);
@@ -269,12 +407,22 @@ impl ClusterNet {
         self.dial_wake.notify_one();
     }
 
-    pub fn reload_cluster_secret(&self, new_secret: [u8; 32]) {
-        *self.secret.lock().unwrap() = new_secret;
+    pub fn switch_membership(&self, new_gen: i64, new_secret: [u8; 32]) {
+        let old_cancel = {
+            let mut st = self.auth.lock().unwrap();
+            st.secret = new_secret;
+            st.membership_gen = new_gen;
+            self.membership_gen_fast.store(new_gen, Ordering::Release);
+            std::mem::replace(&mut st.gen_cancel, self.stopping.child_token())
+        };
+        old_cancel.cancel();
         let entries: Vec<PeerEntry> = self.peers.lock().unwrap().drain().map(|(_, v)| v).collect();
         for entry in entries {
             entry.conn.close(2u32.into(), b"cluster changed");
         }
+        self.dialing.lock().unwrap().clear();
+        self.peer_rpc_sems.lock().unwrap().clear();
+        self.connected_peers.lock().unwrap().peers.clear();
         self.dial_wake.notify_one();
     }
 
@@ -282,71 +430,101 @@ impl ClusterNet {
         if let Some(entry) = self.peers.lock().unwrap().remove(node_id) {
             entry.conn.close(3u32.into(), b"peer removed");
         }
+        self.connected_peers.lock().unwrap().peers.remove(node_id);
+        self.peer_rpc_sems.lock().unwrap().remove(node_id);
     }
 
-    pub fn spawn_loops(self: &Arc<Self>, workers: &TaskTracker, stopping: CancellationToken) {
+    pub fn spawn_loops(self: &Arc<Self>, workers: &TaskTracker) {
         let net_accept = self.clone();
-        let stop_accept = stopping.clone();
         workers.spawn(async move {
-            net_accept.accept_loop(stop_accept).await;
+            net_accept.accept_loop().await;
         });
         let net_dial = self.clone();
         workers.spawn(async move {
-            net_dial.dial_loop(stopping).await;
+            net_dial.dial_loop().await;
         });
     }
 
     pub async fn shutdown(&self) {
+        self.stopping.cancel();
+        self.auth.lock().unwrap().gen_cancel.cancel();
+        *self.handler.lock().unwrap() = None;
         let entries: Vec<PeerEntry> = self.peers.lock().unwrap().drain().map(|(_, v)| v).collect();
         for entry in entries {
             entry.conn.close(0u32.into(), b"shutdown");
         }
         self.endpoint.close().await;
+        self.tasks.close();
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.tasks.wait()).await;
     }
 
-    async fn accept_loop(self: Arc<Self>, stopping: CancellationToken) {
+    async fn accept_loop(self: Arc<Self>) {
         loop {
             let incoming = tokio::select! {
-                _ = stopping.cancelled() => break,
+                _ = self.stopping.cancelled() => break,
                 inc = self.endpoint.accept() => match inc {
                     Some(inc) => inc,
                     None => break,
                 },
             };
             let net = self.clone();
-            tokio::spawn(async move {
-                if let Ok(connecting) = incoming.accept()
-                    && let Ok(conn) = connecting.await
-                {
+            self.tasks.spawn(async move {
+                let stop = net.stopping.clone();
+                let res = tokio::select! {
+                    _ = stop.cancelled() => return,
+                    conn_res = async {
+                        let connecting = incoming.accept().map_err(|_| ())?;
+                        connecting.await.map_err(|_| ())
+                    } => conn_res,
+                };
+                if let Ok(conn) = res {
                     net.handle_incoming_conn(conn).await;
                 }
             });
         }
     }
 
-    async fn dial_loop(self: Arc<Self>, stopping: CancellationToken) {
+    async fn dial_loop(self: Arc<Self>) {
         loop {
-            if stopping.is_cancelled() || self.endpoint.is_closed() {
+            if self.stopping.is_cancelled() || self.endpoint.is_closed() {
                 return;
             }
+            let (mgen, _, gen_cancel) = self.auth_context();
             let peers = match self.db.call(|s| list_peers(&s.conn)).await {
                 Ok(p) => p,
                 Err(_) => break,
             };
+            if gen_cancel.is_cancelled() || self.membership_gen() != mgen {
+                continue;
+            }
             for peer in peers {
-                if stopping.is_cancelled() || self.endpoint.is_closed() {
+                if self.stopping.is_cancelled() || self.endpoint.is_closed() {
                     return;
                 }
-                if self.is_peer_online(&peer.node_id) {
+                if gen_cancel.is_cancelled() || self.membership_gen() != mgen {
+                    break;
+                }
+                if peer.node_id == self.local_node_id || self.is_peer_online(&peer.node_id) {
                     continue;
                 }
+                {
+                    let mut dialing = self.dialing.lock().unwrap();
+                    if !dialing.insert(peer.node_id.clone()) {
+                        continue;
+                    }
+                }
+                let guard = DialGuard {
+                    net: self.clone(),
+                    peer_id: peer.node_id.clone(),
+                };
                 let net = self.clone();
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
+                    let _guard = guard;
                     let _ = net.dial_peer(&peer).await;
                 });
             }
             tokio::select! {
-                _ = stopping.cancelled() => return,
+                _ = self.stopping.cancelled() => return,
                 _ = self.endpoint.closed() => return,
                 _ = self.dial_wake.notified() => (),
                 _ = tokio::time::sleep(RECONNECT_INTERVAL) => (),
@@ -358,17 +536,27 @@ impl ClusterNet {
         if peer.node_id == self.local_node_id || self.is_peer_online(&peer.node_id) {
             return Ok(());
         }
+        let (mgen, cluster_secret, gen_cancel) = self.auth_context();
         let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs)?;
-        let conn = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr, CLUSTER_ALPN))
-            .await
-            .map_err(|_| Error::internal("dial timed out"))?
-            .map_err(|e| Error::internal(format!("dial failed: {e}")))?;
+        let conn = tokio::select! {
+            _ = gen_cancel.cancelled() => return Err(Error::conflict("membership changed during dial")),
+            res = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr, CLUSTER_ALPN)) => {
+                res.map_err(|_| Error::internal("dial timed out"))?
+                    .map_err(|e| Error::internal(format!("dial failed: {e}")))?
+            }
+        };
         let remote_id = conn.remote_id().to_string();
         if remote_id != peer.node_id {
             conn.close(1u32.into(), b"node id mismatch");
             return Err(Error::bad("peer node id mismatch"));
         }
-        let res = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate_outbound(&conn)).await;
+        let res = tokio::select! {
+            _ = gen_cancel.cancelled() => {
+                conn.close(2u32.into(), b"cluster changed");
+                return Err(Error::conflict("membership changed during handshake"));
+            }
+            r = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate_outbound(&conn, &cluster_secret)) => r,
+        };
         let remote_peer = match res {
             Ok(Ok(info)) => info,
             Ok(Err(e)) => {
@@ -380,7 +568,8 @@ impl ClusterNet {
                 return Err(Error::internal("cluster auth timed out"));
             }
         };
-        self.register_peer_conn(conn, remote_peer, true).await;
+        self.register_peer_conn(conn, remote_peer, true, mgen, gen_cancel)
+            .await;
         Ok(())
     }
 
@@ -389,7 +578,14 @@ impl ClusterNet {
             conn.close(1u32.into(), b"unsupported alpn");
             return;
         }
-        let res = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate_inbound(&conn)).await;
+        let (mgen, cluster_secret, gen_cancel) = self.auth_context();
+        let res = tokio::select! {
+            _ = gen_cancel.cancelled() => {
+                conn.close(2u32.into(), b"cluster changed");
+                return;
+            }
+            r = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate_inbound(&conn, &cluster_secret)) => r,
+        };
         let remote_peer = match res {
             Ok(Ok(info)) => info,
             _ => {
@@ -397,12 +593,16 @@ impl ClusterNet {
                 return;
             }
         };
-        self.register_peer_conn(conn, remote_peer, false).await;
+        self.register_peer_conn(conn, remote_peer, false, mgen, gen_cancel)
+            .await;
     }
 
-    async fn authenticate_outbound(&self, conn: &Connection) -> Result<PeerInfo> {
+    async fn authenticate_outbound(
+        &self,
+        conn: &Connection,
+        cluster_secret: &[u8; 32],
+    ) -> Result<PeerInfo> {
         let local = self.db.call(|s| load_local_node(&s.conn)).await?;
-        let cluster_secret = *self.secret.lock().unwrap();
         let self_info = self_peer_info(&local, &self.endpoint.addr());
         let mut client_nonce = [0u8; 32];
         getrandom::fill(&mut client_nonce).map_err(|_| Error::internal("entropy unavailable"))?;
@@ -429,7 +629,7 @@ impl ClusterNet {
             return Err(Error::bad("remote peer identity mismatch"));
         }
         let expected_server_mac = auth_mac(
-            &cluster_secret,
+            cluster_secret,
             b"mygo-auth-srv",
             &remote_id,
             &local.node_id,
@@ -440,7 +640,7 @@ impl ClusterNet {
             return Err(Error::bad("cluster authentication failed"));
         }
         let client_mac = auth_mac(
-            &cluster_secret,
+            cluster_secret,
             b"mygo-auth-cli",
             &local.node_id,
             &remote_id,
@@ -455,9 +655,12 @@ impl ClusterNet {
         }
     }
 
-    async fn authenticate_inbound(&self, conn: &Connection) -> Result<PeerInfo> {
+    async fn authenticate_inbound(
+        &self,
+        conn: &Connection,
+        cluster_secret: &[u8; 32],
+    ) -> Result<PeerInfo> {
         let local = self.db.call(|s| load_local_node(&s.conn)).await?;
-        let cluster_secret = *self.secret.lock().unwrap();
         let remote_id = conn.remote_id().to_string();
         let (mut send, mut recv) = conn
             .accept_bi()
@@ -473,7 +676,7 @@ impl ClusterNet {
         let mut server_nonce = [0u8; 32];
         getrandom::fill(&mut server_nonce).map_err(|_| Error::internal("entropy unavailable"))?;
         let server_mac = auth_mac(
-            &cluster_secret,
+            cluster_secret,
             b"mygo-auth-srv",
             &local.node_id,
             &remote_id,
@@ -495,7 +698,7 @@ impl ClusterNet {
             _ => return Err(Error::bad("expected auth finish")),
         };
         let expected_client_mac = auth_mac(
-            &cluster_secret,
+            cluster_secret,
             b"mygo-auth-cli",
             &remote_id,
             &local.node_id,
@@ -515,59 +718,86 @@ impl ClusterNet {
         conn: Connection,
         remote_peer: PeerInfo,
         is_outbound: bool,
+        mgen: i64,
+        gen_cancel: CancellationToken,
     ) {
+        if gen_cancel.is_cancelled() || self.membership_gen() != mgen {
+            conn.close(2u32.into(), b"cluster changed");
+            return;
+        }
         let remote_id = remote_peer.node_id.clone();
         let self_id = self.local_node_id.clone();
-        let _ = self
+        let ok = self
             .db
             .call(move |s| {
                 let now = chrono::Utc::now().timestamp_millis();
-                upsert_peer(&s.conn, &self_id, &remote_peer, now)?;
-                Ok(())
+                upsert_peer_if_gen(&s.conn, &self_id, &remote_peer, now, true, mgen)
             })
-            .await;
+            .await
+            .is_ok();
+        if !ok || gen_cancel.is_cancelled() || self.membership_gen() != mgen {
+            conn.close(2u32.into(), b"cluster changed");
+            return;
+        }
 
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::AcqRel);
         let old = {
+            if self.membership_gen() != mgen || gen_cancel.is_cancelled() {
+                conn.close(2u32.into(), b"cluster changed");
+                return;
+            }
             let mut peers = self.peers.lock().unwrap();
             if let Some(prev) = peers.get(&remote_id)
+                && prev.membership_gen == mgen
                 && prev.conn.close_reason().is_none()
-                && prev.is_outbound != is_outbound
-                && prev.established_at.elapsed() < Duration::from_secs(5)
-                && (self.local_node_id < remote_id) != is_outbound
             {
-                // Simultaneous dial tie-breaker: deterministically keep outbound on lexicographically smaller node_id.
-                conn.close(4u32.into(), b"duplicate connection");
-                return;
+                if prev.is_outbound != is_outbound {
+                    let keep_prev = (self.local_node_id < remote_id) == prev.is_outbound;
+                    if keep_prev {
+                        conn.close(4u32.into(), b"duplicate connection");
+                        return;
+                    }
+                }
             }
             peers.insert(
                 remote_id.clone(),
                 PeerEntry {
                     conn_id,
+                    membership_gen: mgen,
                     conn: conn.clone(),
                     is_outbound,
-                    established_at: Instant::now(),
                 },
             )
         };
         if let Some(prev) = old {
             prev.conn.close(4u32.into(), b"superseded connection");
         }
-        let _ = self.peer_events.send(PeerEvent::Connected(remote_id.clone()));
+        {
+            self.connected_peers
+                .lock()
+                .unwrap()
+                .peers
+                .insert(remote_id.clone());
+        }
+        self.connect_notify.notify_one();
 
         let net = self.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             loop {
                 tokio::select! {
+                    _ = net.stopping.cancelled() => break,
+                    _ = gen_cancel.cancelled() => break,
                     _ = conn.closed() => break,
                     bi = conn.accept_bi() => {
                         match bi {
                             Ok((send, recv)) => {
-                                let handler = net.handler.lock().unwrap().clone();
+                                let handler = net.handler.lock().unwrap().as_ref().and_then(Weak::upgrade);
                                 let from = remote_id.clone();
-                                tokio::spawn(async move {
+                                let n = net.clone();
+                                let gc = gen_cancel.clone();
+                                net.tasks.spawn(async move {
                                     if let Some(handler) = handler {
-                                        handler.handle_rpc(from, send, recv).await;
+                                        handler.handle_rpc(from, send, recv, mgen, gc, n).await;
                                     }
                                 });
                             }
@@ -576,17 +806,9 @@ impl ClusterNet {
                     }
                 }
             }
-            let removed = {
-                let mut peers = net.peers.lock().unwrap();
-                if peers.get(&remote_id).is_some_and(|e| e.conn_id == conn_id) {
-                    peers.remove(&remote_id);
-                    true
-                } else {
-                    false
-                }
-            };
-            if removed {
-                let _ = net.peer_events.send(PeerEvent::Disconnected(remote_id));
+            let mut peers = net.peers.lock().unwrap();
+            if peers.get(&remote_id).is_some_and(|e| e.conn_id == conn_id) {
+                peers.remove(&remote_id);
             }
         });
     }

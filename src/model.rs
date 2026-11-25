@@ -222,6 +222,7 @@ impl App {
         input: Input,
         out: &mut Output,
         hard: &CancellationToken,
+        run_epoch: i64,
     ) -> std::result::Result<(), Failure> {
         let body = body(self.db.clone(), sid, &input).await?;
         let mut request = self
@@ -369,7 +370,8 @@ impl App {
                         out.final_output_index = Some(idx);
                         return Ok(());
                     }
-                    self.accept(sid, input.call_id, item, out, hard).await?;
+                    self.accept(sid, input.call_id, item, out, hard, run_epoch)
+                        .await?;
                     self.streams.finish_item(sid, input.call_id, idx);
                 }
                 _ => (),
@@ -386,6 +388,7 @@ impl App {
         item: Value,
         out: &mut Output,
         hard: &CancellationToken,
+        run_epoch: i64,
     ) -> Result<()> {
         let kind = item["type"]
             .as_str()
@@ -428,14 +431,14 @@ impl App {
                             None,
                             Some(llm_call_id),
                         )?;
-                        crate::cluster::ledger::record_session_delta(
+                        crate::cluster::ledger::record_session_delta_at_epoch(
                             conn,
                             sid,
                             "session_delta",
                             &[id],
                             Vec::new(),
                             Vec::new(),
-                            false,
+                            Some(run_epoch),
                         )?;
                         Ok(Some(id))
                     },
@@ -479,7 +482,14 @@ impl App {
         self.db
             .call(move |s| {
                 let tx = s.conn.transaction()?;
-                let id = store::add_context_item(&tx, sid, &kind, &item, llm_call_id)?;
+                let id = store::add_context_item(
+                    &tx,
+                    sid,
+                    &kind,
+                    &item,
+                    llm_call_id,
+                    Some(run_epoch),
+                )?;
                 tx.commit()?;
                 s.item_saved(sid, id)?;
                 Ok(())

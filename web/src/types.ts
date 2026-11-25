@@ -12,7 +12,7 @@ export interface SessionInfo {
   status: SessionStatus;
   reasoning_effort: string | null;
   last_error: string;
-  model_id: string | null;
+  model_id: string;
 }
 
 export interface SessionStatusEvent {
@@ -72,7 +72,8 @@ export interface SyncConflictInfo {
   remote_hash_hex: string;
   remote_node_id: string;
   reason: string;
-  remote_snapshot: Record<string, unknown> | null;
+  related_local_id: string | null;
+  remote_summary: Record<string, unknown> | null;
   detected_at: number;
 }
 

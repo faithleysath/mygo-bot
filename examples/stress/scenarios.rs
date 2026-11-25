@@ -215,18 +215,19 @@ impl Work {
             }
             "mixed" => {
                 let page = format!("{messages}?limit=1");
-                let (_, session, config, list) = tokio::try_join!(
+                let expected_model = api.default_model_id()?;
+                let (_, session, models, list) = tokio::try_join!(
                     api.enqueue(path, "mixed"),
                     api.get(path),
-                    api.get("/config"),
+                    api.get("/models"),
                     api.get(&page)
                 )?;
                 check(
                     session["status"] == "idle"
-                        && config["default_model_id"]
-                            .as_str()
-                            .is_some_and(|s| s.starts_with("mdl_"))
-                        && session["model_id"] == config["default_model_id"]
+                        && session["model_id"].as_str() == Some(expected_model)
+                        && models
+                            .as_array()
+                            .is_some_and(|arr| arr.iter().any(|m| m["id"] == session["model_id"]))
                         && list.is_array(),
                     "invalid mixed response",
                 )?;

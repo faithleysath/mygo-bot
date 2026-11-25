@@ -33,10 +33,20 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
         .as_ref()
         .and_then(|p| pricing::snapshot(p, started_at));
     let call_id = CallId::new()?;
+    let origin_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
     conn.execute(
-        "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot)
-         VALUES(?,?,?,?,?,?,'in_flight',?)",
-        params![call_id, sid, model_id, effort, end, started_at, snapshot],
+        "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot,origin_node_id)
+         VALUES(?,?,?,?,?,?,'in_flight',?,?)",
+        params![
+            call_id,
+            sid,
+            model_id,
+            effort,
+            end,
+            started_at,
+            snapshot,
+            origin_node_id
+        ],
     )?;
     crate::cluster::ledger::record_call(conn, call_id)?;
     Ok(Input {
@@ -65,23 +75,25 @@ impl Report {
         reason: Option<&str>,
         at: i64,
     ) -> Result<()> {
-        let snapshot = conn.query_row(
-            "SELECT pricing_snapshot FROM llm_calls WHERE id=? AND status='in_flight'",
-            [id],
-            |r| r.get(0),
-        )?;
-        let usage = self.usage.filter(Value::is_object);
-        let bill = pricing::settle(snapshot, usage.as_ref());
-        conn.execute(
-            "UPDATE llm_calls SET finished_at=?, status=?, error_summary=?, upstream_response_id=?,
-             http_status=?, raw_usage=?, input_uncached_tokens=?, cache_read_tokens=?, cache_write_tokens=?,
-             output_tokens=?, cost_nano_usd=?, pricing_snapshot=? WHERE id=? AND status='in_flight'",
-            params![at, status, reason, self.response_id, self.http_status, usage,
-                bill.input_uncached_tokens, bill.cache_read_tokens, bill.cache_write_tokens,
-                bill.output_tokens, bill.cost_nano_usd, bill.snapshot, id],
-        )?;
-        crate::cluster::ledger::record_call(conn, id)?;
-        Ok(())
+        crate::cluster::ledger::with_savepoint(conn, "finish_call", || {
+            let snapshot = conn.query_row(
+                "SELECT pricing_snapshot FROM llm_calls WHERE id=? AND status='in_flight'",
+                [id],
+                |r| r.get(0),
+            )?;
+            let usage = self.usage.filter(Value::is_object);
+            let bill = pricing::settle(snapshot, usage.as_ref());
+            conn.execute(
+                "UPDATE llm_calls SET finished_at=?, status=?, error_summary=?, upstream_response_id=?,
+                 http_status=?, raw_usage=?, input_uncached_tokens=?, cache_read_tokens=?, cache_write_tokens=?,
+                 output_tokens=?, cost_nano_usd=?, pricing_snapshot=? WHERE id=? AND status='in_flight'",
+                params![at, status, reason, self.response_id, self.http_status, usage,
+                    bill.input_uncached_tokens, bill.cache_read_tokens, bill.cache_write_tokens,
+                    bill.output_tokens, bill.cost_nano_usd, bill.snapshot, id],
+            )?;
+            crate::cluster::ledger::record_call(conn, id)?;
+            Ok(())
+        })
     }
 }
 

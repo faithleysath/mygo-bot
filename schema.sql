@@ -39,6 +39,7 @@ CREATE TABLE mcp_oauth (
     binding TEXT,
     pending TEXT,
     credentials TEXT,
+    staged_credentials TEXT,
     rejected INTEGER NOT NULL DEFAULT 0 CHECK (rejected IN (0,1))
 );
 -- Credentials belong to a particular endpoint, authentication settings and HTTP headers.
@@ -51,7 +52,7 @@ CREATE TABLE sessions (
     created_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle','running','pausing','paused')),
-    model_id TEXT REFERENCES llm_models,
+    model_id TEXT NOT NULL REFERENCES llm_models,
     reasoning_effort TEXT,
     input_queue_cursor TEXT NOT NULL DEFAULT '',
     last_error TEXT NOT NULL DEFAULT '',
@@ -76,6 +77,7 @@ CREATE TABLE llm_calls (
     output_tokens INTEGER CHECK(output_tokens>=0),
     pricing_snapshot TEXT CHECK(pricing_snapshot IS NULL OR json_valid(pricing_snapshot)),
     cost_nano_usd INTEGER CHECK(cost_nano_usd>=0),
+    origin_node_id TEXT NOT NULL DEFAULT '',
     UNIQUE(session_id, id)
 );
 CREATE INDEX calls_by_session ON llm_calls(session_id, started_at, id);
@@ -98,6 +100,7 @@ CREATE TABLE items (
     llm_call_id TEXT,
     idempotency_key TEXT,
     codemode_call_item_id TEXT,
+    origin_node_id TEXT NOT NULL DEFAULT '',
     CHECK (codemode_call_item_id IS NULL OR kind='codemode_event'
            OR (kind='function_call_output' AND target_id IS codemode_call_item_id)),
     CHECK (kind!='codemode_event' OR (codemode_call_item_id IS NOT NULL AND target_id IS NULL
@@ -150,7 +153,8 @@ CREATE TABLE local_node (
     cluster_secret BLOB NOT NULL CHECK (length(cluster_secret) = 32),
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    meta_seq INTEGER NOT NULL DEFAULT 1 CHECK (meta_seq > 0)
+    meta_seq INTEGER NOT NULL DEFAULT 1 CHECK (meta_seq > 0),
+    membership_gen INTEGER NOT NULL DEFAULT 1 CHECK (membership_gen > 0)
 );
 CREATE TABLE cluster_peers (
     node_id TEXT PRIMARY KEY,
@@ -160,6 +164,7 @@ CREATE TABLE cluster_peers (
     arch TEXT NOT NULL DEFAULT '',
     meta_seq INTEGER NOT NULL DEFAULT 0,
     addrs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(addrs_json) = 'array'),
+    addrs_ts INTEGER NOT NULL DEFAULT 0,
     last_seen_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE sync_streams (
@@ -168,15 +173,32 @@ CREATE TABLE sync_streams (
     epoch INTEGER NOT NULL DEFAULT 1 CHECK (epoch > 0),
     head_seq INTEGER NOT NULL DEFAULT 0 CHECK (head_seq >= 0),
     head_hash BLOB NOT NULL CHECK (length(head_hash) = 32),
+    synced_epoch INTEGER NOT NULL DEFAULT 0 CHECK (synced_epoch >= 0),
     synced_seq INTEGER NOT NULL DEFAULT 0 CHECK (synced_seq >= 0),
+    synced_hash BLOB NOT NULL DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000' CHECK (length(synced_hash) = 32),
+    checkpoint_seq INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_seq >= 0),
     watched INTEGER NOT NULL DEFAULT 0 CHECK (watched IN (0,1)),
     deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0,1)),
+    retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1)),
     head_snapshot TEXT CHECK (head_snapshot IS NULL OR json_valid(head_snapshot)),
     updated_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX sync_streams_by_kind ON sync_streams(kind, stream_id);
 CREATE TABLE sync_commits (
     stream_id TEXT NOT NULL REFERENCES sync_streams(stream_id) ON DELETE CASCADE,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    seq INTEGER NOT NULL CHECK (seq > 0),
+    parent_hash BLOB NOT NULL CHECK (length(parent_hash) = 32),
+    commit_hash BLOB NOT NULL CHECK (length(commit_hash) = 32),
+    author_node_id TEXT NOT NULL,
+    op_type TEXT NOT NULL,
+    payload TEXT NOT NULL CHECK (json_valid(payload)),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (stream_id, epoch, seq),
+    UNIQUE (stream_id, commit_hash)
+);
+CREATE TABLE sync_staging_commits (
+    stream_id TEXT NOT NULL,
     epoch INTEGER NOT NULL CHECK (epoch > 0),
     seq INTEGER NOT NULL CHECK (seq > 0),
     parent_hash BLOB NOT NULL CHECK (length(parent_hash) = 32),
@@ -199,7 +221,10 @@ CREATE TABLE sync_conflicts (
     remote_hash BLOB NOT NULL,
     remote_node_id TEXT NOT NULL,
     reason TEXT NOT NULL,
+    related_local_id TEXT,
+    summary_json TEXT CHECK (summary_json IS NULL OR json_valid(summary_json)),
     remote_snapshot TEXT CHECK (remote_snapshot IS NULL OR json_valid(remote_snapshot)),
     detected_at INTEGER NOT NULL
 );
-PRAGMA user_version = 3;
+CREATE INDEX sync_conflicts_by_local ON sync_conflicts(related_local_id) WHERE related_local_id IS NOT NULL;
+PRAGMA user_version = 4;

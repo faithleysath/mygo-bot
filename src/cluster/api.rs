@@ -13,7 +13,7 @@ use crate::{
         SyncSignal,
         identity::{
             current_arch, current_os, delete_peer, encode_endpoint_addrs, encode_invite,
-            list_peers, load_local_node, update_self_meta, apply_join,
+            list_peers, load_local_node, update_self_meta,
         },
         ledger::{ConflictInfo, list_conflicts},
         sync::SyncSummary,
@@ -180,21 +180,12 @@ async fn invite(State(app): State<App>) -> Result<Json<InviteResponse>> {
 #[serde(deny_unknown_fields)]
 struct JoinBody {
     invite: String,
+    #[serde(default)]
+    force: bool,
 }
 
 async fn join(State(app): State<App>, Json(body): Json<JoinBody>) -> Result<Json<Value>> {
-    let (secret_changed, new_secret, peer) = app
-        .db
-        .write(
-            move |conn| apply_join(conn, &body.invite),
-            |_, res| Ok(res),
-        )
-        .await?;
-    if secret_changed {
-        app.cluster.net.reload_cluster_secret(new_secret);
-    } else {
-        app.cluster.net.wake_dialer();
-    }
+    let peer = app.cluster.join_cluster(body.invite, body.force).await?;
     Ok(Json(json!({
         "joined": true,
         "peer": {
@@ -211,28 +202,18 @@ async fn remove_peer(
     State(app): State<App>,
     Path(node_id): Path<String>,
 ) -> Result<StatusCode> {
+    let target = node_id.clone();
     let removed = app
         .db
         .write(
-            move |conn| delete_peer(conn, &node_id),
+            move |conn| delete_peer(conn, &target),
             |_, removed| Ok(removed),
         )
         .await?;
     if !removed {
         return Err(rusqlite::Error::QueryReturnedNoRows.into());
     }
-    // Note: path variable moved into closure; disconnect any active connection after DB delete.
-    // Re-check all online connections against DB peers on disconnect:
-    let online = app.cluster.net.online_peer_ids();
-    let known: std::collections::HashSet<String> = app
-        .db
-        .call(|s| Ok(list_peers(&s.conn)?.into_iter().map(|p| p.node_id).collect()))
-        .await?;
-    for id in online {
-        if !known.contains(&id) {
-            app.cluster.net.disconnect_peer(&id);
-        }
-    }
+    app.cluster.net.disconnect_peer(&node_id);
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -72,7 +72,7 @@ impl Agent {
                     .and_then(|value| value.parse().ok())
             }) {
                 let api = Api::new(address, &token, timeout)?;
-                api.get("/config").await?;
+                api.get("/cluster").await?;
                 return Ok((agent, api));
             }
             check(
