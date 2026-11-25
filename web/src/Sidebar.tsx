@@ -13,6 +13,7 @@ export interface SidebarProps {
   collapsed: boolean;
   searchOpen: boolean;
   conflictCount: number;
+  nodeNameById?: Map<string, string>;
   themePref: ThemePref;
   searchInputRef: RefObject<HTMLInputElement | null>;
   onSelect: (id: string) => void;
@@ -32,6 +33,7 @@ export function Sidebar({
   collapsed,
   searchOpen,
   conflictCount,
+  nodeNameById,
   themePref,
   searchInputRef,
   onSelect,
@@ -215,15 +217,20 @@ export function Sidebar({
           {filtered.map((s) => {
             const active = s.id === activeId;
             const busy = s.status === "running" || s.status === "pausing";
+            const occupied = busy || Boolean(s.runner_node_id);
+            const runnerName = s.runner_node_id
+              ? nodeNameById?.get(s.runner_node_id) || s.runner_node_id
+              : "";
             const dotClass =
               s.status === "paused" && s.last_error ? "dot-error" : `dot-${s.status}`;
             const confirming = confirmId === s.id;
             const group = dateGroupLabelLoc(s.updated_at || s.created_at, locale);
             const showGroup = showGroups && group !== lastGroup;
             lastGroup = group;
-            const tip = s.last_error
-              ? `${statusText(s.status, locale)}: ${s.last_error}`
+            const baseStatus = runnerName
+              ? `${statusText(s.status, locale)} @${runnerName}`
               : statusText(s.status, locale);
+            const tip = s.last_error ? `${baseStatus}: ${s.last_error}` : baseStatus;
 
             return (
               <div key={s.id}>
@@ -240,7 +247,7 @@ export function Sidebar({
                   <span class="session-time" title={formatAbsTime(s.updated_at)}>
                     {formatRelTimeLoc(s.updated_at, locale)}
                   </span>
-                  {!busy && (
+                  {!occupied && (
                     <button
                       type="button"
                       class={`session-del ${confirming ? "confirm" : ""}`}

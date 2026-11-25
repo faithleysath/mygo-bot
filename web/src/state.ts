@@ -327,6 +327,7 @@ export function applySessionEvent(
             status: st.status,
             last_error: st.reason || "",
             updated_at: st.updated_at ?? s.updated_at,
+            runner_node_id: st.runner_node_id !== undefined ? st.runner_node_id : s.runner_node_id,
           }
         : s
     );
@@ -360,7 +361,8 @@ function sameSession(a: SessionInfo, b: SessionInfo): boolean {
     a.model_id === b.model_id &&
     a.reasoning_effort === b.reasoning_effort &&
     a.last_error === b.last_error &&
-    a.updated_at === b.updated_at
+    a.updated_at === b.updated_at &&
+    a.runner_node_id === b.runner_node_id
   );
 }
 

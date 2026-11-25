@@ -298,6 +298,10 @@ const ZH = {
   "Force Switch Cluster": "强制切换集群",
   "Local ID": "本地 ID",
   "Add an active model before creating a session.": "请先添加可用模型后再创建会话。",
+  "Execution Node": "执行节点",
+  "This node": "本节点",
+  "Offline": "离线",
+  "Running on": "运行节点",
 } as const;
 
 export type Msg = keyof typeof ZH;

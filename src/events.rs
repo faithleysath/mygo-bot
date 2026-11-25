@@ -1,5 +1,6 @@
 use crate::{
     App, Result,
+    cluster::exec::RelayedEvent,
     id::{CallId, SessionId},
     store::session,
 };
@@ -11,7 +12,7 @@ use futures_util::Stream;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     convert::Infallible,
     sync::{
         Arc, Mutex,
@@ -22,6 +23,7 @@ use tokio::sync::broadcast::{
     self,
     error::{RecvError, TryRecvError},
 };
+use tokio_util::sync::CancellationToken;
 
 const MAX_DRAFT_FIELD_BYTES: usize = 256 * 1024;
 const GLOBAL_CHANNEL_CAPACITY: usize = 256;
@@ -374,155 +376,232 @@ fn take_older_deltas(
     (ready, false)
 }
 
-pub async fn subscribe(
-    State(app): State<App>,
-    Path(sid): Path<SessionId>,
-) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
-    app.cluster.ensure_session_watched(sid).await?;
-    let (channel, mut rx, initial) = app
-        .db
-        .call(move |s| {
-            let initial = session(&s.conn, sid)?;
-            let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, sid)?;
-            let mut val = serde_json::json!(initial);
-            if let Some(obj) = val.as_object_mut() {
-                obj.insert("history_rev".to_owned(), serde_json::json!(history_rev));
-            }
-            let channel = s.channel(sid);
-            let rx = channel.subscribe();
-            Ok((channel, rx, val))
-        })
-        .await?;
-    let (delta_tx, mut delta_rx, snapshot, mut min_seq) = app.streams.subscribe_delta(sid);
-    let stream = async_stream::stream! {
-        let _channel = channel;
-        let _delta = delta_tx;
-        yield Ok(Event::default().event("ready").data(initial.to_string()));
-        if let Some(snap) = snapshot {
-            yield Ok(Event::default().event("stream.snapshot").data(snap.to_string()));
-        }
-        let mut buffered_delta: Option<Notice> = None;
-        let mut delta_open = true;
-        let mut delta_lagged = false;
-        loop {
-            while delta_lagged {
-                if app.stopping.is_cancelled() {
-                    return;
+pub enum NextSessionNotice {
+    Event { event: String, data: String },
+    Closed,
+}
+
+pub struct SessionEventStream {
+    app: App,
+    sid: SessionId,
+    _channel: broadcast::Sender<Notice>,
+    rx: broadcast::Receiver<Notice>,
+    _delta: broadcast::Sender<Notice>,
+    delta_rx: broadcast::Receiver<Notice>,
+    initial_payload: String,
+    initial_snapshot: Option<String>,
+    buffered_delta: Option<Notice>,
+    queued: VecDeque<(String, String)>,
+    delta_open: bool,
+    delta_lagged: bool,
+    min_seq: u64,
+}
+
+impl SessionEventStream {
+    pub async fn open(app: &App, sid: SessionId) -> Result<Option<Self>> {
+        let opened = app
+            .db
+            .call(move |s| {
+                let info = match session(&s.conn, sid) {
+                    Ok(v) => v,
+                    Err(e) if e.0 == axum::http::StatusCode::NOT_FOUND => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                let initial = s.session_view(info);
+                let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, sid)?;
+                let mut val = serde_json::json!(initial);
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("history_rev".to_owned(), serde_json::json!(history_rev));
                 }
-                buffered_delta = None;
+                let channel = s.channel(sid);
+                let rx = channel.subscribe();
+                Ok(Some((channel, rx, val.to_string())))
+            })
+            .await?;
+        let Some((channel, rx, initial_payload)) = opened else {
+            return Ok(None);
+        };
+        let (delta_tx, delta_rx, snapshot, min_seq) = app.streams.subscribe_delta(sid);
+        Ok(Some(Self {
+            app: app.clone(),
+            sid,
+            _channel: channel,
+            rx,
+            _delta: delta_tx,
+            delta_rx,
+            initial_payload,
+            initial_snapshot: snapshot.map(|s| s.to_string()),
+            buffered_delta: None,
+            queued: VecDeque::new(),
+            delta_open: true,
+            delta_lagged: false,
+            min_seq,
+        }))
+    }
+
+    pub fn initial_payload(&self) -> &str {
+        &self.initial_payload
+    }
+
+    pub fn take_initial_snapshot(&mut self) -> Option<String> {
+        self.initial_snapshot.take()
+    }
+
+    fn push_notice(&mut self, notice: Notice) {
+        self.queued
+            .push_back((notice.name.to_owned(), notice.data.to_string()));
+    }
+
+    async fn resync_payload(&self) -> String {
+        let sid = self.sid;
+        let rev = self
+            .app
+            .db
+            .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
+            .await
+            .unwrap_or(0);
+        json!({"history_rev": rev}).to_string()
+    }
+
+    pub async fn next(&mut self) -> NextSessionNotice {
+        loop {
+            if let Some((event, data)) = self.queued.pop_front() {
+                return NextSessionNotice::Event { event, data };
+            }
+            while self.delta_lagged {
+                if self.app.stopping.is_cancelled() {
+                    return NextSessionNotice::Closed;
+                }
+                self.buffered_delta = None;
                 loop {
-                    match rx.try_recv() {
-                        Ok(d) => yield Ok(d.into_event()),
-                        Err(TryRecvError::Lagged(_)) => {
-                            let rev = app
-                                .db
-                                .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
-                                .await
-                                .unwrap_or(0);
-                            yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
+                    match self.rx.try_recv() {
+                        Ok(d) => {
+                            self.push_notice(d);
                         }
-                        Err(TryRecvError::Closed) => return,
+                        Err(TryRecvError::Lagged(_)) => {
+                            let data = self.resync_payload().await;
+                            self.queued.push_back(("resync".to_owned(), data));
+                        }
+                        Err(TryRecvError::Closed) => {
+                            if let Some((event, data)) = self.queued.pop_front() {
+                                return NextSessionNotice::Event { event, data };
+                            }
+                            return NextSessionNotice::Closed;
+                        }
                         Err(TryRecvError::Empty) => break,
                     }
                 }
-                let (recovery, new_min_seq) = app.streams.recovery(sid);
-                min_seq = min_seq.max(new_min_seq);
+                if let Some((event, data)) = self.queued.pop_front() {
+                    return NextSessionNotice::Event { event, data };
+                }
+                let (recovery, new_min_seq) = self.app.streams.recovery(self.sid);
+                self.min_seq = self.min_seq.max(new_min_seq);
                 let mut relagged = false;
-                while buffered_delta.is_none() && delta_open {
-                    match delta_rx.try_recv() {
-                        Ok(m) if m.seq < min_seq => continue,
-                        Ok(m) => buffered_delta = Some(m),
+                while self.buffered_delta.is_none() && self.delta_open {
+                    match self.delta_rx.try_recv() {
+                        Ok(m) if m.seq < self.min_seq => continue,
+                        Ok(m) => self.buffered_delta = Some(m),
                         Err(TryRecvError::Lagged(_)) => {
                             relagged = true;
                             break;
                         }
                         Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Closed) => delta_open = false,
+                        Err(TryRecvError::Closed) => self.delta_open = false,
                     }
                 }
                 if relagged {
                     continue;
                 }
-                match rx.try_recv() {
+                match self.rx.try_recv() {
                     Ok(d) => {
-                        yield Ok(d.into_event());
-                        continue;
+                        return NextSessionNotice::Event {
+                            event: d.name.to_owned(),
+                            data: d.data.to_string(),
+                        };
                     }
                     Err(TryRecvError::Lagged(_)) => {
-                        let rev = app
-                            .db
-                            .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
-                            .await
-                            .unwrap_or(0);
-                        yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
-                        continue;
+                        return NextSessionNotice::Event {
+                            event: "resync".to_owned(),
+                            data: self.resync_payload().await,
+                        };
                     }
-                    Err(TryRecvError::Closed) => return,
+                    Err(TryRecvError::Closed) => return NextSessionNotice::Closed,
                     Err(TryRecvError::Empty) => {}
                 }
-                delta_lagged = false;
+                self.delta_lagged = false;
                 match recovery {
                     DraftRecovery::Snapshot(snap) => {
-                        yield Ok(Event::default().event("stream.snapshot").data(snap.to_string()));
+                        return NextSessionNotice::Event {
+                            event: "stream.snapshot".to_owned(),
+                            data: snap.to_string(),
+                        };
                     }
                     DraftRecovery::Clear(call_id) => {
-                        yield Ok(
-                            Event::default()
-                                .event("stream.clear")
-                                .data(json!({"llm_call_id": call_id}).to_string()),
-                        );
+                        return NextSessionNotice::Event {
+                            event: "stream.clear".to_owned(),
+                            data: json!({"llm_call_id": call_id}).to_string(),
+                        };
                     }
                     DraftRecovery::None => {}
                 }
             }
-            while buffered_delta.is_some() {
-                match rx.try_recv() {
+            while self.buffered_delta.is_some() {
+                match self.rx.try_recv() {
                     Ok(d) => {
                         let (older, lagged) = take_older_deltas(
-                            &mut buffered_delta,
-                            &mut delta_rx,
-                            &mut delta_open,
-                            min_seq,
+                            &mut self.buffered_delta,
+                            &mut self.delta_rx,
+                            &mut self.delta_open,
+                            self.min_seq,
                             d.seq,
                         );
                         for m in older {
-                            yield Ok(m.into_event());
+                            self.push_notice(m);
                         }
-                        yield Ok(d.into_event());
+                        self.push_notice(d);
                         if lagged {
-                            delta_lagged = true;
-                            buffered_delta = None;
+                            self.delta_lagged = true;
+                            self.buffered_delta = None;
                             break;
+                        }
+                        if let Some((event, data)) = self.queued.pop_front() {
+                            return NextSessionNotice::Event { event, data };
                         }
                     }
                     Err(TryRecvError::Lagged(_)) => {
-                        buffered_delta = None;
-                        delta_lagged = true;
-                        let rev = app
-                            .db
-                            .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
-                            .await
-                            .unwrap_or(0);
-                        yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
-                        break;
+                        self.buffered_delta = None;
+                        self.delta_lagged = true;
+                        return NextSessionNotice::Event {
+                            event: "resync".to_owned(),
+                            data: self.resync_payload().await,
+                        };
                     }
                     Err(TryRecvError::Closed) => {
-                        if let Some(b) = buffered_delta.take()
-                            && b.seq >= min_seq
+                        if let Some(b) = self.buffered_delta.take()
+                            && b.seq >= self.min_seq
                         {
-                            yield Ok(b.into_event());
+                            return NextSessionNotice::Event {
+                                event: b.name.to_owned(),
+                                data: b.data.to_string(),
+                            };
                         }
-                        return;
+                        return NextSessionNotice::Closed;
                     }
                     Err(TryRecvError::Empty) => {
-                        let b = buffered_delta.take().unwrap();
-                        if b.seq >= min_seq {
-                            yield Ok(b.into_event());
+                        let b = self.buffered_delta.take().unwrap();
+                        if b.seq >= self.min_seq {
+                            return NextSessionNotice::Event {
+                                event: b.name.to_owned(),
+                                data: b.data.to_string(),
+                            };
                         }
                     }
                 }
             }
-            if delta_lagged {
+            if let Some((event, data)) = self.queued.pop_front() {
+                return NextSessionNotice::Event { event, data };
+            }
+            if self.delta_lagged {
                 continue;
             }
             enum Incoming {
@@ -531,31 +610,168 @@ pub async fn subscribe(
             }
             let received = tokio::select! {
                 biased;
-                _ = app.stopping.cancelled() => break,
-                msg = rx.recv() => Incoming::Durable(msg),
-                msg = delta_rx.recv(), if delta_open => Incoming::Delta(msg),
+                _ = self.app.stopping.cancelled() => return NextSessionNotice::Closed,
+                msg = self.rx.recv() => Incoming::Durable(msg),
+                msg = self.delta_rx.recv(), if self.delta_open => Incoming::Delta(msg),
             };
             match received {
                 Incoming::Durable(Ok(d)) => {
                     let (older, lagged) = take_older_deltas(
-                        &mut buffered_delta,
-                        &mut delta_rx,
-                        &mut delta_open,
-                        min_seq,
+                        &mut self.buffered_delta,
+                        &mut self.delta_rx,
+                        &mut self.delta_open,
+                        self.min_seq,
                         d.seq,
                     );
                     for m in older {
-                        yield Ok(m.into_event());
+                        self.push_notice(m);
                     }
-                    yield Ok(d.into_event());
+                    self.push_notice(d);
                     if lagged {
-                        delta_lagged = true;
-                        buffered_delta = None;
+                        self.delta_lagged = true;
+                        self.buffered_delta = None;
                     }
                 }
                 Incoming::Durable(Err(RecvError::Lagged(_))) => {
-                    buffered_delta = None;
-                    delta_lagged = true;
+                    self.buffered_delta = None;
+                    self.delta_lagged = true;
+                    return NextSessionNotice::Event {
+                        event: "resync".to_owned(),
+                        data: self.resync_payload().await,
+                    };
+                }
+                Incoming::Durable(Err(RecvError::Closed)) => return NextSessionNotice::Closed,
+                Incoming::Delta(Ok(m)) => {
+                    if m.seq >= self.min_seq {
+                        self.buffered_delta = Some(m);
+                    }
+                }
+                Incoming::Delta(Err(RecvError::Lagged(_))) => {
+                    self.delta_lagged = true;
+                    self.buffered_delta = None;
+                }
+                Incoming::Delta(Err(RecvError::Closed)) => self.delta_open = false,
+            }
+        }
+    }
+}
+
+struct SeenSavedItems {
+    order: VecDeque<String>,
+    set: std::collections::HashSet<String>,
+}
+
+impl SeenSavedItems {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            set: std::collections::HashSet::new(),
+        }
+    }
+
+    fn accept(&mut self, event: &str, data: &str) -> bool {
+        if event != "item.saved" {
+            return true;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return true;
+        };
+        let Some(id) = v.get("id").and_then(Value::as_str) else {
+            return true;
+        };
+        if !self.set.insert(id.to_owned()) {
+            return false;
+        }
+        self.order.push_back(id.to_owned());
+        if self.order.len() > 256
+            && let Some(old) = self.order.pop_front()
+        {
+            self.set.remove(&old);
+        }
+        true
+    }
+}
+
+struct ActiveRelay {
+    peer_id: String,
+    cancel: CancellationToken,
+    rx: tokio::sync::mpsc::Receiver<RelayedEvent>,
+}
+
+impl Drop for ActiveRelay {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+pub async fn subscribe(
+    State(app): State<App>,
+    Path(sid): Path<SessionId>,
+) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
+    app.cluster.ensure_session_watched(sid).await?;
+    let mut local = SessionEventStream::open(&app, sid)
+        .await?
+        .ok_or_else(|| crate::Error::from(rusqlite::Error::QueryReturnedNoRows))?;
+    let mut runner_rx = app.exec.presence().watch_remote_runner(sid);
+    let stream = async_stream::stream! {
+        yield Ok(Event::default().event("ready").data(local.initial_payload()));
+        let mut relay: Option<ActiveRelay> = None;
+        if let Some(peer_id) = runner_rx.borrow().clone() {
+            let cancel = app.stopping.child_token();
+            let rx = app.exec.spawn_event_relay(peer_id.clone(), sid, cancel.clone());
+            relay = Some(ActiveRelay { peer_id, cancel, rx });
+        } else if let Some(snap) = local.take_initial_snapshot() {
+            yield Ok(Event::default().event("stream.snapshot").data(snap));
+        } else {
+            local.take_initial_snapshot();
+        }
+        let mut seen = SeenSavedItems::new();
+        loop {
+            enum SseTurn {
+                Local(NextSessionNotice),
+                RunnerChanged(std::result::Result<(), tokio::sync::watch::error::RecvError>),
+                Relayed(Option<RelayedEvent>),
+            }
+            let turn = if let Some(active) = relay.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = app.stopping.cancelled() => break,
+                    ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
+                    ev = active.rx.recv() => SseTurn::Relayed(ev),
+                    ev = local.next() => SseTurn::Local(ev),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = app.stopping.cancelled() => break,
+                    ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
+                    ev = local.next() => SseTurn::Local(ev),
+                }
+            };
+            match turn {
+                SseTurn::RunnerChanged(Ok(())) => {
+                    let next_peer = runner_rx.borrow().clone();
+                    if relay.as_ref().map(|r| &r.peer_id) != next_peer.as_ref() {
+                        if let Some(old) = relay.take() {
+                            old.cancel.cancel();
+                        }
+                        if let Some(peer_id) = next_peer {
+                            let cancel = app.stopping.child_token();
+                            let rx = app.exec.spawn_event_relay(peer_id.clone(), sid, cancel.clone());
+                            relay = Some(ActiveRelay { peer_id, cancel, rx });
+                        }
+                    }
+                }
+                SseTurn::RunnerChanged(Err(_)) => break,
+                SseTurn::Relayed(Some(RelayedEvent::Event { event, data })) => {
+                    if seen.accept(&event, &data) {
+                        yield Ok(Event::default().event(event).data(data));
+                    }
+                }
+                SseTurn::Relayed(Some(RelayedEvent::Disconnected)) | SseTurn::Relayed(None) => {
+                    if let Some(old) = relay.take() {
+                        old.cancel.cancel();
+                    }
                     let rev = app
                         .db
                         .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
@@ -563,18 +779,16 @@ pub async fn subscribe(
                         .unwrap_or(0);
                     yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
                 }
-                Incoming::Durable(Err(RecvError::Closed)) => break,
-                Incoming::Delta(Ok(m)) => {
-                    if m.seq >= min_seq {
-                        buffered_delta = Some(m);
+                SseTurn::Local(NextSessionNotice::Event { event, data }) => {
+                    if seen.accept(&event, &data) {
+                        yield Ok(Event::default().event(event).data(data));
                     }
                 }
-                Incoming::Delta(Err(RecvError::Lagged(_))) => {
-                    delta_lagged = true;
-                    buffered_delta = None;
-                }
-                Incoming::Delta(Err(RecvError::Closed)) => delta_open = false,
+                SseTurn::Local(NextSessionNotice::Closed) => break,
             }
+        }
+        if let Some(old) = relay.take() {
+            old.cancel.cancel();
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

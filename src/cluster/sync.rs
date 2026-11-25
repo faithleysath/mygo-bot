@@ -2059,6 +2059,16 @@ impl SyncEngine {
         Ok(PullResult::Ignored)
     }
 
+    pub async fn sync_session_latest(&self, sid: SessionId) -> Result<()> {
+        if !self.net.online_peer_ids().is_empty() {
+            let _ = self.sync_with_peers(None, Some(sid)).await?;
+        }
+        self.ensure_session_watched(sid).await?;
+        self.db
+            .call(move |s| crate::cluster::ledger::assert_no_conflict(&s.conn, sid.as_str()))
+            .await
+    }
+
     pub async fn ensure_session_watched(&self, sid: SessionId) -> Result<()> {
         let stream_id = sid.to_string();
 
@@ -3002,7 +3012,8 @@ impl SyncEngine {
                             abort_active_session_worker(s, &streams, sid);
                             s.wake_waiters(sid);
                             if let Ok(info) = session(&s.conn, sid) {
-                                s.publish_global("session.updated", json!(info));
+                                let view = s.session_view(info);
+                                s.publish_global("session.updated", json!(view));
                             }
                         } else if matches!(exp_c.kind, StreamKind::Provider | StreamKind::Model) {
                             s.publish_global("catalog.updated", json!({ "id": sid_owned }));
@@ -3926,7 +3937,9 @@ fn abort_active_session_worker(s: &mut Store, streams: &Hub, sid: SessionId) {
         ctrl.soft.cancel();
         ctrl.hard.cancel();
     }
+    s.pending_wakes.remove(&sid);
     crate::codemode::stop_session(s, sid);
+    s.refresh_local_presence(sid);
     s.bump_run_gen(sid);
     s.bump_reset_gen(sid);
     streams.remove_session(sid);
@@ -3990,7 +4003,8 @@ fn publish_outcome(
                         }
                     }
                     if let Ok(info) = session(&s.conn, sid) {
-                        let data = json!(info);
+                        let view = s.session_view(info);
+                        let data = json!(view);
                         if let Some(ch) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
                             crate::events::Notice::publish(&ch, "session.updated", data.clone());
                         }

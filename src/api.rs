@@ -1,5 +1,7 @@
 use crate::{
-    App, Error, ErrorBody, Result, agent, codemode, events,
+    App, Error, ErrorBody, Result, agent,
+    cluster::exec::WriterTarget,
+    codemode, events,
     events::Notice,
     id::{ItemId, ModelId, SessionId},
     store::{self, Session, SessionStatus, session},
@@ -171,8 +173,9 @@ async fn create_session(
                 session(conn, id)
             },
             |s, created| {
-                s.publish_global("session.created", json!(created));
-                Ok(created)
+                let view = s.session_view(created);
+                s.publish_global("session.created", json!(view));
+                Ok(view)
             },
         )
         .await?;
@@ -181,18 +184,37 @@ async fn create_session(
 
 async fn get_session(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Session>> {
     app.cluster.ensure_session_watched(sid).await?;
-    app.db.call(move |s| Ok(Json(session(&s.conn, sid)?))).await
+    app.db
+        .call(move |s| Ok(Json(s.session_view(session(&s.conn, sid)?))))
+        .await
 }
 
 async fn patch_session(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
-    Json(mut fields): Document,
+    Json(fields): Document,
 ) -> Result<Json<Session>> {
     if fields.is_empty() {
         return Err(Error::bad("expected session settings"));
     }
-    app.cluster.ensure_session_watched(sid).await?;
+    match app.exec.resolve_session_writer(sid).await? {
+        WriterTarget::Remote(peer_id) => app
+            .exec
+            .patch_session_remote(&peer_id, sid, fields)
+            .await
+            .map(Json),
+        WriterTarget::Local => patch_session_local(&app, sid, fields).await.map(Json),
+    }
+}
+
+pub(crate) async fn patch_session_local(
+    app: &App,
+    sid: SessionId,
+    mut fields: Map<String, Value>,
+) -> Result<Session> {
+    if fields.is_empty() {
+        return Err(Error::bad("expected session settings"));
+    }
     let title = extract_title(&mut fields)?;
     app.db
         .write(
@@ -227,12 +249,13 @@ async fn patch_session(
                 session(conn, sid)
             },
             move |s, updated| {
-                let data = json!(updated);
+                let view = s.session_view(updated);
+                let data = json!(view);
                 if let Some(channel) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
                     Notice::publish(&channel, "session.updated", data.clone());
                 }
                 s.publish_global("session.updated", data);
-                Ok(Json(updated))
+                Ok(view)
             },
         )
         .await
@@ -243,6 +266,7 @@ async fn delete_session(
     Path(sid): Path<SessionId>,
 ) -> Result<StatusCode> {
     app.cluster.ensure_session_watched(sid).await?;
+    app.exec.assert_cluster_unoccupied(sid).await?;
     app.db
         .call(move |s| {
             let current = session(&s.conn, sid)?;
@@ -324,6 +348,7 @@ async fn list_sessions(
             let after = page.after.as_ref().map_or("", SessionId::as_str);
             let rows = stmt
                 .query_map((after, page.limit), store::session_row)?
+                .map(|r| r.map(|row| s.session_view(row)))
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(Json(rows))
         })
@@ -353,7 +378,6 @@ async fn enqueue(
     headers: HeaderMap,
     Json(message): Json<Message>,
 ) -> Result<(StatusCode, Json<MessageId>)> {
-    app.cluster.ensure_session_watched(sid).await?;
     let mut keys = headers.get_all("idempotency-key").iter();
     let key = keys
         .next()
@@ -367,9 +391,21 @@ async fn enqueue(
     if keys.next().is_some() || key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
         return Err(Error::bad("invalid idempotency key"));
     }
-    let (status, id) = match app.db.enqueue(sid, message.content, key).await? {
-        store::Enqueued::Created(id) => (StatusCode::CREATED, id),
-        store::Enqueued::Existing(id) => (StatusCode::OK, id),
+    let (status, id) = match app.exec.resolve_session_writer(sid).await? {
+        WriterTarget::Remote(peer_id) => {
+            match app
+                .exec
+                .enqueue_remote(&peer_id, sid, message.content, key)
+                .await?
+            {
+                (true, id) => (StatusCode::CREATED, id),
+                (false, id) => (StatusCode::OK, id),
+            }
+        }
+        WriterTarget::Local => match app.db.enqueue(sid, message.content, key).await? {
+            store::Enqueued::Created(id) => (StatusCode::CREATED, id),
+            store::Enqueued::Existing(id) => (StatusCode::OK, id),
+        },
     };
     Ok((status, Json(MessageId { id })))
 }
@@ -461,7 +497,14 @@ async fn withdraw(
     State(app): State<App>,
     Path((sid, mid)): Path<(SessionId, ItemId)>,
 ) -> Result<StatusCode> {
-    app.cluster.ensure_session_watched(sid).await?;
+    match app.exec.resolve_session_writer(sid).await? {
+        WriterTarget::Remote(peer_id) => app.exec.withdraw_remote(&peer_id, sid, mid).await?,
+        WriterTarget::Local => withdraw_local(&app, sid, mid).await?,
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn withdraw_local(app: &App, sid: SessionId, mid: ItemId) -> Result<()> {
     app.db
         .write(
             move |conn| {
@@ -493,7 +536,7 @@ async fn withdraw(
                 if let Some(id) = created {
                     s.item_saved(sid, id)?;
                 }
-                Ok(StatusCode::NO_CONTENT)
+                Ok(())
             },
         )
         .await
@@ -618,25 +661,14 @@ async fn context(
 }
 
 async fn list_tasks(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Value>> {
-    app.db
-        .call(move |s| {
-            session(&s.conn, sid)?;
-            Ok(Json(codemode::session_tasks_snapshot(s, sid)))
-        })
-        .await
+    app.cluster.ensure_session_watched(sid).await?;
+    app.exec.list_tasks(sid).await.map(Json)
 }
 
 async fn kill_task(
     State(app): State<App>,
     Path((sid, tid)): Path<(SessionId, String)>,
 ) -> Result<Json<Value>> {
-    let id = crate::tools::task_id(&tid).map_err(Error::bad)?;
-    app.db
-        .call(move |s| {
-            session(&s.conn, sid)?;
-            codemode::stop_task(s, sid, id)
-                .map(Json)
-                .ok_or_else(|| Error(StatusCode::NOT_FOUND, "task is not active".into()))
-        })
-        .await
+    app.cluster.ensure_session_watched(sid).await?;
+    app.exec.kill_task(sid, tid).await.map(Json)
 }

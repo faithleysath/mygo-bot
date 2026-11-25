@@ -13,6 +13,7 @@ export interface SessionInfo {
   reasoning_effort: string | null;
   last_error: string;
   model_id: string;
+  runner_node_id: string | null;
 }
 
 export interface SessionStatusEvent {
@@ -20,6 +21,7 @@ export interface SessionStatusEvent {
   status: SessionStatus;
   reason?: string;
   updated_at?: number;
+  runner_node_id?: string | null;
 }
 
 export interface SessionDeletedEvent {
@@ -281,6 +283,7 @@ export interface RetryNotice {
 
 export interface RunningCommand {
   id: number;
+  node?: string;
   program: string;
   args?: string[];
   stdout?: string;

@@ -562,9 +562,14 @@ pub fn missing_session_context_attachments(
     sid: SessionId,
 ) -> Result<Vec<AttachmentId>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
-         WHERE c.session_id=? AND i.kind IN ('user_message','codemode_event','function_call_output')
-         ORDER BY c.position",
+        "SELECT i.kind,i.payload FROM items i
+         WHERE i.session_id=?1
+           AND i.kind IN ('user_message','codemode_event','function_call_output')
+           AND (
+             EXISTS (SELECT 1 FROM context_items c WHERE c.session_id=?1 AND c.item_id=i.id)
+             OR EXISTS (SELECT 1 FROM pending p WHERE p.session_id=?1 AND p.id=i.id)
+           )
+         ORDER BY i.id",
     )?;
     let mut rows = stmt.query([sid])?;
     let mut ids = std::collections::BTreeSet::new();
@@ -596,4 +601,51 @@ pub fn missing_session_context_attachments(
         }
     }
     Ok(missing)
+}
+
+pub fn collect_content_attachment_meta(
+    conn: &Connection,
+    content: &Value,
+) -> Result<Vec<crate::cluster::ledger::AttachmentRef>> {
+    let Some(parts) = content.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for part in parts {
+        if let Some(raw) = part.get("attachment_id").and_then(Value::as_str)
+            && let Ok(att_id) = raw.parse::<AttachmentId>()
+        {
+            ids.insert(att_id);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT mime_type, content_hash, byte_len FROM attachments WHERE id=?",
+    )?;
+    let mut refs = Vec::new();
+    for id in ids {
+        if let Some((mime_type, hash_blob, byte_len)) = stmt
+            .query_row([id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()?
+        {
+            let content_hash: [u8; 32] = hash_blob
+                .try_into()
+                .map_err(|_| Error::internal("invalid stored attachment hash length"))?;
+            refs.push(crate::cluster::ledger::AttachmentRef {
+                id,
+                mime_type,
+                content_hash,
+                byte_len,
+            });
+        }
+    }
+    Ok(refs)
 }

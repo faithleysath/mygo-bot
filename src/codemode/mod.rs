@@ -344,7 +344,9 @@ fn notice(s: &mut Store, sid: SessionId, id: ItemId) {
 }
 fn event_saved(s: &mut Store, app: &App, sid: SessionId, id: ItemId, notify: bool) {
     notice(s, sid, id);
-    if notify && !s.closing && !s.active.contains_key(&sid) {
+    if notify && !s.closing && !s.active.contains_key(&sid) && s.presence.remote_owner(sid).is_none() {
+        s.pending_wakes.insert(sid);
+        s.refresh_local_presence(sid);
         app.wake(sid);
     }
 }
@@ -445,6 +447,10 @@ pub fn stop_session(s: &mut Store, sid: SessionId) {
 
 pub fn has_session_tasks(s: &Store, sid: SessionId) -> bool {
     s.tasks.values().any(|t| t.origin.sid == sid)
+}
+
+pub fn count_session_tasks(s: &Store, sid: SessionId) -> usize {
+    s.tasks.values().filter(|t| t.origin.sid == sid).count()
 }
 
 pub fn session_tasks_snapshot(s: &Store, sid: SessionId) -> Value {
@@ -902,6 +908,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
         }
         let (done, finish) = oneshot::channel();
         s.tasks.insert(id, task);
+        s.refresh_local_presence(sid);
         s.wake_waiters(sid);
         let submitted = app.codemode.pool.submit(Job {
             _slot: slot,
@@ -1082,6 +1089,14 @@ fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()
     };
     if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? {
         let mut task = s.tasks.remove(&id).unwrap();
+        s.refresh_local_presence(sid);
+        if !s.active.contains_key(&sid)
+            && !s.pending_wakes.contains(&sid)
+            && !has_session_tasks(s, sid)
+            && let Ok(info) = session(&s.conn, sid)
+        {
+            s.notify_status(sid, info.status.as_str(), &info.last_error, info.updated_at);
+        }
         s.wake_waiters(sid);
         task.delivered();
         if let Some(k) = task.kill {
@@ -1163,6 +1178,14 @@ fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()
     }
     for (item, wake) in saved {
         event_saved(s, app, sid, item, wake);
+    }
+    s.refresh_local_presence(sid);
+    if !s.active.contains_key(&sid)
+        && !s.pending_wakes.contains(&sid)
+        && !has_session_tasks(s, sid)
+        && let Ok(info) = session(&s.conn, sid)
+    {
+        s.notify_status(sid, info.status.as_str(), &info.last_error, info.updated_at);
     }
     Ok(())
 }

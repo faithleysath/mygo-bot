@@ -14,6 +14,7 @@ import {
   setUnauthorizedHandler,
 } from "./api.ts";
 import { Composer } from "./Composer.tsx";
+import type { ClusterNodeOption } from "./Composer.tsx";
 import { I18nContext, readLocalePref, resolveLocale, saveLocalePref, statusText, tr, useI18n } from "./i18n.ts";
 import type { LocalePref, Msg } from "./i18n.ts";
 import { BrandMark, Icon } from "./Icons.tsx";
@@ -152,6 +153,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
 
 function TopBar({
   session,
+  runnerNodeName,
   sseStatus,
   sidebarCollapsed,
   activeTab,
@@ -162,6 +164,7 @@ function TopBar({
   onPatchSession,
 }: {
   session: SessionInfo | null;
+  runnerNodeName: string | null;
   sseStatus: SseStatus;
   sidebarCollapsed: boolean;
   activeTab: MainTab;
@@ -215,6 +218,9 @@ function TopBar({
             {(session.status === "running" || session.status === "pausing") && <span class="pulse-dot" />}
             {statusText(session.status, locale)}
           </span>
+          {runnerNodeName && (
+            <span class="pill" title={t("Running on")}>@{runnerNodeName}</span>
+          )}
           {sseStatus === "reconnecting" && (
             <span class="pill pill-paused">{t("reconnecting")}</span>
           )}
@@ -297,7 +303,11 @@ function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<MainTab>("chat");
-  const [conflictCount, setConflictCount] = useState(0);
+  const [clusterStatus, setClusterStatus] = useState<ClusterStatus | null>(null);
+  const conflictCount = clusterStatus?.conflict_count ?? 0;
+  const [runNodeBySid, setRunNodeBySid] = useState<Record<string, string>>({});
+  const runNodeBySidRef = useRef<Record<string, string>>({});
+  runNodeBySidRef.current = runNodeBySid;
   const [mcpRefreshNonce, setMcpRefreshNonce] = useState(0);
 
   const [itemsState, setItemsState] = useState<{ sid: string | null; list: HistoryItem[] }>({
@@ -422,7 +432,7 @@ function App() {
   const refreshClusterBadge = async (): Promise<void> => {
     try {
       const status = await apiFetch<ClusterStatus>("/cluster");
-      setConflictCount(status.conflict_count);
+      setClusterStatus(status);
     } catch {}
   };
 
@@ -431,7 +441,7 @@ function App() {
     consumeHashToken();
     apiFetch<ClusterStatus>("/cluster", { token: getToken() })
       .then((status) => {
-        setConflictCount(status.conflict_count);
+        setClusterStatus(status);
         setAuthed(true);
       })
       .catch((e) => {
@@ -814,7 +824,13 @@ function App() {
           setSessions((prev) =>
             prev.map((s) =>
               s.id === sid
-                ? { ...s, status: ev.status, last_error: ev.reason || "", updated_at: ev.updated_at ?? s.updated_at }
+                ? {
+                    ...s,
+                    status: ev.status,
+                    last_error: ev.reason || "",
+                    updated_at: ev.updated_at ?? s.updated_at,
+                    runner_node_id: ev.runner_node_id !== undefined ? ev.runner_node_id : s.runner_node_id,
+                  }
                 : s
             )
           );
@@ -872,7 +888,38 @@ function App() {
 
   const shouldPollTasks =
     Boolean(authed && activeId) &&
-    (tasks.length > 0 || activeSession?.status === "running" || activeSession?.status === "pausing");
+    (tasks.length > 0 ||
+      activeSession?.status === "running" ||
+      activeSession?.status === "pausing" ||
+      Boolean(activeSession?.runner_node_id));
+
+  const clusterNodes = useMemo<ClusterNodeOption[]>(() => {
+    if (!clusterStatus) return [];
+    return [
+      { id: clusterStatus.self.node_id, name: clusterStatus.self.name, online: true, isSelf: true },
+      ...clusterStatus.peers.map((p) => ({
+        id: p.node_id,
+        name: p.name,
+        online: p.online,
+        isSelf: false,
+      })),
+    ];
+  }, [clusterStatus]);
+
+  const nodeNameById = useMemo(
+    () => new Map(clusterNodes.map((n) => [n.id, n.name])),
+    [clusterNodes]
+  );
+
+  const onChangeRunNode = (sid: string, node: string) => {
+    setRunNodeBySid((prev) => {
+      const next = { ...prev };
+      if (node) next[sid] = node;
+      else delete next[sid];
+      runNodeBySidRef.current = next;
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (!shouldPollTasks || !activeId) return;
@@ -1054,8 +1101,12 @@ function App() {
       if (!startRun) return;
       setSendingBySid((prev) => ({ ...prev, [targetSid]: true }));
       updateComposer(targetSid, (c) => ({ ...c, error: "" }));
+      const targetNode = runNodeBySidRef.current[targetSid];
       try {
-        await apiFetch(`/sessions/${targetSid}/run`, { method: "PUT" });
+        await apiFetch(`/sessions/${targetSid}/run`, {
+          method: "PUT",
+          ...(targetNode ? { body: { node: targetNode } } : {}),
+        });
       } catch (e) {
         if (sessionsRef.current.some((s) => s.id === targetSid)) {
           updateComposer(targetSid, (c) => ({ ...c, error: errorMessage(e) }));
@@ -1104,8 +1155,12 @@ function App() {
       });
 
       if (startRun) {
+        const targetNode = runNodeBySidRef.current[targetSid];
         try {
-          await apiFetch(`/sessions/${targetSid}/run`, { method: "PUT" });
+          await apiFetch(`/sessions/${targetSid}/run`, {
+            method: "PUT",
+            ...(targetNode ? { body: { node: targetNode } } : {}),
+          });
         } catch (e) {
           if (!sessionsRef.current.some((s) => s.id === targetSid)) return;
           updateComposer(targetSid, (c) => ({
@@ -1153,6 +1208,7 @@ function App() {
             collapsed={sidebarCollapsed}
             searchOpen={searchOpen}
             conflictCount={conflictCount}
+            nodeNameById={nodeNameById}
             themePref={themePref}
             searchInputRef={searchInputRef}
             onSelect={setActiveId}
@@ -1170,6 +1226,11 @@ function App() {
               <>
                 <TopBar
                   session={activeSession}
+                  runnerNodeName={
+                    activeSession.runner_node_id
+                      ? nodeNameById.get(activeSession.runner_node_id) || activeSession.runner_node_id
+                      : null
+                  }
                   sseStatus={sseStatus}
                   sidebarCollapsed={sidebarCollapsed}
                   activeTab={activeTab}
@@ -1190,11 +1251,13 @@ function App() {
                         <button
                           type="button"
                           class="btn-ghost btn-xs"
-                          onClick={() =>
-                            void apiFetch(`/sessions/${activeSession.id}/run`, { method: "PUT" }).catch((e) =>
-                              setBannerErr(errorMessage(e))
-                            )
-                          }
+                          onClick={() => {
+                            const targetNode = runNodeBySidRef.current[activeSession.id];
+                            void apiFetch(`/sessions/${activeSession.id}/run`, {
+                              method: "PUT",
+                              ...(targetNode ? { body: { node: targetNode } } : {}),
+                            }).catch((e) => setBannerErr(errorMessage(e)));
+                          }}
                         >
                           <Icon n="play" s={11} />
                           <span>{t("Resume")}</span>
@@ -1241,6 +1304,9 @@ function App() {
                       tasks={tasks}
                       queuedCount={queuedIds.size}
                       summary={summary}
+                      clusterNodes={clusterNodes}
+                      runNode={runNodeBySid[activeSession.id] || ""}
+                      onChangeRunNode={onChangeRunNode}
                       onChangeText={onChangeText}
                       onUploadFiles={onUploadFiles}
                       onRemoveAttachment={onRemoveAttachment}

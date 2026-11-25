@@ -1,5 +1,6 @@
 use crate::{
     App, Error, Result, calls,
+    cluster::ledger::StreamHead,
     events::Notice,
     id::{ItemId, SessionId},
     model::{self, Failure},
@@ -7,6 +8,7 @@ use crate::{
 };
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, Query, State},
 };
 use serde::Deserialize;
@@ -29,18 +31,34 @@ enum StartEffect {
     Worker(Vec<ItemId>, i64, i64),
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StartRunBody {
+    #[serde(default)]
+    node: Option<String>,
+}
+
 /// 启动或恢复会话
 ///
 /// 会话需要可用模型；没有待处理工作时返回当前会话。
-pub async fn start(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Session>> {
-    app.start_worker(sid, false).await
+pub async fn start(
+    State(app): State<App>,
+    Path(sid): Path<SessionId>,
+    body: Bytes,
+) -> Result<Json<Session>> {
+    let req: StartRunBody = if body.is_empty() {
+        StartRunBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| Error::bad(e.to_string()))?
+    };
+    app.exec.start_run(&app, sid, req.node).await.map(Json)
 }
 
 impl App {
     pub fn wake(&self, sid: SessionId) {
         let app = self.clone();
         self.workers.spawn(async move {
-            if let Err(e) = app.start_worker(sid, true).await
+            if let Err(e) = app.start_worker_inner(sid, true, None).await
                 && !app.stopping.is_cancelled()
             {
                 tracing::error!(%sid, error=%e, "could not start session for a task event");
@@ -48,6 +66,8 @@ impl App {
                 let _ = app
                     .db
                     .call(move |s| {
+                        s.pending_wakes.remove(&sid);
+                        s.refresh_local_presence(sid);
                         if !s.closing
                             && session(&s.conn, sid)?.status == SessionStatus::Idle
                             && store::has_pending(&s.conn, sid)?
@@ -57,13 +77,47 @@ impl App {
                         Ok(())
                     })
                     .await;
+            } else {
+                let _ = app
+                    .db
+                    .call(move |s| {
+                        if s.pending_wakes.remove(&sid) {
+                            s.refresh_local_presence(sid);
+                        }
+                        Ok(())
+                    })
+                    .await;
             }
         });
     }
 
-    async fn start_worker(&self, sid: SessionId, automatic: bool) -> Result<Json<Session>> {
-        if !automatic {
-            self.cluster.ensure_session_watched(sid).await?;
+    pub async fn start_local_checked(
+        &self,
+        sid: SessionId,
+        expected_head: Option<StreamHead>,
+    ) -> Result<Session> {
+        self.start_worker_inner(sid, false, expected_head).await
+    }
+
+    async fn start_worker_inner(
+        &self,
+        sid: SessionId,
+        automatic: bool,
+        expected_head: Option<StreamHead>,
+    ) -> Result<Session> {
+        if automatic && self.exec.presence().remote_owner(sid).is_some() {
+            let _ = self
+                .db
+                .call(move |s| {
+                    s.pending_wakes.remove(&sid);
+                    s.refresh_local_presence(sid);
+                    Ok(())
+                })
+                .await;
+            return self
+                .db
+                .call(move |s| Ok(s.session_view(session(&s.conn, sid)?)))
+                .await;
         }
         let worker = self.clone();
         self.db
@@ -91,6 +145,19 @@ impl App {
                         return Err(Error::conflict(
                             "session history is incomplete or read-only locally; sync before running",
                         ));
+                    }
+                    if let Some(ref exp) = expected_head {
+                        let cur = crate::cluster::ledger::stream_head(conn, sid.as_str())?;
+                        let matches = cur.as_ref().is_some_and(|h| {
+                            h.epoch == exp.epoch
+                                && h.head_seq == exp.head_seq
+                                && h.head_hash == exp.head_hash
+                        });
+                        if !matches {
+                            return Err(Error::conflict(
+                                "session history changed concurrently before run start",
+                            ));
+                        }
                     }
                     let run_epoch = crate::cluster::ledger::stream_head(conn, sid.as_str())?
                         .map_or(1, |h| h.epoch);
@@ -135,15 +202,20 @@ impl App {
                     ))
                 },
                 move |s, (current, effect)| {
+                    s.pending_wakes.remove(&sid);
                     match effect {
-                        StartEffect::None => (),
-                        StartEffect::Idle(updated_at) => s.notify_status(sid, "idle", "", updated_at),
+                        StartEffect::None => {
+                            s.refresh_local_presence(sid);
+                        }
+                        StartEffect::Idle(updated_at) => {
+                            s.refresh_local_presence(sid);
+                            s.notify_status(sid, "idle", "", updated_at);
+                        }
                         StartEffect::Worker(recovered, updated_at, run_epoch) => {
                             let notices = recovered
                                 .into_iter()
                                 .try_for_each(|id| s.item_saved(sid, id));
                             let channel = s.channel(sid);
-                            s.notify_status(sid, "running", "", updated_at);
                             let run_gen = s.bump_run_gen(sid);
                             let control = Control {
                                 soft: CancellationToken::new(),
@@ -152,13 +224,15 @@ impl App {
                                 run_gen,
                             };
                             s.active.insert(sid, control.clone());
+                            s.refresh_local_presence(sid);
+                            s.notify_status(sid, "running", "", updated_at);
                             let tracker = worker.workers.clone();
                             // A committed start owns a worker even if the client left or a notice failed.
                             tracker.spawn(worker.run(sid, control, channel));
                             notices?;
                         }
                     }
-                    Ok(Json(current))
+                    Ok(s.session_view(current))
                 },
             )
             .await
@@ -182,19 +256,27 @@ pub async fn pause(
     Path(sid): Path<SessionId>,
     Query(q): Query<Pause>,
 ) -> Result<Json<Session>> {
-    app.cluster.ensure_session_watched(sid).await?;
-    app.db
-        .call(move |s| {
-            let current = session(&s.conn, sid)?;
-            let hard = matches!(q.mode, PauseMode::Hard);
-            if current.status != SessionStatus::Paused {
-                request_pause(s, sid, hard, "paused by user")?;
-            } else if hard {
-                crate::codemode::stop_session(s, sid);
-            }
-            Ok(Json(session(&s.conn, sid)?))
-        })
+    app.exec
+        .pause_run(&app, sid, matches!(q.mode, PauseMode::Hard))
         .await
+        .map(Json)
+}
+
+impl App {
+    pub async fn pause_local(&self, sid: SessionId, hard: bool) -> Result<Session> {
+        self.db
+            .call(move |s| {
+                let current = session(&s.conn, sid)?;
+                if current.status != SessionStatus::Paused {
+                    request_pause(s, sid, hard, "paused by user")?;
+                } else if hard {
+                    crate::codemode::stop_session(s, sid);
+                    s.refresh_local_presence(sid);
+                }
+                Ok(s.session_view(session(&s.conn, sid)?))
+            })
+            .await
+    }
 }
 fn request_pause(s: &mut Store, sid: SessionId, hard: bool, reason: &str) -> Result<()> {
     if let Some(control) = s.active.get(&sid).cloned() {
@@ -268,6 +350,7 @@ impl App {
                     {
                         s.active.remove(&sid);
                     }
+                    s.refresh_local_presence(sid);
                     let stream = crate::cluster::ledger::stream_head(&s.conn, sid.as_str())?;
                     let conflicted = crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?;
                     let epoch_ok = stream.as_ref().is_none_or(|st| {
@@ -281,6 +364,7 @@ impl App {
                         return Ok(());
                     };
                     if current.status == SessionStatus::Paused {
+                        s.notify_status(sid, "paused", &current.last_error, current.updated_at);
                         return Ok(());
                     }
                     let reason = if control.soft.is_cancelled() {
@@ -337,10 +421,10 @@ impl App {
                     // A queued message can be withdrawn before this worker takes it.
                     if !needed {
                         tx.commit()?;
-                        s.status(sid, "idle", "")?;
                         if s.active.get(&sid).is_some_and(|c| c.run_gen == run_gen) {
                             s.active.remove(&sid);
                         }
+                        s.status(sid, "idle", "")?;
                         return Ok(None);
                     }
                     let end = store::max_context_position(&tx, sid)?;
@@ -526,6 +610,7 @@ impl App {
                             if s.active.get(&sid).is_some_and(|c| c.run_gen == run_gen) {
                                 s.active.remove(&sid);
                             }
+                            s.refresh_local_presence(sid);
                             let info = session(&s.conn, sid)?;
                             s.notify_status(sid, state, &info.last_error, now);
                         }

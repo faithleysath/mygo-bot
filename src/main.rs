@@ -97,6 +97,7 @@ impl IntoResponse for Error {
 struct App {
     db: Db,
     cluster: Arc<cluster::Cluster>,
+    exec: Arc<cluster::exec::ExecPlane>,
     codemode: Arc<codemode::Engine>,
     client: reqwest::Client,
     mcp_probes: Arc<tokio::sync::Semaphore>,
@@ -520,7 +521,13 @@ async fn serve(
         };
         let streams = events::Hub::default();
         let signal = Arc::new(cluster::ClusterSignal::new());
-        let db = Db::open(Path::new("mygo.sqlite3"), streams.global_sender(), signal.clone())?;
+        let presence = cluster::exec::PresenceState::new();
+        let db = Db::open(
+            Path::new("mygo.sqlite3"),
+            streams.global_sender(),
+            signal.clone(),
+            presence.clone(),
+        )?;
         let client = make_client()?;
         let stopping = CancellationToken::new();
         let workers = TaskTracker::new();
@@ -539,11 +546,22 @@ async fn serve(
             &workers,
         )
         .await?;
+        let exec = cluster::exec::ExecPlane::new(
+            db.clone(),
+            cluster.net.clone(),
+            presence,
+            cluster.sync.clone(),
+            stopping.clone(),
+            workers.clone(),
+        );
+        cluster.net.attach_exec_plane(Arc::downgrade(&exec));
+        exec.spawn_loops();
         let app = App {
             codemode: Arc::new(codemode::Engine::new(threads, make_client()?)?),
             mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
             db,
             cluster,
+            exec,
             client,
             streams,
             stopping,
@@ -551,9 +569,13 @@ async fn serve(
         };
         let cap_server = Arc::new(cluster::cap::CapServer::new(app.clone()));
         app.cluster.net.attach_cap_handler(Arc::downgrade(&cap_server));
-        (app, cap_server)
+        let exec_server = Arc::new(cluster::exec::ExecServer::new(app.clone()));
+        app.cluster
+            .net
+            .attach_exec_handler(Arc::downgrade(&exec_server));
+        (app, cap_server, exec_server)
     };
-    let (app, _cap_server) = app;
+    let (app, _cap_server, _exec_server) = app;
     app.workers
         .spawn(mcp::reap_idle(app.db.clone(), app.stopping.clone()));
     let routes = api::routes(app.clone());

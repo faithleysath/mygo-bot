@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fs::OpenOptions, path::Path, sync::Arc, thread};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::OpenOptions,
+    path::Path,
+    sync::Arc,
+    thread,
+};
 
 use axum::body::Bytes;
 use reqwest::Body;
@@ -14,9 +20,10 @@ use crate::{
     agent::Control,
     cluster::{
         ClusterSignal, SyncSignal,
+        exec::{PresenceState, SessionOccupancy, merge_remote_attachment_refs},
         ledger::{
-            ContextPos, clear_staged, has_conflict, is_session_writable_local, record_call,
-            record_session_delta, take_staged, with_savepoint,
+            AttachmentRef, ContextPos, clear_staged, has_conflict, is_session_writable_local,
+            record_call, record_session_delta, take_staged, with_savepoint,
         },
     },
     events::Notice,
@@ -66,6 +73,9 @@ pub struct Db(mpsc::Sender<Command>);
 
 pub struct Store {
     pub conn: Connection,
+    pub local_node_id: String,
+    pub presence: Arc<PresenceState>,
+    pub pending_wakes: HashSet<SessionId>,
     pub active: HashMap<SessionId, Control>,
     pub tasks: HashMap<ItemId, crate::codemode::Task>,
     pub mcp: crate::mcp::Connections,
@@ -83,6 +93,7 @@ impl Db {
         path: &Path,
         global_events: broadcast::Sender<Notice>,
         sync_tx: Arc<ClusterSignal>,
+        presence: Arc<PresenceState>,
     ) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(false);
@@ -114,6 +125,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         }
         let local_node_id = crate::cluster::identity::load_local_node(&tx)?.node_id;
+        presence.set_local_node_id(local_node_id.clone());
         let call_ids = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM llm_calls WHERE status='in_flight' AND origin_node_id=?1",
@@ -155,6 +167,9 @@ impl Db {
                 let _entered = runtime.enter();
                 let mut store = Store {
                     conn,
+                    local_node_id,
+                    presence,
+                    pending_wakes: HashSet::new(),
                     active: HashMap::new(),
                     tasks: HashMap::new(),
                     mcp: Default::default(),
@@ -222,8 +237,22 @@ impl Db {
         content: Value,
         key: Option<String>,
     ) -> Result<Enqueued> {
+        self.enqueue_with_attachments(sid, content, key, Vec::new())
+            .await
+    }
+
+    pub async fn enqueue_with_attachments(
+        &self,
+        sid: SessionId,
+        content: Value,
+        key: Option<String>,
+        attachments: Vec<AttachmentRef>,
+    ) -> Result<Enqueued> {
         self.write(
-            move |conn| Enqueue { sid, content, key }.insert(conn),
+            move |conn| {
+                merge_remote_attachment_refs(conn, &attachments)?;
+                Enqueue { sid, content, key }.insert(conn)
+            },
             move |store, saved| {
                 if let Enqueued::Created(id) = saved {
                     store.wake_waiters(sid);
@@ -524,21 +553,89 @@ impl Store {
             }
             Ok(())
         })?;
+        self.refresh_local_presence(sid);
         self.notify_status(sid, state, reason, now);
         Ok(())
     }
 
+    pub fn effective_runner_node_id(&self, sid: SessionId) -> Option<String> {
+        if self.active.contains_key(&sid)
+            || self.pending_wakes.contains(&sid)
+            || crate::codemode::has_session_tasks(self, sid)
+        {
+            return Some(self.local_node_id.clone());
+        }
+        self.presence.remote_owner(sid).map(|(id, _)| id)
+    }
+
+    pub fn session_view(&self, mut s: Session) -> Session {
+        let local_busy = self.active.contains_key(&s.id)
+            || self.pending_wakes.contains(&s.id)
+            || crate::codemode::has_session_tasks(self, s.id);
+        if local_busy {
+            s.runner_node_id = Some(self.local_node_id.clone());
+        } else if let Some((peer_id, occ)) = self.presence.remote_owner(s.id) {
+            s.runner_node_id = Some(peer_id);
+            if matches!(occ.status, SessionStatus::Running | SessionStatus::Pausing) {
+                let is_pausing = occ.status == SessionStatus::Pausing;
+                s.status = occ.status;
+                s.updated_at = s.updated_at.max(occ.updated_at);
+                if is_pausing {
+                    s.last_error = occ.reason;
+                } else {
+                    s.last_error.clear();
+                }
+            }
+        } else {
+            s.runner_node_id = None;
+        }
+        s
+    }
+
+    pub fn refresh_local_presence(&self, sid: SessionId) {
+        let active = self.active.contains_key(&sid) || self.pending_wakes.contains(&sid);
+        let active_tasks = crate::codemode::count_session_tasks(self, sid);
+        if !active && active_tasks == 0 {
+            self.presence.set_local(sid, None);
+            return;
+        }
+        let occ = session(&self.conn, sid).ok().map(|info| SessionOccupancy {
+            session_id: sid,
+            status: if active && !matches!(info.status, SessionStatus::Running | SessionStatus::Pausing) {
+                SessionStatus::Running
+            } else {
+                info.status
+            },
+            reason: info.last_error,
+            active_tasks,
+            updated_at: info.updated_at,
+        });
+        self.presence.set_local(sid, occ);
+    }
+
     pub fn notify_status(&self, sid: SessionId, state: &str, reason: &str, updated_at: i64) {
+        let runner_node_id = self.effective_runner_node_id(sid);
         if let Some(channel) = self.channels.get(&sid).and_then(|w| w.upgrade()) {
             Notice::publish(
                 &channel,
                 "session.status",
-                json!({"status":state,"reason":reason,"updated_at":updated_at}),
+                json!({
+                    "status": state,
+                    "reason": reason,
+                    "updated_at": updated_at,
+                    "runner_node_id": runner_node_id,
+                }),
             );
         }
         self.publish_global(
             "session.status",
-            json!({"id":sid,"status":state,"reason":reason,"updated_at":updated_at}),
+            json!({
+                "id": sid,
+                "status": state,
+                "reason": reason,
+                "updated_at": updated_at,
+                "runner_node_id": runner_node_id,
+            }),
         );
     }
 }
@@ -569,7 +666,7 @@ pub fn session(conn: &Connection, sid: SessionId) -> Result<Session> {
     Ok(stmt.query_row([sid], session_row)?)
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub id: SessionId,
     pub title: String,
@@ -579,15 +676,28 @@ pub struct Session {
     pub reasoning_effort: Option<String>,
     pub last_error: String,
     pub model_id: ModelId,
+    #[serde(default)]
+    pub runner_node_id: Option<String>,
 }
 
-#[derive(PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     Idle,
     Running,
     Pausing,
     Paused,
+}
+
+impl SessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Pausing => "pausing",
+            Self::Paused => "paused",
+        }
+    }
 }
 
 impl rusqlite::types::FromSql for SessionStatus {
@@ -610,6 +720,7 @@ pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         reasoning_effort: row.get(5)?,
         last_error: row.get(6)?,
         model_id: row.get(7)?,
+        runner_node_id: None,
     })
 }
 

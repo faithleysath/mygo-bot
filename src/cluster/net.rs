@@ -20,6 +20,7 @@ use crate::{
     Error, Result,
     cluster::{
         cap::CapServer,
+        exec::{ExecPlane, ExecServer},
         identity::{
             LocalNode, PeerInfo, decode_endpoint_addr, list_peers, load_local_node, self_peer_info,
             upsert_peer_if_gen,
@@ -31,7 +32,9 @@ use crate::{
 
 pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/1";
 pub const CAP_ALPN: &[u8] = b"mygo/cap/1";
+pub const EXEC_ALPN: &[u8] = b"mygo/exec/1";
 const MAX_CAP_CONNS_PER_PEER: usize = 4;
+const MAX_EXEC_CONNS_PER_PEER: usize = 2;
 const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 pub const RPC_REQ_HEADER_MAX: usize = 2 * 1024 * 1024;
 pub const RPC_RESP_HEADER_MAX: usize = 6 * 1024 * 1024;
@@ -81,6 +84,9 @@ struct CapPeerEntry {
     peer_cancel: CancellationToken,
 }
 
+type AuxConnMap = Mutex<HashMap<String, Vec<CapPeerEntry>>>;
+type AuxLockMap = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
+
 struct NetAuthState {
     secret: [u8; 32],
     membership_gen: i64,
@@ -92,6 +98,42 @@ struct PeerConnectState {
     peers: HashSet<String>,
 }
 
+#[derive(Clone, Copy)]
+enum AuxKind {
+    Cap,
+    Exec,
+}
+
+impl AuxKind {
+    fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::Cap => CAP_ALPN,
+            Self::Exec => EXEC_ALPN,
+        }
+    }
+
+    fn auth_labels(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            Self::Cap => (b"mygo-cap-srv", b"mygo-cap-cli"),
+            Self::Exec => (b"mygo-exec-srv", b"mygo-exec-cli"),
+        }
+    }
+
+    fn max_conns(self) -> usize {
+        match self {
+            Self::Cap => MAX_CAP_CONNS_PER_PEER,
+            Self::Exec => MAX_EXEC_CONNS_PER_PEER,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Cap => "cap",
+            Self::Exec => "exec",
+        }
+    }
+}
+
 pub struct ClusterNet {
     db: Db,
     endpoint: Endpoint,
@@ -101,10 +143,14 @@ pub struct ClusterNet {
     peers: Mutex<HashMap<String, PeerEntry>>,
     cap_peers: Mutex<HashMap<String, Vec<CapPeerEntry>>>,
     cap_dial_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    exec_peers: Mutex<HashMap<String, Vec<CapPeerEntry>>>,
+    exec_dial_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     dialing: Mutex<HashSet<String>>,
     next_conn_id: AtomicU64,
     handler: Mutex<Option<Weak<SyncEngine>>>,
     cap_handler: Mutex<Option<Weak<CapServer>>>,
+    exec_handler: Mutex<Option<Weak<ExecServer>>>,
+    exec_plane: Mutex<Option<Weak<ExecPlane>>>,
     connected_peers: Mutex<PeerConnectState>,
     connect_notify: Notify,
     dial_wake: Notify,
@@ -292,7 +338,11 @@ impl ClusterNet {
             Endpoint::builder(presets::N0)
         }
         .secret_key(sk)
-        .alpns(vec![CLUSTER_ALPN.to_vec(), CAP_ALPN.to_vec()]);
+        .alpns(vec![
+            CLUSTER_ALPN.to_vec(),
+            CAP_ALPN.to_vec(),
+            EXEC_ALPN.to_vec(),
+        ]);
         if let Some(addr) = config.bind_addr {
             builder = builder
                 .clear_ip_transports()
@@ -317,10 +367,14 @@ impl ClusterNet {
             peers: Mutex::default(),
             cap_peers: Mutex::default(),
             cap_dial_locks: Mutex::default(),
+            exec_peers: Mutex::default(),
+            exec_dial_locks: Mutex::default(),
             dialing: Mutex::default(),
             next_conn_id: AtomicU64::new(1),
             handler: Mutex::default(),
             cap_handler: Mutex::default(),
+            exec_handler: Mutex::default(),
+            exec_plane: Mutex::default(),
             connected_peers: Mutex::default(),
             connect_notify: Notify::new(),
             dial_wake: Notify::new(),
@@ -339,6 +393,14 @@ impl ClusterNet {
 
     pub fn attach_cap_handler(&self, handler: Weak<CapServer>) {
         *self.cap_handler.lock().unwrap() = Some(handler);
+    }
+
+    pub fn attach_exec_handler(&self, handler: Weak<ExecServer>) {
+        *self.exec_handler.lock().unwrap() = Some(handler);
+    }
+
+    pub fn attach_exec_plane(&self, plane: Weak<ExecPlane>) {
+        *self.exec_plane.lock().unwrap() = Some(plane);
     }
 
     pub fn endpoint_addr(&self) -> EndpointAddr {
@@ -391,36 +453,72 @@ impl ClusterNet {
 
     pub fn online_peer_ids(&self) -> Vec<String> {
         let current_gen = self.membership_gen();
-        let mut peers = self.peers.lock().unwrap();
-        peers.retain(|_, entry| {
-            entry.membership_gen == current_gen && entry.conn.close_reason().is_none()
-        });
-        let mut ids: Vec<String> = peers.keys().cloned().collect();
-        ids.sort();
+        let mut stale = Vec::new();
+        let ids: Vec<String> = {
+            let mut peers = self.peers.lock().unwrap();
+            peers.retain(|id, entry| {
+                let keep =
+                    entry.membership_gen == current_gen && entry.conn.close_reason().is_none();
+                if !keep {
+                    stale.push(id.clone());
+                }
+                keep
+            });
+            let mut ids: Vec<String> = peers.keys().cloned().collect();
+            ids.sort();
+            ids
+        };
+        for id in stale {
+            self.notify_peer_offline(&id);
+        }
         ids
     }
 
     pub fn is_peer_online(&self, node_id: &str) -> bool {
         let current_gen = self.membership_gen();
-        let mut peers = self.peers.lock().unwrap();
-        if let Some(entry) = peers.get(node_id) {
-            if entry.membership_gen == current_gen && entry.conn.close_reason().is_none() {
-                return true;
+        let removed = {
+            let mut peers = self.peers.lock().unwrap();
+            if let Some(entry) = peers.get(node_id) {
+                if entry.membership_gen == current_gen && entry.conn.close_reason().is_none() {
+                    return true;
+                }
+                peers.remove(node_id).is_some()
+            } else {
+                false
             }
-            peers.remove(node_id);
+        };
+        if removed {
+            self.notify_peer_offline(node_id);
         }
         false
     }
 
     pub fn get_connection(&self, node_id: &str) -> Option<Connection> {
         let current_gen = self.membership_gen();
-        let mut peers = self.peers.lock().unwrap();
-        let entry = peers.get(node_id)?;
-        if entry.membership_gen == current_gen && entry.conn.close_reason().is_none() {
-            Some(entry.conn.clone())
-        } else {
-            peers.remove(node_id);
-            None
+        let (conn, removed) = {
+            let mut peers = self.peers.lock().unwrap();
+            let entry = peers.get(node_id)?;
+            if entry.membership_gen == current_gen && entry.conn.close_reason().is_none() {
+                (Some(entry.conn.clone()), false)
+            } else {
+                peers.remove(node_id);
+                (None, true)
+            }
+        };
+        if removed {
+            self.notify_peer_offline(node_id);
+        }
+        conn
+    }
+
+    fn notify_peer_offline(&self, node_id: &str) {
+        self.clear_aux_for_peer(AuxKind::Cap, node_id, 3, b"peer offline");
+        self.clear_aux_for_peer(AuxKind::Exec, node_id, 3, b"peer offline");
+        self.connected_peers.lock().unwrap().peers.remove(node_id);
+        self.peer_rpc_sems.lock().unwrap().remove(node_id);
+        let plane = self.exec_plane.lock().unwrap().as_ref().and_then(Weak::upgrade);
+        if let Some(plane) = plane {
+            plane.on_peer_offline(node_id);
         }
     }
 
@@ -441,21 +539,15 @@ impl ClusterNet {
         for entry in entries {
             entry.conn.close(2u32.into(), b"cluster changed");
         }
-        let cap_entries: Vec<CapPeerEntry> = self
-            .cap_peers
-            .lock()
-            .unwrap()
-            .drain()
-            .flat_map(|(_, v)| v)
-            .collect();
-        for entry in cap_entries {
-            entry.peer_cancel.cancel();
-            entry.conn.close(2u32.into(), b"cluster changed");
-        }
-        self.cap_dial_locks.lock().unwrap().clear();
+        self.drain_aux_all(AuxKind::Cap, 2, b"cluster changed");
+        self.drain_aux_all(AuxKind::Exec, 2, b"cluster changed");
         self.dialing.lock().unwrap().clear();
         self.peer_rpc_sems.lock().unwrap().clear();
         self.connected_peers.lock().unwrap().peers.clear();
+        let plane = self.exec_plane.lock().unwrap().as_ref().and_then(Weak::upgrade);
+        if let Some(plane) = plane {
+            plane.on_membership_switched();
+        }
         self.dial_wake.notify_one();
     }
 
@@ -463,15 +555,7 @@ impl ClusterNet {
         if let Some(entry) = self.peers.lock().unwrap().remove(node_id) {
             entry.conn.close(3u32.into(), b"peer removed");
         }
-        if let Some(entries) = self.cap_peers.lock().unwrap().remove(node_id) {
-            for entry in entries {
-                entry.peer_cancel.cancel();
-                entry.conn.close(3u32.into(), b"peer removed");
-            }
-        }
-        self.cap_dial_locks.lock().unwrap().remove(node_id);
-        self.connected_peers.lock().unwrap().peers.remove(node_id);
-        self.peer_rpc_sems.lock().unwrap().remove(node_id);
+        self.notify_peer_offline(node_id);
     }
 
     pub fn spawn_loops(self: &Arc<Self>, workers: &TaskTracker) {
@@ -490,22 +574,14 @@ impl ClusterNet {
         self.auth.lock().unwrap().gen_cancel.cancel();
         *self.handler.lock().unwrap() = None;
         *self.cap_handler.lock().unwrap() = None;
+        *self.exec_handler.lock().unwrap() = None;
+        *self.exec_plane.lock().unwrap() = None;
         let entries: Vec<PeerEntry> = self.peers.lock().unwrap().drain().map(|(_, v)| v).collect();
         for entry in entries {
             entry.conn.close(0u32.into(), b"shutdown");
         }
-        let cap_entries: Vec<CapPeerEntry> = self
-            .cap_peers
-            .lock()
-            .unwrap()
-            .drain()
-            .flat_map(|(_, v)| v)
-            .collect();
-        for entry in cap_entries {
-            entry.peer_cancel.cancel();
-            entry.conn.close(0u32.into(), b"shutdown");
-        }
-        self.cap_dial_locks.lock().unwrap().clear();
+        self.drain_aux_all(AuxKind::Cap, 0, b"shutdown");
+        self.drain_aux_all(AuxKind::Exec, 0, b"shutdown");
         self.endpoint.close().await;
         self.tasks.close();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.tasks.wait()).await;
@@ -631,10 +707,14 @@ impl ClusterNet {
 
     async fn handle_incoming_conn(self: Arc<Self>, conn: Connection) {
         let alpn = conn.alpn();
-        let (srv_label, cli_label, is_cap) = if alpn == CLUSTER_ALPN {
-            (b"mygo-auth-srv".as_slice(), b"mygo-auth-cli".as_slice(), false)
+        let (srv_label, cli_label, aux) = if alpn == CLUSTER_ALPN {
+            (b"mygo-auth-srv".as_slice(), b"mygo-auth-cli".as_slice(), None)
         } else if alpn == CAP_ALPN {
-            (b"mygo-cap-srv".as_slice(), b"mygo-cap-cli".as_slice(), true)
+            let (s, c) = AuxKind::Cap.auth_labels();
+            (s, c, Some(AuxKind::Cap))
+        } else if alpn == EXEC_ALPN {
+            let (s, c) = AuxKind::Exec.auth_labels();
+            (s, c, Some(AuxKind::Exec))
         } else {
             conn.close(1u32.into(), b"unsupported alpn");
             return;
@@ -654,14 +734,12 @@ impl ClusterNet {
                 return;
             }
         };
-        if is_cap {
+        if let Some(kind) = aux {
             if remote_peer.node_id == self.local_node_id {
                 conn.close(1u32.into(), b"self connection");
                 return;
             }
-            let _ = self
-                .register_cap_conn(conn, remote_peer.node_id, mgen, gen_cancel)
-                .await;
+            let _ = self.register_aux_conn(kind, conn, remote_peer.node_id, mgen, gen_cancel);
         } else {
             self.register_peer_conn(conn, remote_peer, false, mgen, gen_cancel)
                 .await;
@@ -788,8 +866,42 @@ impl ClusterNet {
         Ok(remote_peer)
     }
 
-    fn cap_dial_lock(&self, node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.cap_dial_locks.lock().unwrap();
+    fn aux_maps(&self, kind: AuxKind) -> (&AuxConnMap, &AuxLockMap) {
+        match kind {
+            AuxKind::Cap => (&self.cap_peers, &self.cap_dial_locks),
+            AuxKind::Exec => (&self.exec_peers, &self.exec_dial_locks),
+        }
+    }
+
+    fn clear_aux_for_peer(&self, kind: AuxKind, node_id: &str, code: u32, reason: &[u8]) {
+        let (peers_map, locks_map) = self.aux_maps(kind);
+        if let Some(entries) = peers_map.lock().unwrap().remove(node_id) {
+            for entry in entries {
+                entry.peer_cancel.cancel();
+                entry.conn.close(code.into(), reason);
+            }
+        }
+        locks_map.lock().unwrap().remove(node_id);
+    }
+
+    fn drain_aux_all(&self, kind: AuxKind, code: u32, reason: &[u8]) {
+        let (peers_map, locks_map) = self.aux_maps(kind);
+        let entries: Vec<CapPeerEntry> = peers_map
+            .lock()
+            .unwrap()
+            .drain()
+            .flat_map(|(_, v)| v)
+            .collect();
+        for entry in entries {
+            entry.peer_cancel.cancel();
+            entry.conn.close(code.into(), reason);
+        }
+        locks_map.lock().unwrap().clear();
+    }
+
+    fn aux_dial_lock(&self, kind: AuxKind, node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let (_, locks_map) = self.aux_maps(kind);
+        let mut map = locks_map.lock().unwrap();
         map.retain(|_, w| w.strong_count() > 0);
         if let Some(lock) = map.get(node_id).and_then(Weak::upgrade) {
             return lock;
@@ -799,25 +911,32 @@ impl ClusterNet {
         lock
     }
 
-    fn pick_cap_conn(&self, node_id: &str, mgen: i64) -> Option<(Connection, CancellationToken)> {
-        let mut cap_peers = self.cap_peers.lock().unwrap();
-        let list = cap_peers.get_mut(node_id)?;
+    fn pick_aux_conn(
+        &self,
+        kind: AuxKind,
+        node_id: &str,
+        mgen: i64,
+    ) -> Option<(Connection, CancellationToken)> {
+        let (peers_map, _) = self.aux_maps(kind);
+        let mut peers = peers_map.lock().unwrap();
+        let list = peers.get_mut(node_id)?;
         list.retain(|e| {
             e.membership_gen == mgen
                 && !e.peer_cancel.is_cancelled()
                 && e.conn.close_reason().is_none()
         });
         if list.is_empty() {
-            cap_peers.remove(node_id);
+            peers.remove(node_id);
             return None;
         }
         let entry = list.last()?;
         Some((entry.conn.clone(), entry.peer_cancel.clone()))
     }
 
-    pub fn evict_cap_conn(&self, node_id: &str, conn: &Connection) {
-        let mut cap_peers = self.cap_peers.lock().unwrap();
-        if let Some(list) = cap_peers.get_mut(node_id) {
+    fn evict_aux_conn(&self, kind: AuxKind, node_id: &str, conn: &Connection) {
+        let (peers_map, _) = self.aux_maps(kind);
+        let mut peers = peers_map.lock().unwrap();
+        if let Some(list) = peers.get_mut(node_id) {
             let sid = conn.stable_id();
             list.retain(|e| {
                 if e.conn.stable_id() == sid {
@@ -828,9 +947,17 @@ impl ClusterNet {
                 }
             });
             if list.is_empty() {
-                cap_peers.remove(node_id);
+                peers.remove(node_id);
             }
         }
+    }
+
+    pub fn evict_cap_conn(&self, node_id: &str, conn: &Connection) {
+        self.evict_aux_conn(AuxKind::Cap, node_id, conn);
+    }
+
+    pub fn evict_exec_conn(&self, node_id: &str, conn: &Connection) {
+        self.evict_aux_conn(AuxKind::Exec, node_id, conn);
     }
 
     pub async fn get_or_dial_cap_connection(
@@ -838,6 +965,26 @@ impl ClusterNet {
         peer: &PeerInfo,
         cancel: &CancellationToken,
     ) -> std::result::Result<(Connection, CancellationToken), String> {
+        self.get_or_dial_aux_connection(AuxKind::Cap, peer, cancel)
+            .await
+    }
+
+    pub async fn get_or_dial_exec_connection(
+        self: &Arc<Self>,
+        peer: &PeerInfo,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(Connection, CancellationToken), String> {
+        self.get_or_dial_aux_connection(AuxKind::Exec, peer, cancel)
+            .await
+    }
+
+    async fn get_or_dial_aux_connection(
+        self: &Arc<Self>,
+        kind: AuxKind,
+        peer: &PeerInfo,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(Connection, CancellationToken), String> {
+        let tag = kind.tag();
         if cancel.is_cancelled() || self.stopping.is_cancelled() {
             return Err("cancelled".into());
         }
@@ -845,37 +992,38 @@ impl ClusterNet {
             return Err(format!("peer {} is offline", peer.node_id));
         }
         let (mgen, _, gen_cancel) = self.auth_context();
-        if let Some(found) = self.pick_cap_conn(&peer.node_id, mgen) {
+        if let Some(found) = self.pick_aux_conn(kind, &peer.node_id, mgen) {
             return Ok(found);
         }
-        let lock = self.cap_dial_lock(&peer.node_id);
+        let lock = self.aux_dial_lock(kind, &peer.node_id);
         let _guard = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err("cancelled".into()),
-            _ = gen_cancel.cancelled() => return Err("membership changed during cap dial".into()),
+            _ = gen_cancel.cancelled() => return Err(format!("membership changed during {tag} dial")),
             g = lock.lock() => g,
         };
         if !self.is_peer_online(&peer.node_id) {
             return Err(format!("peer {} is offline", peer.node_id));
         }
         let (mgen, cluster_secret, gen_cancel) = self.auth_context();
-        if let Some(found) = self.pick_cap_conn(&peer.node_id, mgen) {
+        if let Some(found) = self.pick_aux_conn(kind, &peer.node_id, mgen) {
             return Ok(found);
         }
         let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs).map_err(|e| e.to_string())?;
         let conn = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err("cancelled".into()),
-            _ = gen_cancel.cancelled() => return Err("membership changed during cap dial".into()),
-            res = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr, CAP_ALPN)) => {
-                res.map_err(|_| format!("cap dial to {} timed out", peer.node_id))?
-                    .map_err(|e| format!("cap dial to {} failed: {e}", peer.node_id))?
+            _ = gen_cancel.cancelled() => return Err(format!("membership changed during {tag} dial")),
+            res = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr, kind.alpn())) => {
+                res.map_err(|_| format!("{tag} dial to {} timed out", peer.node_id))?
+                    .map_err(|e| format!("{tag} dial to {} failed: {e}", peer.node_id))?
             }
         };
         if conn.remote_id().to_string() != peer.node_id {
             conn.close(1u32.into(), b"node id mismatch");
             return Err("peer node id mismatch".into());
         }
+        let (srv_label, cli_label) = kind.auth_labels();
         let auth = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -884,11 +1032,11 @@ impl ClusterNet {
             }
             _ = gen_cancel.cancelled() => {
                 conn.close(2u32.into(), b"cluster changed");
-                return Err("membership changed during cap handshake".into());
+                return Err(format!("membership changed during {tag} handshake"));
             }
             r = tokio::time::timeout(
                 HANDSHAKE_TIMEOUT,
-                self.authenticate_outbound(&conn, &cluster_secret, b"mygo-cap-srv", b"mygo-cap-cli"),
+                self.authenticate_outbound(&conn, &cluster_secret, srv_label, cli_label),
             ) => r,
         };
         match auth {
@@ -899,18 +1047,18 @@ impl ClusterNet {
             }
             Err(_) => {
                 conn.close(1u32.into(), b"auth timeout");
-                return Err("cap auth timed out".into());
+                return Err(format!("{tag} auth timed out"));
             }
         }
         let peer_cancel = self
-            .register_cap_conn(conn.clone(), peer.node_id.clone(), mgen, gen_cancel)
-            .await
-            .ok_or_else(|| "membership changed during cap register".to_owned())?;
+            .register_aux_conn(kind, conn.clone(), peer.node_id.clone(), mgen, gen_cancel)
+            .ok_or_else(|| format!("membership changed during {tag} register"))?;
         Ok((conn, peer_cancel))
     }
 
-    async fn register_cap_conn(
+    fn register_aux_conn(
         self: &Arc<Self>,
+        kind: AuxKind,
         conn: Connection,
         remote_id: String,
         mgen: i64,
@@ -927,8 +1075,9 @@ impl ClusterNet {
                 conn.close(2u32.into(), b"cluster changed");
                 return None;
             }
-            let mut cap_peers = self.cap_peers.lock().unwrap();
-            let list = cap_peers.entry(remote_id.clone()).or_default();
+            let (peers_map, _) = self.aux_maps(kind);
+            let mut peers = peers_map.lock().unwrap();
+            let list = peers.entry(remote_id.clone()).or_default();
             list.retain(|e| {
                 e.membership_gen == mgen
                     && !e.peer_cancel.is_cancelled()
@@ -940,7 +1089,7 @@ impl ClusterNet {
                 conn: conn.clone(),
                 peer_cancel: peer_cancel.clone(),
             });
-            let excess = list.len().saturating_sub(MAX_CAP_CONNS_PER_PEER);
+            let excess = list.len().saturating_sub(kind.max_conns());
             if excess > 0 {
                 list.drain(..excess).collect()
             } else {
@@ -949,7 +1098,7 @@ impl ClusterNet {
         };
         for old in evicted {
             old.peer_cancel.cancel();
-            old.conn.close(4u32.into(), b"cap connection pool limit");
+            old.conn.close(4u32.into(), b"connection pool limit");
         }
         let net = self.clone();
         let pc = peer_cancel.clone();
@@ -962,14 +1111,26 @@ impl ClusterNet {
                     bi = conn.accept_bi() => {
                         match bi {
                             Ok((send, recv)) => {
-                                let handler = net.cap_handler.lock().unwrap().as_ref().and_then(Weak::upgrade);
                                 let from = remote_id.clone();
                                 let stream_cancel = pc.clone();
-                                net.tasks.spawn(async move {
-                                    if let Some(handler) = handler {
-                                        handler.handle_stream(from, send, recv, stream_cancel).await;
+                                match kind {
+                                    AuxKind::Cap => {
+                                        let handler = net.cap_handler.lock().unwrap().as_ref().and_then(Weak::upgrade);
+                                        net.tasks.spawn(async move {
+                                            if let Some(handler) = handler {
+                                                handler.handle_stream(from, send, recv, stream_cancel).await;
+                                            }
+                                        });
                                     }
-                                });
+                                    AuxKind::Exec => {
+                                        let handler = net.exec_handler.lock().unwrap().as_ref().and_then(Weak::upgrade);
+                                        net.tasks.spawn(async move {
+                                            if let Some(handler) = handler {
+                                                handler.handle_stream(from, send, recv, stream_cancel).await;
+                                            }
+                                        });
+                                    }
+                                }
                             }
                             Err(_) => break,
                         }
@@ -977,11 +1138,12 @@ impl ClusterNet {
                 }
             }
             pc.cancel();
-            let mut cap_peers = net.cap_peers.lock().unwrap();
-            if let Some(list) = cap_peers.get_mut(&remote_id) {
+            let (peers_map, _) = net.aux_maps(kind);
+            let mut peers = peers_map.lock().unwrap();
+            if let Some(list) = peers.get_mut(&remote_id) {
                 list.retain(|e| e.conn_id != conn_id);
                 if list.is_empty() {
-                    cap_peers.remove(&remote_id);
+                    peers.remove(&remote_id);
                 }
             }
         });
@@ -1055,6 +1217,9 @@ impl ClusterNet {
                 .insert(remote_id.clone());
         }
         self.connect_notify.notify_one();
+        if let Some(plane) = self.exec_plane.lock().unwrap().as_ref().and_then(Weak::upgrade) {
+            plane.on_peer_online(remote_id.clone());
+        }
 
         let net = self.clone();
         self.tasks.spawn(async move {
@@ -1081,9 +1246,16 @@ impl ClusterNet {
                     }
                 }
             }
-            let mut peers = net.peers.lock().unwrap();
-            if peers.get(&remote_id).is_some_and(|e| e.conn_id == conn_id) {
-                peers.remove(&remote_id);
+            let removed = {
+                let mut peers = net.peers.lock().unwrap();
+                if peers.get(&remote_id).is_some_and(|e| e.conn_id == conn_id) {
+                    peers.remove(&remote_id).is_some()
+                } else {
+                    false
+                }
+            };
+            if removed {
+                net.notify_peer_offline(&remote_id);
             }
         });
     }

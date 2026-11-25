@@ -19,6 +19,13 @@ function formatRem(sec: number | null | undefined): string {
   return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
 }
 
+export interface ClusterNodeOption {
+  id: string;
+  name: string;
+  online: boolean;
+  isSelf: boolean;
+}
+
 export interface ComposerProps {
   session: SessionInfo;
   providers: ProviderInfo[];
@@ -29,6 +36,9 @@ export interface ComposerProps {
   tasks: ActiveTask[];
   queuedCount: number;
   summary: CallsSummary | null;
+  clusterNodes?: ClusterNodeOption[];
+  runNode?: string;
+  onChangeRunNode?: (sid: string, node: string) => void;
   onChangeText: (sid: string, text: string) => void;
   onUploadFiles: (sid: string, files: FileList | null) => void;
   onRemoveAttachment: (sid: string, aid: string) => void;
@@ -54,6 +64,9 @@ export function Composer({
   tasks,
   queuedCount,
   summary,
+  clusterNodes = [],
+  runNode = "",
+  onChangeRunNode,
   onChangeText,
   onUploadFiles,
   onRemoveAttachment,
@@ -178,7 +191,9 @@ export function Composer({
                   </div>
                   {task.running_commands?.map((c) => (
                     <div key={c.id} class="task-cmd">
-                      <div class="mono muted small">$ {c.program} {(c.args || []).join(" ")}</div>
+                      <div class="mono muted small">
+                        {c.node ? `[${c.node}] ` : ""}$ {c.program} {(c.args || []).join(" ")}
+                      </div>
                       {c.stdout && <pre class="code-box">{c.stdout}</pre>}
                       {c.stderr && <pre class="code-box err-text">{c.stderr}</pre>}
                     </div>
@@ -317,6 +332,32 @@ export function Composer({
           </div>
 
           <div class="row gap-1 composer-right">
+            {clusterNodes.length > 1 && (
+              <select
+                class="composer-select"
+                title={t("Execution Node")}
+                disabled={running || Boolean(session.runner_node_id)}
+                value={
+                  session.runner_node_id
+                    ? session.runner_node_id === clusterNodes.find((n) => n.isSelf)?.id
+                      ? ""
+                      : session.runner_node_id
+                    : runNode
+                }
+                onChange={(e) => onChangeRunNode?.(session.id, e.currentTarget.value)}
+              >
+                {clusterNodes.map((n) => (
+                  <option
+                    key={n.isSelf ? "__self__" : n.id}
+                    value={n.isSelf ? "" : n.id}
+                    disabled={!n.online}
+                  >
+                    {n.isSelf ? `${t("This node")} (${n.name})` : `${n.name}${n.online ? "" : ` (${t("Offline")})`}`}
+                  </option>
+                ))}
+              </select>
+            )}
+
             <select
               class="composer-select"
               title={t("Session Model")}
