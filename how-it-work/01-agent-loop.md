@@ -163,7 +163,7 @@ stateDiagram-v2
 **崩溃恢复专门拿来跟硬暂停做对照：硬暂停是程序还醒着，能自己把残局结清；`SIGKILL` 强杀或直接断电，是连最后一次结账的机会都没给。**
 
 所以进程重新拉起、打开数据库 `Db::open` 时，只认 SQLite WAL 最后一次提交的事务，在一个启动事务里做三件事：
-1. **验库、对齐时钟水位与认领本机身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 `4`，紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L111)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`（详见 [第 2 篇](02-storage-and-concurrency.md)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
+1. **验库、对齐时钟水位与认领本机身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 `6`，紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L113)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`（详见 [第 2 篇](02-storage-and-concurrency.md)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
 2. **只按源节点 `origin_node_id` 截停状态**：建表时每行 `llm_calls` 和 `items` 都记录着写下这行原始数据的 `origin_node_id`。启动恢复只把 `origin_node_id == local_node_id` 且仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`），把本机原先是 `'running'` 或 `'pausing'` 的会话统一标成 `'paused'`，同时交给 `codemode::ledger::recover` 也按 `origin_node_id` 过滤后处理未结清的后台任务与过期租期提醒（详见 [第 5 篇](05-codemode-lifecycle.md)）——既不会从旧提交 JSON 里误扫出别的节点的任务，也绝不会越权修改冲突未决或只有半份目录头的远端会话；恢复动作仅在对本机无冲突且可写完整的流上才补记同步提交，让集群同伴看到一致状态。
 3. **等人工重开才补未果工具**：注意启动恢复时**绝不会擅自重跑上次没回来的普通工具调用**——因为账上没记 `function_call_output`，只说明**结果没落盘**，推不出**工具当时没执行过**（比如发邮件、扣款）。重启后这些工具的空缺先留着，等你下次手动调 `PUT /sessions/{sid}/run` 恢复会话时，程序再翻流水账收残局，调用 `publish_tools(..., recovering=true)` 补上 `"Execution interrupted; result unknown."`。补齐残局后要不要接着问模型，又稳稳地回到前面那两个书签：先看 `needs_model`，再看 `pending` 队列，有活接着跑，没活切回 `idle`。
 

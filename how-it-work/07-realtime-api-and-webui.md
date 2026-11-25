@@ -30,7 +30,7 @@
 
 ## HTTP API 全景、三条路由面与内置 OpenAPI 文档
 
-整套系统一共对外暴露 **36 条路径、51 个操作**（完整契约及 **56 个 Schema** 以单行压缩 JSON 格式编译期嵌在 [src/openapi.json](../src/openapi.json) 里，约 **79.0 KiB / 80,908 字节**，OpenAPI `3.1.0`；契约内完整声明了按需 Watch 拉取与同步冲突拦截相关的 `409 Conflict`——覆盖 `/sessions/{sid}` 及 `/history`、`/context`、`/messages`、`/events`、`/run` 停跑、`GET /attachments/{id}` 及目录/MCP 写操作——以及 `POST /cluster/sync` 指定不存在 `session_id` 时的 `404 Not Found`）：
+整套系统一共对外暴露 **36 条路径、51 个操作**（完整契约及 **56 个 Schema** 以单行压缩 JSON 格式编译期嵌在 [src/openapi.json](../src/openapi.json) 里，约 **79.4 KiB / 81,341 字节**，OpenAPI `3.1.0`；契约内完整声明了按需 Watch 拉取与同步冲突拦截相关的 `409 Conflict`——覆盖 `/sessions/{sid}` 及 `/history`、`/context`、`/messages`、`/events`、`/run` 停跑、`GET /attachments/{id}` 及目录/MCP 写操作——以及 `GET /sessions/{sid}/history` 返回的 **`X-History-Rev`** 响应头与 `POST /cluster/sync` 指定不存在 `session_id` 时的 `404 Not Found`）：
 
 | 模块 | 路由一览 | 核心职责 |
 | :--- | :--- | :--- |
@@ -64,7 +64,7 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 ### 1. 构建、压缩与强 ETag 嵌入（`web/build.mjs` & `src/webui.rs`）
 
 执行 `bun run build` 先跑一遍 `tsc --noEmit` 全量类型检查，随后：
-- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 44.7 KiB / 45,822 字节）**；
+- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 45.1 KiB / 46,171 字节）**；
 - 自定义状态机压缩 CSS（保留引号内容、去注释、去尾分号），压进 **`src/webui/app.css.gz`（约 6.6 KiB / 6,736 字节）**；
 - `index.html` 折叠标签间空白生成 **`src/webui/index.html`（898 字节）**，开头直接内联了一小段同步 `<script>`，在浏览器首帧绘制前读取 `localStorage.mygo_theme` 和系统深浅色偏好把 `dataset.theme` 设好，彻底杜绝深色模式下切白闪屏（FOUC）。
 
@@ -83,7 +83,7 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 | :--- | :--- |
 | **1. 全局快照与增量缓冲（`activeBuffer` + `latestSeq`）** | 全量拉取 `GET /sessions` 还在半路时，全局 SSE 推来的 `session.created`/`status` 以及本地已经确认成功的 `onLocalPatch`/`runRefresh` 更新，都会先就地生效并记进临时缓冲，等全量快照回来再按序（本地改动走 `applyLocalPatch`）重放盖上去。省掉它，拉列表那几百毫秒里刚发生的事件或刚改好的标题/模型就会被旧快照抹掉。 |
 | **2. 单会话版本号 + 永久墓碑 `deletedIds` + 回拉退避** | 每次调 `PATCH /sessions/{sid}` 前先拍下该会话此刻的版本号 `baseVersion`。如果请求飞在半路时有更新的 SSE 事件把版本号推高了，或者该会话已经被删进 `deletedIds` 墓碑集里——回包绝对不允许直接盖上去把旧数据覆盖回来、更不许把删掉的会话“复活”！冲突时自动改调一次带 `1s..8s` 退避的 `GET /sessions/{sid}` 对齐权威状态（`404` 立刻转为删除）。 |
-| **3. 立即首屏、历史缺口锁与全量重置校验（`start` + `gapOpen` + `knownHistoryRev`）** | 切进会话不等 SSE `ready`，`SessionSync.start()` 立刻先拉最新 50 条（`?tail=true&limit=50`），记下已同步游标 `syncedThroughId`（哪怕实时流被代理卡住也能正常看聊天记录；首次 Watch 多页追更和单条超大回复分片都由后端透明收齐，详见 [第 2 篇](02-storage-and-concurrency.md)）。一旦连上 `ready` 或收到 `resync`，把 `gapOpen` 置 `true` 锁住游标：期间新到达的 `item.saved` 先渲染上屏但不推高 `syncedThroughId`，等 `?after=...&limit=200` 补齐缺口再合拢。只要后端因同步覆盖重写历史而推来 **`session.reset`**，或者哪怕覆盖恰巧发生在 SSE 断线/`Lagged` 漏帧期间、重连后在 `ready`/`resync` 里带着递增后的 **`history_rev`**——`createSessionSync`（`web/src/state.ts`）一旦发现 `historyRev !== knownHistoryRev` 就会立刻调 `onReset(historyRev)` 递增 `resetGen`、丢弃在途旧页、清零游标并调用 `onReplaceItems` 全量拉新替换屏幕列表，彻底抹去已落败分支的幽灵消息；同时同一会话的 sidecar 刷新合并为最多“一个在途 + 一个尾随”，用量只按屏幕上的 `llm_call_id` 按需单条拉取。 |
+| **3. 立即首屏、历史缺口锁与全量重置校验（`start` + `gapOpen` + `knownHistoryRev` + `loadOlder`）** | 切进会话不等 SSE `ready`，`SessionSync.start()` 立刻先拉最新 50 条（`?tail=true&limit=50`），当即从首包响应头 **`X-History-Rev`** 捕获并锁定初始 `knownHistoryRev`（哪怕还没等到 SSE `ready` 就已建立版本基线），并记下已同步游标 `syncedThroughId`；向上翻页（`before` 分页）也统一收归 **`sessionSync.loadOlder`** 带着 `AbortController` 管理，一旦翻页响应头 `X-History-Rev` 与基线不一致或分页流半途被后端中断，同样立即触发重置全拉。只要连接上 `ready` 或收到 `resync`，把 `gapOpen` 置 `true` 锁住游标：期间新到达的 `item.saved` 先渲染上屏但不推高 `syncedThroughId`，等 `?after=...&limit=200` 补齐缺口再合拢。只要后端因同步覆盖重写历史而推来 **`session.reset`**，或者覆盖发生在 SSE 断线/`Lagged` 漏帧期间、重连后在 `ready`/`resync` 里带着递增后的 `history_rev`——`createSessionSync`（`web/src/state.ts`）一旦发现 `historyRev !== knownHistoryRev` 就会立刻调 `onReset(historyRev)` 取消在途翻页与旧请求、递增 `resetGen`、清零游标并调用 `onReplaceItems` 全量拉新替换屏幕列表，彻底抹去已落败分支的幽灵消息；同时同一会话的 sidecar 刷新合并为最多“一个在途 + 一个尾随”，用量只按屏幕上的 `llm_call_id` 按需单条拉取。 |
 | **4. 草稿防幽灵重现（`closedCalls` / `closedItems`）** | 当某条流式回答或工具调用已经被 `item.saved` 正式落盘、或者收到 `stream.clear` / `attempt.retry` 时，不仅立刻清掉屏幕上的流式草稿，还把对应的 `llm_call_id` 或 `call_id:output_index` 记进关闭集合；收到 `stream.clear` 时更会借助 UUIDv7 `CallId` 的单调递增序把所有不晚于该 ID 的旧草稿一并清盘并封禁，且对重连收到的 `stream.snapshot` 按 `closedItems` 逐项过滤，把任何迟到的增量碎片或旧快照彻底拦在门外，防止同一句话闪回屏幕两次。 |
 
 ### 4. 四块界面能力速览

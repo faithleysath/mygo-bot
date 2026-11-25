@@ -71,7 +71,9 @@
 - 普通写（比如投信、建目录、保存模型）只能和普通写拼车；
 - **最关键的是同一个会话被两个客户端同时点 `PUT /run` 点火**：如果两笔针对同一个会话 `sid` 的点火被塞进同一个外层事务里，第一笔虽然在 SQLite 里改了 `status='running'`，但外层事务还没 `COMMIT`，它的 `publish` 阶段还没来得及把 worker 登记进内存 `s.active` 字典，紧接着第二笔在同一批里一看 `s.active` 还是空的，就会误以为“还没人跑”，再派一个重复 worker 出来！
 - 所以规则写得死死的：**不同会话的点火可以拼车，同一个会话的两次点火绝不能进同一车**——第一车提交并把 worker 登记进 `s.active` 之后，第二车进门一眼看见活动 worker 已经在了，直接跳过开新循环、原样返回当前会话状态。顺便一提，在优雅退出阶段（`self.closing == true`），点火批次还会直接拒绝开新单，统一返回 `503 Service Unavailable`（`"shutting down"`）。
-- **还要防着过期老 worker 死灰复燃（运行世代栅栏）**：假如会话正跑在半路，突然碰上集群全量覆盖或删除会话，旧 worker 虽然收到了取消信号，但手里已经攥着一笔算完的工具账单正准备排进写通道。为了绝不让“上一任过期打工人”写坏新历史、错删后来新点火 worker 的 `s.active` 登记，记账员维护了一本 `Store.session_run_gen` 运行世代账：每次会话点火都先递增世代号 `run_gen` 并钉在 `Control` 上，该 worker 后续每一笔工具落账与终态写库都经 `Db::write_for_run` 附带 `expected_run_gen`，记账员在 `commit_batch`（[src/store.rs](../src/store.rs#L390)）里先核对与当前 `session_run_gen` 一致才放行，否则当场拒写；同时集群覆盖或删会话时会调 `abort_active_session_worker`（硬取消当前 worker、停掉名下 codemode 任务、从 `s.active` 摘除并递增 `run_gen`），`clear_session_body_rows` 也会把滞留的 `'running'`/`'pausing'` 状态先归位为 `'paused'` 再重放胜方快照——哪怕是在同 `epoch` 里选 `cluster` 覆盖，过期 worker 也既写不进新账，也不会把会话卡死在 `running`。
+- **还要防着过期老 worker 死灰复燃（运行世代与重置世代分离）**：假如会话正跑在半路，突然碰上集群全量覆盖或删除会话，旧 worker 虽然收到了取消信号，但手里已经攥着一笔算完的工具账单正准备排进写通道。为了既不让“上一任过期打工人”写坏新历史、错删新点火 worker 的 `s.active` 登记，又不至于让正常新开的下一回合把上一回合留下的后台任务完成事件吞掉，记账员把**两件事彻底拆成两本世代账**：
+  - `Store.session_run_gen`（Worker 身份世代）：每次会话点火都先递增并钉在 `Control` 上，模型 worker 的每一笔写库——包括 [src/model.rs](../src/model.rs) 里的流式中间推理/回复输出，以及 [src/tools.rs](../src/tools.rs) 配合 `hard.is_cancelled()` 守门的参数校验报错回包——全都要经 `Db::write_for_run` 附带 `expected_run_gen`，记账员在 `commit_batch`（[src/store.rs](../src/store.rs#L385-L411)）核对一致才放行，否则当场拒写；
+  - `Store.session_reset_gen` 与持久化的 `sync_streams.reset_gen`（`history_rev` 正文替换世代）：**只在真正覆盖整本正文或删除会话时才递增**，供后台 `codemode` 任务在 `task_superseded` 里核对。因此正常开新回合不会递增 `reset_gen`，上一回合遗留的后台任务完成事件照常送达；只有真正被集群替代或删会话时，`abort_active_session_worker` 才会同时硬取消 worker、停掉名下任务、摘除 `s.active` 并递增这两套世代号，同时 `clear_session_body_rows` 把滞留的 `'running'`/`'pausing'` 状态先归位为 `'paused'` 再重放胜方快照。
 
 ---
 
@@ -83,7 +85,7 @@
 
 1. **三选一翻页与先钉死终点**：
    - **先分清两类分页接口**（`limit` 统一限制在 `1..=200`）：只有 `/sessions/{sid}/history` 和 `/sessions/{sid}/context` 完整支持 `after`、`before`、`tail=true` 三种互斥游标模式（最多传一个），其中 `/history` 传 `itm_...` 形式的 **TypeID 字符串**，而 `/context` 传该会话内从 `1` 开始连续递增的整型 `position`（`after >= 0`、`before > 0`）。至于 `/sessions`、`/calls` 和 `/sessions/{sid}/messages` 列表接口，**仅支持向后翻页的 `after` 游标**（分别传 `ses_...`、`cal_...`、`itm_...` TypeID 字符串），不接受 `before` 或 `tail`。
-   - 真正取数据前，记账员先花一瞬间的读操作把本次范围 `(start, end)` **钉死**：查流水账 `/history` 钉的是 `items.id`，查上下文 `/context` 和喂模型钉的是 `context_items.position`。（注意两边游标**绝不能混用**，因为并发工具归进上下文的 `position` 顺序和原 `items.id` 顺序可能不同。）终点一钉死，哪怕下一毫秒门外又新落盘了几十条记录，编号也全都落在 `end` 外面，留给下次再翻。
+   - 真正取数据前，记账员先花一瞬间的读操作把本次范围 `(start, end)` **钉死**：查流水账 `/history` 钉的是 `items.id`，查上下文 `/context` 和喂模型钉的是 `context_items.position`。（注意两边游标**绝不能混用**，因为并发工具归进上下文的 `position` 顺序和原 `items.id` 顺序可能不同。）终点一钉死，哪怕下一毫秒门外又新落盘了几十条记录，编号也全都落在 `end` 外面，留给下次再翻。此外，`GET /sessions/{sid}/history` 会返回 **`X-History-Rev`** 响应头，且 `JsonRows::history_body` 每一瓢出勺前都会重新校验 `session_history_rev == expected`——一旦翻页半途会话正文被集群覆盖替换，立刻返 `409 Conflict` 或中断当前流，防止前后批次拼出不同历史纪元的幻觉。
 2. **一瓢一瓢往外舀**：
    - 接着从 `start` 到 `end`，每次只请记账员舀**一小瓢**：最多 **256 行**，或者字节攒到大约 **64 KiB** 就立刻打住（如果单条记录本身超过 64 KiB，也会完整放行这一条不卡死）；
    - 舀出这一瓢立刻松开记账员窗口，通过 `async_stream` 交给网络流往下发；发完这瓢再去通道排队舀下一瓢，直到抵达终点 `end` 才合上末尾括号。
@@ -125,8 +127,8 @@
 ### 1. 单机即 1 节点集群：`local_node`、成员代数与确定性破冰
 
 在 MyGo-Bot 里，**没有“单机模式”和“集群模式”两套代码**：
-- 首次开库建表（当前 schema 版本 `PRAGMA user_version = 5`）时，程序在 `local_node` 表生成本机专属密钥（`iroh` Ed25519 节点身份 `node_id`）、初始成员代数 `membership_gen = 1` 和一条 32 字节随机集群密钥 `cluster_secret`——此时你就是一台 **1 节点私有集群**；
-- 通过 `POST /cluster/invite` 生成一次性邀请码（打包了集群密钥与接入地址）；在另一台节点上调 `POST /cluster/join` 填入后：如果本机还没有任何集群同伴，会直接热切换密钥并合并保留本地数据接入；如果本机**已经存在 `cluster_peers`** 且邀请码更换了 `cluster_secret`，默认返回 **`409 Conflict`** 防止误踢原有集群，必须明确传入 **`force: true`** 才执行切换（保留本地数据、清空旧 `cluster_peers` 与 `sync_staging_commits` 暂存表、写入新同伴、原子递增 `membership_gen` 并经 `switch_membership` 立刻切断所有旧世代连接），同时 `sync.rs` 里每一笔远端应用与暂存写库都在 SQLite 事务内校验 `identity::assert_membership_gen`，杜绝切换瞬间还在半路的旧世代同步包跨世污染新集群；另，`--cluster-local --cluster-bind` 在绑定端点前会先 `clear_ip_transports()` 确保不会混用其他默认传输地址；
+- 首次开库建表（当前 schema 版本 `PRAGMA user_version = 6`）时，程序在 `local_node` 表生成本机专属密钥（`iroh` Ed25519 节点身份 `node_id`）、初始成员代数 `membership_gen = 1` 和一条 32 字节随机集群密钥 `cluster_secret`——此时你就是一台 **1 节点私有集群**；
+- 通过 `POST /cluster/invite` 生成一次性邀请码（打包了集群密钥与接入地址）；在另一台节点上调 `POST /cluster/join` 填入后：如果本机还没有任何集群同伴，会直接热切换密钥并合并保留本地数据接入；如果本机**已经存在 `cluster_peers`** 且邀请码更换了 `cluster_secret`，默认返回 **`409 Conflict`** 防止误踢原有集群，必须明确传入 **`force: true`** 才执行切换（保留本地数据、清空旧 `cluster_peers` 与 `sync_staging_commits` 暂存表、写入新同伴、原子递增 `membership_gen` 并先调 `net.switch_membership` 立刻切断旧世代连接，再通知 `sync.on_membership_switched`），同时拉回来的清单和 `InboundState` 入站队列条目从获取那一刻就绑死当时的 **`membership_gen`**，并在对账前与每一笔落库 SQLite 事务内经 `identity::assert_membership_gen` 核对，跨世代旧包当场丢弃重取，杜绝换群瞬间还在半路的同步包跨世污染新集群；另，`--cluster-local --cluster-bind` 在绑定端点前会先 `clear_ip_transports()` 确保不会混用其他默认传输地址；
 - **双向 BLAKE3 keyed-MAC 握手 + 区分来源的 PEX + 确定性破冰**：连上后双方互相拿 `cluster_secret` + 各自随机数算两轮 BLAKE3 keyed-MAC 验身份（`mygo-auth-srv` / `mygo-auth-cli`），验过身份后做 **PEX（Peer Exchange）** 自动发现全网状同伴，并单独区分直连实测地址与间接 PEX 转发时间戳（`addrs_ts`），避免陈旧转播覆盖新地址；同一对节点若同毫秒互相拨通，就按 `node_id` 字典序破冰（只保留较小 `node_id` 主动拨出的那条连接），同时每节点同一时刻只允许一个 `DialGuard` 在途拨号。
 
 ### 2. `(epoch, seq)` 哈希链、有界 RPC 与 8 阶段外键安全同步
@@ -154,8 +156,8 @@
 1. 同步引擎检测到分叉（包括多候选之间通过 `GetCommitHash` 校验出的共同祖先分歧，以及同序号不同哈希碰撞）后，把内部重放数据保存在库内、向 HTTP **`GET /cluster/conflicts` 只吐出脱敏后的白名单摘要（`remote_summary` + `related_local_id`）** 绝不泄露 `api_key` / `headers` / `env` / OAuth 凭据，同时向全局 SSE 推送 **`sync.conflict`**，并**立刻用 `409 Conflict` + savepoint 回滚锁住该流在本机的写操作**，防止在分叉之上越写越多或留下半截脏写；
 2. 人工只在 WebUI 或 `/cluster/conflicts/{stream_id}/resolve` 选两个干脆方向之一（带 CAS 冲突快照校验防并发误裁）：
    - **`local`（保留本地强推集群）**：先在本机事务内验证持有完整连续前缀与目标头哈希；如果本机是只有 `watched = 0` 目录头的会话节点，必须先向持有该本地分支正文的在线同伴拉齐完整分支落进正表（`commit_staged_branch_preserving_conflict`）——**拉不齐就返回 `409` 绝不发布空正文高 `epoch` 抹除集群历史**！确认完整后才把 **`epoch` 推到 `max(local_epoch, remote_epoch) + 1`** 打出完整快照提交并广播覆盖同伴；
-   - **`cluster`（采用集群覆盖本地）**：清掉本地分叉链与冲突投影，向验证过与冲突记录一致（或其直系后代）的持有者拉齐并完整重放覆盖（同时支持**同高度编辑 vs 删除**相撞时接受删除：`apply_terminal_session_delete` / `apply_terminal_mcp_delete` 在核对远端匹配 `expected_conflict` 后直接放行，并在事务内先无条件删除 `sync_conflicts` 再合并通知标记，绝不漏清残留冲突）；若是**非删除类**的会话覆盖，只清空旧正文行而**保留既有 `llm_calls.session_id` 关联**；若撞上唯一名字冲突，则在重放时自动归档或重命名本地碰撞项；
-3. **离线裁决回执表（`sync_resolutions`）防滞留卡死**：人工裁决完不仅广播实时通知，还会把胜方凭证记进有界表 **`sync_resolutions`**（按时间最多保留最新 **2048** 条 `ResolutionReceipt`）。如果有同伴裁决当时恰好离线没接到通知，等它重连恢复、且发现本地 `sync_conflicts` 仍有未决项时，同步循环会在常规清单对账前先调 **`RpcReq::GetResolutions` / `RpcResp::Resolutions`** 拉取裁决回执，核对本地头对齐胜方后自动清理滞留冲突。
+   - **`cluster`（采用集群覆盖本地）**：清掉本地分叉链与冲突投影，向验证过与冲突记录一致（或其直系后代）的持有者拉齐并完整重放覆盖（同时支持**同高度编辑 vs 删除**相撞时接受删除：`apply_terminal_session_delete` 与 `apply_terminal_mcp_delete` 在核对远端匹配 `expected_conflict` 后直接放行，并在事务内先无条件删除 `sync_conflicts` 再合并通知标记，绝不漏清残留冲突；而自动接收远端会话删除时，`apply_terminal_session_delete` 必须把预先核验的 `AncestorProof` 精确绑定 `(epoch, seq, hash)` 带进事务做 CAS 比对，一旦本地头在网络等待期间又往前推进就返回 **`ApplyOutcome::StaleProof`** 重新取证或转入分叉冲突，绝不吞掉刚提交的新消息）；若是**非删除类**的会话覆盖，只清空旧正文行而**保留既有 `llm_calls.session_id` 关联**；若撞上唯一名字冲突，则在重放时自动归档或重命名本地碰撞项；
+3. **离线裁决回执与对端收敛证明（`sync_resolutions`）防滞留卡死**：人工裁决完不仅广播实时通知，还会把胜方凭证（包括同 `epoch` 选 `cluster` 后本地追齐的情况）记进有界表 **`sync_resolutions`**（按时间最多保留最新 **2048** 条 `ResolutionReceipt`）。如果有同伴裁决当时恰好离线没接到通知、或选 `local` 刚通知完而对方此前已各自收齐同分叉，等对方重连发现本地 `sync_conflicts` 仍有未决项时，同步循环会通过 `list_conflict_probes_page` 按 `(stream_id, remote_hash)` 发起 **`RpcReq::GetResolutions`**；对端经 `read_resolutions_and_converged` 同时返回匹配的 `ResolutionReceipt` 和不带 `head_snapshot` 的已收敛头信息，接收方再经严格要求 `(local/remote)` 四元组精确匹配的 **`apply_resolution_receipt`**，或用明确验证过的 `expected_remote_hash` + `AncestorProof` 走 **`apply_counterparty_convergence`** 确认胜方已在当前线，自动清理滞留冲突。
 
 ---
 
