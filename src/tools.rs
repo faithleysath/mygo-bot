@@ -34,7 +34,7 @@ pub fn definitions() -> Value {
                 "- Use for await on streams; break closes them, or call await body.return() to discard an unread response.\n",
                 "- Use new TextDecoder().decode(chunk,{stream:true}) with the same decoder for each chunk, then decoder.decode() to flush.\n\n",
                 "Processes (proc):\n",
-                "- await proc.exec(program,args,{cwd,env,stdin,timeout_ms}) runs an executable directly (no shell; text/Uint8Array stdin",
+                "- await proc.exec(program,args,{cwd,env,stdin,timeout_ms}) runs an executable directly (cwd defaults to the service user's home directory; no shell; text/Uint8Array stdin",
                 cfg_select! {
                     windows => { "; Windows .bat/.cmd require cmd.exe" }
                     _ => { "" }

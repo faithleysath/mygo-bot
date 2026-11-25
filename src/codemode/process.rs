@@ -3,6 +3,7 @@
 use std::{
     io,
     os::unix::process::{CommandExt, ExitStatusExt},
+    path::Path,
     process::{Child, Command, ExitStatus, Stdio},
 };
 
@@ -29,6 +30,7 @@ use super::{
 pub(super) async fn execute(
     program: &str,
     argv: &[String],
+    cwd: &Path,
     opts: &Value,
     stdin: Option<Vec<u8>>,
     cancel: CancellationToken,
@@ -38,6 +40,7 @@ pub(super) async fn execute(
     let mut command = Command::new(program);
     command
         .args(argv)
+        .current_dir(cwd)
         .process_group(0)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -46,9 +49,6 @@ pub(super) async fn execute(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(cwd) = opts["cwd"].as_str() {
-        command.current_dir(cwd);
-    }
     if let Some(env) = opts["env"].as_object() {
         for (name, value) in env {
             command.env(name, value.as_str().ok_or("env values must be strings")?);

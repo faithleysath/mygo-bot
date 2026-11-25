@@ -345,6 +345,7 @@ enum LaunchOutcome {
 fn launch(
     program: &str,
     argv: &[String],
+    cwd: &Path,
     opts: &Value,
     stdio: [File; 3],
     cancel: &CancellationToken,
@@ -352,7 +353,7 @@ fn launch(
 ) -> Result<LaunchOutcome, String> {
     let failed = |e: io::Error| format!("spawn_failed: {program}: {e}");
     let mut cmd = command_line(program, argv).map_err(failed)?;
-    let cwd = std::path::absolute(opts["cwd"].as_str().unwrap_or(".")).map_err(failed)?;
+    let cwd = std::path::absolute(cwd).map_err(failed)?;
     if !cwd.is_dir() {
         return Err(format!("spawn_failed: invalid cwd {}", cwd.display()));
     }
@@ -450,6 +451,7 @@ async fn feed(mut pipe: File, bytes: Vec<u8>, finished: &CancellationToken) -> i
 pub async fn execute(
     program: &str,
     argv: &[String],
+    cwd: &Path,
     opts: &Value,
     stdin: Option<Vec<u8>>,
     cancel: CancellationToken,
@@ -471,6 +473,7 @@ pub async fn execute(
         tokio::try_join!(output_pipe(), output_pipe()).map_err(pipe_error)?;
     let program = program.to_owned();
     let argv = argv.to_owned();
+    let cwd = cwd.to_owned();
     let opts = opts.clone();
     let launch_cancel = cancel.child_token();
     let _cancel_on_drop = launch_cancel.clone().drop_guard();
@@ -478,6 +481,7 @@ pub async fn execute(
         launch(
             &program,
             &argv,
+            &cwd,
             &opts,
             [child_input, child_out, child_err],
             &launch_cancel,

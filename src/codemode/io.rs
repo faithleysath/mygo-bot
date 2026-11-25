@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, path::Path, time::Duration};
 
 use axum::{
     body::Body,
@@ -387,13 +387,20 @@ async fn command(host: &Host, args: &Value, stdin: Option<Vec<u8>>) -> Result<Va
     if program.is_empty() || program.contains('\0') || argv.iter().any(|arg| arg.contains('\0')) {
         return Err("invalid program or argument".into());
     }
-    if let Some(cwd) = args.get("cwd")
-        && !cwd
-            .as_str()
-            .is_some_and(|s| !s.is_empty() && !s.contains('\0'))
-    {
-        return Err("cwd must be a valid path".into());
-    }
+    let cwd = match args.get("cwd") {
+        Some(value) => Path::new(
+            value
+                .as_str()
+                .filter(|s| !s.is_empty() && !s.contains('\0'))
+                .ok_or("cwd must be a valid path")?,
+        ),
+        None => host
+            .app
+            .codemode
+            .home_dir
+            .as_deref()
+            .ok_or("spawn_failed: service user home directory is unavailable; specify cwd")?,
+    };
     if let Some(env) = args.get("env") {
         for (k, v) in env.as_object().ok_or("env must be an object")? {
             if k.is_empty()
@@ -408,8 +415,17 @@ async fn command(host: &Host, args: &Value, stdin: Option<Vec<u8>>) -> Result<Va
     use super::process::execute;
     #[cfg(windows)]
     use super::windows::execute;
-    let preview = CommandGuard::start(&host.live, program, &argv, args["cwd"].as_str());
-    execute(program, &argv, args, stdin, host.cancel.clone(), &preview).await
+    let preview = CommandGuard::start(&host.live, program, &argv, cwd.to_str());
+    execute(
+        program,
+        &argv,
+        cwd,
+        args,
+        stdin,
+        host.cancel.clone(),
+        &preview,
+    )
+    .await
 }
 
 pub(super) async fn drain(

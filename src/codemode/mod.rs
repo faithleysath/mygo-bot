@@ -25,6 +25,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -45,6 +46,7 @@ const MAX_SESSION_TASKS: usize = 32;
 
 pub struct Engine {
     pool: vm::Pool,
+    home_dir: Option<PathBuf>,
     vm_counts: Mutex<HashMap<SessionId, usize>>,
     client: reqwest::Client,
 }
@@ -52,6 +54,7 @@ impl Engine {
     pub fn new(threads: usize, client: reqwest::Client) -> Result<Self> {
         Ok(Self {
             pool: vm::Pool::new(threads)?,
+            home_dir: std::env::home_dir().filter(|path| path.is_absolute()),
             vm_counts: Mutex::default(),
             client,
         })
