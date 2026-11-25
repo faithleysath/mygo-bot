@@ -13,7 +13,7 @@
 早期架构只把写进 SQLite 的成品 `item` 往外推，人坐在屏幕前要干等模型整段话吐完才能看见内容。为了让界面跟聊天软件一样实时跳字，同时又绝不污染只增不删的账本，[src/events.rs](../src/events.rs) 和 [src/model.rs](../src/model.rs#L79-L127) 搭了一套**“两级广播 + 全局统一编号”**的实时流中心（`events::Hub`）：
 
 1. **先分两股流接口**：
-   - **全局流 `GET /events`**：容量 **256** 的广播通道。一连上先推 `ready`（`{}`），之后整个进程任何会话新建（`session.created`）、改配置/改标题（`session.updated`）、切状态（`session.status`）或删除（`session.deleted`），侧边栏靠它实时刷新；谁掉队了收到 `resync`。
+   - **全局流 `GET /events`**：容量 **256** 的广播通道。一连上先推 `ready`（`{}`），之后整个进程任何会话新建（`session.created`）、改配置/改标题（`session.updated`）、切状态（`session.status`）或删除（`session.deleted`），外加集群同步拉来新目录/MCP/分叉告警时触发的 **`catalog.updated`**、**`mcp.updated`** 和 **`sync.conflict`**，侧边栏与设置页全靠它实时刷新；谁掉队了收到 `resync`。
    - **单会话流 `GET /sessions/{sid}/events`**：每个新连上的订阅者，都会同时接上**两条独立广播通道**：
      - **持久通道（记账员拥有，容量 64）**：只在事务 `COMMIT` 之后发成品事件——`item.saved`（完整账目）、`session.status`、`session.updated`，外加不进数据库的 `attempt.retry`。**压根没人订阅时，记账员连回查数据库组装 JSON 的活都直接省掉**；有人听时，一笔新账只组装一份 `Arc<str>` 丢进槽里大家共享引用；要是某个慢窗口积压超过 64 条，广播槽直接冲它扔一条 **`resync`** 让它自己去翻 `/history` 补课，绝不回头等它。
      - **临时草稿通道（`Hub` 拥有，容量 256）**：模型在上游刚吐字时，经过一个 **`DeltaBatcher`**（每攒满 **30 毫秒**或者满 **256 字节**就打包推一次，不按单字符轰炸广播槽）发来 `item.started`、`item.delta`（区分 `text`/`reasoning`/`arguments`）和收尾清空用的 `stream.clear`。同时内存里维持着一个每字段封顶 **256 KiB** 的 `ActiveDraft` 影子草稿——所以你半路刷新页面或刚点进一个正在生成的会话，一连上紧跟着 `ready` 就会收到一份 **`stream.snapshot`**，立刻把屏幕上已经吐到一半的话续上，不用等这轮说完！
@@ -30,18 +30,18 @@
 
 ## HTTP API 全景、三条路由面与内置 OpenAPI 文档
 
-整套系统一共对外暴露 **29 条路径、45 个操作**（完整契约编译期嵌在 [src/openapi.json](../src/openapi.json) 里，OpenAPI `3.1.0`）：
+整套系统一共对外暴露 **36 条路径、51 个操作**（完整契约及 **56 个 Schema** 编译期嵌在 [src/openapi.json](../src/openapi.json) 里，OpenAPI `3.1.0`）：
 
 | 模块 | 路由一览 | 核心职责 |
 | :--- | :--- | :--- |
-| **全局配置**（2） | `GET/PATCH /config` | 读写新建会话继承的默认模型与推理强度 |
 | **供应商与模型**（12） | `GET/POST /providers`，`GET/PATCH/DELETE /providers/{id}`，`POST .../restore`<br>`GET/POST /models`，`GET/PATCH/DELETE /models/{id}`，`POST .../restore` | 维护多上游地址/密钥（脱敏）、模态/档位/价目表及软归档恢复 |
 | **会话与账本**（7） | `GET/POST /sessions`，`GET/PATCH/DELETE /sessions/{sid}`<br>`GET /sessions/{sid}/history`，`GET /sessions/{sid}/context` | 管理会话生命周期与 `items`/`context_items` 分块流式分页 |
 | **排队消息**（3） | `GET/POST /sessions/{sid}/messages`，`DELETE /sessions/{sid}/messages/{mid}` | 投信（`Idempotency-Key` 幂等）、查排队状态、撤回未进上下文输入 |
 | **运行、流与任务**（6） | `GET /events`，`GET /sessions/{sid}/events`<br>`PUT/DELETE /sessions/{sid}/run`，`GET .../tasks`，`DELETE .../tasks/{tid}` | 点火/软硬暂停（`?mode=soft\|hard`）、订阅两级 SSE、查停后台 JS 任务 |
-| **媒体附件**（2） | `POST /attachments`，`GET /attachments/{id}` | 上传不超过 50 MiB 多模态原文件及防嗅探下载 |
+| **媒体附件**（2） | `POST /attachments`，`GET /attachments/{id}` | 上传不超过 50 MiB 多模态原文件及按需跨节点分块拉取、防嗅探下载 |
 | **调用与计费**（3） | `GET /calls`，`GET /calls/summary`，`GET /calls/{id}` | 查询每轮上游调用明细、token、最新上下文长度与 `cost_nano_usd` 费用 |
-| **MCP 与 OAuth**（10） | `GET/POST /mcp/servers`，`GET/PATCH/DELETE /mcp/servers/{id}`，`POST .../test`<br>`GET/DELETE .../oauth`，`POST .../oauth/login`，`POST .../oauth/callback` | 注册传输配置、并发 4 体检探测、启动/手动完成/撤销 OAuth 2.1 |
+| **MCP 与 OAuth**（10） | `GET/POST /mcp/servers`，`GET/PATCH/DELETE /mcp/servers/{id}`，`POST .../test`<br>`GET/DELETE .../oauth`，`POST .../oauth/login`，`POST .../oauth/callback` | 注册传输与 `shared` 同步开关、并发 4 体检探测、启动/手动完成/撤销 OAuth 2.1 |
+| **集群与同步**（8） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync`<br>`GET /cluster/conflicts`，`POST /cluster/conflicts/{stream_id}/resolve` | 查询集群状态与成员、改本机名称/描述、邀请/加入/踢出节点、触发全量同步、查看并双向裁决分叉冲突 |
 
 ### 三条不同的路由出口（[src/main.rs](../src/main.rs#L503-L541)、[src/api.rs](../src/api.rs#L51-L78)）
 
@@ -64,15 +64,15 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 ### 1. 构建、压缩与强 ETag 嵌入（`web/build.mjs` & `src/webui.rs`）
 
 执行 `bun run build` 先跑一遍 `tsc --noEmit` 全量类型检查，随后：
-- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 41.5 KiB）**；
-- 自定义状态机压缩 CSS（保留引号内容、去注释、去尾分号），压进 **`src/webui/app.css.gz`（约 6.6 KiB）**；
+- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 44.1 KiB / 45,149 字节）**；
+- 自定义状态机压缩 CSS（保留引号内容、去注释、去尾分号），压进 **`src/webui/app.css.gz`（约 6.6 KiB / 6,736 字节）**；
 - `index.html` 折叠标签间空白生成 **`src/webui/index.html`（898 字节）**，开头直接内联了一小段同步 `<script>`，在浏览器首帧绘制前读取 `localStorage.mygo_theme` 和系统深浅色偏好把 `dataset.theme` 设好，彻底杜绝深色模式下切白闪屏（FOUC）。
 
 这三份静态资源在 Rust 编译时通过 `include_bytes!` 直接焊进最终二进制里。`GET /`、`GET /ui/app.js` 和 `GET /ui/app.css` 每次按 64 位 FNV-1a 算法算好强 ETag（`"16位十六进制"`），客户端带 `If-None-Match` 命中直接回 `304 Not Modified`；`.js` 和 `.css` 直接附带 `Content-Encoding: gzip` + `Vary: Accept-Encoding` 原样吐出压缩字节。
 
 ### 2. 鉴权门禁与 `fetch` 驱动的 SSE 客户端（`web/src/api.ts`、`web/src/main.tsx`）
 
-- **自动绕过与一次性 URL Token**：浏览器一打开页面，先把地址栏里的 `/#token=...`（如果有的话）捞进 `localStorage.mygo_token` 并立刻用 `history.replaceState` 擦掉 URL 痕迹，接着拿着手头的 Token 去试探 `GET /config`。如果是通过 Unix Socket 或免鉴权反代打开的，空 Token 也能直接返回 `200`、自动跳过密码门禁进主界面；如果返回 `401` 就弹出 `TokenGate` 登录框；运行途中任何接口或 SSE 遇到 `401` 立刻清掉本地 Token 退回门禁。
+- **自动绕过与一次性 URL Token**：浏览器一打开页面，先把地址栏里的 `/#token=...`（如果有的话）捞进 `localStorage.mygo_token` 并立刻用 `history.replaceState` 擦掉 URL 痕迹，接着拿着手头的 Token 去试探 `GET /cluster`。如果是通过 Unix Socket 或免鉴权反代打开的，空 Token 也能直接返回 `200`、自动跳过密码门禁进主界面；如果返回 `401` 就弹出 `TokenGate` 登录框；运行途中任何接口或 SSE 遇到 `401` 立刻清掉本地 Token 退回门禁。
 - **为什么手写 SSE 客户端**：浏览器原生的 `EventSource` 规范不允许自定义 `Authorization: Bearer` 请求头，所以前端用 `fetch` 自己读取 `ReadableStream` 逐行解码 `event:` 与多行 `data:`，自带 `500ms -> 8s` 指数退避重连。附件缩略图则走带 Token 的 `fetch` 转成 Blob URL，放进容量 **48 项的 LRU 缓存**里，淘汰时自动调 `URL.revokeObjectURL` 释放内存。
 
 ### 3. 前端状态同步的四大防错机关（`web/src/state.ts`）
@@ -88,10 +88,10 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 
 ### 4. 四块界面能力速览
 
-- **侧边栏（`Sidebar.tsx`）**：按 `updated_at` 倒序排列，状态圆点一目了然（`idle`/`running` 呼吸灯/`pausing`/`paused`/带 `last_error` 红灯），运行中和暂停中隐藏删除按钮，删会话需 3 秒内二次确认；窄屏自动折叠为抽屉。
+- **侧边栏（`Sidebar.tsx`）**：按 `updated_at` 倒序排列，状态圆点一目了然（`idle`/`running` 呼吸灯/`pausing`/`paused`/带 `last_error` 红灯），运行中和暂停中隐藏删除按钮，删会话需 3 秒内二次确认；窄屏自动折叠为抽屉；底部保留 **Cluster** 入口，当存在未裁决的同步冲突（`conflict_count > 0`）时亮起冲突计数徽章。
 - **时间线（`Timeline.tsx`、`markdown.tsx`）**：把 `withdrawal` 折叠并直接给对应用户消息画删除线；把同一组 `function_call` 与 `function_call_output` 配对成可展开工具卡片（专门把 `codemode` 的 `code`/`trigger_code` 高亮展示，也支持展示工具返回的图片音视频附件）；自研零依赖 Preact JSX Markdown 解析器——**全程零 `dangerouslySetInnerHTML`**，所有链接在行内通过单趟线性栈扫描配对括号提取目标地址并严格经 `new URL` 校验只放行显式 `http://`、`https://`、`mailto:`（彻底杜绝流式未闭合长链接引发正则回溯与平方级扫描卡死），且故意屏蔽 `![img](...)` 外链防跟踪像素；每条回复卡片和底部汇总栏统一按后端 `uncached + cache_read + cache_write` 口径计算总输入与缓存命中率。
-- **输入框与顶栏（`Composer.tsx`、`TopBar`）**：按会话独立保存未发草稿与粘贴/拖拽上传的待发附件；提交前锁定内容快照复用或生成 `Idempotency-Key`（4xx 报错重置 Key，网络/5xx 报错保留 Key 防重投），而且只有当用户在请求飞出期间**没继续打字改文本框（`textVersion` 未变）**时才清空输入，绝不吞掉用户刚续写的新字；上方在有活跃任务时展示可折叠的任务栏（每 2 秒轮询，直接展示 `running_commands` 实时终端尾部与 `Kill` 按钮）；顶栏集中放会话改名、模型切换（切模型主动清零 `reasoning_effort`）、推理档位选择和基于 `last_input_tokens / context_window_tokens` 计算的上下文用量与花费统计。
-- **设置弹窗（`Settings.tsx`）**：分 `Models`（全局默认、显示归档、供应商密钥安全编辑、模型能力与定价 JSON）、`MCP`（编辑时屏蔽未改动的查询串/Headers/Args/Env/OAuth 防误覆盖且无改动不发 PATCH；OAuth 既提供一键弹窗打开授权，也贴心留了粘贴远程回调 URL 的 `Submit Callback` 框方便跨机部署）、`Usage`（按会话筛调用费和历史流水）与 `General`（主题、`/docs` 链接、登出）。
+- **输入框与顶栏（`Composer.tsx`、`TopBar`）**：按会话独立保存未发草稿与粘贴/拖拽上传的待发附件；不再依赖服务端全局默认表，新建会话时从浏览器 `localStorage`（`mygo_last_model_id` / `mygo_last_reasoning_effort`）顺手带上上次选用的模型与推理档位；提交前锁定内容快照复用或生成 `Idempotency-Key`（4xx 报错重置 Key，网络/5xx 报错保留 Key 防重投），而且只有当用户在请求飞出期间**没继续打字改文本框（`textVersion` 未变）**时才清空输入，绝不吞掉用户刚续写的新字；上方在有活跃任务时展示可折叠的任务栏（每 2 秒轮询，直接展示 `running_commands` 实时终端尾部与 `Kill` 按钮）；顶栏集中放会话改名、模型切换（切模型主动清零 `reasoning_effort`）、推理档位选择和基于 `last_input_tokens / context_window_tokens` 计算的上下文用量与花费统计。
+- **设置弹窗（`Settings.tsx`）**：分 `Models`（去掉全局默认开关，保留显示归档、供应商密钥安全编辑、模型能力与定价 JSON）、`MCP`（新增 **`shared` 集群同步开关**与共享角标，编辑时屏蔽未改动的查询串/Headers/Args/Env/OAuth 防误覆盖且无改动不发 PATCH；关闭同步前显式提醒将克隆为新本地服务并清理他机旧共享副本；OAuth 既提供一键弹窗打开授权，也贴心留了粘贴远程回调 URL 的 `Submit Callback` 框方便跨机部署）、`Cluster`（修改本机节点名称与描述、复制 Node ID、一键全量同步、生成邀请码或输入邀请码加入集群、查看同伴在线/离线状态及移除成员、列出分叉冲突并支持选 `Keep Local` 或 `Use Cluster (Overwrite)` 裁决）、`Usage`（按会话筛调用费和历史流水）与 `General`（主题、`/docs` 链接、登出）。
 
 ---
 

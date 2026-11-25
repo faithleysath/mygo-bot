@@ -20,14 +20,15 @@
 - 而**子进程一写出管道，立刻把内存里的 `self.token` 抹成 `None`** 再往 `mygo.log` 写启动日志——并且整个系统**绝不把任何 Token 写进 `tracing` 日志**。哪怕是在 `--foreground` 模式下（没有父进程管道中转），也**只有当 `stderr` 连着交互式终端（`IsTerminal`）时**，才会直接往终端打一次 `TCP Bearer token: ...`；只要被重定向进日志文件或者跑在 `systemd`/`launchd` 托管服务里，随机 Token 就绝不会落入日志或磁盘（而若在启动参数里固定传了 `--token`，则永远不会自动输出）。
 - 万一端口全被占或同目录已经有另一个实例占死了数据库锁，子进程还没来得及还终端就会把错误顺着管道吐回来，父进程当场报错退出。
 
-### 2. TCP 探测与 Unix Socket（`src/main.rs`、`src/socket.rs`）
+### 2. TCP 探测、Unix Socket 与集群网络选项（`src/main.rs`、`src/socket.rs`、`src/cluster/net.rs`）
 
 - **TCP 监听**：默认从 `127.0.0.1:26946` 开始试，撞上 `AddrInUse` 就往后顺延试 **100 个端口**（最多到 `27045`）；显式传 `--listen IP:PORT` 只试指定地址（端口填 `0` 让系统挑空闲端口）。
+- **私有集群参数**：每个节点默认绑定一条 `iroh` QUIC 集群端点；可通过 **`--cluster-local`** 关闭公共中继与 DNS 发现（纯局域网/本机直连），并用 **`--cluster-bind <IP:PORT>`** 显式绑定固定的 UDP 地址（不传或端口填 `0` 时自动挑选可用 UDP 端口）。
 - **Unix Socket（仅 Unix 平台编译，Windows 仅提供 TCP）**：默认路径改在了**系统临时目录下的按用户隔离目录** `<temp_dir>/mygo-<euid>/mygo.sock`（`--unix-socket` 可改路径，支持非 UTF-8 路径；`--no-unix-socket` 可关）：
   - 先以 `0700` 创建父目录，再用 `symlink_metadata` 严格核实确实是目录、属主是当前用户且同组/其他人无任何权限（防恶意抢占临时目录）；
   - 创建监听 Socket 前，在单线程初始化阶段临时把进程 `umask` 切到 `0o177` 原子创建出 `0600` 权限的 socket 文件再恢复 `umask`，杜绝权限窗口竞态；
   - 启动时**故意不自动删同名旧文件**——否则要是有活着的实例正用着同路径就会被覆盖误伤（`SIGKILL` 遗留的死文件报错退回人工处理）；正常退出清理时会再次比对 `(dev, ino)` 确认确实是自己创建的那枚 inode 才删。
-- 想在**同一台机器同时跑两个实例**：只要各自换不同工作目录（分开 `mygo.sqlite3`），再给第二个实例换个 `--unix-socket` 路径（或加 `--no-unix-socket`）即可。
+- 想在**同一台机器同时跑两个实例**：只要各自换不同工作目录（分开 `mygo.sqlite3`），再给第二个实例换个 `--unix-socket` 路径（或加 `--no-unix-socket`）；如果要让同机多实例快速组建本地测试集群，还可以加上 `--cluster-local` 与固定 `--cluster-bind`。
 
 ---
 
@@ -61,7 +62,7 @@
 ## 版本元数据与极限瘦身发布
 
 - **版本自动烙印（[build.rs](../build.rs)）**：默认直接读当前 Git 提交时间戳（按 Howard Hinnant 算法转为 UTC `YYYYMMDD`）、7 位短 SHA 和工作区脏标记，拼成 `0.1.0+YYYYMMDD.<sha7>[.dirty]` 写进 `MYGO_VERSION`（也支持用 `MYGO_BUILD` 环境变量显式指定或置空覆盖）。在 Windows 下则跳过内嵌 C 编译，直接动态链接系统自带的 `winsqlite3.dll`（32 位 x86 因 stdcall 调用约定回退到 `sqlite3`）。
-- **极限体积瘦身**：[Cargo.toml](../Cargo.toml) 的 `[profile.release]` 打开了 `opt-level = "z"`、`lto = "fat"`、`panic = "abort"`、`codegen-units = 1`、`strip = "symbols"`，并关闭不必要的 crate 默认特性和 `rquickjs` 断言。发布脚本 [tools/release.py](../tools/release.py)（通过 `mise run release` 调用）在 macOS/Linux 上进一步注入 `-C force-unwind-tables=no` 剥除异常展开表，随后用 `upx --best` 极限压缩（macOS 加 `--force-macos`）并跑 `upx -t` 校验，按平台输出三套发布包到 `target/<target>/release/dist/`：
+- **极限体积瘦身**：[Cargo.toml](../Cargo.toml) 的 `[profile.release]` 打开了 `opt-level = "z"`、`lto = "fat"`、`panic = "abort"`、`codegen-units = 1`、`strip = "symbols"`，并关闭不必要的 crate 默认特性和 `rquickjs` 断言（即便引入 `iroh` 与 `blake3` 实现 P2P 集群组网和哈希链同步，`iroh` 也仅保留 `tls-ring` 与 `portmapper` 最小特性，当前 release 二进制仍维持约 `6.1 MiB`）。发布脚本 [tools/release.py](../tools/release.py)（通过 `mise run release` 调用）在 macOS/Linux 上进一步注入 `-C force-unwind-tables=no` 剥除异常展开表，随后用 `upx --best` 极限压缩（macOS 加 `--force-macos`）并跑 `upx -t` 校验，按平台输出三套发布包到 `target/<target>/release/dist/`：
   - **Linux**：UPX 压缩版 `mygo-<target>` + 基于压缩前 ELF `objdump -p` 抽取的依赖清单 `mygo-<target>.requirements.json`；
   - **macOS**：UPX 压缩版 `mygo-<target>.upx` + 用 `upx -d` 还原、逐字节与原二进制比对一致后打进 HFS+ LZMA 镜像的 `mygo-<target>.dmg`（确保挂载就能直接合法执行）；
   - **Windows**：UPX 压缩版 `mygo-<target>.exe`。

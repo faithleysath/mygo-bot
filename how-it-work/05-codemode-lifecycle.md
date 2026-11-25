@@ -139,9 +139,9 @@
 1. **软暂停**：只拦下一步不打断当前 `step`。正在等的前台 `codemode` 照旧等（满 90 秒照样打欠条转后台），后台任务更完全不受打扰（即使途中报信也只进队列排队，绝不唤醒 `paused` 会话）。但 **`codemode_wait` 一听到软暂停立刻收工**返回 `"session pausing"`；若挂着 `trigger_code` 探针，先拉闸等它把子进程清净、丢弃输出再交账。
 2. **硬暂停**：一边掐断模型流，一边把该会话名下全部前后台任务统一按 `killed` 拉闸，同时 `can_detach` 锁死，**绝不让刚好踩到 90 秒线的前台任务趁乱转后台**。前台 `codemode` 与 `codemode_wait` 当场松手让 `run_loop` 由 `publish_tools(..., recovering=true)` 补上 `"Execution interrupted; result unknown."` 停进 `paused`；等虚拟机在后台慢吞吞把子进程组拆干净回来交差时，`complete()` 检查 `original_pending` 发现原调用早被结清了，就安静摘牌退出，绝不写重账。
 3. **优雅退出**：第一步前 5 秒给活动会话发软暂停（正卡在 `codemode_wait` 的会话立刻脱身），同时**先把所有后台 `codemode` 任务按 `interrupted` 停掉**（前台脚本留 5 秒看能不能跟着当前 `step` 收完尾）；如果哪个原本睡在 `idle` 的会话因为断了后台任务受影响，顺手把它标成 `paused`（`"background task interrupted by shutdown"`）留痕；5 秒还没退完切第二步，剩下的前台任务和会话全部按硬暂停掐断再等 5 秒。
-4. **崩溃恢复（`ledger::recover`）**：强杀或断电重启后，内存里的所有车间和进程全没了，启动事务一口气收三摊残局：
-   - **第一摊**：把全库所有门外未读的 `lease_warning` 全塞进 `invalidated_warnings` 作废——因为重启后没有哪个租期还活着；
-   - **第二摊**：顺着 `codemode_receipts` 索引找出所有打过后台欠条（`codemode_call_item_id IS NOT NULL`）却还没等来 `completed` 事件的任务，挨个补写一笔 `"Daemon restarted; result unknown."`（`status: "interrupted"`）的 `completed` 事件，并把对应会话标成 `paused`——跟普通工具一样，绝不擅自重跑可能已产生的副作用；
+4. **崩溃恢复（`ledger::recover`）**：强杀或断电重启后，内存里的所有车间和进程全没了，启动事务一口气收三摊残局（并且前两摊先对照 `sync_commits` 的最近 `author_node_id`，**只认当前本机节点写出的记录**，绝不误伤集群其他节点仍在跑的任务；所有恢复改动都会补记 `session_delta` 提交同步给同伴）：
+   - **第一摊**：把全库所有本机产出、门外未读的 `lease_warning` 全塞进 `invalidated_warnings` 作废——因为本机重启后没有哪个租期还活着；
+   - **第二摊**：顺着 `codemode_receipts` 索引找出所有本机打过后台欠条（`codemode_call_item_id IS NOT NULL`）却还没等来 `completed` 事件的任务，挨个补写一笔 `"Daemon restarted; result unknown."`（`status: "interrupted"`）的 `completed` 事件，并把对应会话标成 `paused`——跟普通工具一样，绝不擅自重跑可能已产生的副作用；
    - **第三摊**：万一崩溃刚好卡在“后台事件刚写库提交，但 `app.wake` 还没来得及把 `idle` 会话拉起来”的那一微秒，就把这些门外压着未读 `codemode_event` 却仍停在 `idle` 的会话也统一标成 `paused`（`"daemon restarted with pending codemode events"`），等你下次点 `/run` 接手，绝不让事件沉底装死。
 
 ---

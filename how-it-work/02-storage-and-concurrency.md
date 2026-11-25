@@ -63,7 +63,7 @@
 - 同车里其余正常成功的写单各自提交自己的 `savepoint`，跟着外层事务照常一次刷盘；
 - 只有当外层 `COMMIT` 物理刷盘本身彻底挂了，整车才会一起失败。
 
-并且记账员死守一条发布顺序：**所有对外部的回信、唤醒信号、SSE 广播，一律按 FIFO 顺序排在外层事务 `COMMIT` 彻底落稳之后才发**（代码里 `apply` 和 `publish` 两段回调就是干这个用的）。哪怕前面客户端在 HTTP 返回前突然断线，只要事务提交成功，后续工作照样走完，绝不出现“广播发出去了结果盘上没落稳”的幻觉。
+并且记账员死守一条发布顺序：**所有对外部的回信、唤醒信号、SSE 广播，以及触发集群同步的流变动通知，一律按 FIFO 顺序排在外层事务 `COMMIT` 彻底落稳之后才发**（代码里 `apply` 和 `publish` 两段回调就是干这个用的）。每一笔写单提交哈希链变更时，先把涉及的 `stream_id` 暂存在记账员线程局部缓冲区 `SYNC_STAGED` 里，跟它自己的 `savepoint` 同生共死——哪个 `savepoint` 失败回滚就当场丢弃它暂存的流 ID，只有等整车外层事务 `COMMIT` 真正落盘后，记账员才统一收拢发出 `SyncSignal::StreamsChanged` 唤醒后台同步循环。哪怕客户端在 HTTP 返回前突然断线，或者半路有一两单被回滚，既不漏播已落盘的提交，也绝不会把回滚了的脏状态广播给集群同伴。
 
 ### 细节二：谁绝不能拼进同一趟车？——`Write::can_join`
 
@@ -110,10 +110,50 @@
 - **查排队信件 `GET /sessions/{sid}/messages`**：通过左连接撤回单 `withdrawal` 和上下文 `context_items`，实时把每条 `user_message` 算出 `queued`、`included`、`withdrawn` 三种状态，支持按 `id` 和 `status` 过滤及游标分页。
 - **撤回消息 `DELETE /sessions/{sid}/messages/{mid}`**：只能撤回还没被 `take_pending` 收进上下文的 `user_message`。如果已经进上下文，直接返回 `409 Conflict`（`"message already included"`）；如果已经撤回过再点撤回，直接幂等返回 `204 No Content`，不会写第二张撤回单（`UNIQUE(kind, target_id)` 也兜底锁死了这一点）。
 - **彻底删除会话 `DELETE /sessions/{sid}`**：
-  - **先查禁区**：只要会话正在 `running`/`pausing`，或者 `s.active` 还在跑，或者名下还有活着的 `codemode` 任务，一律返回 `409 Conflict` 拒删——必须先停下来。
+  - **先入 Watch 再查禁区**：入口处先调用 `ensure_session_watched(sid)` 把会话正文拉齐（免得在只有半份目录头的状态下误删），进事务后再检查不能处于冲突未裁决态（`409`）；只要会话正在 `running`/`pausing`，或者 `s.active` 还在跑，或者名下还有活着的 `codemode` 任务，一律返回 `409 Conflict` 拒删——必须先停下来。
   - **外键有序清表**：在事务里严格按外键依赖依次清理 `context_items` -> `invalidated_warnings` -> 带 `target_id` 或 `codemode_call_item_id` 的衍生 `items` -> 其余 `items`。
-  - **留住花费账单**：删会话**不会删历史花费账单**！程序只把 `llm_calls.session_id` 设为 `NULL`，保留所有模型调用和费用记录供全局核算，然后才删 `sessions` 行。
+  - **留住花费账单并记录脱钩**：删会话**不会删历史花费账单**！程序只把 `llm_calls.session_id` 设为 `NULL`（同时把这几笔脱离关联的 `llm_calls` 各自记进同步提交，确保其他节点同步刷新），保留所有模型调用和费用记录供全局核算，然后才删 `sessions` 行，并在该会话流上写入一笔永久 `session_delete` 墓碑（`deleted = 1`），保证离线节点重新上线后也会跟着彻底删掉它、绝不会把旧副本“复活”回来。
   - **清光内存残留**：事务提交后，记账员当场从内存摘掉该会话的 MCP 连接（`s.mcp.forget_session(sid)`）、广播槽、唤醒弦、草稿流缓存，并向全局事件流广播 `session.deleted`。
+
+---
+
+## 多节点私有集群与哈希链同步（Stage 1）
+
+前面看懂了一台机器里记账员怎么写盘，再往上推一层：如果你有笔记本、台式机、云端服务器好几台设备各自跑着 MyGo-Bot，怎么让它们既能零门槛单机开跑，又能在组网后像同一套系统那样自动同步状态，还绝不算乱账？
+
+### 1. 单机即 1 节点集群：`local_node`、MAC 握手与 PEX
+
+在 MyGo-Bot 里，**没有“单机模式”和“集群模式”两套代码**：
+- 首次开库建表时，程序在 `local_node` 表生成本机专属密钥（`iroh` Ed25519 节点身份 `node_id`）和一条 32 字节随机集群密钥 `cluster_secret`——此时你就是一台 **1 节点私有集群**；
+- 通过 `POST /cluster/invite` 生成一次性邀请码（打包了集群密钥与接入地址），在另一台节点上调 `POST /cluster/join` 填入并热重载密钥后，双方立刻用 **`iroh`（QUIC）** 建立点对点加密连接；
+- **双向 BLAKE3 keyed-MAC 握手 + PEX + 确定性破冰**：光过 TLS/NodeId 还不够，连上后双方还得互相拿 `cluster_secret` + 各自随机数算两轮 BLAKE3 keyed-MAC 验身份（`mygo-auth-srv` / `mygo-auth-cli`），防任何集群外节点混进来；验过身份后顺手做一次 **PEX（Peer Exchange）**，把彼此认识的其他成员写进 `cluster_peers`（实现两两全网状自动发现）；万一两台节点恰好同一毫秒同时互相拨通，就按 `node_id` 字典序破冰（只保留较小 `node_id` 主动拨出的那条连接），彻底消除双连接来回抢占踢下线的抖动。
+
+### 2. `(epoch, seq)` 哈希链与外键安全同步
+
+跟很多框架整库拷贝 SQLite 文件不同，MyGo-Bot 把每条需要同步的业务实体（供应商、模型、共享 MCP、会话、调用账单）拆成各自独立的一条**可同步流（`sync_streams`）**，所有写变动追加进 **`sync_commits`**：
+- **一条环环相扣的提交链**：每一笔提交编号为 `(epoch, seq)`，`commit_hash` 用 BLAKE3 把 `stream_id`、`kind`、`epoch`、`seq`、`parent_hash`、`author_node_id`、`op_type`、`payload` 和时间戳全部锁在一起，上一笔的 `commit_hash` 就是下一笔的 `parent_hash`；
+- **出站合并广播 + 严格 6 阶段外键回放**：本地 `StreamsChanged` 信号经过去重合并后由专有广播协程推 `NotifyHeads` 给在线同伴；远端拉取清点（`GetManifest` -> `GetCommits`）时严格按外键依赖分 **6 个阶段**顺序落库：
+  `Provider -> Model -> Mcp -> SessionHeads（轻目录头）-> Call -> SessionBodies（正文细节与墓碑）`；
+  万一在通知广播流里收到靠后依赖的对象（比如先看见 `llm_models`、还没拿到它指着的 `llm_providers`），回放返回 `BlockedOnDependency`，接收端立刻顺手补发一轮 `GetManifest` 拉齐缺失的前置流自愈，绝不卡死在外键约束上。
+
+### 3. 四档分级自动同步策略
+
+为了既能随时随地查看目录，又不把几百兆没看过的对话正文和媒体字节盲目塞满每台机器，集群按资源重要性和体量分了四档策略：
+
+| 资源类型 | 同步节奏与机制 | 省掉会出什么问题 |
+| :--- | :--- | :--- |
+| **供应商、模型、会话目录头、`llm_calls`** | **即时全量自动同步**：每次变动主动推头给在线同伴 | 不同步目录，别的节点WebUI看不到全集群有哪些模型、哪些会话与总费用账单 |
+| **会话正文**（`items`、`context_items`、`invalidated_warnings`） | **按需 Watch 懒同步**：新会话初始在 `sync_streams` 只存轻量 `head_snapshot`，设 **`watched = 0, synced_seq = 0`**；直到某节点打开历史/上下文/SSE/投信/点火/改删会话时自动 `ensure_session_watched`，把 `watched` 置 `1` 拉齐历史并从此自动追更 | 全量预推所有历史对话会瞬间撑爆小设备存储和同步带宽 |
+| **多模态附件**（`attachments`） | 仅元数据随 Watch 同步；`data` 字节默认置空，下载或发模型前按 **256 KiB 多节点并发分块（BT 风格）** + BLAKE3 校验按需拉取（详见 [第 3 篇](03-catalog-media-and-billing.md)） | 提前广播大图片/音视频会拖垮日常消息与控制信令 |
+| **MCP 服务与 OAuth**（`mcp_servers` / `mcp_oauth`） | 由单服务 **`shared`** 开关控制，授权/拒绝凭证同步、进行中 `pending` 态不同步（详见 [第 6 篇](06-mcp-and-oauth.md)） | 一刀切同步会把纯本机命令行 MCP 或半途一次性的登录回调乱推到全集群 |
+
+### 4. 分叉冲突检测与双向人工裁决
+
+要是节点 A 和节点 B 在断网离线期间同时改了同一条流（同一个 `epoch` 里沿着相同的历史长出了不同的 `(seq, commit_hash)`），系统绝不自作主张盲目覆盖或半吊子合并：
+1. 同步引擎检测到分叉后，把冲突详情记入 `sync_conflicts`、向全局 SSE 推送 **`sync.conflict`**、在 WebUI 亮起冲突提示，并**立刻用 `409 Conflict` 锁住该流在本机的写操作**，防止在分叉之上越写越多；
+2. 人工只在 WebUI 或 `/cluster/conflicts/{stream_id}/resolve` 选两个干脆方向之一：
+   - **`local`（保留本地强推集群）**：把这条流的 **`epoch` 推到 `max(local_epoch, remote_epoch) + 1`**，清掉旧分叉冲突并用当前本机完整快照重新打一笔新纪元的 `seq = 1` 提交；任何曾经落后甚至当时离线的同伴重连后，只要看见更高的 `epoch`，就直接清掉旧纪元分叉、按新快照收敛，绝不会反复留下僵尸冲突；
+   - **`cluster`（采用集群覆盖本地）**：清掉本地分叉链与冲突投影，从持有远端版本的同伴完整重放覆盖（同时在唯一名字撞车时妥善归档或重命名本地碰撞项，详见 `resolve_conflict_cluster`）。
 
 ---
 

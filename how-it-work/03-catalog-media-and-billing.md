@@ -27,7 +27,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 
 意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会撞上唯一索引返回 `409 Conflict`。
 
-判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。当你把某个供应商或模型归档时，记账员会在**同一个数据库事务**里顺手把指向不可用模型的全局 `config.default_model_id` 和 `default_reasoning_effort` 一起清空。
+判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会记入同步提交，在私有集群内即时自动同步。
 
 ### 护账与护会话的四道铁门
 
@@ -36,18 +36,20 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 | 铁门 | 在哪拦截 | 它只管哪件事、省掉会漏掉什么 |
 | :--- | :--- | :--- |
 | **1. 跑过一次就锁死身份** | `PATCH /models/{id}`<br>（`Model::check_update`） | 只要 `llm_calls` 里已经记过哪怕一笔调用，该模型的 `provider_id` 和 `model_key` 就永久锁死不可改（返 `409`）。省掉它，改一下 `model_key` 就会把昨天跑旧模型的花费算到新模型头上。 |
-| **2. 缩减能力先扫全局和所有会话** | `PATCH /models/{id}`<br>（`Model::check_update`） | 想从模型里删掉某个 `reasoning_effort` 或某项 `input_modality`？先查全局 `config` 和每一个正在用该模型的会话——只要有人选了被删的档位，或者会话历史/队列里存了被删的媒体类型，立刻返 `409` 拦下。 |
-| **3. 换会话模型先查历史媒体** | `PATCH /sessions/{sid}` | 给会话切换 `model_id` 时必跑 `media::check_session` 验光全部现有媒体是否被新模型支持；而且**只有完全空的会话**（上下文、排队队列、工具调用全为空）才允许把 `model_id` 改回 `null`（传 `model_id: null` 时自动联动清空 `reasoning_effort`）。 |
-| **4. 归档供应商拒绝挂新模型** | `POST /models` / `PATCH /models/{id}` | 不能往已归档的供应商下面添新模型或把模型挪过去（返 `409`）。同时无论全局 `config` 还是会话 `Selection`，没选模型一律不准单填 `reasoning_effort`。 |
+| **2. 缩减能力先扫所有相关会话** | `PATCH /models/{id}`<br>（`Model::check_update`） | 想从模型里删掉某个 `reasoning_effort` 或某项 `input_modality`？先扫描所有正在使用该模型的现有会话——只要有人选了被删的档位，或者会话历史/队列里存了被删的媒体类型，立刻返 `409` 拦下。 |
+| **3. 换会话模型先查历史媒体** | `PATCH /sessions/{sid}` | 给会话切换 `model_id` 时必跑 `media::check_session` 验光全部现有媒体是否被新模型支持（仅凭 `attachments` 元数据里的 `mime_type` 就能判断，不用把远端附件大文件先拉下来）；而且**只有完全空的会话**（上下文、排队队列、工具调用全为空）才允许把 `model_id` 改回 `null`（传 `model_id: null` 时自动联动清空 `reasoning_effort`）。 |
+| **4. 归档供应商拒绝挂新模型** | `POST /models` / `PATCH /models/{id}` | 不能往已归档的供应商下面添新模型或把模型挪过去（返 `409`）。同时针对单个会话的 `Selection` 配置，没选模型时一律不准单填 `reasoning_effort`。 |
 
 ---
 
-## 多模态附件：账本存门牌号，发上游才现包 Base64
+## 多模态附件：内容寻址存门牌、按需分块拉字节、发上游才现包 Base64
 
-图片、音频、视频动辄几兆甚至几十兆，MyGo-Bot 坚决不把原始二进制直接塞进 `items` 表的 JSON 里，而是用 `attachments` 表单独托管（[src/media.rs](../src/media.rs)）：
+图片、音频、视频动辄几兆甚至几十兆，MyGo-Bot 坚决不把原始二进制直接塞进 `items` 表的 JSON 里，也不在集群同步会话时盲目把整包大文件到处预先拷贝，而是用 `attachments` 表单独托管（[src/media.rs](../src/media.rs)、[src/cluster/sync.rs](../src/cluster/sync.rs)）：
 
-1. **上传与下载的防线**：
-   - 客户端先调 `POST /attachments`，Body 直接传原始二进制（上限 **50 MiB**），请求头必须带单个具体、无 `*` 通配符的 `image/*`、`audio/*` 或 `video/*` `Content-Type`，落库后拿到 `att_<26位后缀>` 格式的 TypeID。
+1. **上传、内容寻址与下载防线**：
+   - 客户端先调 `POST /attachments`，Body 直接传原始二进制（上限 **50 MiB**），请求头必须带单个具体、无 `*` 通配符的 `image/*`、`audio/*` 或 `video/*` `Content-Type`。落库时同步算好 32 字节 BLAKE3 **`content_hash`** 与 **`byte_len`**，拿到 `att_<26位后缀>` 格式的 TypeID；
+   - 表里的 **`data` 列是可空的**：从其他集群节点 Watch 同步会话正文时，只先同步 `attachments` 的轻量元数据行（`id`、`mime_type`、`content_hash`、`byte_len`，此时 `data = NULL`），没点开、没重跑的媒体一字节都不浪费带宽；
+   - 一旦需要真正用到数据——无论用户在客户端或 WebUI 调 **`GET /attachments/{id}`**（触发 `ensure_attachment_data`），还是某节点准备发上游大模型前跑 `model::stream`（触发 `ensure_session_attachments`）——如果发现本地 `data IS NULL`：先顺着局部索引 `attachments_by_hash` 在本机找找有没有同 `content_hash` 的现成副本直接复用；本机没有，再像 BT 下载一样向所有在线且持有该 `content_hash` 的节点并发发起 **256 KiB 分块（`GetAttachmentChunk`）** 接力拉取，拼齐后整包核验 BLAKE3 `content_hash` 完全吻合才落盘；
    - 下载接口 `GET /attachments/{id}` 会原样吐出存储的 `mime_type` 和字节流，但强制加上 `Content-Disposition: attachment` 和 `X-Content-Type-Options: nosniff`，防止浏览器把恶意文件当成同源网页或脚本执行。
 2. **轻量账本引用 vs 上游实时展开**：
    - 写进 `user_message`、`function_call_output` 或 `codemode_event` 的媒体块，只留一个干净的小指针：`{"type":"image","attachment_id":"att_<26位后缀>"}`。
@@ -63,7 +65,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 
 ## 每次请求立一张单：`llm_calls` 与 `PriceBook` 精确计费
 
-每当 Agent 循环准备向模型发起**一次**上游 HTTP 请求（注意：**自动重试时的每一次重发也算单独一笔**！），记账员就会在钉死 `input_end_position` 的同一个事务里，往 `llm_calls` 表插一行 `status = 'in_flight'` 的账单（[src/calls.rs](../src/calls.rs)）。
+每当 Agent 循环准备向模型发起**一次**上游 HTTP 请求（注意：**自动重试时的每一次重发也算单独一笔**！），记账员就会在钉死 `input_end_position` 的同一个事务里，往 `llm_calls` 表插一行 `status = 'in_flight'` 的账单（[src/calls.rs](../src/calls.rs)），并同步写进集群账本。`llm_calls` 与目录表一样走**即时全量自动同步**（收尾结果及删会话时 `session_id = NULL` 脱钩均会补记提交），确保各节点随时能看到全集群的完整调用流水与花费。
 
 ### 为什么开跑时就先把价格快照冻进账单？
 
