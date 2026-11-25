@@ -12,6 +12,10 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use crate::{
     Error, Result,
     agent::Control,
+    cluster::{
+        SyncSignal,
+        ledger::{ContextPos, clear_staged, record_call, record_session_delta, take_staged},
+    },
     events::Notice,
     id::{CallId, ItemId, ModelId, SessionId},
 };
@@ -64,11 +68,16 @@ pub struct Store {
     pub channels: HashMap<SessionId, broadcast::WeakSender<Notice>>,
     pub wake_sequences: HashMap<SessionId, watch::Sender<u64>>,
     pub global_events: broadcast::Sender<Notice>,
+    pub sync_tx: mpsc::UnboundedSender<SyncSignal>,
     pub closing: bool,
 }
 
 impl Db {
-    pub fn open(path: &Path, global_events: broadcast::Sender<Notice>) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        global_events: broadcast::Sender<Notice>,
+        sync_tx: mpsc::UnboundedSender<SyncSignal>,
+    ) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -87,19 +96,49 @@ impl Db {
         )?;
         if !initialized {
             tx.execute_batch(include_str!("../schema.sql"))?;
+            crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 2 {
+            if version != 3 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
             }
             crate::id::seed_from_db(&tx)?;
+            crate::cluster::identity::ensure_local_node(&tx)?;
         }
-        tx.execute("UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE status='in_flight'", [])?;
-        tx.execute("UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE status IN ('running','pausing')", [])?;
+        let local_node_id = crate::cluster::identity::load_local_node(&tx)?.node_id;
+        let call_ids = {
+            let mut stmt = tx.prepare(
+                "SELECT c.id FROM llm_calls c WHERE c.status='in_flight'
+                 AND coalesce((SELECT sc.author_node_id FROM sync_commits sc
+                               WHERE sc.stream_id=c.id ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1",
+            )?;
+            stmt.query_map([&local_node_id], |r| r.get::<_, CallId>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for cid in call_ids {
+            tx.execute(
+                "UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE id=?",
+                [cid],
+            )?;
+            record_call(&tx, cid)?;
+        }
+        let running_sids = {
+            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE status IN ('running','pausing')")?;
+            stmt.query_map([], |r| r.get::<_, SessionId>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for sid in running_sids {
+            tx.execute(
+                "UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE id=?",
+                [sid],
+            )?;
+            record_session_delta(&tx, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
+        }
         crate::codemode::ledger::recover(&tx)?;
         tx.commit()?;
+        clear_staged();
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
         let runtime = tokio::runtime::Handle::current();
         thread::Builder::new()
@@ -114,13 +153,19 @@ impl Db {
                     channels: HashMap::new(),
                     wake_sequences: HashMap::new(),
                     global_events,
+                    sync_tx,
                     closing: false,
                 };
                 let mut next = None;
                 let mut batch = Vec::new();
                 while let Some(command) = next.take().or_else(|| receiver.blocking_recv()) {
                     match command {
-                        Command::Call(call) => call(&mut store),
+                        Command::Call(call) => {
+                            clear_staged();
+                            call(&mut store);
+                            let staged = take_staged();
+                            store.notify_streams(staged);
+                        }
                         Command::Write(first) => {
                             batch.push(first);
                             // Drain only compatible writes already waiting at the head of the queue.
@@ -265,15 +310,28 @@ impl Enqueue {
         let now = chrono::Utc::now().timestamp_millis();
         conn.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute((self.sid, now))?;
+        record_session_delta(conn, self.sid, "session_delta", &[id], Vec::new(), Vec::new(), true)?;
         Ok(Enqueued::Created(id))
     }
 }
 
 impl Store {
+    pub fn sync_signal(&self, signal: SyncSignal) {
+        let _ = self.sync_tx.send(signal);
+    }
+
+    pub fn notify_streams(&self, ids: Vec<String>) {
+        if !ids.is_empty() {
+            let _ = self.sync_tx.send(SyncSignal::StreamsChanged(ids));
+        }
+    }
+
     fn commit_batch(&mut self, batch: &mut Vec<Write>) {
         let starting = batch[0].start_session.is_some();
         let mut replies = Vec::with_capacity(batch.len());
         let mut pending = batch.drain(..);
+        let mut staged = Vec::new();
+        clear_staged();
         let committed = (|| -> Result<()> {
             if starting && self.closing {
                 return Err(Error(
@@ -284,6 +342,7 @@ impl Store {
             let mut tx = self.conn.transaction()?;
             for write in pending.by_ref() {
                 // A failed multi-statement operation must not leave part of its reply in the DB.
+                clear_staged();
                 let savepoint = tx.savepoint();
                 let active = write
                     .start_session
@@ -298,7 +357,9 @@ impl Store {
                 let savepoint = savepoint?;
                 if ok {
                     savepoint.commit()?;
+                    staged.extend(take_staged());
                 } else {
+                    clear_staged();
                     savepoint.finish()?;
                 }
             }
@@ -306,7 +367,10 @@ impl Store {
             Ok(())
         })();
         if let Err(error) = &committed {
+            clear_staged();
             replies.extend(pending.map(|write| (write.apply)(Err(error.clone()), false).1));
+        } else {
+            self.notify_streams(staged);
         }
         for reply in replies {
             reply(self, &committed);
@@ -372,6 +436,9 @@ impl Store {
             "UPDATE sessions SET status=?2,last_error=?3,updated_at=?4 WHERE id=?1",
             (sid, state, reason, now),
         )?;
+        if matches!(state, "idle" | "paused") {
+            record_session_delta(&self.conn, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
+        }
         self.notify_status(sid, state, reason, now);
         Ok(())
     }
@@ -469,8 +536,8 @@ pub fn has_pending(conn: &Connection, sid: SessionId) -> Result<bool> {
         |r| r.get(0),
     )?;
     // The caller can go idle without calling take_pending when only discarded inputs remain.
-    if !ready {
-        advance_queue(conn, sid, false)?;
+    if !ready && advance_queue(conn, sid, false)? {
+        record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
     }
     Ok(ready)
 }
@@ -487,7 +554,9 @@ pub fn pending_reason(conn: &Connection, sid: SessionId) -> Result<Option<&'stat
         (true, false) => Ok(Some("user_message")),
         (false, true) => Ok(Some("task_event")),
         (false, false) => {
-            advance_queue(conn, sid, false)?;
+            if advance_queue(conn, sid, false)? {
+                record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new(), true)?;
+            }
             Ok(None)
         }
     }
@@ -507,17 +576,45 @@ pub fn take_pending(tx: &Connection, sid: SessionId) -> Result<()> {
          FROM pending WHERE session_id=?1 ORDER BY id",
         (sid, base),
     )?;
-    advance_queue(tx, sid, added > 0)
+    let mut ctx_added = Vec::new();
+    if added > 0 {
+        let mut stmt = tx.prepare_cached(
+            "SELECT position,item_id FROM context_items WHERE session_id=? AND position>? ORDER BY position",
+        )?;
+        ctx_added = stmt
+            .query_map((sid, base), |r| {
+                Ok(ContextPos {
+                    position: r.get(0)?,
+                    item_id: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+    }
+    let advanced = advance_queue(tx, sid, added > 0)?;
+    if !ctx_added.is_empty() || advanced {
+        record_session_delta(tx, sid, "session_delta", &[], ctx_added, Vec::new(), true)?;
+    }
+    Ok(())
 }
 
-fn advance_queue(conn: &Connection, sid: SessionId, added: bool) -> Result<()> {
-    conn.execute(
+fn advance_queue(conn: &Connection, sid: SessionId, added: bool) -> Result<bool> {
+    let changed = conn.execute(
         "UPDATE sessions SET input_queue_cursor=last_id,needs_model=needs_model OR ?2
          FROM (SELECT max(id) AS last_id FROM items WHERE session_id=?1 AND kind IN ('user_message','codemode_event'))
          WHERE sessions.id=?1 AND input_queue_cursor<last_id",
         (sid, added),
     )?;
-    Ok(())
+    if changed == 0 && added {
+        let mut updated = 0;
+        if added {
+            updated = conn.execute(
+                "UPDATE sessions SET needs_model=1 WHERE id=?1 AND needs_model=0",
+                [sid],
+            )?;
+        }
+        return Ok(updated > 0);
+    }
+    Ok(changed > 0)
 }
 
 pub fn add_item(
@@ -536,6 +633,22 @@ pub fn add_item(
     Ok(id)
 }
 
+pub fn add_context_item_raw(
+    tx: &Connection,
+    sid: SessionId,
+    kind: &str,
+    item: &Value,
+    call_id: CallId,
+) -> Result<(ItemId, i64)> {
+    let id = add_item(tx, sid, kind, item, None, Some(call_id))?;
+    let pos = max_context_position(tx, sid)? + 1;
+    tx.execute(
+        "INSERT INTO context_items(session_id,position,item_id) VALUES(?,?,?)",
+        (sid, pos, id),
+    )?;
+    Ok((id, pos))
+}
+
 pub fn add_context_item(
     tx: &Connection,
     sid: SessionId,
@@ -543,11 +656,18 @@ pub fn add_context_item(
     item: &Value,
     call_id: CallId,
 ) -> Result<ItemId> {
-    let id = add_item(tx, sid, kind, item, None, Some(call_id))?;
-    let pos = max_context_position(tx, sid)? + 1;
-    tx.execute(
-        "INSERT INTO context_items(session_id,position,item_id) VALUES(?,?,?)",
-        (sid, pos, id),
+    let (id, pos) = add_context_item_raw(tx, sid, kind, item, call_id)?;
+    record_session_delta(
+        tx,
+        sid,
+        "session_delta",
+        &[id],
+        vec![ContextPos {
+            position: pos,
+            item_id: id,
+        }],
+        Vec::new(),
+        false,
     )?;
     Ok(id)
 }
@@ -556,6 +676,7 @@ pub fn add_context_item(
 // is recorded explicitly: replaying an already executed tool could repeat its effect.
 pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Result<Vec<ItemId>> {
     let mut recovered = Vec::new();
+    let mut ctx_added = Vec::new();
     let mut after: Option<ItemId> = None;
     let mut pos = max_context_position(tx, sid)? + 1;
     let mut pending = tx.prepare_cached(
@@ -590,7 +711,26 @@ pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Resul
             "INSERT INTO context_items(session_id,position,item_id) VALUES(?1,?2,?3),(?1,?4,?5)",
             (sid, pos, id, pos + 1, result),
         )?;
+        ctx_added.push(ContextPos {
+            position: pos,
+            item_id: id,
+        });
+        ctx_added.push(ContextPos {
+            position: pos + 1,
+            item_id: result,
+        });
         pos += 2;
+    }
+    if !recovered.is_empty() || !ctx_added.is_empty() {
+        record_session_delta(
+            tx,
+            sid,
+            "session_delta",
+            &recovered,
+            ctx_added,
+            Vec::new(),
+            false,
+        )?;
     }
     Ok(recovered)
 }

@@ -38,6 +38,7 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
          VALUES(?,?,?,?,?,?,'in_flight',?)",
         params![call_id, sid, model_id, effort, end, started_at, snapshot],
     )?;
+    crate::cluster::ledger::record_call(conn, call_id)?;
     Ok(Input {
         call_id,
         model,
@@ -79,6 +80,7 @@ impl Report {
                 bill.input_uncached_tokens, bill.cache_read_tokens, bill.cache_write_tokens,
                 bill.output_tokens, bill.cost_nano_usd, bill.snapshot, id],
         )?;
+        crate::cluster::ledger::record_call(conn, id)?;
         Ok(())
     }
 }

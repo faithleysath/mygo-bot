@@ -112,18 +112,29 @@ pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Res
     if data.is_empty() || data.len() > MAX_ATTACHMENT_BYTES {
         return Err(Error::bad("expected 1 byte to 50 MiB of attachment data"));
     }
+    let hash = blake3::hash(data);
+    let byte_len = i64::try_from(data.len()).map_err(|_| Error::bad("attachment too large"))?;
     let id = AttachmentId::new()?;
-    conn.prepare_cached("INSERT INTO attachments(id,mime_type,data) VALUES(?,?,?)")?
-        .execute((id, mime.as_ref(), data))?;
+    conn.prepare_cached(
+        "INSERT INTO attachments(id,mime_type,content_hash,byte_len,data) VALUES(?,?,?,?,?)",
+    )?
+    .execute((
+        id,
+        mime.as_ref(),
+        hash.as_bytes().as_slice(),
+        byte_len,
+        data,
+    ))?;
     Ok(id)
 }
 
 async fn download(State(app): State<App>, Path(id): Path<AttachmentId>) -> Result<Response> {
+    app.cluster.ensure_attachment_data(id).await?;
     let (mime, data) = app
         .db
         .call(move |store| {
             Ok(store.conn.query_row(
-                "SELECT mime_type,data FROM attachments WHERE id=?",
+                "SELECT mime_type,data FROM attachments WHERE id=? AND data IS NOT NULL",
                 [id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )?)
@@ -218,6 +229,11 @@ impl<'a> ContentBlock<'a> {
         let mime: String = row.get(0)?;
         let data = match row.get_ref(1)? {
             ValueRef::Blob(data) => data,
+            ValueRef::Null => {
+                return Err(Error::conflict(format!(
+                    "attachment {id} bytes are unavailable locally"
+                )));
+            }
             value => {
                 return Err(rusqlite::Error::InvalidColumnType(
                     1,
@@ -432,4 +448,45 @@ pub fn wire_message(conn: &Connection, kind: &str, mut payload: Value) -> Result
             .map_err(|e| at_part(index, e))?;
     }
     Ok(payload)
+}
+
+pub fn missing_session_context_attachments(
+    conn: &Connection,
+    sid: SessionId,
+) -> Result<Vec<AttachmentId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
+         WHERE c.session_id=? AND i.kind IN ('user_message','codemode_event','function_call_output')
+         ORDER BY c.position",
+    )?;
+    let mut rows = stmt.query([sid])?;
+    let mut ids = std::collections::BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        let payload: Value = row.get(1)?;
+        let parts = match kind.as_str() {
+            "user_message" | "codemode_event" => payload.get("content").and_then(Value::as_array),
+            "function_call_output" => payload.get("output").and_then(Value::as_array),
+            _ => None,
+        };
+        if let Some(parts) = parts {
+            for part in parts {
+                if let Some(raw) = part.get("attachment_id").and_then(Value::as_str)
+                    && let Ok(att_id) = raw.parse::<AttachmentId>()
+                {
+                    ids.insert(att_id);
+                }
+            }
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    let mut check = conn.prepare_cached("SELECT data IS NULL FROM attachments WHERE id=?")?;
+    let mut missing = Vec::new();
+    for id in ids {
+        if check.query_row([id], |r| r.get::<_, bool>(0)).optional()? == Some(true) {
+            missing.push(id);
+        }
+    }
+    Ok(missing)
 }

@@ -4,7 +4,7 @@ mod config;
 mod content;
 pub(crate) mod diagnostics;
 mod errors;
-mod oauth;
+pub(crate) mod oauth;
 mod stdio;
 pub use config::routes;
 
@@ -122,6 +122,10 @@ impl Connections {
             true
         });
     }
+    pub(crate) fn reset_server(&mut self, id: McpServerId) {
+        self.oauth().cancel_login(id);
+        self.forget(id);
+    }
     pub fn forget_session(&mut self, sid: SessionId) {
         self.slots.retain(|(session, _), (slot, _)| {
             if *session == sid {
@@ -188,6 +192,7 @@ async fn connect(app: &App, endpoint: config::Endpoint) -> std::result::Result<C
             let http = oauth::HttpClient::new(
                 app.client.clone(),
                 app.db.clone(),
+                app.cluster.clone(),
                 endpoint.id,
                 endpoint.revision,
                 oauth,

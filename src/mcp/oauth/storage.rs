@@ -28,6 +28,7 @@ impl Account {
         set: &'static str,
         guard: &str,
         value: Option<String>,
+        sync: bool,
     ) -> Result<()> {
         let id = self.id;
         let revision = self.revision;
@@ -40,6 +41,9 @@ impl Account {
                         return Err(Error::conflict(
                             "OAuth login expired or configuration changed",
                         ));
+                    }
+                    if sync {
+                        crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
                     }
                     Ok(())
                 },
@@ -55,6 +59,7 @@ impl Account {
                 "AND json_extract(pending,'$.csrf_token')=?4 AND json_extract(pending,'$.created_at')+{LOGIN_TTL}>unixepoch()"
             ),
             Some(state.to_owned()),
+            false,
         )
         .await
     }
@@ -75,10 +80,12 @@ impl Account {
                         WHERE server_id=?1 AND generation=?2 AND pending IS NULL AND
                         (credentials IS NOT NULL OR EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND revision=?3))
                         RETURNING (SELECT revision=?3 FROM mcp_servers WHERE id=?1)";
-                    conn.query_row(sql, params![id, generation, revision, value], |row| {
-                        row.get::<_, bool>(0)
-                    })
-                    .map_err(Into::into)
+                    let current = conn
+                        .query_row(sql, params![id, generation, revision, value], |row| {
+                            row.get::<_, bool>(0)
+                        })?;
+                    crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
+                    Ok(current)
                 },
                 |_, current| Ok(current),
             )
@@ -116,6 +123,7 @@ impl Account {
                  THEN NULL ELSE credentials END",
                 "AND json_extract(credentials,'$.token_response.access_token')=?4",
                 Some(token),
+                true,
             )
             .await;
     }
@@ -132,6 +140,7 @@ impl Account {
                         AND json_extract(credentials,'$.token_response.refresh_token')=?",
                         params![id, generation, token],
                     )?;
+                    crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
                     Ok(())
                 },
                 |_, ()| Ok(()),

@@ -60,6 +60,9 @@ impl App {
     }
 
     async fn start_worker(&self, sid: SessionId, automatic: bool) -> Result<Json<Session>> {
+        if !automatic {
+            self.cluster.ensure_session_watched(sid).await?;
+        }
         let worker = self.clone();
         self.db
             .start_write(
@@ -83,6 +86,7 @@ impl App {
                     if active {
                         return Ok((current, StartEffect::None));
                     }
+                    crate::cluster::ledger::assert_no_conflict(conn, sid.as_str())?;
                     let unfinished: bool = conn.query_row(
                         "SELECT needs_model FROM sessions WHERE id=?",
                         [sid],
@@ -94,6 +98,15 @@ impl App {
                             conn.execute(
                                 "UPDATE sessions SET status='idle',last_error='',updated_at=?2 WHERE id=?1",
                                 (sid, now),
+                            )?;
+                            crate::cluster::ledger::record_session_delta(
+                                conn,
+                                sid,
+                                "session_delta",
+                                &[],
+                                Vec::new(),
+                                Vec::new(),
+                                true,
                             )?;
                             return Ok((session(conn, sid)?, StartEffect::Idle(now)));
                         }
@@ -289,7 +302,13 @@ impl App {
             let streamed = tokio::select! {
                 biased;
                 _ = control.hard.cancelled() => Err(Failure::Cancelled),
-                result = self.stream(sid, input, &mut output, &control.hard) => result,
+                result = async {
+                    self.cluster
+                        .ensure_session_attachments(sid)
+                        .await
+                        .map_err(Failure::Fatal)?;
+                    self.stream(sid, input, &mut output, &control.hard).await
+                } => result,
             };
             let finished_at = chrono::Utc::now().timestamp_millis();
             let report = std::mem::take(&mut output.report);
@@ -378,14 +397,22 @@ impl App {
                         if let Some(report) = final_report {
                             report.finish(conn, call_id, "succeeded", None, finished_at)?;
                         }
+                        let mut added_items = Vec::new();
+                        let mut added_ctx = Vec::new();
                         let saved = if let Some(item) = output.final_item {
-                            Some(store::add_context_item(
+                            let (id, pos) = store::add_context_item_raw(
                                 conn,
                                 sid,
                                 "assistant_message",
                                 &item,
                                 call_id,
-                            )?)
+                            )?;
+                            added_items.push(id);
+                            added_ctx.push(crate::cluster::ledger::ContextPos {
+                                position: pos,
+                                item_id: id,
+                            });
+                            Some(id)
                         } else {
                             None
                         };
@@ -400,6 +427,15 @@ impl App {
                         conn.execute(
                             "UPDATE sessions SET needs_model=?2,status=?3,updated_at=?4 WHERE id=?1",
                             (sid, tools, state, now),
+                        )?;
+                        crate::cluster::ledger::record_session_delta(
+                            conn,
+                            sid,
+                            "session_delta",
+                            &added_items,
+                            added_ctx,
+                            Vec::new(),
+                            true,
                         )?;
                         Ok((saved, state, now))
                     },

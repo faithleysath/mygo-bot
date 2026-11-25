@@ -378,6 +378,7 @@ pub async fn subscribe(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
+    app.cluster.ensure_session_watched(sid).await?;
     let (channel, mut rx, initial) = app
         .db
         .call(move |s| {

@@ -150,6 +150,7 @@ export function createMcpForm(s: McpServerInfo | null = null): McpFormState {
       name: "",
       description: "",
       enabled: true,
+      shared: false,
       transport: "streamable-http",
       url: "",
       replaceUrl: true,
@@ -175,6 +176,7 @@ export function createMcpForm(s: McpServerInfo | null = null): McpFormState {
     name: s.name,
     description: s.description,
     enabled: s.enabled,
+    shared: s.shared,
     transport: s.transport,
     url: s.url || "",
     replaceUrl: false,
@@ -232,6 +234,7 @@ export function buildMcpPayload(f: McpFormState): Record<string, unknown> {
       name: f.name,
       description: f.description,
       enabled: f.enabled,
+      shared: f.shared,
       transport: f.transport,
       timeout_ms: timeoutNum,
       allowed_tools: nextAllowed,
@@ -255,6 +258,7 @@ export function buildMcpPayload(f: McpFormState): Record<string, unknown> {
   const body: Record<string, unknown> = {};
   if (f.description !== orig.description) body.description = f.description;
   if (f.enabled !== orig.enabled) body.enabled = f.enabled;
+  if (f.shared !== orig.shared) body.shared = f.shared;
   if (timeoutNum !== orig.timeout_ms) body.timeout_ms = timeoutNum;
   if (!sameAllowedTools(nextAllowed, orig.allowed_tools)) {
     body.allowed_tools = nextAllowed;

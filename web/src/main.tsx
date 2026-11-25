@@ -38,8 +38,8 @@ import { Timeline } from "./Timeline.tsx";
 import type {
   ActiveDraft,
   ActiveTask,
-  AppConfig,
   CallsSummary,
+  ClusterStatus,
   ComposerAttachment,
   ComposerDraft,
   DraftDeltaEvent,
@@ -88,7 +88,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
     setBusy(true);
     setErr("");
     try {
-      await apiFetch<AppConfig>("/config", { token });
+      await apiFetch<ClusterStatus>("/cluster", { token });
       setToken(token);
       onSuccess();
     } catch (ex) {
@@ -291,12 +291,13 @@ function App() {
     sessionFilter: string;
   }>({ open: false, tab: "models", sessionFilter: "" });
 
-  const [config, setConfig] = useState<AppConfig | null>(null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<MainTab>("chat");
+  const [conflictCount, setConflictCount] = useState(0);
+  const [mcpRefreshNonce, setMcpRefreshNonce] = useState(0);
 
   const [itemsState, setItemsState] = useState<{ sid: string | null; list: HistoryItem[] }>({
     sid: null,
@@ -417,12 +418,19 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, settingsState.open]);
 
+  const refreshClusterBadge = async (): Promise<void> => {
+    try {
+      const status = await apiFetch<ClusterStatus>("/cluster");
+      setConflictCount(status.conflict_count);
+    } catch {}
+  };
+
   useEffect(() => {
     setUnauthorizedHandler(() => setAuthed(false));
     consumeHashToken();
-    apiFetch<AppConfig>("/config", { token: getToken() })
-      .then((cfg) => {
-        setConfig(cfg);
+    apiFetch<ClusterStatus>("/cluster", { token: getToken() })
+      .then((status) => {
+        setConflictCount(status.conflict_count);
         setAuthed(true);
       })
       .catch((e) => {
@@ -445,12 +453,10 @@ function App() {
   };
 
   const loadCatalog = async (): Promise<void> => {
-    const [cfg, prov, mods] = await Promise.all([
-      apiFetch<AppConfig>("/config"),
+    const [prov, mods] = await Promise.all([
       apiFetch<ProviderInfo[]>("/providers?include_archived=true"),
       apiFetch<ModelInfo[]>("/models?include_archived=true"),
     ]);
-    setConfig(cfg);
     setProviders(prov);
     setModels(mods);
   };
@@ -460,6 +466,7 @@ function App() {
     let alive = true;
     let selectedInitial = false;
     loadCatalog().catch((e) => alive && setBannerErr(errorMessage(e)));
+    void refreshClusterBadge();
 
     const sync = createGlobalSessionSync({
       fetchSessions: fetchAllSessions,
@@ -513,12 +520,19 @@ function App() {
       onEvent: (name, data) => {
         if (name === "ready" || name === "resync") {
           void sync.sync();
+          void refreshClusterBadge();
         } else if (name === "session.created" || name === "session.updated") {
           sync.onEvent(name, data as SessionInfo);
         } else if (name === "session.status") {
           sync.onEvent(name, data as SessionStatusEvent);
         } else if (name === "session.deleted") {
           sync.onEvent(name, data as SessionDeletedEvent);
+        } else if (name === "catalog.updated") {
+          void loadCatalog().catch(() => {});
+        } else if (name === "mcp.updated") {
+          setMcpRefreshNonce((n) => n + 1);
+        } else if (name === "sync.conflict") {
+          void refreshClusterBadge();
         }
       },
     });
@@ -840,7 +854,21 @@ function App() {
   const createSession = async () => {
     setBannerErr("");
     try {
-      const s = await apiFetch<SessionInfo>("/sessions", { method: "POST", body: {} });
+      const body: Record<string, unknown> = {};
+      try {
+        const savedModelId = localStorage.getItem("mygo_last_model_id");
+        const savedEffort = localStorage.getItem("mygo_last_reasoning_effort");
+        if (savedModelId) {
+          const m = models.find((x) => x.id === savedModelId && !x.archived_at && !x.provider_archived_at);
+          if (m) {
+            body.model_id = m.id;
+            if (savedEffort && m.reasoning_efforts.includes(savedEffort)) {
+              body.reasoning_effort = savedEffort;
+            }
+          }
+        }
+      } catch {}
+      const s = await apiFetch<SessionInfo>("/sessions", { method: "POST", body });
       const added = globalSyncRef.current
         ? globalSyncRef.current.onLocalCreated(s)
         : (setSessions((prev) => applySessionEvent(prev, "session.created", s)), true);
@@ -874,6 +902,17 @@ function App() {
     const baseVersion = globalSyncRef.current?.getSessionVersion(sid) ?? 0;
     try {
       const updated = await apiFetch<SessionInfo>(`/sessions/${sid}`, { method: "PATCH", body: patch });
+      if (patch.model_id !== undefined || patch.reasoning_effort !== undefined) {
+        try {
+          if (updated.model_id) localStorage.setItem("mygo_last_model_id", updated.model_id);
+          else localStorage.removeItem("mygo_last_model_id");
+          if (updated.reasoning_effort) {
+            localStorage.setItem("mygo_last_reasoning_effort", updated.reasoning_effort);
+          } else {
+            localStorage.removeItem("mygo_last_reasoning_effort");
+          }
+        } catch {}
+      }
       if (globalSyncRef.current) globalSyncRef.current.onLocalPatch(updated, baseVersion);
       else setSessions((prev) => applyLocalPatch(prev, updated));
     } catch (e) {
@@ -1084,6 +1123,7 @@ function App() {
             open={sidebarOpen}
             collapsed={sidebarCollapsed}
             searchOpen={searchOpen}
+            conflictCount={conflictCount}
             themePref={themePref}
             searchInputRef={searchInputRef}
             onSelect={setActiveId}
@@ -1253,10 +1293,10 @@ function App() {
 
           {settingsState.open && (
             <Settings
-              config={config}
               providers={providers}
               models={models}
               sessions={sessions}
+              mcpRefreshNonce={mcpRefreshNonce}
               themePref={themePref}
               localePref={localePref}
               initialTab={settingsState.tab}
@@ -1264,6 +1304,11 @@ function App() {
               onSetThemePref={setThemePrefState}
               onSetLocalePref={setLocalePrefState}
               onRefreshCatalog={loadCatalog}
+              onClusterChanged={() => {
+                void refreshClusterBadge();
+                void loadCatalog().catch(() => {});
+                void globalSyncRef.current?.sync();
+              }}
               onSignOut={() => {
                 setToken("");
                 setSettingsState({ open: false, tab: "models", sessionFilter: "" });

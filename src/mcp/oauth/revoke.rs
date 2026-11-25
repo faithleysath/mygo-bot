@@ -35,6 +35,7 @@ fn take(conn: &Connection, id: McpServerId, expected: Option<&str>, timeout: Dur
         ));
     }
     conn.execute("DELETE FROM mcp_oauth WHERE server_id=?", [id])?;
+    crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
     Ok(grant)
 }
 

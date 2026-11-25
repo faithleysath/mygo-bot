@@ -1,5 +1,6 @@
 use super::client::OAuthHttp;
 use super::*;
+use crate::cluster::Cluster;
 use crate::mcp::client::McpError;
 
 struct Authorization {
@@ -8,6 +9,7 @@ struct Authorization {
     binding: Binding,
     account: Account,
     gate: Arc<tokio::sync::Mutex<()>>,
+    cluster: Arc<Cluster>,
 }
 
 #[derive(Clone)]
@@ -20,6 +22,7 @@ impl HttpClient {
     pub(in crate::mcp) async fn new(
         http: reqwest::Client,
         db: Db,
+        cluster: Arc<Cluster>,
         id: McpServerId,
         revision: i64,
         oauth_enabled: bool,
@@ -64,6 +67,7 @@ impl HttpClient {
                 binding,
                 account,
                 gate,
+                cluster,
             }))
         } else {
             None
@@ -83,6 +87,14 @@ impl HttpClient {
         };
         if auth.endpoint != uri {
             return Err(McpError::AuthRequired);
+        }
+        if let Ok(Some((creds, rejected))) = auth.account.load_credentials().await
+            && storage::needs_refresh(&creds, rejected)
+        {
+            let _ = auth
+                .cluster
+                .coordinate_mcp_oauth_refresh(auth.account.id, &auth.account.generation)
+                .await;
         }
         // Queued requests recheck expiry after the previous refresh commits. Once token
         // acquisition starts, finish a possible refresh even if this MCP operation times out:

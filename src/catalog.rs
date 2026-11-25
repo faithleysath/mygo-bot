@@ -83,7 +83,7 @@ fn catalog_error(err: rusqlite::Error) -> Error {
     }
 }
 
-// The database worker commits this write (including any default change) atomically.
+// The database worker commits this write atomically.
 async fn set_archived<K: Prefix>(
     app: App,
     table: &'static str,
@@ -103,13 +103,12 @@ async fn set_archived<K: Prefix>(
                 if conn.execute(&sql, (timestamp, id)).map_err(catalog_error)? == 0 {
                     return Err(rusqlite::Error::QueryReturnedNoRows.into());
                 }
-                if archive {
-                    conn.execute(
-                        "UPDATE config SET default_model_id=NULL, default_reasoning_effort=NULL
-                         WHERE EXISTS(SELECT 1 FROM model_catalog
-                                      WHERE id=config.default_model_id AND NOT available)",
-                        [],
-                    )?;
+                if table == "llm_providers" {
+                    let pid: ProviderId = id.as_str().parse().map_err(|_| Error::internal("invalid provider id"))?;
+                    crate::cluster::ledger::record_provider(conn, pid)?;
+                } else if table == "llm_models" {
+                    let mid: ModelId = id.as_str().parse().map_err(|_| Error::internal("invalid model id"))?;
+                    crate::cluster::ledger::record_model(conn, mid)?;
                 }
                 Ok(())
             },
@@ -269,6 +268,7 @@ fn save_provider(
         params![id, provider.name, provider.base_url, provider.api_key.filter(|k| !k.is_empty())],
         |r| r.get(0),
     ).map_err(catalog_error)?;
+    crate::cluster::ledger::record_provider(conn, id)?;
     record(conn, PROVIDER, id, public_provider)
 }
 
@@ -374,23 +374,6 @@ impl Model {
             .any(|m| !self.input_modalities.contains(m));
         if !fewer_efforts && !fewer_modalities {
             return Ok(());
-        }
-        if fewer_efforts {
-            let default: Option<String> = conn
-                .query_row(
-                    "SELECT default_reasoning_effort FROM config WHERE default_model_id=?",
-                    [id],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
-            if let Some(e) = default
-                && !self.reasoning_efforts.contains(&e)
-            {
-                return Err(Error::conflict(format!(
-                    "default_reasoning_effort {e} is in use"
-                )));
-            }
         }
         let modalities = json!(self.input_modalities);
         let mut sessions = conn.prepare_cached(
@@ -505,6 +488,7 @@ fn save_model(conn: &Connection, id: Option<ModelId>, fields: Document) -> Resul
         ],
         |r| r.get(0),
     ).map_err(catalog_error)?;
+    crate::cluster::ledger::record_model(conn, id)?;
     record(conn, MODEL, id, public_model)
 }
 

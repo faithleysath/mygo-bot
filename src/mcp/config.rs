@@ -10,7 +10,7 @@ use reqwest::{
     Url,
     header::{HeaderName, HeaderValue},
 };
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -42,6 +42,8 @@ struct McpServerConfig {
     #[serde(default = "enabled")]
     enabled: bool,
     #[serde(default)]
+    shared: bool,
+    #[serde(default)]
     transport: McpTransport,
     url: Option<String>,
     #[serde(default)]
@@ -71,6 +73,7 @@ struct McpServerInfo {
     name: String,
     description: String,
     enabled: bool,
+    shared: bool,
     transport: McpTransport,
     /// 查询参数可能含凭据，读取时省略。
     url: Option<String>,
@@ -136,23 +139,24 @@ struct Stored {
     revision: i64,
     cfg: McpServerConfig,
 }
-const SELECT: &str = "SELECT id,name,description,enabled,transport,config_json,allowed_tools,timeout_ms,revision FROM mcp_servers";
+const SELECT: &str = "SELECT id,name,description,enabled,shared,transport,config_json,allowed_tools,timeout_ms,revision FROM mcp_servers";
 fn stored(r: &Row) -> rusqlite::Result<Stored> {
-    let mut value: Value = r.get(5)?;
+    let mut value: Value = r.get(6)?;
     let obj = value.as_object_mut().ok_or(rusqlite::Error::InvalidQuery)?;
     obj.insert("name".into(), json!(r.get::<_, String>(1)?));
     obj.insert("description".into(), json!(r.get::<_, String>(2)?));
     obj.insert("enabled".into(), json!(r.get::<_, bool>(3)?));
-    obj.insert("transport".into(), json!(r.get::<_, String>(4)?));
+    obj.insert("shared".into(), json!(r.get::<_, bool>(4)?));
+    obj.insert("transport".into(), json!(r.get::<_, String>(5)?));
     obj.insert(
         "allowed_tools".into(),
-        r.get::<_, Option<Value>>(6)?.unwrap_or(Value::Null),
+        r.get::<_, Option<Value>>(7)?.unwrap_or(Value::Null),
     );
-    obj.insert("timeout_ms".into(), json!(r.get::<_, u32>(7)?));
+    obj.insert("timeout_ms".into(), json!(r.get::<_, u32>(8)?));
     let cfg = serde_json::from_value(value).map_err(|_| rusqlite::Error::InvalidQuery)?;
     Ok(Stored {
         id: r.get(0)?,
-        revision: r.get(8)?,
+        revision: r.get(9)?,
         cfg,
     })
 }
@@ -173,6 +177,7 @@ impl Stored {
             name: c.name,
             description: c.description,
             enabled: c.enabled,
+            shared: c.shared,
             transport: c.transport,
             url,
             has_url_query,
@@ -331,7 +336,7 @@ fn save(
     conn: &Connection,
     id: Option<McpServerId>,
     fields: Fields,
-) -> Result<(McpServerInfo, bool)> {
+) -> Result<(McpServerInfo, bool, Option<McpServerId>)> {
     if fields.is_empty() {
         return Err(Error::bad("expected MCP configuration fields"));
     }
@@ -372,14 +377,70 @@ fn save(
     let auth_changed = old.as_ref().is_some_and(|s| {
         s.cfg.transport != c.transport || connection_document(&s.cfg) != connection
     });
-    let sql = "INSERT INTO mcp_servers(id,name,description,enabled,transport,config_json,allowed_tools,timeout_ms,revision)
-        VALUES(?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET description=excluded.description,enabled=excluded.enabled,
-        transport=excluded.transport,config_json=excluded.config_json,allowed_tools=excluded.allowed_tools,
-        timeout_ms=excluded.timeout_ms,revision=mcp_servers.revision+1 RETURNING id";
     let transport = match c.transport {
         McpTransport::StreamableHttp => "streamable-http",
         McpTransport::Stdio => "stdio",
     };
+
+    if let Some(old_id) = id
+        && old.as_ref().is_some_and(|s| s.cfg.shared && !c.shared)
+    {
+        crate::cluster::ledger::assert_no_conflict(conn, old_id.as_str())?;
+        let old_oauth = if !auth_changed {
+            conn.query_row(
+                "SELECT generation,binding,pending,credentials,rejected FROM mcp_oauth WHERE server_id=?",
+                [old_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let new_id = McpServerId::new()?;
+        conn.execute("DELETE FROM mcp_servers WHERE id=?", [old_id])?;
+        conn.execute(
+            "INSERT INTO mcp_servers(id,name,description,enabled,shared,transport,config_json,allowed_tools,timeout_ms,revision)
+             VALUES(?,?,?,?,0,?,?,?,?,1)",
+            params![
+                new_id,
+                c.name,
+                c.description,
+                c.enabled,
+                transport,
+                connection,
+                c.allowed_tools.as_ref().map(|names| json!(names)),
+                c.timeout_ms
+            ],
+        )
+        .map_err(|e| match e.sqlite_error().map(|code| code.extended_code) {
+            Some(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE) => {
+                Error::conflict("MCP server name already exists")
+            }
+            _ => e.into(),
+        })?;
+        if let Some((generation, binding, pending, credentials, rejected)) = old_oauth {
+            conn.execute(
+                "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,rejected)
+                 VALUES(?,?,?,?,?,?)",
+                params![new_id, generation, binding, pending, credentials, rejected],
+            )?;
+        }
+        crate::cluster::ledger::record_mcp_deleted(conn, old_id)?;
+        return Ok((by_id(conn, new_id)?, auth_changed, Some(old_id)));
+    }
+
+    let sql = "INSERT INTO mcp_servers(id,name,description,enabled,shared,transport,config_json,allowed_tools,timeout_ms,revision)
+        VALUES(?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET description=excluded.description,enabled=excluded.enabled,
+        shared=excluded.shared,transport=excluded.transport,config_json=excluded.config_json,allowed_tools=excluded.allowed_tools,
+        timeout_ms=excluded.timeout_ms,revision=mcp_servers.revision+1 RETURNING id";
     let id = match id {
         Some(id) => id,
         None => McpServerId::new()?,
@@ -392,6 +453,7 @@ fn save(
                 c.name,
                 c.description,
                 c.enabled,
+                c.shared,
                 transport,
                 connection,
                 c.allowed_tools.as_ref().map(|names| json!(names)),
@@ -405,7 +467,10 @@ fn save(
             }
             _ => e.into(),
         })?;
-    Ok((by_id(conn, id)?, auth_changed))
+    if c.shared {
+        crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
+    }
+    Ok((by_id(conn, id)?, auth_changed, None))
 }
 
 async fn list_servers(State(app): State<App>) -> Result<Json<Vec<McpServerInfo>>> {
@@ -435,7 +500,7 @@ async fn create_server(
     app.db
         .write(
             move |conn| save(conn, None, fields),
-            |_, (value, _)| Ok((StatusCode::CREATED, Json(value))),
+            |_, (value, _, _)| Ok((StatusCode::CREATED, Json(value))),
         )
         .await
 }
@@ -448,11 +513,16 @@ async fn patch_server(
     app.db
         .write(
             move |conn| save(conn, Some(id), fields),
-            move |s, (value, auth_changed)| {
-                if auth_changed || !value.enabled {
-                    s.mcp.oauth().cancel_login(id);
+            move |s, (value, auth_changed, detached_from)| {
+                if let Some(old_id) = detached_from {
+                    s.mcp.oauth().cancel_login(old_id);
+                    s.mcp.forget(old_id);
+                } else {
+                    if auth_changed || !value.enabled {
+                        s.mcp.oauth().cancel_login(id);
+                    }
+                    s.mcp.forget(id);
                 }
-                s.mcp.forget(id);
                 Ok(Json(value))
             },
         )
@@ -463,9 +533,11 @@ async fn delete_server(State(app): State<App>, Path(id): Path<McpServerId>) -> R
     app.db
         .write(
             move |conn| {
+                crate::cluster::ledger::assert_no_conflict(conn, id.as_str())?;
                 if conn.execute("DELETE FROM mcp_servers WHERE id=?", [id])? == 0 {
                     return Err(rusqlite::Error::QueryReturnedNoRows.into());
                 }
+                crate::cluster::ledger::record_mcp_deleted(conn, id)?;
                 Ok(())
             },
             move |s, ()| {

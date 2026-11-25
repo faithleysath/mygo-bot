@@ -26,6 +26,7 @@ CREATE TABLE mcp_servers (
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL,
     enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
+    shared INTEGER NOT NULL DEFAULT 0 CHECK (shared IN (0,1)),
     transport TEXT NOT NULL CHECK (transport IN ('streamable-http','stdio')),
     allowed_tools TEXT CHECK (allowed_tools IS NULL OR json_type(allowed_tools)='array'),
     config_json TEXT NOT NULL CHECK (json_type(config_json)='object'),
@@ -44,12 +45,6 @@ CREATE TABLE mcp_oauth (
 CREATE TRIGGER invalidate_mcp_oauth AFTER UPDATE ON mcp_servers
 WHEN NEW.transport != OLD.transport OR NEW.config_json != OLD.config_json
 BEGIN DELETE FROM mcp_oauth WHERE server_id=NEW.id; END;
-CREATE TABLE config (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    default_model_id TEXT REFERENCES llm_models,
-    default_reasoning_effort TEXT
-);
-INSERT INTO config(id) VALUES(1);
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL DEFAULT '',
@@ -88,8 +83,11 @@ CREATE INDEX calls_by_model ON llm_calls(model_id, started_at, id);
 CREATE TABLE attachments (
     id TEXT PRIMARY KEY,
     mime_type TEXT NOT NULL,
-    data BLOB NOT NULL
+    content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
+    byte_len INTEGER NOT NULL CHECK (byte_len > 0),
+    data BLOB
 );
+CREATE INDEX attachments_by_hash ON attachments(content_hash) WHERE data IS NOT NULL;
 CREATE TABLE items (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions,
@@ -145,4 +143,63 @@ WHERE i.kind IN ('user_message','codemode_event') AND i.id>s.input_queue_cursor
 AND ((i.kind='user_message' AND NOT EXISTS (SELECT 1 FROM items w WHERE w.kind='withdrawal' AND w.target_id=i.id))
   OR (i.kind='codemode_event' AND json_extract(i.payload,'$.notify')
       AND NOT EXISTS (SELECT 1 FROM invalidated_warnings w WHERE w.item_id=i.id)));
-PRAGMA user_version = 2;
+CREATE TABLE local_node (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    secret_key BLOB NOT NULL CHECK (length(secret_key) = 32),
+    node_id TEXT NOT NULL,
+    cluster_secret BLOB NOT NULL CHECK (length(cluster_secret) = 32),
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    meta_seq INTEGER NOT NULL DEFAULT 1 CHECK (meta_seq > 0)
+);
+CREATE TABLE cluster_peers (
+    node_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    os TEXT NOT NULL DEFAULT '',
+    arch TEXT NOT NULL DEFAULT '',
+    meta_seq INTEGER NOT NULL DEFAULT 0,
+    addrs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(addrs_json) = 'array'),
+    last_seen_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE sync_streams (
+    stream_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('provider','model','mcp','session','call')),
+    epoch INTEGER NOT NULL DEFAULT 1 CHECK (epoch > 0),
+    head_seq INTEGER NOT NULL DEFAULT 0 CHECK (head_seq >= 0),
+    head_hash BLOB NOT NULL CHECK (length(head_hash) = 32),
+    synced_seq INTEGER NOT NULL DEFAULT 0 CHECK (synced_seq >= 0),
+    watched INTEGER NOT NULL DEFAULT 0 CHECK (watched IN (0,1)),
+    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0,1)),
+    head_snapshot TEXT CHECK (head_snapshot IS NULL OR json_valid(head_snapshot)),
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX sync_streams_by_kind ON sync_streams(kind, stream_id);
+CREATE TABLE sync_commits (
+    stream_id TEXT NOT NULL REFERENCES sync_streams(stream_id) ON DELETE CASCADE,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    seq INTEGER NOT NULL CHECK (seq > 0),
+    parent_hash BLOB NOT NULL CHECK (length(parent_hash) = 32),
+    commit_hash BLOB NOT NULL CHECK (length(commit_hash) = 32),
+    author_node_id TEXT NOT NULL,
+    op_type TEXT NOT NULL,
+    payload TEXT NOT NULL CHECK (json_valid(payload)),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (stream_id, epoch, seq),
+    UNIQUE (stream_id, commit_hash)
+);
+CREATE TABLE sync_conflicts (
+    stream_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('provider','model','mcp','session','call')),
+    local_epoch INTEGER NOT NULL,
+    local_seq INTEGER NOT NULL,
+    local_hash BLOB NOT NULL,
+    remote_epoch INTEGER NOT NULL,
+    remote_seq INTEGER NOT NULL,
+    remote_hash BLOB NOT NULL,
+    remote_node_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    remote_snapshot TEXT CHECK (remote_snapshot IS NULL OR json_valid(remote_snapshot)),
+    detected_at INTEGER NOT NULL
+);
+PRAGMA user_version = 3;

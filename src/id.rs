@@ -183,7 +183,7 @@ fn decode_base32(suffix: &[u8]) -> Option<[u8; 16]> {
     Some(v.to_be_bytes())
 }
 
-fn observe_id_str(id: &str) -> Result<()> {
+pub(crate) fn observe_id_str(id: &str) -> Result<()> {
     let b = id.as_bytes();
     let Some(raw) = (b.len() == 30 && b[3] == b'_')
         .then(|| decode_base32(&b[4..]))
@@ -205,6 +205,10 @@ fn observe_id_str(id: &str) -> Result<()> {
         state.seq = seq;
     }
     Ok(())
+}
+
+pub(crate) fn observe_id<K: Prefix>(id: Id<K>) {
+    let _ = observe_id_str(id.as_str());
 }
 
 /// Advances the monotonic UUIDv7 generator past all TypeIDs and cursors already committed in SQLite.

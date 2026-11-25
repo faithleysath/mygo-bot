@@ -214,3 +214,82 @@ async fn logout(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<S
         })??;
     Ok(StatusCode::NO_CONTENT)
 }
+
+pub(crate) async fn refresh_shared_as_coordinator(
+    db: &Db,
+    _client: &reqwest::Client,
+    id: McpServerId,
+    generation: &str,
+    after_epoch: i64,
+    after_seq: i64,
+) -> Result<(
+    Option<crate::cluster::ledger::StreamHead>,
+    Vec<crate::cluster::ledger::CommitWire>,
+)> {
+    let gen_owned = generation.to_owned();
+    let (revision, binding, endpoint, gate) = db
+        .call(move |s| {
+            let sql = format!(
+                "SELECT m.revision, o.binding, json_extract(m.config_json,'$.url')
+                 FROM mcp_servers m JOIN mcp_oauth o ON o.server_id=m.id
+                 WHERE m.id=?1 AND m.shared=1 AND o.generation=?2 AND {}",
+                storage::AUTHORIZED_SQL
+            );
+            let (revision, raw, endpoint): (i64, String, String) = s
+                .conn
+                .query_row(&sql, params![id, gen_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let gate = s.mcp.oauth().refresh_lock(&gen_owned);
+            Ok((revision, decode::<Binding>(&raw)?, endpoint, gate))
+        })
+        .await?;
+
+    let _guard = gate.lock_owned().await;
+    let base = flow::discovery_base(&endpoint)?;
+    let oauth_http = client::OAuthHttp::new(&base).map_err(Error::internal)?;
+    let account = Account {
+        db: db.clone(),
+        id,
+        revision,
+        generation: generation.to_owned(),
+    };
+    storage::acquire_valid_token(&oauth_http, &binding, &account)
+        .await
+        .map_err(|reauth| {
+            if reauth {
+                Error::conflict("MCP OAuth re-authentication required")
+            } else {
+                Error::internal("MCP OAuth token refresh failed")
+            }
+        })?;
+
+    db.call(move |s| {
+        let Some(st) = crate::cluster::ledger::stream_head(&s.conn, id.as_str())? else {
+            return Ok((None, Vec::new()));
+        };
+        let start_after = if st.epoch == after_epoch && after_seq >= 0 && after_seq <= st.head_seq {
+            after_seq
+        } else {
+            0
+        };
+        let (commits, _) = crate::cluster::ledger::read_commits_range(
+            &s.conn,
+            &st.stream_id,
+            st.epoch,
+            start_after,
+            256,
+            4 * 1024 * 1024,
+        )?;
+        let head = crate::cluster::ledger::StreamHead {
+            stream_id: st.stream_id,
+            kind: st.kind,
+            epoch: st.epoch,
+            head_seq: st.head_seq,
+            head_hash: st.head_hash,
+            deleted: st.deleted,
+            head_snapshot: st.head_snapshot,
+            updated_at: st.updated_at,
+        };
+        Ok((Some(head), commits))
+    })
+    .await
+}

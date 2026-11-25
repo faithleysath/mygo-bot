@@ -48,21 +48,50 @@ pub fn tool(
          WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.call_id')=?3
          RETURNING id",
     )?.query_row(params![sid, original, call, payload, background.then_some(original), id], |r| r.get(0))?;
-    if !background {
-        invalidate(conn, sid, original)?;
-    }
+    let invalidated = if !background {
+        invalidate_only(conn, sid, original)?
+    } else {
+        Vec::new()
+    };
+    crate::cluster::ledger::record_session_delta(
+        conn,
+        sid,
+        "session_delta",
+        &[id],
+        Vec::new(),
+        invalidated,
+        false,
+    )?;
     Ok(id)
 }
 
-pub fn invalidate(conn: &Connection, sid: SessionId, origin: ItemId) -> Result<()> {
-    conn.prepare_cached(
+fn invalidate_only(conn: &Connection, sid: SessionId, origin: ItemId) -> Result<Vec<ItemId>> {
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO invalidated_warnings(item_id)
          SELECT i.id FROM items i JOIN sessions s ON s.id=i.session_id
          WHERE i.session_id=? AND i.codemode_call_item_id=? AND i.kind='codemode_event'
            AND i.id>s.input_queue_cursor AND json_extract(i.payload,'$.event')='lease_warning'
-         ON CONFLICT(item_id) DO NOTHING",
-    )?
-    .execute((sid, origin))?;
+         ON CONFLICT(item_id) DO NOTHING RETURNING item_id",
+    )?;
+    let ids = stmt
+        .query_map((sid, origin), |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<ItemId>>>()?;
+    Ok(ids)
+}
+
+pub fn invalidate(conn: &Connection, sid: SessionId, origin: ItemId) -> Result<()> {
+    let ids = invalidate_only(conn, sid, origin)?;
+    if !ids.is_empty() {
+        crate::cluster::ledger::record_session_delta(
+            conn,
+            sid,
+            "session_delta",
+            &[],
+            Vec::new(),
+            ids,
+            false,
+        )?;
+    }
     Ok(())
 }
 
@@ -116,9 +145,20 @@ pub fn event(
          WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.name')='codemode'
          RETURNING id",
     )?.query_row(params![sid, origin, payload, id], |r| r.get(0))?;
-    if kind == "completed" {
-        invalidate(conn, sid, origin)?;
-    }
+    let invalidated = if kind == "completed" {
+        invalidate_only(conn, sid, origin)?
+    } else {
+        Vec::new()
+    };
+    crate::cluster::ledger::record_session_delta(
+        conn,
+        sid,
+        "session_delta",
+        &[id],
+        Vec::new(),
+        invalidated,
+        false,
+    )?;
     Ok(id)
 }
 
@@ -264,23 +304,52 @@ pub fn materialize(conn: &Connection, sid: SessionId, blocks: &Blocks) -> Result
 }
 
 pub fn recover(conn: &Connection) -> Result<()> {
+    let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
     // Foreground tasks may have emitted lease warnings too. No lease survives a restart.
-    conn.execute(
-        "INSERT INTO invalidated_warnings(item_id)
-         SELECT i.id FROM items i INDEXED BY codemode_warnings JOIN sessions s ON s.id=i.session_id
-         WHERE i.kind='codemode_event' AND json_extract(i.payload,'$.event')='lease_warning'
-           AND i.id>s.input_queue_cursor ON CONFLICT(item_id) DO NOTHING",
-        [],
-    )?;
+    let invalidated_rows = {
+        let mut stmt = conn.prepare(
+            "INSERT INTO invalidated_warnings(item_id)
+             SELECT i.id FROM items i INDEXED BY codemode_warnings JOIN sessions s ON s.id=i.session_id
+             WHERE i.kind='codemode_event' AND json_extract(i.payload,'$.event')='lease_warning'
+               AND i.id>s.input_queue_cursor
+               AND coalesce((SELECT sc.author_node_id FROM sync_commits sc WHERE sc.stream_id=i.session_id AND sc.payload LIKE '%' || i.id || '%' ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1
+             ON CONFLICT(item_id) DO NOTHING RETURNING item_id",
+        )?;
+        stmt.query_map([&local_node_id], |r| r.get::<_, ItemId>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !invalidated_rows.is_empty() {
+        let mut by_session: std::collections::HashMap<SessionId, Vec<ItemId>> =
+            std::collections::HashMap::new();
+        for item_id in invalidated_rows {
+            let sid: SessionId =
+                conn.query_row("SELECT session_id FROM items WHERE id=?", [item_id], |r| {
+                    r.get(0)
+                })?;
+            by_session.entry(sid).or_default().push(item_id);
+        }
+        for (sid, ids) in by_session {
+            crate::cluster::ledger::record_session_delta(
+                conn,
+                sid,
+                "session_delta",
+                &[],
+                Vec::new(),
+                ids,
+                false,
+            )?;
+        }
+    }
     let mut receipts = conn.prepare(
         "SELECT r.session_id,r.codemode_call_item_id FROM items r INDEXED BY codemode_receipts
          WHERE r.kind='function_call_output' AND r.codemode_call_item_id IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM items e WHERE e.kind='codemode_event'
                            AND e.codemode_call_item_id=r.codemode_call_item_id AND json_extract(e.payload,'$.event')='completed')
+           AND coalesce((SELECT sc.author_node_id FROM sync_commits sc WHERE sc.stream_id=r.session_id AND sc.payload LIKE '%' || r.id || '%' ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1
          ORDER BY r.id",
     )?;
     let missing = receipts
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([&local_node_id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<Vec<(SessionId, ItemId)>>>()?;
     for (sid, origin) in missing {
         let status = json!({"id":origin.task_id(),"status":"interrupted","error":"Daemon restarted; result unknown."});
@@ -290,15 +359,42 @@ pub fn recover(conn: &Connection) -> Result<()> {
             "UPDATE sessions SET status='paused',last_error='daemon restarted' WHERE id=?",
             [sid],
         )?;
+        crate::cluster::ledger::record_session_delta(
+            conn,
+            sid,
+            "session_delta",
+            &[],
+            Vec::new(),
+            Vec::new(),
+            true,
+        )?;
     }
     // A crash after committing an event can precede the idle worker's wake-up.
-    conn.execute(
-        "UPDATE sessions SET status='paused',last_error='daemon restarted with pending codemode events'
-         WHERE status='idle' AND EXISTS (
-             SELECT 1 FROM pending p JOIN items i ON i.id=p.id
-             WHERE p.session_id=sessions.id AND i.kind='codemode_event'
-         )",
-        [],
-    )?;
+    let pending_sids = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sessions WHERE status='idle' AND EXISTS (
+                 SELECT 1 FROM pending p JOIN items i ON i.id=p.id
+                 WHERE p.session_id=sessions.id AND i.kind='codemode_event'
+                   AND coalesce((SELECT sc.author_node_id FROM sync_commits sc WHERE sc.stream_id=i.session_id AND sc.payload LIKE '%' || i.id || '%' ORDER BY sc.epoch DESC, sc.seq DESC LIMIT 1), ?1) = ?1
+             )",
+        )?;
+        stmt.query_map([&local_node_id], |r| r.get::<_, SessionId>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for sid in pending_sids {
+        conn.execute(
+            "UPDATE sessions SET status='paused',last_error='daemon restarted with pending codemode events' WHERE id=?",
+            [sid],
+        )?;
+        crate::cluster::ledger::record_session_delta(
+            conn,
+            sid,
+            "session_delta",
+            &[],
+            Vec::new(),
+            Vec::new(),
+            true,
+        )?;
+    }
     Ok(())
 }

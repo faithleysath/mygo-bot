@@ -2,6 +2,7 @@ mod agent;
 mod api;
 mod calls;
 mod catalog;
+mod cluster;
 mod codemode;
 mod daemon;
 mod docs;
@@ -95,6 +96,7 @@ impl IntoResponse for Error {
 #[derive(Clone)]
 struct App {
     db: Db,
+    cluster: Arc<cluster::Cluster>,
     codemode: Arc<codemode::Engine>,
     client: reqwest::Client,
     mcp_probes: Arc<tokio::sync::Semaphore>,
@@ -130,11 +132,13 @@ fn daemon_help() {
 By default, start in the background and log to ./mygo.log.
 
 Options:
-  --foreground          Run attached to this terminal and log to stderr
-  --js-threads <COUNT>  JavaScript workers (default: up to four logical CPUs)
-  --listen <IP:PORT>    Bind this address once (0 selects a free port). Default: 127.0.0.1:{DEFAULT_PORT}, then the next free port ({DEFAULT_PORT_ATTEMPTS} attempts)
-  --token <TOKEN>       TCP Bearer token (default: generate and print once)
-{HELP_SOCKET_OPTIONS}  -h, --help            Print help
+  --foreground            Run attached to this terminal and log to stderr
+  --js-threads <COUNT>    JavaScript workers (default: up to four logical CPUs)
+  --listen <IP:PORT>      Bind this address once (0 selects a free port). Default: 127.0.0.1:{DEFAULT_PORT}, then the next free port ({DEFAULT_PORT_ATTEMPTS} attempts)
+  --token <TOKEN>         TCP Bearer token (default: generate and print once)
+  --cluster-local         Disable public relay and DNS discovery for local-only cluster mode
+  --cluster-bind <IP:PORT> Bind the iroh cluster endpoint to a specific UDP address
+{HELP_SOCKET_OPTIONS}  -h, --help              Print help
 "
     );
 }
@@ -144,6 +148,8 @@ struct DaemonOptions {
     js_threads: Option<NonZeroUsize>,
     listen: Option<SocketAddr>,
     token: Option<String>,
+    cluster_local: bool,
+    cluster_bind: Option<SocketAddr>,
     #[cfg(unix)]
     unix_socket: Option<PathBuf>,
     #[cfg(unix)]
@@ -253,6 +259,8 @@ impl DaemonOptions {
         let mut js_threads: Option<NonZeroUsize> = None;
         let mut listen: Option<SocketAddr> = None;
         let mut token: Option<String> = None;
+        let mut cluster_local = false;
+        let mut cluster_bind: Option<SocketAddr> = None;
         #[cfg(unix)]
         let mut unix_socket: Option<PathBuf> = None;
         #[cfg(unix)]
@@ -313,6 +321,26 @@ impl DaemonOptions {
                     }
                     token = Some(take_str_value(inline, &mut args, "--token")?);
                 }
+                "--cluster-local" if inline.is_none() => {
+                    if cluster_local {
+                        return Err(
+                            "the argument '--cluster-local' cannot be used multiple times".into(),
+                        );
+                    }
+                    cluster_local = true;
+                }
+                "--cluster-bind" => {
+                    if cluster_bind.is_some() {
+                        return Err(
+                            "the argument '--cluster-bind <IP:PORT>' cannot be used multiple times"
+                                .into(),
+                        );
+                    }
+                    let val = take_str_value(inline, &mut args, "--cluster-bind")?;
+                    cluster_bind = Some(val.parse::<SocketAddr>().map_err(|e| {
+                        format!("invalid value '{val}' for '--cluster-bind': {e}")
+                    })?);
+                }
                 #[cfg(unix)]
                 "--unix-socket" => {
                     if unix_socket.is_some() {
@@ -358,6 +386,8 @@ impl DaemonOptions {
             js_threads,
             listen,
             token,
+            cluster_local,
+            cluster_bind,
             #[cfg(unix)]
             unix_socket,
             #[cfg(unix)]
@@ -489,14 +519,36 @@ async fn serve(
             builder.build()
         };
         let streams = events::Hub::default();
+        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        let db = Db::open(Path::new("mygo.sqlite3"), streams.global_sender(), sync_tx.clone())?;
+        let client = make_client()?;
+        let stopping = CancellationToken::new();
+        let workers = TaskTracker::new();
+        let cluster = cluster::Cluster::start(
+            cluster::ClusterStart {
+                db: db.clone(),
+                client: client.clone(),
+                streams: streams.clone(),
+                signal_tx: sync_tx,
+                signal_rx: sync_rx,
+                config: cluster::ClusterConfig {
+                    local_only: options.cluster_local,
+                    bind_addr: options.cluster_bind,
+                },
+                stopping: stopping.clone(),
+            },
+            &workers,
+        )
+        .await?;
         App {
             codemode: Arc::new(codemode::Engine::new(threads, make_client()?)?),
             mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
-            db: Db::open(Path::new("mygo.sqlite3"), streams.global_sender())?,
-            client: make_client()?,
+            db,
+            cluster,
+            client,
             streams,
-            stopping: CancellationToken::new(),
-            workers: TaskTracker::new(),
+            stopping,
+            workers,
         }
     };
     app.workers
@@ -549,6 +601,7 @@ async fn serve(
         app.shutdown(),
         tokio::time::timeout(Duration::from_secs(6), server)
     );
+    app.cluster.shutdown().await;
     workers?;
     if let Ok(result) = http {
         result?;

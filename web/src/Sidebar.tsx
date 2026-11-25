@@ -12,6 +12,7 @@ export interface SidebarProps {
   open: boolean;
   collapsed: boolean;
   searchOpen: boolean;
+  conflictCount: number;
   themePref: ThemePref;
   searchInputRef: RefObject<HTMLInputElement | null>;
   onSelect: (id: string) => void;
@@ -30,6 +31,7 @@ export function Sidebar({
   open,
   collapsed,
   searchOpen,
+  conflictCount,
   themePref,
   searchInputRef,
   onSelect,
@@ -124,6 +126,13 @@ export function Sidebar({
             <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("mcp"); onClose(); }}>
               <Icon n="plug" />
               <span>{t("MCP Servers")}</span>
+            </button>
+            <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("cluster"); onClose(); }}>
+              <Icon n="globe" />
+              <span>{t("Cluster")}</span>
+              {conflictCount > 0 && (
+                <span class="pill pill-failed" style="margin-left:auto">{conflictCount}</span>
+              )}
             </button>
             <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("usage"); onClose(); }}>
               <Icon n="chart" />

@@ -51,7 +51,6 @@ pub async fn authorize_tcp(
 
 pub fn routes(app: App) -> Router {
     Router::new()
-        .route("/config", get(get_config).patch(patch_config))
         .route("/events", get(events::subscribe_global))
         .route("/sessions", get(list_sessions).post(create_session))
         .route(
@@ -66,6 +65,7 @@ pub fn routes(app: App) -> Router {
         .route("/sessions/{sid}/events", get(events::subscribe))
         .route("/sessions/{sid}/tasks", get(list_tasks))
         .route("/sessions/{sid}/tasks/{tid}", delete(kill_task))
+        .merge(crate::cluster::api::routes())
         .merge(crate::catalog::routes())
         .merge(crate::mcp::routes())
         .merge(crate::mcp::diagnostics::routes())
@@ -79,12 +79,6 @@ pub fn internal_routes(app: App) -> Router {
 }
 
 type Document = Json<Map<String, Value>>;
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    default_model_id: Option<ModelId>,
-    default_reasoning_effort: Option<String>,
-}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,14 +93,6 @@ impl Selection {
             model_id: row.get(0)?,
             reasoning_effort: row.get(1)?,
         })
-    }
-
-    fn defaults(conn: &Connection) -> Result<Self> {
-        Ok(conn.query_row(
-            "SELECT default_model_id,default_reasoning_effort FROM config WHERE id=1",
-            [],
-            Self::read,
-        )?)
     }
 
     fn apply(self, fields: Map<String, Value>) -> Result<Self> {
@@ -139,45 +125,6 @@ impl Selection {
         }
         Ok(Some(modalities))
     }
-
-    fn config(self) -> Config {
-        Config {
-            default_model_id: self.model_id,
-            default_reasoning_effort: self.reasoning_effort,
-        }
-    }
-}
-
-async fn get_config(State(app): State<App>) -> Result<Json<Config>> {
-    app.db
-        .call(|s| Ok(Json(Selection::defaults(&s.conn)?.config())))
-        .await
-}
-
-async fn patch_config(State(app): State<App>, Json(fields): Document) -> Result<Json<Config>> {
-    let mut selection = Map::new();
-    for (key, value) in fields {
-        let field = match key.as_str() {
-            "default_model_id" => "model_id",
-            "default_reasoning_effort" => "reasoning_effort",
-            _ => return Err(Error::bad("unknown configuration field")),
-        };
-        selection.insert(field.into(), value);
-    }
-    if selection.is_empty() {
-        return Err(Error::bad("expected configuration fields"));
-    }
-    app.db
-        .call(move |s| {
-            let next = Selection::defaults(&s.conn)?.apply(selection)?;
-            next.validate(&s.conn)?;
-            s.conn.execute(
-                "UPDATE config SET default_model_id=?, default_reasoning_effort=? WHERE id=1",
-                params![next.model_id, next.reasoning_effort],
-            )?;
-            Ok(Json(next.config()))
-        })
-        .await
 }
 
 fn extract_title(fields: &mut Map<String, Value>) -> Result<Option<String>> {
@@ -203,13 +150,26 @@ async fn create_session(
         .db
         .write(
             move |conn| {
-                let next = Selection::defaults(conn)?.apply(fields)?;
+                let next = Selection {
+                    model_id: None,
+                    reasoning_effort: None,
+                }
+                .apply(fields)?;
                 next.validate(conn)?;
                 let id = SessionId::new()?;
                 let now = chrono::Utc::now().timestamp_millis();
                 conn.execute(
                     "INSERT INTO sessions(id,title,created_at,updated_at,model_id,reasoning_effort) VALUES(?,?,?,?,?,?)",
                     params![id, title, now, now, next.model_id, next.reasoning_effort],
+                )?;
+                crate::cluster::ledger::record_session_delta(
+                    conn,
+                    id,
+                    "session_delta",
+                    &[],
+                    Vec::new(),
+                    Vec::new(),
+                    true,
                 )?;
                 session(conn, id)
             },
@@ -234,6 +194,7 @@ async fn patch_session(
     if fields.is_empty() {
         return Err(Error::bad("expected session settings"));
     }
+    app.cluster.ensure_session_watched(sid).await?;
     let title = extract_title(&mut fields)?;
     app.db
         .write(
@@ -267,6 +228,15 @@ async fn patch_session(
                     "UPDATE sessions SET model_id=?,reasoning_effort=?,title=coalesce(?,title),updated_at=? WHERE id=?",
                     params![next.model_id, next.reasoning_effort, title, now, sid],
                 )?;
+                crate::cluster::ledger::record_session_delta(
+                    conn,
+                    sid,
+                    "session_delta",
+                    &[],
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                )?;
                 session(conn, sid)
             },
             move |s, updated| {
@@ -285,6 +255,7 @@ async fn delete_session(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
 ) -> Result<StatusCode> {
+    app.cluster.ensure_session_watched(sid).await?;
     app.db
         .call(move |s| {
             let current = session(&s.conn, sid)?;
@@ -297,6 +268,12 @@ async fn delete_session(
                 ));
             }
             let tx = s.conn.transaction()?;
+            crate::cluster::ledger::assert_no_conflict(&tx, sid.as_str())?;
+            let detached_calls = {
+                let mut stmt = tx.prepare("SELECT id FROM llm_calls WHERE session_id=? ORDER BY id")?;
+                stmt.query_map([sid], |r| r.get::<_, crate::id::CallId>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
             tx.execute("DELETE FROM context_items WHERE session_id=?", [sid])?;
             tx.execute(
                 "DELETE FROM invalidated_warnings WHERE item_id IN (SELECT id FROM items WHERE session_id=?)",
@@ -308,7 +285,11 @@ async fn delete_session(
             )?;
             tx.execute("DELETE FROM items WHERE session_id=?", [sid])?;
             tx.execute("UPDATE llm_calls SET session_id=NULL WHERE session_id=?", [sid])?;
+            for cid in detached_calls {
+                crate::cluster::ledger::record_call(&tx, cid)?;
+            }
             tx.execute("DELETE FROM sessions WHERE id=?", [sid])?;
+            crate::cluster::ledger::record_session_deleted(&tx, sid)?;
             tx.commit()?;
             s.mcp.forget_session(sid);
             s.channels.remove(&sid);
@@ -383,6 +364,7 @@ async fn enqueue(
     headers: HeaderMap,
     Json(message): Json<Message>,
 ) -> Result<(StatusCode, Json<MessageId>)> {
+    app.cluster.ensure_session_watched(sid).await?;
     let mut keys = headers.get_all("idempotency-key").iter();
     let key = keys
         .next()
@@ -458,6 +440,7 @@ async fn messages(
     ) {
         return Err(Error::bad("unknown message status"));
     }
+    app.cluster.ensure_session_watched(sid).await?;
     app.db
         .call(move |s| {
             session(&s.conn, sid)?;
@@ -489,6 +472,7 @@ async fn withdraw(
     State(app): State<App>,
     Path((sid, mid)): Path<(SessionId, ItemId)>,
 ) -> Result<StatusCode> {
+    app.cluster.ensure_session_watched(sid).await?;
     app.db
         .call(move |s| {
             let sql = "SELECT EXISTS(SELECT 1 FROM items WHERE kind='withdrawal' AND target_id=?2),
@@ -502,6 +486,15 @@ async fn withdraw(
             }
             if !withdrawn {
                 let id = store::add_item(&s.conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
+                crate::cluster::ledger::record_session_delta(
+                    &s.conn,
+                    sid,
+                    "session_delta",
+                    &[id],
+                    Vec::new(),
+                    Vec::new(),
+                    false,
+                )?;
                 s.item_saved(sid, id)?;
             }
             Ok(StatusCode::NO_CONTENT)
@@ -561,6 +554,7 @@ async fn history(
         page.tail,
         page.limit,
     )?;
+    app.cluster.ensure_session_watched(sid).await?;
     let range = app
         .db
         .call(move |s| {
@@ -597,6 +591,7 @@ async fn context(
             "expected after >= 0, before > 0, and limit 1..200",
         ));
     }
+    app.cluster.ensure_session_watched(sid).await?;
     let range = app
         .db
         .call(move |s| {

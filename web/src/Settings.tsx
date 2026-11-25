@@ -5,9 +5,11 @@ import { formatRelTimeLoc, statusText, useI18n } from "./i18n.ts";
 import type { LocalePref } from "./i18n.ts";
 import { Icon } from "./Icons.tsx";
 import { buildMcpPayload, createMcpForm } from "./state.ts";
+import { CopyBtn } from "./Timeline.tsx";
 import type {
-  AppConfig,
   CallsSummary,
+  ClusterStatus,
+  ClusterSyncSummary,
   LlmCallInfo,
   McpFormState,
   McpOAuthAction,
@@ -21,6 +23,7 @@ import type {
   ModelInfo,
   ProviderInfo,
   SessionInfo,
+  SyncConflictInfo,
   ThemePref,
 } from "./types.ts";
 
@@ -43,12 +46,10 @@ interface ModelFormState {
 }
 
 function ModelsTab({
-  config,
   providers,
   models,
   onRefresh,
 }: {
-  config: AppConfig | null;
   providers: ProviderInfo[];
   models: ModelInfo[];
   onRefresh: () => Promise<void>;
@@ -62,8 +63,6 @@ function ModelsTab({
   const providersById = useMemo(() => new Map(providers.map((p) => [p.id, p])), [providers]);
   const visibleProviders = showArchived ? providers : providers.filter((p) => !p.archived_at);
   const visibleModels = showArchived ? models : models.filter((m) => !m.archived_at && !m.provider_archived_at);
-  const availableModels = models.filter((m) => !m.archived_at && !m.provider_archived_at);
-  const selectedDefault = models.find((m) => m.id === config?.default_model_id);
 
   const run = async (fn: () => Promise<void>) => {
     setErr("");
@@ -74,9 +73,6 @@ function ModelsTab({
       setErr(errorMessage(e));
     }
   };
-
-  const saveDefault = (patch: Partial<AppConfig>) =>
-    run(() => apiFetch("/config", { method: "PATCH", body: patch }).then(() => undefined));
 
   const saveProvider = (e: TargetedSubmitEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -129,59 +125,20 @@ function ModelsTab({
 
       <section class="panel">
         <div class="panel-head">
-          <h4>{t("Default Selection")}</h4>
-          <label class="check-row">
-            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.currentTarget.checked)} />
-            {t("Show archived")}
-          </label>
-        </div>
-        <div class="grid-2">
-          <label class="field">
-            <span>{t("Default Model")}</span>
-            <select
-              value={config?.default_model_id ?? ""}
-              onChange={(e) =>
-                void saveDefault({
-                  default_model_id: e.currentTarget.value || null,
-                })
-              }
-            >
-              <option value="">{t("None")}</option>
-              {availableModels.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.model_key} ({m.id})
-                </option>
-              ))}
-            </select>
-          </label>
-          <label class="field">
-            <span>{t("Default Effort")}</span>
-            <select
-              disabled={!selectedDefault || selectedDefault.reasoning_efforts.length === 0}
-              value={config?.default_reasoning_effort ?? ""}
-              onChange={(e) =>
-                void saveDefault({ default_reasoning_effort: e.currentTarget.value || null })
-              }
-            >
-              <option value="">{t("Default")}</option>
-              {(selectedDefault?.reasoning_efforts || []).map((ef) => (
-                <option key={ef} value={ef}>{ef}</option>
-              ))}
-            </select>
-          </label>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
           <h4>{t("Providers")}</h4>
-          <button
-            type="button"
-            class="btn-ghost btn-xs"
-            onClick={() => setProvForm({ id: null, name: "", base_url: "", api_key: "", clearKey: false })}
-          >
-            {t("+ Provider")}
-          </button>
+          <div class="row gap-2">
+            <label class="check-row">
+              <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.currentTarget.checked)} />
+              {t("Show archived")}
+            </label>
+            <button
+              type="button"
+              class="btn-ghost btn-xs"
+              onClick={() => setProvForm({ id: null, name: "", base_url: "", api_key: "", clearKey: false })}
+            >
+              {t("+ Provider")}
+            </button>
+          </div>
         </div>
         {provForm && (
           <form class="form-box" onSubmit={saveProvider}>
@@ -370,7 +327,7 @@ function ModelsTab({
   );
 }
 
-function McpTab() {
+function McpTab({ refreshNonce }: { refreshNonce: number }) {
   const { t } = useI18n();
   const [servers, setServers] = useState<McpServerInfo[]>([]);
   const [oauth, setOauth] = useState<Record<string, string>>({});
@@ -404,7 +361,7 @@ function McpTab() {
 
   useEffect(() => {
     load().catch((e) => setErr(errorMessage(e)));
-  }, []);
+  }, [refreshNonce]);
 
   const run = async (fn: () => Promise<void>) => {
     setErr("");
@@ -672,10 +629,21 @@ function McpTab() {
             </div>
           )}
 
-          <label class="check-row">
-            <input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.currentTarget.checked })} />
-            {t("Enabled")}
-          </label>
+          <div class="row gap-2">
+            <label class="check-row">
+              <input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.currentTarget.checked })} />
+              {t("Enabled")}
+            </label>
+            <label class="check-row">
+              <input type="checkbox" checked={form.shared} onChange={(e) => setForm({ ...form, shared: e.currentTarget.checked })} />
+              {t("Sync across cluster")}
+            </label>
+          </div>
+          {form.orig?.shared && !form.shared && (
+            <div class="muted small">
+              {t("Disabling cluster sync detaches this server into a new local copy and removes the old shared server from other nodes.")}
+            </div>
+          )}
           <div class="row gap-1">
             <button type="submit" class="btn-primary btn-xs">{t("Save")}</button>
             <button type="button" class="btn-ghost btn-xs" onClick={() => setForm(null)}>{t("Cancel")}</button>
@@ -696,6 +664,7 @@ function McpTab() {
               <div class="list-row">
                 <div>
                   <strong>{s.name}</strong> <span class="pill">{s.transport}</span>{" "}
+                  {s.shared && <span class="pill pill-succeeded">{t("shared")}</span>}{" "}
                   {!s.enabled && <span class="pill">{t("disabled")}</span>}
                   {s.allowed_tools !== null && (
                     <span class="pill">
@@ -998,13 +967,317 @@ function UsageTab({
   );
 }
 
-export type SettingsTabId = "models" | "mcp" | "usage" | "general";
+function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
+  const { locale, t } = useI18n();
+  const [status, setStatus] = useState<ClusterStatus | null>(null);
+  const [conflicts, setConflicts] = useState<SyncConflictInfo[]>([]);
+  const [selfName, setSelfName] = useState("");
+  const [selfDesc, setSelfDesc] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
+  const [joinInvite, setJoinInvite] = useState("");
+  const [busySync, setBusySync] = useState(false);
+  const [busyJoin, setBusyJoin] = useState(false);
+  const [resolvingId, setResolvingId] = useState<string | null>(null);
+  const [confirmPeerId, setConfirmPeerId] = useState<string | null>(null);
+  const [notice, setNotice] = useState("");
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (confirmPeerId == null) return;
+    const tmr = setTimeout(() => setConfirmPeerId(null), 3000);
+    return () => clearTimeout(tmr);
+  }, [confirmPeerId]);
+
+  const load = async () => {
+    const [st, confs] = await Promise.all([
+      apiFetch<ClusterStatus>("/cluster"),
+      apiFetch<SyncConflictInfo[]>("/cluster/conflicts"),
+    ]);
+    setStatus(st);
+    setSelfName(st.self.name);
+    setSelfDesc(st.self.description);
+    setConflicts(confs);
+  };
+
+  useEffect(() => {
+    load().catch((e) => setErr(errorMessage(e)));
+  }, []);
+
+  const saveSelf = async (e: TargetedSubmitEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setErr("");
+    setNotice("");
+    try {
+      await apiFetch("/cluster/self", {
+        method: "PATCH",
+        body: { name: selfName, description: selfDesc },
+      });
+      await load();
+      onClusterChanged();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    }
+  };
+
+  const triggerSync = async () => {
+    setErr("");
+    setNotice("");
+    setBusySync(true);
+    try {
+      const res = await apiFetch<ClusterSyncSummary>("/cluster/sync", { method: "POST", body: {} });
+      setNotice(
+        `${t("Synced:")} ${res.peers_queried} ${t("peers queried")}, ${res.streams_updated} ${t("streams updated")}, ${res.conflicts} ${t("conflicts")}`
+      );
+      await load();
+      onClusterChanged();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setBusySync(false);
+    }
+  };
+
+  const generateInvite = async () => {
+    setErr("");
+    try {
+      const res = await apiFetch<{ invite: string }>("/cluster/invite", { method: "POST" });
+      setInviteCode(res.invite);
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    }
+  };
+
+  const submitJoin = async (e: TargetedSubmitEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const inv = joinInvite.trim();
+    if (!inv) return;
+    setErr("");
+    setNotice("");
+    setBusyJoin(true);
+    try {
+      const res = await apiFetch<{ joined: boolean; peer: { name: string; node_id: string } }>("/cluster/join", {
+        method: "POST",
+        body: { invite: inv },
+      });
+      setJoinInvite("");
+      setNotice(`${t("Joined cluster via")} ${res.peer.name || res.peer.node_id}`);
+      await load();
+      onClusterChanged();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setBusyJoin(false);
+    }
+  };
+
+  const resolveConflict = async (streamId: string, resolution: "local" | "cluster") => {
+    setErr("");
+    setNotice("");
+    setResolvingId(streamId);
+    try {
+      await apiFetch(`/cluster/conflicts/${encodeURIComponent(streamId)}/resolve`, {
+        method: "POST",
+        body: { resolution },
+      });
+      await load();
+      onClusterChanged();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setResolvingId(null);
+    }
+  };
+
+  const removePeer = async (nodeId: string) => {
+    setErr("");
+    try {
+      await apiFetch(`/cluster/peers/${encodeURIComponent(nodeId)}`, { method: "DELETE" });
+      await load();
+      onClusterChanged();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    }
+  };
+
+  return (
+    <div class="tab-stack">
+      {err && <div class="err-inline">{err}</div>}
+      {notice && <div class="probe-box probe-ok small">{notice}</div>}
+
+      <section class="panel">
+        <div class="panel-head">
+          <div class="row gap-1">
+            <h4>{t("This Node")}</h4>
+            {status?.self.local_only && <span class="pill">{t("Local-only")}</span>}
+          </div>
+          <div class="row gap-1">
+            <button type="button" class="btn-ghost btn-xs" disabled={busySync} onClick={triggerSync}>
+              <Icon n="refresh" s={12} />
+              <span>{busySync ? t("Syncing…") : t("Sync Now")}</span>
+            </button>
+          </div>
+        </div>
+        {status && (
+          <>
+            <div class="row gap-2 small">
+              <span class="muted">{t("Node ID")}:</span>
+              <code class="md-inline-code mono truncate" style="max-width:440px">{status.self.node_id}</code>
+              <CopyBtn text={status.self.node_id} />
+              <span class="pill mono">{status.self.os}/{status.self.arch}</span>
+            </div>
+            <form class="form-box" onSubmit={saveSelf}>
+              <div class="grid-2">
+                <label class="field">
+                  <span>{t("Name")}</span>
+                  <input value={selfName} onInput={(e) => setSelfName(e.currentTarget.value)} />
+                </label>
+                <label class="field">
+                  <span>{t("Description")}</span>
+                  <input value={selfDesc} onInput={(e) => setSelfDesc(e.currentTarget.value)} />
+                </label>
+              </div>
+              <div class="row gap-1">
+                <button type="submit" class="btn-primary btn-xs">{t("Save")}</button>
+              </div>
+            </form>
+          </>
+        )}
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h4>{t("Peers & Join")}</h4>
+          <button type="button" class="btn-ghost btn-xs" onClick={generateInvite}>
+            {t("Generate Invite")}
+          </button>
+        </div>
+        {inviteCode && (
+          <div class="form-box">
+            <div class="row gap-1" style="justify-content:space-between">
+              <span class="small muted">{t("Invite code")}</span>
+              <CopyBtn text={inviteCode} label={t("Copy")} />
+            </div>
+            <textarea rows={2} readOnly class="mono small" value={inviteCode} />
+          </div>
+        )}
+        <form class="row gap-1" onSubmit={submitJoin}>
+          <input
+            style="flex:1"
+            placeholder={t("Paste invite code…")}
+            value={joinInvite}
+            onInput={(e) => setJoinInvite(e.currentTarget.value)}
+          />
+          <button type="submit" class="btn-primary btn-xs" disabled={busyJoin || !joinInvite.trim()}>
+            {busyJoin ? t("Joining…") : t("Join")}
+          </button>
+        </form>
+        <div class="item-list">
+          {(!status || status.peers.length === 0) && (
+            <div class="empty-hint small">
+              {t("No peers registered yet. Generate an invite or join an existing cluster.")}
+            </div>
+          )}
+          {(status?.peers || []).map((p) => {
+            const confirming = confirmPeerId === p.node_id;
+            return (
+              <div key={p.node_id} class="list-row">
+                <div style="min-width:0">
+                  <div class="row gap-1" style="flex-wrap:wrap">
+                    <strong>{p.name || p.node_id.slice(0, 12)}</strong>
+                    <span class={`pill ${p.online ? "pill-succeeded" : ""}`}>
+                      {p.online ? t("online") : t("offline")}
+                    </span>
+                    <span class="pill mono">{p.os}/{p.arch}</span>
+                  </div>
+                  <div class="row gap-1 muted small">
+                    <span class="mono">{p.node_id.slice(0, 16)}…</span>
+                    <CopyBtn text={p.node_id} />
+                    {p.description && <span>· {p.description}</span>}
+                    {p.last_seen_at > 0 && <span>· {formatRelTimeLoc(p.last_seen_at, locale)}</span>}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="btn-danger btn-xs"
+                  onClick={() => {
+                    if (confirming) {
+                      setConfirmPeerId(null);
+                      void removePeer(p.node_id);
+                    } else {
+                      setConfirmPeerId(p.node_id);
+                    }
+                  }}
+                >
+                  {confirming ? t("Confirm?") : t("Remove")}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div class="row gap-1">
+            <h4>{t("Sync Conflicts")}</h4>
+            {conflicts.length > 0 && <span class="pill pill-failed">{conflicts.length}</span>}
+          </div>
+        </div>
+        <div class="item-list">
+          {conflicts.length === 0 && (
+            <div class="empty-hint small">{t("No sync conflicts.")}</div>
+          )}
+          {conflicts.map((c) => {
+            const busy = resolvingId === c.stream_id;
+            return (
+              <div key={c.stream_id} class="form-box">
+                <div class="row gap-1" style="justify-content:space-between;flex-wrap:wrap">
+                  <div class="row gap-1" style="flex-wrap:wrap">
+                    <span class="pill">{c.kind}</span>
+                    <strong class="mono small">{c.stream_id}</strong>
+                    <span class="pill pill-failed">{c.reason}</span>
+                  </div>
+                  <span class="muted small">{formatRelTimeLoc(c.detected_at, locale)}</span>
+                </div>
+                <div class="small mono muted">
+                  {t("Local")}: epoch={c.local_epoch} seq={c.local_seq} ({c.local_hash_hex.slice(0, 10)}) ·{" "}
+                  {t("Cluster")}: epoch={c.remote_epoch} seq={c.remote_seq} ({c.remote_hash_hex.slice(0, 10)}) via{" "}
+                  {c.remote_node_id.slice(0, 12)}…
+                </div>
+                <div class="row gap-1">
+                  <button
+                    type="button"
+                    class="btn-primary btn-xs"
+                    disabled={busy}
+                    onClick={() => void resolveConflict(c.stream_id, "local")}
+                  >
+                    {busy ? t("Resolving…") : t("Keep Local (Force Push)")}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-danger btn-xs"
+                    disabled={busy}
+                    onClick={() => void resolveConflict(c.stream_id, "cluster")}
+                  >
+                    {busy ? t("Resolving…") : t("Use Cluster (Overwrite)")}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+export type SettingsTabId = "models" | "mcp" | "cluster" | "usage" | "general";
 
 export interface SettingsProps {
-  config: AppConfig | null;
   providers: ProviderInfo[];
   models: ModelInfo[];
   sessions: SessionInfo[];
+  mcpRefreshNonce: number;
   themePref: ThemePref;
   localePref: LocalePref;
   initialTab?: SettingsTabId;
@@ -1012,15 +1285,16 @@ export interface SettingsProps {
   onSetThemePref: (pref: ThemePref) => void;
   onSetLocalePref: (pref: LocalePref) => void;
   onRefreshCatalog: () => Promise<void>;
+  onClusterChanged: () => void;
   onSignOut: () => void;
   onClose: () => void;
 }
 
 export function Settings({
-  config,
   providers,
   models,
   sessions,
+  mcpRefreshNonce,
   themePref,
   localePref,
   initialTab,
@@ -1028,6 +1302,7 @@ export function Settings({
   onSetThemePref,
   onSetLocalePref,
   onRefreshCatalog,
+  onClusterChanged,
   onSignOut,
   onClose,
 }: SettingsProps) {
@@ -1045,6 +1320,7 @@ export function Settings({
   const tabs = [
     { id: "models" as const, label: t("Models"), icon: "sliders" as const },
     { id: "mcp" as const, label: t("MCP"), icon: "plug" as const },
+    { id: "cluster" as const, label: t("Cluster"), icon: "globe" as const },
     { id: "usage" as const, label: t("Usage"), icon: "chart" as const },
     { id: "general" as const, label: t("General"), icon: "settings" as const },
   ];
@@ -1072,9 +1348,10 @@ export function Settings({
         </div>
         <div class="modal-body">
           {tab === "models" && (
-            <ModelsTab config={config} providers={providers} models={models} onRefresh={onRefreshCatalog} />
+            <ModelsTab providers={providers} models={models} onRefresh={onRefreshCatalog} />
           )}
-          {tab === "mcp" && <McpTab />}
+          {tab === "mcp" && <McpTab refreshNonce={mcpRefreshNonce} />}
+          {tab === "cluster" && <ClusterTab onClusterChanged={onClusterChanged} />}
           {tab === "usage" && (
             <UsageTab models={models} sessions={sessions} initialSessionId={initialSessionFilter} />
           )}

@@ -26,9 +26,54 @@ export interface SessionDeletedEvent {
   id: string;
 }
 
-export interface AppConfig {
-  default_model_id: string | null;
-  default_reasoning_effort: string | null;
+export interface SelfNodeStatus {
+  node_id: string;
+  name: string;
+  description: string;
+  os: string;
+  arch: string;
+  meta_seq: number;
+  addrs: string[];
+  local_only: boolean;
+}
+
+export interface ClusterPeerView {
+  node_id: string;
+  name: string;
+  description: string;
+  os: string;
+  arch: string;
+  meta_seq: number;
+  addrs: string[];
+  last_seen_at: number;
+  online: boolean;
+}
+
+export interface ClusterStatus {
+  self: SelfNodeStatus;
+  peers: ClusterPeerView[];
+  conflict_count: number;
+}
+
+export interface ClusterSyncSummary {
+  peers_queried: number;
+  streams_updated: number;
+  conflicts: number;
+}
+
+export interface SyncConflictInfo {
+  stream_id: string;
+  kind: "provider" | "model" | "mcp" | "call" | "session";
+  local_epoch: number;
+  local_seq: number;
+  local_hash_hex: string;
+  remote_epoch: number;
+  remote_seq: number;
+  remote_hash_hex: string;
+  remote_node_id: string;
+  reason: string;
+  remote_snapshot: Record<string, unknown> | null;
+  detected_at: number;
 }
 
 export interface ProviderInfo {
@@ -61,6 +106,7 @@ export interface McpServerInfo {
   name: string;
   description: string;
   enabled: boolean;
+  shared: boolean;
   transport: McpTransport;
   url: string | null;
   has_url_query: boolean;
@@ -81,6 +127,7 @@ export interface McpFormState {
   name: string;
   description: string;
   enabled: boolean;
+  shared: boolean;
   transport: McpTransport;
   url: string;
   replaceUrl: boolean;

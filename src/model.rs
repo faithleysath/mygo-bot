@@ -420,14 +420,24 @@ impl App {
                             }
                             return Ok(None);
                         }
-                        Ok(Some(store::add_item(
+                        let id = store::add_item(
                             conn,
                             sid,
                             "function_call",
                             &item,
                             None,
                             Some(llm_call_id),
-                        )?))
+                        )?;
+                        crate::cluster::ledger::record_session_delta(
+                            conn,
+                            sid,
+                            "session_delta",
+                            &[id],
+                            Vec::new(),
+                            Vec::new(),
+                            false,
+                        )?;
+                        Ok(Some(id))
                     },
                     move |s, id| {
                         if let Some(id) = id {
