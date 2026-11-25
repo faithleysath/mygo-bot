@@ -11,8 +11,8 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 在使用之前，先理清配置和会话的上下游关系（详见 [第 3 篇](03-catalog-media-and-billing.md)）：
 
 - **供应商与模型目录（`llm_providers` 与 `llm_models`）**：模型的上游地址 `base_url`、密钥 `api_key`、模型代号 `model_key`、上下文窗口大小、支持的输入模态（`text`、`image`、`audio`、`video`）、推理强度档位以及价格表，都登记在独立的目录表里。
-- **不再维护全局默认表 `config`**：为了免去多节点同步全局配置的耦合与状态同步包袱，系统直接移除全局 `config` 表，新建会话改为显式选模：调 `POST /sessions` 时可以直接传入 `model_id` 和 `reasoning_effort`，不传的话新建出的 `sessions` 行里 `model_id` 暂时是 `null`；WebUI 会在浏览器 `localStorage` 里记住上次使用的模型和推理强度，方便你下次一点就用上；已有会话随时可以通过 `PATCH /sessions/{sid}` 单独调整。
-- **什么时候必须有可用模型**：建空会话时 `model_id` 可以暂时是空的；但真想往会话里投信（`POST /sessions/{sid}/messages`）或者点火开工（`PUT /sessions/{sid}/run`），会话必须已经选定一个**可用**（自己和所属供应商都没有被归档）的模型。发给上游时，除了在 `input` 最前面实时拼入一条静态英文 `role: "developer"` 指南消息（位于 [src/model.rs](../src/model.rs#L55-L107)；内含编译期静态写入的宿主 OS/架构，不含动态环境信息、不写进流水账，同时可稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
+- **不再维护全局默认表 `config`**：为了免去多节点同步全局配置的耦合与状态同步包袱，系统直接移除全局 `config` 表，改为在建会话时显式选模：数据库里 `sessions.model_id` 是 `NOT NULL`，调 `POST /sessions` **必须传入**一个当前可用（自己和所属供应商都没有被归档）的 `model_id`（缺省或传 `null` 直接返 `400`），可选再带上该模型支持的 `reasoning_effort`；WebUI 会在浏览器 `localStorage` 里记住上次使用的模型并自动回落到首个可用模型（若尚无可用模型则弹窗引导先添加），已有会话随时可以通过 `PATCH /sessions/{sid}` 改换别的有效模型，但不允许把 `model_id` 改回 `null`。
+- **发给上游的静态前缀**：会话跑起来发请求时，除了在 `input` 最前面实时拼入一条静态英文 `role: "developer"` 指南消息（位于 [src/model.rs](../src/model.rs#L55-L107)；内含编译期静态写入的宿主 OS/架构，不含动态环境信息、不写进流水账，同时可稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
 
 ---
 
@@ -123,9 +123,9 @@ stateDiagram-v2
     pausing --> paused: "进程崩溃重启（标 daemon restarted）"
 ```
 
-每个活动会话在内存里都挂着一对取消令牌 `Control { soft, hard }`：
+每个活动会话在内存里都挂着一份控制句柄 `Control { soft, hard, epoch }`（其中的 `epoch` 钉住开跑时的同步纪元，万一运行半途被集群高 `epoch` 覆盖或删会话，旧循环会检测到纪元失效并自动退出，绝不会把旧分支的尾账写进新历史）：
 
-- **软暂停（`DELETE /sessions/{sid}/run` 或 `?mode=soft`）**：只拉响 `soft` 令牌，把数据库状态改成 `pausing`。正在跑的这趟模型流和已经派出去的工具照常跑完、结果照常归档；只等这个 `step` 收完尾，循环看见 `soft` 已取消，就不再开下一步，把会话落成 `paused`（注意：如果是连发两次软暂停，因为 `soft` 已经拉响，不会重复发通知，意思依然是“做完这步就停”）。如果会话本来就没在跑，软暂停也会直接落成 `paused`。
+- **软暂停（`DELETE /sessions/{sid}/run` 或 `?mode=soft`）**：如果本机还只是未拉正文的目录节点，入口先调 `ensure_session_watched` 把完整正文拉齐才准开改账本。真要发暂停时，先把数据库状态提交为 `pausing`（写库失败则直接回滚，绝不半途误触取消），再拉响 `soft` 令牌。正在跑的这趟模型流和已经派出去的工具照常跑完、结果照常归档；只等这个 `step` 收完尾，循环看见 `soft` 已取消，就不再开下一步，把会话落成 `paused`（注意：如果是连发两次软暂停，因为 `soft` 已经拉响，不会重复发通知，意思依然是“做完这步就停”）。如果会话本来就没在跑，软暂停也会直接落成 `paused`。
 - **硬暂停（`DELETE /sessions/{sid}/run?mode=hard`）**：同时拉响 `soft` 和 `hard`（并顺手把该会话名下所有 `codemode` 任务按 `killed` 拉闸，见 [第 5 篇](05-codemode-lifecycle.md)）。模型请求流被 `tokio::select!` 当场掐断，正在跑的工具和等待器立刻松手。**硬暂停认的保存边界是 `item` 而不是 `step`**：
   - 流到一半还没凑齐的文本、思考碎片或半截工具参数，直接清草稿丢掉；
   - 已经拼完整并落库的 `item` 全都留着；
@@ -158,13 +158,13 @@ stateDiagram-v2
 2. 5 秒后如果还有会话或前台脚本没退完，立刻切第二步：把剩下的所有任务和会话全部按**硬暂停**掐断，再等最多 **5 秒**让工作协程把进程组和工具账结清；
 3. 最后关闭全部 MCP 连接；外层 HTTP 服务器还有 **6 秒**宽限排空在途请求，Tokio 运行时离开前再兜底等 **1 秒**（专门防挂在无响应网络磁盘上的阻塞文件读写拖死进程退出）。
 
-### 3. 崩溃恢复与 Schema 守门（`src/store.rs:76-141` + `src/codemode/ledger.rs:306-400`）
+### 3. 崩溃恢复与 Schema 守门（`src/store.rs:80-150` + `src/codemode/ledger.rs:343-475`）
 
 **崩溃恢复专门拿来跟硬暂停做对照：硬暂停是程序还醒着，能自己把残局结清；`SIGKILL` 强杀或直接断电，是连最后一次结账的机会都没给。**
 
 所以进程重新拉起、打开数据库 `Db::open` 时，只认 SQLite WAL 最后一次提交的事务，在一个启动事务里做三件事：
-1. **验库、对齐时钟水位与认领本机身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 `3`，紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L100-L109)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`（详见 [第 2 篇](02-storage-and-concurrency.md)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
-2. **只按本机身份截停状态**：只把最新同步提交归属本机（`author_node_id == local_node_id`）且仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`），把本机原先是 `'running'` 或 `'pausing'` 的会话统一标成 `'paused'`，同时交给 `codemode::ledger::recover` 也按本机作者过滤后处理未结清的后台任务与过期租期提醒（详见 [第 5 篇](05-codemode-lifecycle.md)）——免得把从集群其它节点同步过来的活动任务误判成本机崩溃残局；所有恢复变动都会顺手补记同步提交，让集群同伴看到一致状态。
+1. **验库、对齐时钟水位与认领本机身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 `4`，紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L111)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`（详见 [第 2 篇](02-storage-and-concurrency.md)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
+2. **只按源节点 `origin_node_id` 截停状态**：建表时每行 `llm_calls` 和 `items` 都记录着写下这行原始数据的 `origin_node_id`。启动恢复只把 `origin_node_id == local_node_id` 且仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`），把本机原先是 `'running'` 或 `'pausing'` 的会话统一标成 `'paused'`，同时交给 `codemode::ledger::recover` 也按 `origin_node_id` 过滤后处理未结清的后台任务与过期租期提醒（详见 [第 5 篇](05-codemode-lifecycle.md)）——既不会从旧提交 JSON 里误扫出别的节点的任务，也绝不会越权修改冲突未决或只有半份目录头的远端会话；恢复动作仅在对本机无冲突且可写完整的流上才补记同步提交，让集群同伴看到一致状态。
 3. **等人工重开才补未果工具**：注意启动恢复时**绝不会擅自重跑上次没回来的普通工具调用**——因为账上没记 `function_call_output`，只说明**结果没落盘**，推不出**工具当时没执行过**（比如发邮件、扣款）。重启后这些工具的空缺先留着，等你下次手动调 `PUT /sessions/{sid}/run` 恢复会话时，程序再翻流水账收残局，调用 `publish_tools(..., recovering=true)` 补上 `"Execution interrupted; result unknown."`。补齐残局后要不要接着问模型，又稳稳地回到前面那两个书签：先看 `needs_model`，再看 `pending` 队列，有活接着跑，没活切回 `idle`。
 
 ---

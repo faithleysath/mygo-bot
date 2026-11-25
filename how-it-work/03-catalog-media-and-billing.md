@@ -36,8 +36,8 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 | 铁门 | 在哪拦截 | 它只管哪件事、省掉会漏掉什么 |
 | :--- | :--- | :--- |
 | **1. 跑过一次就锁死身份** | `PATCH /models/{id}`<br>（`Model::check_update`） | 只要 `llm_calls` 里已经记过哪怕一笔调用，该模型的 `provider_id` 和 `model_key` 就永久锁死不可改（返 `409`）。省掉它，改一下 `model_key` 就会把昨天跑旧模型的花费算到新模型头上。 |
-| **2. 缩减能力先扫所有相关会话** | `PATCH /models/{id}`<br>（`Model::check_update`） | 想从模型里删掉某个 `reasoning_effort` 或某项 `input_modality`？先扫描所有正在使用该模型的现有会话——只要有人选了被删的档位，或者会话历史/队列里存了被删的媒体类型，立刻返 `409` 拦下。 |
-| **3. 换会话模型先查历史媒体** | `PATCH /sessions/{sid}` | 给会话切换 `model_id` 时必跑 `media::check_session` 验光全部现有媒体是否被新模型支持（仅凭 `attachments` 元数据里的 `mime_type` 就能判断，不用把远端附件大文件先拉下来）；而且**只有完全空的会话**（上下文、排队队列、工具调用全为空）才允许把 `model_id` 改回 `null`（传 `model_id: null` 时自动联动清空 `reasoning_effort`）。 |
+| **2. 缩减能力先扫所有相关会话** | `PATCH /models/{id}`<br>（`Model::check_update`） | 想从模型里删掉某个 `reasoning_effort` 或某项 `input_modality`？先扫描所有正在使用该模型的现有会话：对本地已完整同步正文（或无集群记录）的会话跑 `media::check_session` 逐项验光；对只留有目录头的未 Watch 会话，直接核对目录头里 `SessionSnapshot.required_modalities`（若缺失该快照或仍包含被删模态，同样返 `409` 拦下，无需先拉全本对话正文）。 |
+| **3. 换会话模型先查历史媒体** | `PATCH /sessions/{sid}` | 由于数据库里 `sessions.model_id` 是 `NOT NULL`，给会话切换模型时（入口先 `ensure_session_watched(sid)` 拉齐正文）必跑 `media::check_session` 验光全部现有媒体是否被新模型支持（仅凭 `attachments` 元数据里的 `mime_type` 就能判断，不用把远端附件大文件先拉下来）；而且**任何情况下都不再允许传 `model_id: null`**（传 `null` 直接返 `400`）。 |
 | **4. 归档供应商拒绝挂新模型** | `POST /models` / `PATCH /models/{id}` | 不能往已归档的供应商下面添新模型或把模型挪过去（返 `409`）。同时针对单个会话的 `Selection` 配置，没选模型时一律不准单填 `reasoning_effort`。 |
 
 ---
@@ -49,7 +49,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 1. **上传、内容寻址与下载防线**：
    - 客户端先调 `POST /attachments`，Body 直接传原始二进制（上限 **50 MiB**），请求头必须带单个具体、无 `*` 通配符的 `image/*`、`audio/*` 或 `video/*` `Content-Type`。落库时同步算好 32 字节 BLAKE3 **`content_hash`** 与 **`byte_len`**，拿到 `att_<26位后缀>` 格式的 TypeID；
    - 表里的 **`data` 列是可空的**：从其他集群节点 Watch 同步会话正文时，只先同步 `attachments` 的轻量元数据行（`id`、`mime_type`、`content_hash`、`byte_len`，此时 `data = NULL`），没点开、没重跑的媒体一字节都不浪费带宽；
-   - 一旦需要真正用到数据——无论用户在客户端或 WebUI 调 **`GET /attachments/{id}`**（触发 `ensure_attachment_data`），还是某节点准备发上游大模型前跑 `model::stream`（触发 `ensure_session_attachments`）——如果发现本地 `data IS NULL`：先顺着局部索引 `attachments_by_hash` 在本机找找有没有同 `content_hash` 的现成副本直接复用；本机没有，再像 BT 下载一样向所有在线且持有该 `content_hash` 的节点并发发起 **256 KiB 分块（`GetAttachmentChunk`）** 接力拉取，拼齐后整包核验 BLAKE3 `content_hash` 完全吻合才落盘；
+   - 一旦需要真正用到数据——无论用户在客户端或 WebUI 调 **`GET /attachments/{id}`**（触发 `ensure_attachment_data`），还是某节点准备发上游大模型前跑 `model::stream`（触发 `ensure_session_attachments`）——如果发现本地 `data IS NULL`：先顺着局部索引 `attachments_by_hash` 在本机找找有没有同 `content_hash` 的现成副本直接复用；本机没有，再像 BT 下载一样向所有在线且持有该 `content_hash` 的节点并发发起 **256 KiB 分块（`GetAttachmentChunk`）** 接力拉取（服务端通过 SQLite **`blob_open` 增量读取**只抠出请求的字节区间，无需整包读进堆内存；接收端在全局块预算内并行拉取后把拼装与 BLAKE3 整包哈希核验卸载到阻塞线程池），验证通过才落盘；
    - 下载接口 `GET /attachments/{id}` 会原样吐出存储的 `mime_type` 和字节流，但强制加上 `Content-Disposition: attachment` 和 `X-Content-Type-Options: nosniff`，防止浏览器把恶意文件当成同源网页或脚本执行。
 2. **轻量账本引用 vs 上游实时展开**：
    - 写进 `user_message`、`function_call_output` 或 `codemode_event` 的媒体块，只留一个干净的小指针：`{"type":"image","attachment_id":"att_<26位后缀>"}`。

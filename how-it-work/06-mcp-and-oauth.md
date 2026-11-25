@@ -122,8 +122,8 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 
 1. **SSRF 与重定向防火墙（`MetadataResolver`）**：发现元数据和动态注册都要按服务端吐出来的 URL 去发请求，绝不能被恶意服务端引去扫内网或云厂商元数据（`metadata.google.internal` 等）。所以自研 DNS 解析器会把所有 IP（包括 IPv4-mapped IPv6、NAT64、6to4 等变形地址）分类：链路本地/保留段一律死封；私网和回环地址**只有当管理员最初配的 MCP 地址本身就是私网字面 IP 或回环地址时才放行对应网段**；发现过程最多跟 10 跳**同源**重定向且严禁 HTTPS 降级为 HTTP。
 2. **用 `generation` 世代号和触发器锁死状态归属（`mcp_oauth` 表）**：每次发起新登录都发一块全新的 48 位十六进制随机 `generation` 牌子，且只有 `login` 接口允许往 `mcp_oauth` 插行，所有后续回调、刷新、标拒全都改成带 `WHERE server_id=? AND generation=?` 的 `UPDATE`——绝不允许一个半小时前超时掉队的回调或刷新任务把用户刚注销的账号悄悄插回数据库里！同时 `schema.sql` 里的触发器 **`invalidate_mcp_oauth`** 盯紧 `mcp_servers`：改 `description`/`enabled`/`allowed_tools`/`timeout_ms` 不影响已登录的 OAuth，但只要改了 `transport` 或 `config_json`（端点 URL、静态头、OAuth 配置），数据库当场自动删掉旧 OAuth 凭证。
-3. **跨取消的令牌轮换保护（`oauth/transport.rs`）**：很多 OAuth 服务启用了 **Refresh Token Rotation（每次刷新都把旧 `refresh_token` 作废、发个新的）**。要是把刷新 HTTP 请求直接跑在 MCP 工具的异步任务里，刚收到新令牌、还没来得及写进 SQLite，外层 MCP 调用恰巧超时被取消，新旧 `refresh_token` 就全毁了！所以 `acquire_token` 拿到同世代的 `gate` 锁之后，特意把 `acquire_valid_token` 放进一个**独立的 `tokio::spawn`（设 45 秒超时）**里跑完——哪怕外面那次 MCP 调用已经超时或被硬暂停取消，后台这趟刷新照样把轮换来的新令牌稳稳存进数据库，甚至就算期间有人顺手改了服务描述导致 `revision` 涨了，`save_credentials` 依然允许把轮换令牌存下，同时返回 `false` 通知老连接退场让新连接继承这枚珍贵的新令牌。
-4. **登出与远程撤销（`DELETE /oauth`、`oauth/revoke.rs`）**：点登出时，先按最多 5 秒等一把可能正在途的 `gate` 刷新任务，然后带 `generation` 校验删光本地 `mcp_oauth` 行并踢掉全部相关 MCP 连接；接着再走 Worker 任务按 **RFC 7009** 并行去授权服务器撤销 `refresh_token` 和 `access_token`（只认跟 `issuer` 或 `token_endpoint` 同源的撤销地址）。就算远端撤销失败或刚好撞上刷新超时，**绝不回滚本地已经完成的登出清理**，而是直接返回 `502 Bad Gateway` 提醒用户“本地凭据已清，请去授权方手动撤销授权”。
+3. **跨取消与冲突中保住轮换令牌（`oauth/transport.rs`、`oauth/storage.rs`）**：很多 OAuth 服务启用了 **Refresh Token Rotation（每次刷新都把旧 `refresh_token` 作废、发个新的）**。要是把刷新 HTTP 请求直接跑在 MCP 工具的异步任务里，刚收到新令牌、还没来得及写进 SQLite，外层 MCP 调用恰巧超时被取消，新旧 `refresh_token` 就全毁了！所以 `acquire_token` 拿到同世代的 `gate` 锁之后，特意把 `acquire_valid_token` 放进一个**独立的 `tokio::spawn`（设 45 秒超时）**里跑完——哪怕外面那次 MCP 调用已经超时或被硬暂停取消，后台这趟刷新照样把轮换来的新令牌稳稳存进数据库，甚至就算期间有人顺手改了服务描述导致 `revision` 涨了，`save_credentials` 依然允许把轮换令牌存下，同时返回 `false` 通知老连接退场让新连接继承这枚珍贵的新令牌。更进一步，万一网络刷新飞在半路时该共享 MCP 流恰好撞上集群分叉冲突，直接返 `409` 回滚就会白白吞掉单次有效的 `refresh_token`；此时 `save_credentials` 会先把轮换新凭据落进 **`mcp_oauth.staged_credentials`**（保留冲突冻结态），等后续选择保留本地（`resolve_conflict_local`）时再自动把暂存新凭据晋升成正式凭据发出，刷新绝不丢单。
+4. **登出与远程撤销（`DELETE /oauth`、`oauth/revoke.rs`）**：点登出时，先确认该共享服务没有未决同步冲突（有冲突则返 `409` 不动库），再按最多 5 秒等一把可能正在途的 `gate` 刷新任务，然后带 `generation` 校验删光本地 `mcp_oauth` 行并踢掉全部相关 MCP 连接；接着再走 Worker 任务按 **RFC 7009** 并行去授权服务器撤销 `refresh_token` 和 `access_token`（只认跟 `issuer` 或 `token_endpoint` 同源的撤销地址）。就算远端撤销失败或刚好撞上刷新超时，**绝不回滚本地已经完成的登出清理**，而是直接返回 `502 Bad Gateway` 提醒用户“本地凭据已清，请去授权方手动撤销授权”。
 
 ---
 
@@ -134,15 +134,15 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 1. **双态控制与 `pending` 登录态隔离（`src/cluster/ledger.rs`、`src/mcp/config.rs`）**：
    - `shared = false` 时，服务配置、修改与 OAuth 登录全部留在本机，不写任何集群提交；
    - `shared = true` 时，服务配置和已经进入终态（`credentials IS NOT NULL` 或 `rejected = 1`）的 `mcp_oauth` 记录一起打包进 `mcp_upsert` 提交实时同步全集群。**唯独进行中的 `pending` 登录态绝对不同步**——一次性 PKCE 挑战码和本地回调地址只属于发起登录的那一台机器。
-2. **共享切回私有的脱钩与永久墓碑（`true -> false`）**：
-   - 把一台共享服务关掉同步时，如果只在原行把 `shared` 改成 `0`、停止发送更新，其他节点手里还留着老配置，下次再改回来或同步对账时就会打架。所以当检测到 `shared` 从 `true` 切回 `false` 时，服务端在同一事务里执行两步动作：先把本机服务（含已存在的 OAuth 凭据）改用一枚**全新的本地 `McpServerId`**（`shared = 0`、`revision = 1`）克隆留下，同时往**旧 `McpServerId`** 的同步流写下一笔永久 **`mcp_delete` 墓碑**（`deleted = 1`）——在线同伴以及日后上线重连的离线同伴都会依墓碑删净旧副本，绝不会再反向复活。
-3. **回放次序与连接池热重置**：
-   - 远端回放 `mcp_upsert` 时，程序总是**先 upsert `mcp_servers`、再按需写入 `mcp_oauth`**——因为前面说过 `schema.sql` 挂了 `invalidate_mcp_oauth` 触发器，如果顺手先写了 OAuth 再更新服务传输配置，触发器就会把刚到手的有效凭据洗光；每次同步变更落盘后，记账员也会当场调用 `Connections::reset_server(id)` 清掉旧连接槽位，让后续工具调用立刻用上最新配置和令牌。
+2. **共享切回私有、删服的高 `epoch` 墓碑与清密（`true -> false` / `DELETE`）**：
+   - 把一台共享服务关掉同步或彻底删掉时，如果只追加一笔普通删除提交，旧 `sync_commits` 里依然残留着带 `url` 参数、`headers`、`env` 或 OAuth 凭据的历史快照，不但占着本地库，还会继续扩散给新上线节点。因此无论 `shared` 从 `true` 切回 `false` 还是直接删共享 MCP：服务端先把旧配置克隆为一枚**全新的本地 `McpServerId`**（`shared = 0`、`revision = 1`，**仅复制已授权/已拒的终态 OAuth，绝不带走 `pending` 登录态并清除暂存凭据**），同时把旧 `McpServerId` 流推进到**更高 `epoch`**，写入永久 **`mcp_delete` 墓碑（`deleted = 1, retired = 1`）并就地洗清旧 `sync_commits`**；在线与日后重连的同伴收到高 `epoch` 墓碑后，也会一并删净旧配置和旧历史提交里的全部敏感凭据，并锁死该 `stream_id` 永不复活。
+3. **回放次序与连接池精确热重置**：
+   - 远端回放 `mcp_upsert` 时，程序总是**先 upsert `mcp_servers`、再按需写入 `mcp_oauth`**——因为前面说过 `schema.sql` 挂了 `invalidate_mcp_oauth` 触发器，如果顺手先写了 OAuth 再更新服务传输配置，触发器就会把刚到手的有效凭据洗光；每次同步变更落盘后，记账员调用 `Connections::apply_sync_change(McpChange)` 清掉旧连接槽位，并**只在凭据或绑定确实发生变化（`cancel_login = true`）时**才取消本机登录监听，避免无辜元数据更新打断本机正在扫码/回调的登录窗口。
 4. **跨节点 OAuth 刷新协调（`coordinate_mcp_oauth_refresh`，`src/cluster/sync.rs`、`src/mcp/oauth/transport.rs`）**：
    - 前面讲过很多 OAuth 服务会开启 Refresh Token Rotation：多台节点手里拿着同一份同步来的 `refresh_token`，如果同一秒各自拿它去换新令牌，慢半拍的节点一定把令牌撞废！
-   - 当共享服务的令牌临近过期或遇 401 准备刷新时，本机先群发 `RpcReq::GetHeads` 询问所有在线同伴谁拿着这条非墓碑 `mcp_*` 流，然后按**字典序挑出在线最小 `node_id` 作为唯一协调者**：
+   - 当共享服务的令牌临近过期或遇 401 准备刷新时（若流本身已有冲突则当场返 `409` 阻止盲刷），本机先群发 `RpcReq::GetHeads` 询问所有在线同伴谁拿着这条非墓碑 `mcp_*` 流，然后按**字典序挑出在线最小 `node_id` 作为唯一协调者**：
      - 若最小节点就是本机（或没有其他在线同伴持有），直接本机刷新并写入同步提交；
-     - 否则向协调者发一趟 `RpcReq::OAuthRefresh`（附带本机当前 `(after_epoch, after_seq)`），由协调者抢住同世代 `gate` 锁单点刷新，并把刷出来的最新提交顺路打包回传，本机落盘后即刻生效；万一协调者刚好掉线或执行失败，再回退由本机尝试兜底刷新。
+     - 否则向协调者发一趟 `RpcReq::OAuthRefresh`——除了 `(server_id, generation)`，还顺手带上调用方此刻的 **`(expected_epoch, expected_seq, expected_hash)`** 与 **`rejected_token_hash`**（被远端 401 拒掉的访问令牌 BLAKE3 摘要）。协调者抢住同世代 `gate` 锁后，先比对流前缀祖先是否一致（分叉直接返回 `Conflicted`，落后则让调用方先对账）、再看协调者手里是不是早已有更新过的有效访问令牌（若 `rejected_token_hash` 已经不是协调者当前令牌，说明同伴刚顺手刷好了，直接返回 `UpToDate` 和缺失提交、根本不再多余请求授权方）；真要刷才单点刷新并把最新流头和提交分页打回调用方；调用方收齐验证收敛到目标头才放行。万一协调者返回需要重登录（`ReauthRequired`），调用方直接返 `AuthRequired` 停止重刷；若协调者半途失联，调用方会**先跟在线同伴同步一轮确认对方没把单次令牌偷刷走**，确认没推进后才在本机兜底刷新。
 
 ---
 

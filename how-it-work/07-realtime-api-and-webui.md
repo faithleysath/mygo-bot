@@ -15,7 +15,7 @@
 1. **先分两股流接口**：
    - **全局流 `GET /events`**：容量 **256** 的广播通道。一连上先推 `ready`（`{}`），之后整个进程任何会话新建（`session.created`）、改配置/改标题（`session.updated`）、切状态（`session.status`）或删除（`session.deleted`），外加集群同步拉来新目录/MCP/分叉告警时触发的 **`catalog.updated`**、**`mcp.updated`** 和 **`sync.conflict`**，侧边栏与设置页全靠它实时刷新；谁掉队了收到 `resync`。
    - **单会话流 `GET /sessions/{sid}/events`**：每个新连上的订阅者，都会同时接上**两条独立广播通道**：
-     - **持久通道（记账员拥有，容量 64）**：只在事务 `COMMIT` 之后发成品事件——`item.saved`（完整账目）、`session.status`、`session.updated`，外加不进数据库的 `attempt.retry`。**压根没人订阅时，记账员连回查数据库组装 JSON 的活都直接省掉**；有人听时，一笔新账只组装一份 `Arc<str>` 丢进槽里大家共享引用；要是某个慢窗口积压超过 64 条，广播槽直接冲它扔一条 **`resync`** 让它自己去翻 `/history` 补课，绝不回头等它。
+     - **持久通道（记账员拥有，容量 64）**：只在事务 `COMMIT` 之后发成品事件——`item.saved`（完整账目）、`session.status`、`session.updated`、`session.reset`（当集群切更高 `epoch` 重写整本会话历史时通知前端清游标重拉），外加不进数据库的 `attempt.retry`。**压根没人订阅时，记账员连回查数据库组装 JSON 的活都直接省掉**；有人听时，一笔新账只组装一份 `Arc<str>` 丢进槽里大家共享引用；要是某个慢窗口积压超过 64 条，广播槽直接冲它扔一条 **`resync`** 让它自己去翻 `/history` 补课，绝不回头等它。
      - **临时草稿通道（`Hub` 拥有，容量 256）**：模型在上游刚吐字时，经过一个 **`DeltaBatcher`**（每攒满 **30 毫秒**或者满 **256 字节**就打包推一次，不按单字符轰炸广播槽）发来 `item.started`、`item.delta`（区分 `text`/`reasoning`/`arguments`）和收尾清空用的 `stream.clear`。同时内存里维持着一个每字段封顶 **256 KiB** 的 `ActiveDraft` 影子草稿——所以你半路刷新页面或刚点进一个正在生成的会话，一连上紧跟着 `ready` 就会收到一份 **`stream.snapshot`**，立刻把屏幕上已经吐到一半的话续上，不用等这轮说完！
 
 2. **两股通道怎么保证“碎片不跑到成品后面”？**
@@ -64,7 +64,7 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 ### 1. 构建、压缩与强 ETag 嵌入（`web/build.mjs` & `src/webui.rs`）
 
 执行 `bun run build` 先跑一遍 `tsc --noEmit` 全量类型检查，随后：
-- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 44.1 KiB / 45,149 字节）**；
+- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 44.7 KiB / 45,738 字节）**；
 - 自定义状态机压缩 CSS（保留引号内容、去注释、去尾分号），压进 **`src/webui/app.css.gz`（约 6.6 KiB / 6,736 字节）**；
 - `index.html` 折叠标签间空白生成 **`src/webui/index.html`（898 字节）**，开头直接内联了一小段同步 `<script>`，在浏览器首帧绘制前读取 `localStorage.mygo_theme` 和系统深浅色偏好把 `dataset.theme` 设好，彻底杜绝深色模式下切白闪屏（FOUC）。
 
@@ -83,15 +83,15 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 | :--- | :--- |
 | **1. 全局快照与增量缓冲（`activeBuffer` + `latestSeq`）** | 全量拉取 `GET /sessions` 还在半路时，全局 SSE 推来的 `session.created`/`status` 以及本地已经确认成功的 `onLocalPatch`/`runRefresh` 更新，都会先就地生效并记进临时缓冲，等全量快照回来再按序（本地改动走 `applyLocalPatch`）重放盖上去。省掉它，拉列表那几百毫秒里刚发生的事件或刚改好的标题/模型就会被旧快照抹掉。 |
 | **2. 单会话版本号 + 永久墓碑 `deletedIds` + 回拉退避** | 每次调 `PATCH /sessions/{sid}` 前先拍下该会话此刻的版本号 `baseVersion`。如果请求飞在半路时有更新的 SSE 事件把版本号推高了，或者该会话已经被删进 `deletedIds` 墓碑集里——回包绝对不允许直接盖上去把旧数据覆盖回来、更不许把删掉的会话“复活”！冲突时自动改调一次带 `1s..8s` 退避的 `GET /sessions/{sid}` 对齐权威状态（`404` 立刻转为删除）。 |
-| **3. 立即首屏与历史缺口闭合锁（`start` + `gapOpen`）** | 切进会话不等 SSE `ready`，`SessionSync.start()` 立刻先拉最新 50 条（`?tail=true&limit=50`），记下已同步游标 `syncedThroughId`（哪怕实时流被代理卡住也能正常看聊天记录）。随后一旦连上 `ready` 或收到 `resync`，立刻把 `gapOpen` 置 `true` 锁住游标：期间新到达的 `item.saved` 可以先渲染上屏给人看，但**绝不推高 `syncedThroughId`**，一直等到 `?after=...&limit=200` 把断线或首屏交接期间漏掉的历史一页页补齐合并，才把缺口合拢！同时同一会话的 sidecar 刷新（排队消息、汇总、活跃任务）会合并为最多“一个在途 + 一个尾随”，可见回复的用量则只按页面上出现的 `llm_call_id` 按需单条拉取 `GET /calls/{id}`，不再全量扫 `/calls`。 |
+| **3. 立即首屏、历史缺口锁与跨纪元全量重置（`start` + `gapOpen` + `onReset`）** | 切进会话不等 SSE `ready`，`SessionSync.start()` 立刻先拉最新 50 条（`?tail=true&limit=50`），记下已同步游标 `syncedThroughId`（哪怕实时流被代理卡住也能正常看聊天记录）。一旦连上 `ready` 或收到 `resync`，把 `gapOpen` 置 `true` 锁住游标：期间新到达的 `item.saved` 先渲染上屏但不推高 `syncedThroughId`，等 `?after=...&limit=200` 补齐缺口再合拢。若后端因同步裁决换了更高 **`epoch`** 而推来 **`session.reset`**，前端立刻调 `sessionSync.onReset()` 递增 `resetGen` 丢弃在途旧页、清零游标并调用 `onReplaceItems` 用全新快照替换屏幕列表，彻底抹去已落败分支的幽灵消息；同时同一会话的 sidecar 刷新合并为最多“一个在途 + 一个尾随”，用量只按屏幕上的 `llm_call_id` 按需单条拉取。 |
 | **4. 草稿防幽灵重现（`closedCalls` / `closedItems`）** | 当某条流式回答或工具调用已经被 `item.saved` 正式落盘、或者收到 `stream.clear` / `attempt.retry` 时，不仅立刻清掉屏幕上的流式草稿，还把对应的 `llm_call_id` 或 `call_id:output_index` 记进关闭集合；收到 `stream.clear` 时更会借助 UUIDv7 `CallId` 的单调递增序把所有不晚于该 ID 的旧草稿一并清盘并封禁，且对重连收到的 `stream.snapshot` 按 `closedItems` 逐项过滤，把任何迟到的增量碎片或旧快照彻底拦在门外，防止同一句话闪回屏幕两次。 |
 
 ### 4. 四块界面能力速览
 
 - **侧边栏（`Sidebar.tsx`）**：按 `updated_at` 倒序排列，状态圆点一目了然（`idle`/`running` 呼吸灯/`pausing`/`paused`/带 `last_error` 红灯），运行中和暂停中隐藏删除按钮，删会话需 3 秒内二次确认；窄屏自动折叠为抽屉；底部保留 **Cluster** 入口，当存在未裁决的同步冲突（`conflict_count > 0`）时亮起冲突计数徽章。
 - **时间线（`Timeline.tsx`、`markdown.tsx`）**：把 `withdrawal` 折叠并直接给对应用户消息画删除线；把同一组 `function_call` 与 `function_call_output` 配对成可展开工具卡片（专门把 `codemode` 的 `code`/`trigger_code` 高亮展示，也支持展示工具返回的图片音视频附件）；自研零依赖 Preact JSX Markdown 解析器——**全程零 `dangerouslySetInnerHTML`**，所有链接在行内通过单趟线性栈扫描配对括号提取目标地址并严格经 `new URL` 校验只放行显式 `http://`、`https://`、`mailto:`（彻底杜绝流式未闭合长链接引发正则回溯与平方级扫描卡死），且故意屏蔽 `![img](...)` 外链防跟踪像素；每条回复卡片和底部汇总栏统一按后端 `uncached + cache_read + cache_write` 口径计算总输入与缓存命中率。
-- **输入框与顶栏（`Composer.tsx`、`TopBar`）**：按会话独立保存未发草稿与粘贴/拖拽上传的待发附件；不再依赖服务端全局默认表，新建会话时从浏览器 `localStorage`（`mygo_last_model_id` / `mygo_last_reasoning_effort`）顺手带上上次选用的模型与推理档位；提交前锁定内容快照复用或生成 `Idempotency-Key`（4xx 报错重置 Key，网络/5xx 报错保留 Key 防重投），而且只有当用户在请求飞出期间**没继续打字改文本框（`textVersion` 未变）**时才清空输入，绝不吞掉用户刚续写的新字；上方在有活跃任务时展示可折叠的任务栏（每 2 秒轮询，直接展示 `running_commands` 实时终端尾部与 `Kill` 按钮）；顶栏集中放会话改名、模型切换（切模型主动清零 `reasoning_effort`）、推理档位选择和基于 `last_input_tokens / context_window_tokens` 计算的上下文用量与花费统计。
-- **设置弹窗（`Settings.tsx`）**：分 `Models`（去掉全局默认开关，保留显示归档、供应商密钥安全编辑、模型能力与定价 JSON）、`MCP`（新增 **`shared` 集群同步开关**与共享角标，编辑时屏蔽未改动的查询串/Headers/Args/Env/OAuth 防误覆盖且无改动不发 PATCH；关闭同步前显式提醒将克隆为新本地服务并清理他机旧共享副本；OAuth 既提供一键弹窗打开授权，也贴心留了粘贴远程回调 URL 的 `Submit Callback` 框方便跨机部署）、`Cluster`（修改本机节点名称与描述、复制 Node ID、一键全量同步、生成邀请码或输入邀请码加入集群、查看同伴在线/离线状态及移除成员、列出分叉冲突并支持选 `Keep Local` 或 `Use Cluster (Overwrite)` 裁决）、`Usage`（按会话筛调用费和历史流水）与 `General`（主题、`/docs` 链接、登出）。
+- **输入框与顶栏（`Composer.tsx`、`TopBar`）**：按会话独立保存未发草稿与粘贴/拖拽上传的待发附件；由于后端强制要求每场会话都带有有效模型，新建会话优先取 `localStorage`（`mygo_last_model_id` / `mygo_last_reasoning_effort`）里仍未归档的模型、否则自动回落到首个可用模型（若完全没有可用模型则提示并直接打开 `Settings -> Models`）；提交前锁定内容快照复用或生成 `Idempotency-Key`（4xx 报错重置 Key，网络/5xx 报错保留 Key 防重投），而且只有当用户在请求飞出期间**没继续打字改文本框（`textVersion` 未变）**时才清空输入，绝不吞掉用户刚续写的新字；上方在有活跃任务时展示可折叠的任务栏（每 2 秒轮询，直接展示 `running_commands` 实时终端尾部与 `Kill` 按钮）；顶栏集中放会话改名、模型切换（去掉“无模型”选项，切模型主动清零 `reasoning_effort`）、推理档位选择和基于 `last_input_tokens / context_window_tokens` 计算的上下文用量与花费统计。
+- **设置弹窗（`Settings.tsx`）**：分 `Models`（去掉全局默认开关，保留显示归档、供应商密钥安全编辑、模型能力与定价 JSON）、`MCP`（新增 **`shared` 集群同步开关**与共享角标，编辑时屏蔽未改动的查询串/Headers/Args/Env/OAuth 防误覆盖且无改动不发 PATCH；关闭同步前显式提醒将克隆为新本地服务并清理他机旧共享副本；OAuth 既提供一键弹窗打开授权，也贴心留了粘贴远程回调 URL 的 `Submit Callback` 框方便跨机部署）、`Cluster`（修改本机节点名称与描述、复制 Node ID、一键全量同步、生成邀请码或输入邀请码加入集群——若已有同伴触发 `409` 会弹出带警告的 **`Force Switch Cluster`** 按钮二次确认以 `force: true` 切换、查看同伴在线/离线状态及移除成员、列出分叉冲突并通过脱敏的 `remote_summary` 与 `related_local_id` 对照后选 `Keep Local` 或 `Use Cluster (Overwrite)` 裁决）、`Usage`（按会话筛调用费和历史流水）与 `General`（主题、`/docs` 链接、登出）。
 
 ---
 
