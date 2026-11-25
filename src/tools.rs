@@ -24,6 +24,7 @@ pub fn definitions() -> Value {
                 "- At most 16 concurrent host calls or open streams per task (32 I/O slots globally); use proc.exec for heavy CPU or memory work.\n",
                 "- Native file and HTTP APIs work on devices without shell utilities.\n\n",
                 "Files (fs):\n",
+                "- Relative file paths resolve from the service user's home directory.\n",
                 "- fs.read/write handle regular files only: await fs.read(path) for bytes, {encoding:'utf8'} for text, or {stream:true} for an async iterable of Uint8Array chunks.\n",
                 "- await fs.write(path,textOrBytesOrStream,{append}) returns bytes written. Example: await fs.write(dst,await fs.read(src,{stream:true})).\n",
                 "- for await (const {name,type} of fs.readDir(path)) iterates one directory. await fs.stat(path,{followSymlinks}) returns {type,size,mtimeMs}; types are file, directory, symlink or other.\n",

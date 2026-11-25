@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::Path,
@@ -21,15 +22,19 @@ pub(super) async fn execute(
     data: Option<Vec<u8>>,
 ) -> Result<Reply, HostError> {
     check_cancel(&host.cancel)?;
+    let home = host.app.codemode.home_dir.as_deref();
     if op == "fs.rename" {
         let from = path_arg(args, "from")?;
         let to = path_arg(args, "to")?;
-        tokio::fs::rename(from, to).await.map_err(|e| {
-            HostError::from(e).context(format!("{op} {} to {}", from.display(), to.display()))
-        })?;
+        tokio::fs::rename(resolve_path(home, from)?, resolve_path(home, to)?)
+            .await
+            .map_err(|e| {
+                HostError::from(e).context(format!("{op} {} to {}", from.display(), to.display()))
+            })?;
         return Ok(Reply::value(Value::Null));
     }
     let path = path_arg(args, "path")?;
+    let resolved = resolve_path(home, path)?;
     let at_path = |e: io::Error| HostError::from(e).context(format!("{op} {}", path.display()));
     let value = match op {
         "fs.read" | "fs.write" => {
@@ -57,7 +62,7 @@ pub(super) async fn execute(
                     io::Error::new(io::ErrorKind::FileTooLarge, "input exceeds 8 MiB").into(),
                 );
             }
-            let owned_path = path.to_owned();
+            let owned_path = resolved.into_owned();
             let host = host.clone();
             return tokio::task::spawn_blocking(move || {
                 let reservation = stream.then(|| host.streams.reserve()).transpose()?;
@@ -88,15 +93,15 @@ pub(super) async fn execute(
         }
         "fs.readDir" => {
             let reservation = host.streams.reserve()?;
-            let dir = tokio::fs::read_dir(path).await.map_err(at_path)?;
+            let dir = tokio::fs::read_dir(resolved).await.map_err(at_path)?;
             check_cancel(&host.cancel)?;
             json!(reservation.insert(Resource::Directory(dir)))
         }
         "fs.stat" => {
             let metadata = if flag(args, "followSymlinks", true)? {
-                tokio::fs::metadata(path).await
+                tokio::fs::metadata(resolved).await
             } else {
-                tokio::fs::symlink_metadata(path).await
+                tokio::fs::symlink_metadata(resolved).await
             }
             .map_err(at_path)?;
             let modified = metadata.modified().map_err(at_path)?;
@@ -108,16 +113,16 @@ pub(super) async fn execute(
         }
         "fs.mkdir" => {
             if flag(args, "recursive", false)? {
-                tokio::fs::create_dir_all(path).await
+                tokio::fs::create_dir_all(resolved).await
             } else {
-                tokio::fs::create_dir(path).await
+                tokio::fs::create_dir(resolved).await
             }
             .map_err(at_path)?;
             Value::Null
         }
         "fs.remove" => {
             let recursive = flag(args, "recursive", false)?;
-            remove(path, recursive, &host.cancel)
+            remove(&resolved, recursive, &host.cancel)
                 .await
                 .map_err(at_path)?;
             Value::Null
@@ -133,6 +138,33 @@ fn path_arg<'a>(args: &'a Value, key: &str) -> Result<&'a Path, HostError> {
         .filter(|s| !s.is_empty() && !s.contains('\0'))
         .ok_or_else(|| format!("{key} must be a nonempty path without NUL"))?;
     Ok(Path::new(path))
+}
+
+fn resolve_path<'a>(home: Option<&Path>, path: &'a Path) -> Result<Cow<'a, Path>, HostError> {
+    if path.is_absolute() {
+        return Ok(Cow::Borrowed(path));
+    }
+    let home =
+        home.ok_or("service user home directory is unavailable; specify an absolute path")?;
+    #[cfg(windows)]
+    let path = {
+        use std::path::{Component, Prefix};
+        let mut parts = path.components();
+        if let Some(Component::Prefix(prefix)) = parts.next() {
+            // C:file names a path relative to the current directory on C:.
+            let same_drive = matches!(home.components().next(), Some(Component::Prefix(base))
+                if matches!(base.kind(), Prefix::Disk(d) | Prefix::VerbatimDisk(d)
+                    if prefix.kind() == Prefix::Disk(d)));
+            if !same_drive {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                    "drive-relative path is on a different drive from home; specify an absolute path").into());
+            }
+            parts.as_path()
+        } else {
+            path
+        }
+    };
+    Ok(Cow::Owned(home.join(path)))
 }
 
 fn flag(args: &Value, key: &str, default: bool) -> Result<bool, HostError> {
