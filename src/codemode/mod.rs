@@ -1,5 +1,5 @@
-mod files;
-mod io;
+pub(crate) mod files;
+pub(crate) mod io;
 pub mod ledger;
 mod live;
 mod output;
@@ -19,16 +19,19 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use live::{LiveState, ProgressFingerprint};
+pub(crate) use live::{CommandGuard, CommandPreview, McpGuard, RemoteCommandProgress, Stream};
 pub(crate) use output::TASK_BYTES;
 pub use output::{Blocks, Part};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
+pub(crate) use streams::{Resource as StreamResource, Reservation as StreamReservation};
 use tokio::{
     runtime::Handle,
     sync::{Notify, oneshot, watch},
@@ -59,14 +62,34 @@ impl Engine {
             client,
         })
     }
+
+    pub(crate) fn home_dir(&self) -> Option<&Path> {
+        self.home_dir.as_deref()
+    }
+
+    pub(crate) fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
 }
 
 #[derive(Debug)]
 pub struct HostError {
     message: String,
-    code: Option<&'static str>,
+    code: Option<Cow<'static, str>>,
 }
 impl HostError {
+    pub(crate) fn coded(code: impl Into<Cow<'static, str>>, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: Some(code.into()),
+        }
+    }
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+    pub(crate) fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
     pub(super) fn context(mut self, context: String) -> Self {
         self.message = format!("{context}: {}", self.message);
         self
@@ -109,7 +132,7 @@ impl From<std::io::Error> for HostError {
         };
         Self {
             message: error.to_string(),
-            code: Some(code),
+            code: Some(Cow::Borrowed(code)),
         }
     }
 }
@@ -179,17 +202,17 @@ pub struct Job {
 
 #[derive(Clone)]
 pub struct Host {
-    live: Arc<Mutex<LiveState>>,
-    app: App,
-    sid: SessionId,
-    origin: ItemId,
+    pub(crate) live: Arc<Mutex<LiveState>>,
+    pub(crate) app: App,
+    pub(crate) sid: SessionId,
+    pub(crate) origin: ItemId,
     trigger: bool,
     last_task_query: Arc<tokio::sync::Mutex<Option<Instant>>>,
     deadline: watch::Receiver<Instant>,
     pub client: reqwest::Client,
     pub cancel: CancellationToken,
     pub executor: Handle,
-    streams: Arc<streams::Streams>,
+    pub(crate) streams: Arc<streams::Streams>,
 }
 impl Host {
     fn new(

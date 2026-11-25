@@ -19,6 +19,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     Error, Result,
     cluster::{
+        cap::CapServer,
         identity::{
             LocalNode, PeerInfo, decode_endpoint_addr, list_peers, load_local_node, self_peer_info,
             upsert_peer_if_gen,
@@ -29,6 +30,8 @@ use crate::{
 };
 
 pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/1";
+pub const CAP_ALPN: &[u8] = b"mygo/cap/1";
+const MAX_CAP_CONNS_PER_PEER: usize = 4;
 const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 pub const RPC_REQ_HEADER_MAX: usize = 2 * 1024 * 1024;
 pub const RPC_RESP_HEADER_MAX: usize = 6 * 1024 * 1024;
@@ -70,6 +73,14 @@ struct PeerEntry {
     is_outbound: bool,
 }
 
+#[derive(Clone)]
+struct CapPeerEntry {
+    conn_id: u64,
+    membership_gen: i64,
+    conn: Connection,
+    peer_cancel: CancellationToken,
+}
+
 struct NetAuthState {
     secret: [u8; 32],
     membership_gen: i64,
@@ -88,9 +99,12 @@ pub struct ClusterNet {
     membership_gen_fast: AtomicI64,
     local_node_id: String,
     peers: Mutex<HashMap<String, PeerEntry>>,
+    cap_peers: Mutex<HashMap<String, Vec<CapPeerEntry>>>,
+    cap_dial_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     dialing: Mutex<HashSet<String>>,
     next_conn_id: AtomicU64,
     handler: Mutex<Option<Weak<SyncEngine>>>,
+    cap_handler: Mutex<Option<Weak<CapServer>>>,
     connected_peers: Mutex<PeerConnectState>,
     connect_notify: Notify,
     dial_wake: Notify,
@@ -278,7 +292,7 @@ impl ClusterNet {
             Endpoint::builder(presets::N0)
         }
         .secret_key(sk)
-        .alpns(vec![CLUSTER_ALPN.to_vec()]);
+        .alpns(vec![CLUSTER_ALPN.to_vec(), CAP_ALPN.to_vec()]);
         if let Some(addr) = config.bind_addr {
             builder = builder
                 .clear_ip_transports()
@@ -301,9 +315,12 @@ impl ClusterNet {
             }),
             local_node_id: local.node_id,
             peers: Mutex::default(),
+            cap_peers: Mutex::default(),
+            cap_dial_locks: Mutex::default(),
             dialing: Mutex::default(),
             next_conn_id: AtomicU64::new(1),
             handler: Mutex::default(),
+            cap_handler: Mutex::default(),
             connected_peers: Mutex::default(),
             connect_notify: Notify::new(),
             dial_wake: Notify::new(),
@@ -318,6 +335,10 @@ impl ClusterNet {
 
     pub fn attach_handler(&self, handler: Weak<SyncEngine>) {
         *self.handler.lock().unwrap() = Some(handler);
+    }
+
+    pub fn attach_cap_handler(&self, handler: Weak<CapServer>) {
+        *self.cap_handler.lock().unwrap() = Some(handler);
     }
 
     pub fn endpoint_addr(&self) -> EndpointAddr {
@@ -420,6 +441,18 @@ impl ClusterNet {
         for entry in entries {
             entry.conn.close(2u32.into(), b"cluster changed");
         }
+        let cap_entries: Vec<CapPeerEntry> = self
+            .cap_peers
+            .lock()
+            .unwrap()
+            .drain()
+            .flat_map(|(_, v)| v)
+            .collect();
+        for entry in cap_entries {
+            entry.peer_cancel.cancel();
+            entry.conn.close(2u32.into(), b"cluster changed");
+        }
+        self.cap_dial_locks.lock().unwrap().clear();
         self.dialing.lock().unwrap().clear();
         self.peer_rpc_sems.lock().unwrap().clear();
         self.connected_peers.lock().unwrap().peers.clear();
@@ -430,6 +463,13 @@ impl ClusterNet {
         if let Some(entry) = self.peers.lock().unwrap().remove(node_id) {
             entry.conn.close(3u32.into(), b"peer removed");
         }
+        if let Some(entries) = self.cap_peers.lock().unwrap().remove(node_id) {
+            for entry in entries {
+                entry.peer_cancel.cancel();
+                entry.conn.close(3u32.into(), b"peer removed");
+            }
+        }
+        self.cap_dial_locks.lock().unwrap().remove(node_id);
         self.connected_peers.lock().unwrap().peers.remove(node_id);
         self.peer_rpc_sems.lock().unwrap().remove(node_id);
     }
@@ -449,10 +489,23 @@ impl ClusterNet {
         self.stopping.cancel();
         self.auth.lock().unwrap().gen_cancel.cancel();
         *self.handler.lock().unwrap() = None;
+        *self.cap_handler.lock().unwrap() = None;
         let entries: Vec<PeerEntry> = self.peers.lock().unwrap().drain().map(|(_, v)| v).collect();
         for entry in entries {
             entry.conn.close(0u32.into(), b"shutdown");
         }
+        let cap_entries: Vec<CapPeerEntry> = self
+            .cap_peers
+            .lock()
+            .unwrap()
+            .drain()
+            .flat_map(|(_, v)| v)
+            .collect();
+        for entry in cap_entries {
+            entry.peer_cancel.cancel();
+            entry.conn.close(0u32.into(), b"shutdown");
+        }
+        self.cap_dial_locks.lock().unwrap().clear();
         self.endpoint.close().await;
         self.tasks.close();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.tasks.wait()).await;
@@ -555,7 +608,10 @@ impl ClusterNet {
                 conn.close(2u32.into(), b"cluster changed");
                 return Err(Error::conflict("membership changed during handshake"));
             }
-            r = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate_outbound(&conn, &cluster_secret)) => r,
+            r = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                self.authenticate_outbound(&conn, &cluster_secret, b"mygo-auth-srv", b"mygo-auth-cli"),
+            ) => r,
         };
         let remote_peer = match res {
             Ok(Ok(info)) => info,
@@ -574,17 +630,22 @@ impl ClusterNet {
     }
 
     async fn handle_incoming_conn(self: Arc<Self>, conn: Connection) {
-        if conn.alpn() != CLUSTER_ALPN {
+        let alpn = conn.alpn();
+        let (srv_label, cli_label, is_cap) = if alpn == CLUSTER_ALPN {
+            (b"mygo-auth-srv".as_slice(), b"mygo-auth-cli".as_slice(), false)
+        } else if alpn == CAP_ALPN {
+            (b"mygo-cap-srv".as_slice(), b"mygo-cap-cli".as_slice(), true)
+        } else {
             conn.close(1u32.into(), b"unsupported alpn");
             return;
-        }
+        };
         let (mgen, cluster_secret, gen_cancel) = self.auth_context();
         let res = tokio::select! {
             _ = gen_cancel.cancelled() => {
                 conn.close(2u32.into(), b"cluster changed");
                 return;
             }
-            r = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate_inbound(&conn, &cluster_secret)) => r,
+            r = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate_inbound(&conn, &cluster_secret, srv_label, cli_label)) => r,
         };
         let remote_peer = match res {
             Ok(Ok(info)) => info,
@@ -593,14 +654,26 @@ impl ClusterNet {
                 return;
             }
         };
-        self.register_peer_conn(conn, remote_peer, false, mgen, gen_cancel)
-            .await;
+        if is_cap {
+            if remote_peer.node_id == self.local_node_id {
+                conn.close(1u32.into(), b"self connection");
+                return;
+            }
+            let _ = self
+                .register_cap_conn(conn, remote_peer.node_id, mgen, gen_cancel)
+                .await;
+        } else {
+            self.register_peer_conn(conn, remote_peer, false, mgen, gen_cancel)
+                .await;
+        }
     }
 
     async fn authenticate_outbound(
         &self,
         conn: &Connection,
         cluster_secret: &[u8; 32],
+        srv_label: &[u8],
+        cli_label: &[u8],
     ) -> Result<PeerInfo> {
         let local = self.db.call(|s| load_local_node(&s.conn)).await?;
         let self_info = self_peer_info(&local, &self.endpoint.addr());
@@ -630,7 +703,7 @@ impl ClusterNet {
         }
         let expected_server_mac = auth_mac(
             cluster_secret,
-            b"mygo-auth-srv",
+            srv_label,
             &remote_id,
             &local.node_id,
             &client_nonce,
@@ -641,7 +714,7 @@ impl ClusterNet {
         }
         let client_mac = auth_mac(
             cluster_secret,
-            b"mygo-auth-cli",
+            cli_label,
             &local.node_id,
             &remote_id,
             &server_nonce,
@@ -659,6 +732,8 @@ impl ClusterNet {
         &self,
         conn: &Connection,
         cluster_secret: &[u8; 32],
+        srv_label: &[u8],
+        cli_label: &[u8],
     ) -> Result<PeerInfo> {
         let local = self.db.call(|s| load_local_node(&s.conn)).await?;
         let remote_id = conn.remote_id().to_string();
@@ -677,7 +752,7 @@ impl ClusterNet {
         getrandom::fill(&mut server_nonce).map_err(|_| Error::internal("entropy unavailable"))?;
         let server_mac = auth_mac(
             cluster_secret,
-            b"mygo-auth-srv",
+            srv_label,
             &local.node_id,
             &remote_id,
             &client_nonce,
@@ -699,7 +774,7 @@ impl ClusterNet {
         };
         let expected_client_mac = auth_mac(
             cluster_secret,
-            b"mygo-auth-cli",
+            cli_label,
             &remote_id,
             &local.node_id,
             &server_nonce,
@@ -711,6 +786,206 @@ impl ClusterNet {
         write_auth(&mut send, &AuthMsg::Ok).await?;
         let _ = send.finish();
         Ok(remote_peer)
+    }
+
+    fn cap_dial_lock(&self, node_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.cap_dial_locks.lock().unwrap();
+        map.retain(|_, w| w.strong_count() > 0);
+        if let Some(lock) = map.get(node_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        map.insert(node_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn pick_cap_conn(&self, node_id: &str, mgen: i64) -> Option<(Connection, CancellationToken)> {
+        let mut cap_peers = self.cap_peers.lock().unwrap();
+        let list = cap_peers.get_mut(node_id)?;
+        list.retain(|e| {
+            e.membership_gen == mgen
+                && !e.peer_cancel.is_cancelled()
+                && e.conn.close_reason().is_none()
+        });
+        if list.is_empty() {
+            cap_peers.remove(node_id);
+            return None;
+        }
+        let entry = list.last()?;
+        Some((entry.conn.clone(), entry.peer_cancel.clone()))
+    }
+
+    pub fn evict_cap_conn(&self, node_id: &str, conn: &Connection) {
+        let mut cap_peers = self.cap_peers.lock().unwrap();
+        if let Some(list) = cap_peers.get_mut(node_id) {
+            let sid = conn.stable_id();
+            list.retain(|e| {
+                if e.conn.stable_id() == sid {
+                    e.peer_cancel.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+            if list.is_empty() {
+                cap_peers.remove(node_id);
+            }
+        }
+    }
+
+    pub async fn get_or_dial_cap_connection(
+        self: &Arc<Self>,
+        peer: &PeerInfo,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(Connection, CancellationToken), String> {
+        if cancel.is_cancelled() || self.stopping.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        if !self.is_peer_online(&peer.node_id) {
+            return Err(format!("peer {} is offline", peer.node_id));
+        }
+        let (mgen, _, gen_cancel) = self.auth_context();
+        if let Some(found) = self.pick_cap_conn(&peer.node_id, mgen) {
+            return Ok(found);
+        }
+        let lock = self.cap_dial_lock(&peer.node_id);
+        let _guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("cancelled".into()),
+            _ = gen_cancel.cancelled() => return Err("membership changed during cap dial".into()),
+            g = lock.lock() => g,
+        };
+        if !self.is_peer_online(&peer.node_id) {
+            return Err(format!("peer {} is offline", peer.node_id));
+        }
+        let (mgen, cluster_secret, gen_cancel) = self.auth_context();
+        if let Some(found) = self.pick_cap_conn(&peer.node_id, mgen) {
+            return Ok(found);
+        }
+        let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs).map_err(|e| e.to_string())?;
+        let conn = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("cancelled".into()),
+            _ = gen_cancel.cancelled() => return Err("membership changed during cap dial".into()),
+            res = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr, CAP_ALPN)) => {
+                res.map_err(|_| format!("cap dial to {} timed out", peer.node_id))?
+                    .map_err(|e| format!("cap dial to {} failed: {e}", peer.node_id))?
+            }
+        };
+        if conn.remote_id().to_string() != peer.node_id {
+            conn.close(1u32.into(), b"node id mismatch");
+            return Err("peer node id mismatch".into());
+        }
+        let auth = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                conn.close(1u32.into(), b"cancelled");
+                return Err("cancelled".into());
+            }
+            _ = gen_cancel.cancelled() => {
+                conn.close(2u32.into(), b"cluster changed");
+                return Err("membership changed during cap handshake".into());
+            }
+            r = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                self.authenticate_outbound(&conn, &cluster_secret, b"mygo-cap-srv", b"mygo-cap-cli"),
+            ) => r,
+        };
+        match auth {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                conn.close(1u32.into(), b"auth failed");
+                return Err(e.to_string());
+            }
+            Err(_) => {
+                conn.close(1u32.into(), b"auth timeout");
+                return Err("cap auth timed out".into());
+            }
+        }
+        let peer_cancel = self
+            .register_cap_conn(conn.clone(), peer.node_id.clone(), mgen, gen_cancel)
+            .await
+            .ok_or_else(|| "membership changed during cap register".to_owned())?;
+        Ok((conn, peer_cancel))
+    }
+
+    async fn register_cap_conn(
+        self: &Arc<Self>,
+        conn: Connection,
+        remote_id: String,
+        mgen: i64,
+        gen_cancel: CancellationToken,
+    ) -> Option<CancellationToken> {
+        if gen_cancel.is_cancelled() || self.membership_gen() != mgen {
+            conn.close(2u32.into(), b"cluster changed");
+            return None;
+        }
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::AcqRel);
+        let peer_cancel = gen_cancel.child_token();
+        let evicted: Vec<CapPeerEntry> = {
+            if self.membership_gen() != mgen || gen_cancel.is_cancelled() {
+                conn.close(2u32.into(), b"cluster changed");
+                return None;
+            }
+            let mut cap_peers = self.cap_peers.lock().unwrap();
+            let list = cap_peers.entry(remote_id.clone()).or_default();
+            list.retain(|e| {
+                e.membership_gen == mgen
+                    && !e.peer_cancel.is_cancelled()
+                    && e.conn.close_reason().is_none()
+            });
+            list.push(CapPeerEntry {
+                conn_id,
+                membership_gen: mgen,
+                conn: conn.clone(),
+                peer_cancel: peer_cancel.clone(),
+            });
+            let excess = list.len().saturating_sub(MAX_CAP_CONNS_PER_PEER);
+            if excess > 0 {
+                list.drain(..excess).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for old in evicted {
+            old.peer_cancel.cancel();
+            old.conn.close(4u32.into(), b"cap connection pool limit");
+        }
+        let net = self.clone();
+        let pc = peer_cancel.clone();
+        self.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = net.stopping.cancelled() => break,
+                    _ = pc.cancelled() => break,
+                    _ = conn.closed() => break,
+                    bi = conn.accept_bi() => {
+                        match bi {
+                            Ok((send, recv)) => {
+                                let handler = net.cap_handler.lock().unwrap().as_ref().and_then(Weak::upgrade);
+                                let from = remote_id.clone();
+                                let stream_cancel = pc.clone();
+                                net.tasks.spawn(async move {
+                                    if let Some(handler) = handler {
+                                        handler.handle_stream(from, send, recv, stream_cancel).await;
+                                    }
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            pc.cancel();
+            let mut cap_peers = net.cap_peers.lock().unwrap();
+            if let Some(list) = cap_peers.get_mut(&remote_id) {
+                list.retain(|e| e.conn_id != conn_id);
+                if list.is_empty() {
+                    cap_peers.remove(&remote_id);
+                }
+            }
+        });
+        Some(peer_cancel)
     }
 
     async fn register_peer_conn(

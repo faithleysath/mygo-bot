@@ -40,7 +40,7 @@ use windows_sys::Win32::{
 
 use super::{
     io::drain,
-    live::{CommandGuard, Stream},
+    live::{CommandPreview, Stream},
 };
 
 fn checked(ok: i32) -> io::Result<()> {
@@ -455,7 +455,7 @@ pub async fn execute(
     opts: &Value,
     stdin: Option<Vec<u8>>,
     cancel: CancellationToken,
-    command_preview: &CommandGuard<'_>,
+    command_preview: &CommandPreview<'_>,
 ) -> Result<Value, String> {
     let deadline = super::io::timeout(opts)?.map(|d| Instant::now() + d);
     if cancel.is_cancelled() {

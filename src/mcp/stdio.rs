@@ -35,7 +35,10 @@ pub(super) struct SpawnedChild {
     stdin: ChildStdin,
 }
 
-pub(super) fn spawn(config: StdioConfig) -> io::Result<SpawnedChild> {
+pub(super) fn spawn(
+    config: StdioConfig,
+    default_cwd: Option<std::path::PathBuf>,
+) -> io::Result<SpawnedChild> {
     #[cfg(windows)]
     if std::path::Path::new(config.command.trim_end_matches([' ', '.']))
         .extension()
@@ -46,6 +49,28 @@ pub(super) fn spawn(config: StdioConfig) -> io::Result<SpawnedChild> {
             "stdio requires a native executable",
         ));
     }
+    let resolved_cwd = match config.cwd {
+        Some(cwd) => {
+            let path = std::path::PathBuf::from(&cwd);
+            if path.is_absolute() {
+                path
+            } else {
+                let home = default_cwd.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "service user home directory is unavailable; specify cwd",
+                    )
+                })?;
+                home.join(path)
+            }
+        }
+        None => default_cwd.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "service user home directory is unavailable; specify cwd",
+            )
+        })?,
+    };
     let mut cmd = Command::new(config.command);
     // Keep executable lookup and OS runtime paths; never inherit the daemon's secret environment.
     cmd.env_clear();
@@ -59,9 +84,7 @@ pub(super) fn spawn(config: StdioConfig) -> io::Result<SpawnedChild> {
         }
     }
     cmd.args(config.args).envs(config.env);
-    if let Some(cwd) = config.cwd {
-        cmd.current_dir(cwd);
-    }
+    cmd.current_dir(resolved_cwd);
     // A server may log credentials or flood stderr. The null device provides a nonblocking sink.
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

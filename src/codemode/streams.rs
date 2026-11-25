@@ -17,15 +17,18 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(super) const CHUNK: usize = 64 * 1024;
+pub(crate) const CHUNK: usize = 64 * 1024;
 const PER_TASK: usize = 16;
 const MAX_EXPIRED_REASONS: usize = 64;
 static HANDLES: Semaphore = Semaphore::const_new(128);
 
-pub(super) enum Resource {
+pub(crate) enum Resource {
     Reader(Pin<Box<dyn AsyncRead + Send>>),
     Directory(ReadDir),
     Writer(File),
+    RemoteReader(crate::cluster::cap::RemoteByteReader),
+    RemoteWriter(crate::cluster::cap::RemoteByteWriter),
+    RemoteDir(crate::cluster::cap::RemoteDirReader),
     Upload {
         sender: mpsc::Sender<Option<Vec<u8>>>,
         receiver: Option<mpsc::Receiver<Option<Vec<u8>>>>,
@@ -53,7 +56,8 @@ struct Table {
     expired: VecDeque<(u32, &'static str)>,
 }
 
-pub(super) struct Streams {
+#[derive(Clone)]
+pub(crate) struct Streams {
     table: Arc<Mutex<Table>>,
     slots: Arc<Semaphore>,
 }
@@ -67,7 +71,7 @@ impl Default for Streams {
     }
 }
 
-pub(super) struct Reservation<'a> {
+pub(crate) struct Reservation<'a> {
     streams: &'a Streams,
     id: u32,
     permits: (OwnedSemaphorePermit, SemaphorePermit<'static>),
@@ -227,16 +231,23 @@ impl Streams {
                     }
                     Value::Null
                 }
-                ("stream.next", Resource::Directory(dir)) => match dir.next_entry().await? {
-                    Some(entry) => {
-                        let name = entry.file_name().into_string().map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "directory entry name is not UTF-8",
-                            )
-                        })?;
-                        json!({"name":name, "type":super::files::file_type(entry.file_type().await?)})
+                ("stream.next", Resource::Directory(dir)) => {
+                    match super::files::next_dir_entry(dir).await? {
+                        Some((name, kind)) => json!({"name": name, "type": kind}),
+                        None => Value::Null,
                     }
+                }
+                ("stream.next", Resource::RemoteReader(reader)) => match reader.next_chunk().await? {
+                    Some(chunk) => {
+                        return Ok(Reply {
+                            value: Value::Null,
+                            data: Some(chunk),
+                        });
+                    }
+                    None => Value::Null,
+                },
+                ("stream.next", Resource::RemoteDir(dir)) => match dir.next_entry().await? {
+                    Some((name, kind)) => json!({"name": name, "type": kind}),
                     None => Value::Null,
                 },
                 ("stream.write", Resource::Writer(file)) => {
@@ -246,6 +257,15 @@ impl Streams {
                 }
                 ("stream.finish", Resource::Writer(file)) => {
                     file.flush().await?;
+                    Value::Null
+                }
+                ("stream.write", Resource::RemoteWriter(writer)) => {
+                    let bytes = chunk(data)?;
+                    writer.write_chunk(&bytes).await?;
+                    Value::Null
+                }
+                ("stream.finish", Resource::RemoteWriter(writer)) => {
+                    writer.finish().await?;
                     Value::Null
                 }
                 ("stream.write" | "stream.finish", Resource::Upload { sender, .. }) => {
@@ -324,15 +344,6 @@ impl Streams {
             }
         };
         Ok((stream, closed))
-    }
-
-    pub async fn upload(
-        &self,
-        id: &Value,
-        cancel: CancellationToken,
-    ) -> Result<(reqwest::Body, CancellationToken), HostError> {
-        let (stream, closed) = self.upload_stream(id, cancel).await?;
-        Ok((reqwest::Body::wrap_stream(stream), closed))
     }
 }
 

@@ -139,75 +139,90 @@
         return response;
     }
 
+    function createNode(target) {
+        if (typeof target !== 'string' || !target.trim() || target.includes('\0')) {
+            throw new TypeError('node target must be a nonempty string');
+        }
+        const node = target;
+        return Object.freeze({
+            fs: Object.freeze({
+                async read(path, { encoding, stream = false } = {}) {
+                    if (stream && encoding !== undefined) throw new TypeError('stream reads produce bytes');
+                    const value = await call('fs.read', { node, path, encoding, stream });
+                    if (stream) return reader(value);
+                    return encoding === 'utf8' ? decode(value, false) : value;
+                },
+                async write(path, data, { append } = {}) {
+                    if (data?.[Symbol.asyncIterator]) {
+                        return consume(data, () => call('fs.write', { node, path, append, stream: true }));
+                    }
+                    return call('fs.write', { node, path, append }, data);
+                },
+                async *readDir(path) { yield* reader(await call('fs.readDir', { node, path })); },
+                async stat(path, { followSymlinks } = {}) { return call('fs.stat', { node, path, followSymlinks }); },
+                async mkdir(path, { recursive } = {}) { await call('fs.mkdir', { node, path, recursive }); },
+                async rename(from, to) { await call('fs.rename', { node, from, to }); },
+                async remove(path, { recursive } = {}) { await call('fs.remove', { node, path, recursive }); },
+            }),
+            proc: Object.freeze({
+                async exec(program, args = [], { cwd, env, stdin, timeout_ms } = {}) {
+                    return call('proc.exec', { node, program, args, cwd, env, timeout_ms }, stdin);
+                },
+            }),
+            http: Object.freeze({
+                async request({ url, method, headers, body, timeout_ms, stream = false }) {
+                    if (typeof stream !== 'boolean') throw new TypeError('stream must be a boolean');
+                    return sendRequest('http.request', { node, url, method, headers, timeout_ms, stream }, body, stream);
+                },
+            }),
+            mcp: Object.freeze({
+                async servers() { return call('mcp.servers', { node }); },
+                async tools(server, { query, cursor } = {}) { return call('mcp.tools', { node, server, query, cursor }); },
+                async call(server, tool, args = {}) { return mcpResult('mcp.call', { node, server, tool, args }); },
+                async resources(server, { cursor } = {}) { return call('mcp.resources', { node, server, cursor }); },
+                async resourceTemplates(server, { cursor } = {}) { return call('mcp.resourceTemplates', { node, server, cursor }); },
+                async readResource(server, uri) { return mcpResult('mcp.readResource', { node, server, uri }); },
+                async prompts(server, { cursor } = {}) { return call('mcp.prompts', { node, server, cursor }); },
+                async getPrompt(server, name, args) { return mcpResult('mcp.getPrompt', { node, server, name, args }); },
+            }),
+            mygo: Object.freeze({
+                async request({ path, method, headers, body, timeout_ms, stream = false }) {
+                    if (typeof stream !== 'boolean') throw new TypeError('stream must be a boolean');
+                    let reqHeaders = headers;
+                    let reqBody = body;
+                    if (body !== undefined && body !== null && !body[Symbol.asyncIterator]
+                        && typeof body !== 'string' && !(body instanceof Uint8Array)) {
+                        if (isView(body) || body instanceof ArrayBuffer) {
+                            throw new TypeError('expected string, Uint8Array, async iterable, or JSON value');
+                        }
+                        const json = stringify(body);
+                        if (json === undefined) {
+                            throw new TypeError('request body cannot be serialized as JSON');
+                        }
+                        reqBody = json;
+                        if (headers === undefined || headers === null || (typeof headers === 'object' && !Array.isArray(headers))) {
+                            const hasType = headers && Object.keys(headers).some(k => k.toLowerCase() === 'content-type');
+                            if (!hasType) reqHeaders = { ...headers, 'content-type': 'application/json' };
+                        }
+                    }
+                    return sendRequest('mygo.request', { node, path, method, headers: reqHeaders, timeout_ms, stream }, reqBody, stream);
+                },
+            }),
+        });
+    }
+
     Object.assign(globalThis, {
-        fs: {
-            async read(path, { encoding, stream = false } = {}) {
-                if (stream && encoding !== undefined) throw new TypeError('stream reads produce bytes');
-                const value = await call('fs.read', { path, encoding, stream });
-                if (stream) return reader(value);
-                return encoding === 'utf8' ? decode(value, false) : value;
-            },
-            async write(path, data, { append } = {}) {
-                if (data?.[Symbol.asyncIterator]) {
-                    return consume(data, () => call('fs.write', { path, append, stream: true }));
-                }
-                return call('fs.write', { path, append }, data);
-            },
-            async *readDir(path) { yield* reader(await call('fs.readDir', { path })); },
-            async stat(path, { followSymlinks } = {}) { return call('fs.stat', { path, followSymlinks }); },
-            async mkdir(path, { recursive } = {}) { await call('fs.mkdir', { path, recursive }); },
-            async rename(from, to) { await call('fs.rename', { from, to }); },
-            async remove(path, { recursive } = {}) { await call('fs.remove', { path, recursive }); },
-        },
-        http: {
-            async request({ url, method, headers, body, timeout_ms, stream = false }) {
-                if (typeof stream !== 'boolean') throw new TypeError('stream must be a boolean');
-                return sendRequest('http.request', { url, method, headers, timeout_ms, stream }, body, stream);
-            },
-        },
+        cluster: Object.freeze({
+            async nodes() { return call('cluster.nodes', {}); },
+            node(target) { return createNode(target); },
+        }),
         mygo: Object.freeze({
             sessionId,
             taskId: taskId ?? null,
-            async request({ path, method, headers, body, timeout_ms, stream = false }) {
-                if (typeof stream !== 'boolean') throw new TypeError('stream must be a boolean');
-                let reqHeaders = headers;
-                let reqBody = body;
-                if (body !== undefined && body !== null && !body[Symbol.asyncIterator]
-                    && typeof body !== 'string' && !(body instanceof Uint8Array)) {
-                    if (isView(body) || body instanceof ArrayBuffer) {
-                        throw new TypeError('expected string, Uint8Array, async iterable, or JSON value');
-                    }
-                    const json = stringify(body);
-                    if (json === undefined) {
-                        throw new TypeError('request body cannot be serialized as JSON');
-                    }
-                    reqBody = json;
-                    if (headers === undefined || headers === null || (typeof headers === 'object' && !Array.isArray(headers))) {
-                        const hasType = headers && Object.keys(headers).some(k => k.toLowerCase() === 'content-type');
-                        if (!hasType) reqHeaders = { ...headers, 'content-type': 'application/json' };
-                    }
-                }
-                return sendRequest('mygo.request', { path, method, headers: reqHeaders, timeout_ms, stream }, reqBody, stream);
-            },
         }),
         task: {
             async list() { return call('task.list', {}); },
             async status(id) { return call('task.status', { id }); },
-        },
-        mcp: {
-            async servers() { return call('mcp.servers', {}); },
-            async tools(server, { query, cursor } = {}) { return call('mcp.tools', { server, query, cursor }); },
-            async call(server, tool, args = {}) { return mcpResult('mcp.call', { server, tool, args }); },
-            async resources(server, { cursor } = {}) { return call('mcp.resources', { server, cursor }); },
-            async resourceTemplates(server, { cursor } = {}) { return call('mcp.resourceTemplates', { server, cursor }); },
-            async readResource(server, uri) { return mcpResult('mcp.readResource', { server, uri }); },
-            async prompts(server, { cursor } = {}) { return call('mcp.prompts', { server, cursor }); },
-            async getPrompt(server, name, args) { return mcpResult('mcp.getPrompt', { server, name, args }); },
-        },
-        proc: {
-            async exec(program, args = [], { cwd, env, stdin, timeout_ms } = {}) {
-                return call('proc.exec', { program, args, cwd, env, timeout_ms }, stdin);
-            },
         },
         async sleep(ms) { await call('sleep', { ms }); },
         async emitEvent(value) { return emit(value); },

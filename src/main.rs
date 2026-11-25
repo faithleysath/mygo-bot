@@ -539,7 +539,7 @@ async fn serve(
             &workers,
         )
         .await?;
-        App {
+        let app = App {
             codemode: Arc::new(codemode::Engine::new(threads, make_client()?)?),
             mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
             db,
@@ -548,8 +548,12 @@ async fn serve(
             streams,
             stopping,
             workers,
-        }
+        };
+        let cap_server = Arc::new(cluster::cap::CapServer::new(app.clone()));
+        app.cluster.net.attach_cap_handler(Arc::downgrade(&cap_server));
+        (app, cap_server)
     };
+    let (app, _cap_server) = app;
     app.workers
         .spawn(mcp::reap_idle(app.db.clone(), app.stopping.clone()));
     let routes = api::routes(app.clone());

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod cap;
 pub mod identity;
 pub mod ledger;
 pub mod net;

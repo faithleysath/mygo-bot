@@ -307,8 +307,8 @@ fn settle<'js>(ctx: &Ctx<'js>, resolvers: &Resolvers, done: Completed) -> JsResu
     let value = match reply {
         Ok(reply) => reply_value(ctx, reply),
         Err(e) => {
-            let error = Exception::from_message(ctx.clone(), &e.message)?;
-            if let Some(code) = e.code {
+            let error = Exception::from_message(ctx.clone(), e.message())?;
+            if let Some(code) = e.code() {
                 error.set("code", code)?;
             }
             Err(ctx.throw(error.into_value()))
@@ -655,7 +655,7 @@ fn push_part<'js>(ctx: &Ctx<'js>, blocks: &mut Blocks, part: &Object<'js>) -> Js
         "blob" => {
             return Err(Exception::throw_type(
                 ctx,
-                "MCP resource blob cannot be sent as model content; use block.data in the script or save it with fs.write",
+                "MCP resource blob cannot be sent as model content; use block.data in the script or save it with node.fs.write",
             ));
         }
         _ => {

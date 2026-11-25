@@ -204,9 +204,10 @@ async fn connect(app: &App, endpoint: config::Endpoint) -> std::result::Result<C
             Client::connect_http(http, url, headers).await
         }
         config::Transport::Stdio(config) => {
+            let default_cwd = app.codemode.home_dir().map(std::path::Path::to_path_buf);
             // PATH and cwd can be on a slow filesystem. Starting the child must not stall the
             // daemon's single I/O thread. Its RAII guard also owns cleanup if this wait is cancelled.
-            let spawned = tokio::task::spawn_blocking(move || stdio::spawn(config))
+            let spawned = tokio::task::spawn_blocking(move || stdio::spawn(config, default_cwd))
                 .await
                 .map_err(|_| "MCP stdio launch worker stopped")?
                 .map_err(|e| format!("MCP stdio launch failed ({})", e.kind()))?;

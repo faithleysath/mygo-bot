@@ -508,6 +508,86 @@ pub fn list_peers(conn: &Connection) -> Result<Vec<PeerInfo>> {
     Ok(rows)
 }
 
+pub enum ResolvedNode {
+    Local { name: String },
+    Remote(PeerInfo),
+}
+
+pub fn resolve_node_target(
+    conn: &Connection,
+    target: &str,
+) -> std::result::Result<ResolvedNode, (&'static str, String)> {
+    let local = match load_local_node(conn) {
+        Ok(n) => n,
+        Err(e) => return Err(("EIO", e.to_string())),
+    };
+    let peers = match list_peers(conn) {
+        Ok(p) => p,
+        Err(e) => return Err(("EIO", e.to_string())),
+    };
+    if local.node_id == target {
+        return Ok(ResolvedNode::Local { name: local.name });
+    }
+    if let Some(peer) = peers.iter().find(|p| p.node_id == target) {
+        return Ok(ResolvedNode::Remote(peer.clone()));
+    }
+    let mut matches = Vec::new();
+    if local.name == target {
+        matches.push(ResolvedNode::Local { name: local.name });
+    }
+    for peer in peers {
+        if peer.name == target {
+            matches.push(ResolvedNode::Remote(peer));
+        }
+    }
+    match matches.len() {
+        0 => Err(("ENODENOTFOUND", format!("node not found: {target}"))),
+        1 => Ok(matches.pop().unwrap()),
+        _ => Err((
+            "ENODEAMBIGUOUS",
+            format!("ambiguous node name '{target}'; specify node id"),
+        )),
+    }
+}
+
+pub fn list_cluster_nodes(
+    conn: &Connection,
+    net: &crate::cluster::net::ClusterNet,
+) -> Result<Vec<serde_json::Value>> {
+    let local = load_local_node(conn)?;
+    let peers = list_peers(conn)?;
+    let mut nodes = Vec::with_capacity(1 + peers.len());
+    nodes.push((
+        local.name.clone(),
+        local.node_id.clone(),
+        serde_json::json!({
+            "id": local.node_id,
+            "name": local.name,
+            "description": local.description,
+            "os": current_os(),
+            "arch": current_arch(),
+            "online": true,
+        }),
+    ));
+    for peer in peers {
+        let online = net.is_peer_online(&peer.node_id);
+        nodes.push((
+            peer.name.clone(),
+            peer.node_id.clone(),
+            serde_json::json!({
+                "id": peer.node_id,
+                "name": peer.name,
+                "description": peer.description,
+                "os": peer.os,
+                "arch": peer.arch,
+                "online": online,
+            }),
+        ));
+    }
+    nodes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(nodes.into_iter().map(|(_, _, v)| v).collect())
+}
+
 pub fn delete_peer(conn: &Connection, node_id: &str) -> Result<bool> {
     let changed = conn.execute("DELETE FROM cluster_peers WHERE node_id=?", [node_id])?;
     Ok(changed > 0)

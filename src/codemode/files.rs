@@ -10,19 +10,21 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Host, HostError, Reply,
+    HostError, Reply,
     io::BODY_LIMIT,
-    streams::{CHUNK, Resource},
+    streams::{CHUNK, Resource, Streams},
 };
 
-pub(super) async fn execute(
-    host: &Host,
+pub(crate) async fn execute_local(
+    app: &crate::App,
+    cancel: &CancellationToken,
+    streams: Option<&Streams>,
     op: &str,
     args: &Value,
     data: Option<Vec<u8>>,
 ) -> Result<Reply, HostError> {
-    check_cancel(&host.cancel)?;
-    let home = host.app.codemode.home_dir.as_deref();
+    check_cancel(cancel)?;
+    let home = app.codemode.home_dir();
     if op == "fs.rename" {
         let from = path_arg(args, "from")?;
         let to = path_arg(args, "to")?;
@@ -39,6 +41,9 @@ pub(super) async fn execute(
     let value = match op {
         "fs.read" | "fs.write" => {
             let stream = flag(args, "stream", false)?;
+            if stream && streams.is_none() {
+                return Err("streaming fs operations require stream RPC".into());
+            }
             let access = if op == "fs.read" {
                 if let Some(encoding) = args.get("encoding")
                     && (stream || encoding.as_str() != Some("utf8"))
@@ -63,10 +68,14 @@ pub(super) async fn execute(
                 );
             }
             let owned_path = resolved.into_owned();
-            let host = host.clone();
+            let cancel = cancel.clone();
+            let streams = streams.cloned();
             return tokio::task::spawn_blocking(move || {
-                let reservation = stream.then(|| host.streams.reserve()).transpose()?;
-                let mut file = open_regular(&owned_path, access, &host.cancel)?;
+                let reservation = match (stream, streams.as_ref()) {
+                    (true, Some(streams)) => Some(streams.reserve()?),
+                    _ => None,
+                };
+                let mut file = open_regular(&owned_path, access, &cancel)?;
                 if let Some(reservation) = reservation {
                     let file = tokio::fs::File::from_std(file);
                     let resource = match access {
@@ -77,14 +86,14 @@ pub(super) async fn execute(
                 }
                 if let Some(bytes) = data {
                     for chunk in bytes.chunks(CHUNK) {
-                        check_cancel(&host.cancel)?;
+                        check_cancel(&cancel)?;
                         file.write_all(chunk)?;
                     }
                     return Ok(Reply::value(json!(bytes.len())));
                 }
                 Ok(Reply {
                     value: Value::Null,
-                    data: Some(read_buffered(file, &host.cancel)?),
+                    data: Some(read_buffered(file, &cancel)?),
                 })
             })
             .await
@@ -92,9 +101,10 @@ pub(super) async fn execute(
             .map_err(|e: HostError| e.context(format!("{op} {}", path.display())));
         }
         "fs.readDir" => {
-            let reservation = host.streams.reserve()?;
+            let streams = streams.ok_or("fs.readDir requires stream RPC")?;
+            let reservation = streams.reserve()?;
             let dir = tokio::fs::read_dir(resolved).await.map_err(at_path)?;
-            check_cancel(&host.cancel)?;
+            check_cancel(cancel)?;
             json!(reservation.insert(Resource::Directory(dir)))
         }
         "fs.stat" => {
@@ -122,7 +132,7 @@ pub(super) async fn execute(
         }
         "fs.remove" => {
             let recursive = flag(args, "recursive", false)?;
-            remove(&resolved, recursive, &host.cancel)
+            remove(&resolved, recursive, cancel)
                 .await
                 .map_err(at_path)?;
             Value::Null
@@ -132,7 +142,88 @@ pub(super) async fn execute(
     Ok(Reply::value(value))
 }
 
-fn path_arg<'a>(args: &'a Value, key: &str) -> Result<&'a Path, HostError> {
+fn validate_path_str<'a>(op: &str, path_str: &'a str) -> Result<&'a Path, HostError> {
+    if path_str.is_empty() || path_str.contains('\0') {
+        return Err(format!("{op}: path must be nonempty without NUL").into());
+    }
+    Ok(Path::new(path_str))
+}
+
+pub(crate) async fn open_stream_read(
+    app: &crate::App,
+    path_str: &str,
+    cancel: &CancellationToken,
+) -> Result<tokio::fs::File, HostError> {
+    check_cancel(cancel)?;
+    let path = validate_path_str("fs.read", path_str)?;
+    let owned = resolve_path(app.codemode.home_dir(), path)?.into_owned();
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        let file = open_regular(&owned, Access::Read, &cancel)?;
+        Ok::<_, io::Error>(tokio::fs::File::from_std(file))
+    })
+    .await
+    .map_err(|e| HostError::from(format!("fs.read: {e}")))?
+    .map_err(|e| HostError::from(e).context(format!("fs.read {path_str}")))
+}
+
+pub(crate) async fn open_stream_write(
+    app: &crate::App,
+    path_str: &str,
+    append: bool,
+    cancel: &CancellationToken,
+) -> Result<tokio::fs::File, HostError> {
+    check_cancel(cancel)?;
+    let path = validate_path_str("fs.write", path_str)?;
+    let owned = resolve_path(app.codemode.home_dir(), path)?.into_owned();
+    let access = if append {
+        Access::Append
+    } else {
+        Access::Overwrite
+    };
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        let file = open_regular(&owned, access, &cancel)?;
+        Ok::<_, io::Error>(tokio::fs::File::from_std(file))
+    })
+    .await
+    .map_err(|e| HostError::from(format!("fs.write: {e}")))?
+    .map_err(|e| HostError::from(e).context(format!("fs.write {path_str}")))
+}
+
+pub(crate) async fn open_read_dir(
+    app: &crate::App,
+    path_str: &str,
+    cancel: &CancellationToken,
+) -> Result<tokio::fs::ReadDir, HostError> {
+    check_cancel(cancel)?;
+    let path = validate_path_str("fs.readDir", path_str)?;
+    let resolved = resolve_path(app.codemode.home_dir(), path)?;
+    let dir = tokio::fs::read_dir(resolved)
+        .await
+        .map_err(|e| HostError::from(e).context(format!("fs.readDir {path_str}")))?;
+    check_cancel(cancel)?;
+    Ok(dir)
+}
+
+pub(crate) async fn next_dir_entry(
+    dir: &mut tokio::fs::ReadDir,
+) -> Result<Option<(String, &'static str)>, HostError> {
+    match dir.next_entry().await? {
+        Some(entry) => {
+            let name = entry.file_name().into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry name is not UTF-8",
+                )
+            })?;
+            Ok(Some((name, file_type(entry.file_type().await?))))
+        }
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn path_arg<'a>(args: &'a Value, key: &str) -> Result<&'a Path, HostError> {
     let path = args[key]
         .as_str()
         .filter(|s| !s.is_empty() && !s.contains('\0'))
@@ -140,7 +231,10 @@ fn path_arg<'a>(args: &'a Value, key: &str) -> Result<&'a Path, HostError> {
     Ok(Path::new(path))
 }
 
-fn resolve_path<'a>(home: Option<&Path>, path: &'a Path) -> Result<Cow<'a, Path>, HostError> {
+pub(crate) fn resolve_path<'a>(
+    home: Option<&Path>,
+    path: &'a Path,
+) -> Result<Cow<'a, Path>, HostError> {
     if path.is_absolute() {
         return Ok(Cow::Borrowed(path));
     }
@@ -167,7 +261,7 @@ fn resolve_path<'a>(home: Option<&Path>, path: &'a Path) -> Result<Cow<'a, Path>
     Ok(Cow::Owned(home.join(path)))
 }
 
-fn flag(args: &Value, key: &str, default: bool) -> Result<bool, HostError> {
+pub(crate) fn flag(args: &Value, key: &str, default: bool) -> Result<bool, HostError> {
     match args.get(key) {
         Some(v) => v
             .as_bool()
