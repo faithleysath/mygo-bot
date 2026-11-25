@@ -17,6 +17,7 @@
    - **单会话流 `GET /sessions/{sid}/events`**：每个新连上的订阅者，都会同时接上**两条独立广播通道**：
      - **持久通道（记账员拥有，容量 64）**：只在事务 `COMMIT` 之后发成品事件——`item.saved`（完整账目）、`session.status`、`session.updated`、`session.reset`（当集群重写整本会话历史并递增 `sync_streams.reset_gen` 时，携带着最新 **`history_rev`** 通知前端清游标重拉），外加不进数据库的 `attempt.retry`。连接首包的 `ready` 和后续所有 `resync` 也都会一并带上当前 `history_rev`。**压根没人订阅时，记账员连回查数据库组装 JSON 的活都直接省掉**；有人听时，一笔新账只组装一份 `Arc<str>` 丢进槽里大家共享引用；要是某个慢窗口积压超过 64 条，广播槽直接冲它扔一条 **`resync`** 让它自己去翻 `/history` 补课，绝不回头等它。
      - **临时草稿通道（`Hub` 拥有，容量 256）**：模型在上游刚吐字时，经过一个 **`DeltaBatcher`**（每攒满 **30 毫秒**或者满 **256 字节**就打包推一次，不按单字符轰炸广播槽）发来 `item.started`、`item.delta`（区分 `text`/`reasoning`/`arguments`）和收尾清空用的 `stream.clear`。同时内存里维持着一个每字段封顶 **256 KiB** 的 `ActiveDraft` 影子草稿——所以你半路刷新页面或刚点进一个正在生成的会话，一连上紧跟着 `ready` 就会收到一份 **`stream.snapshot`**，立刻把屏幕上已经吐到一半的话续上，不用等这轮说完！
+   - **跨节点实时流中继（`ALPN b"mygo/exec/1"`）**：单会话流核心逻辑被抽成了可复用的 `SessionEventStream`（同时服务本地 HTTP SSE 与远端 `ExecServer::handle_subscribe_events`）。当浏览器连到**非执行节点**的 `GET /sessions/{sid}/events` 时，接入协程会顺手订阅 `PresenceState::watch_remote_runner(sid)`：只要发现某位远端同伴正作为 Runner 跑着这场会话（或在页面停着期间远程启动），立刻经 `mygo/exec/1` 发起一条 `SubscribeSessionEvents` 长流，把远端 Runner 吐出的 `item.started`、`item.delta`、`stream.snapshot`、`stream.clear`、`attempt.retry` 和 `item.saved` 原汁原味中继给浏览器。为了防止同一条已完成项既走中继提前露面、又随集群同步提交在本地再次落库触发第二次 `item.saved`，中继出口维护了一圈容量 **256 条**的 **`SeenSavedItems`** 去重窗口；远端中继断开时会自动补推带当前 `history_rev` 的 **`resync`**；浏览器一旦关闭标签页，借助 `ActiveRelay::drop` -> `recv.stop` -> `send.stopped()` 三端联动立即退出协程并归还远端 SSE 并发许可（上限 `64` 路）。
 
 2. **两股通道怎么保证“碎片不跑到成品后面”？**
    既然打字机碎片走 `Hub` 的 256 通道、成品 `item.saved` 走记账员的 64 通道，万一两路消息在 `tokio::select!` 里抢跑，用户刚看到完整的 `item.saved` 落盘卡片，下一毫秒一条迟到的 `item.delta` 才冒出来怎么办？
@@ -30,7 +31,7 @@
 
 ## HTTP API 全景、三条路由面与内置 OpenAPI 文档
 
-整套系统一共对外暴露 **36 条路径、51 个操作**（完整契约及 **56 个 Schema** 以单行压缩 JSON 格式编译期嵌在 [src/openapi.json](../src/openapi.json) 里，约 **79.4 KiB / 81,341 字节**，OpenAPI `3.1.0`；契约内完整声明了按需 Watch 拉取与同步冲突拦截相关的 `409 Conflict`——覆盖 `/sessions/{sid}` 及 `/history`、`/context`、`/messages`、`/events`、`/run` 停跑、`GET /attachments/{id}` 及目录/MCP 写操作——以及 `GET /sessions/{sid}/history` 返回的 **`X-History-Rev`** 响应头与 `POST /cluster/sync` 指定不存在 `session_id` 时的 `404 Not Found`）：
+整套系统一共对外暴露 **36 条路径、51 个操作**（完整契约及 **57 个 Schema** 以单行压缩 JSON 格式编译期嵌在 [src/openapi.json](../src/openapi.json) 里，约 **80.5 KiB / 82,414 字节**，OpenAPI `3.1.0`；契约内新增 **`Session.runner_node_id`** 与可选请求体 **`SessionRunRequest`**（`PUT /sessions/{sid}/run` 可传 `{ "node": "<id-or-name>" }` 路由执行节点，目标离线返回 `503`），并完整声明了按需 Watch 拉取、同步冲突及集群占有权拦截相关的 `409 Conflict`——覆盖 `/sessions/{sid}` 删改及 `/history`、`/context`、`/messages`、`/events`、`/run`、`/tasks`、`GET /attachments/{id}` 及目录/MCP 写操作——以及 `GET /sessions/{sid}/history` 返回的 **`X-History-Rev`** 响应头与 `POST /cluster/sync` 指定不存在 `session_id` 时的 `404 Not Found`）：
 
 | 模块 | 路由一览 | 核心职责 |
 | :--- | :--- | :--- |
@@ -64,7 +65,7 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 ### 1. 构建、压缩与强 ETag 嵌入（`web/build.mjs` & `src/webui.rs`）
 
 执行 `bun run build` 先跑一遍 `tsc --noEmit` 全量类型检查，随后：
-- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 45.1 KiB / 46,171 字节）**；
+- Bun 把 `web/src/main.tsx` 打包压缩成 ESM，再用 `gzip -9` 压进 **`src/webui/app.js.gz`（约 45.7 KiB / 46,787 字节）**；
 - 自定义状态机压缩 CSS（保留引号内容、去注释、去尾分号），压进 **`src/webui/app.css.gz`（约 6.6 KiB / 6,736 字节）**；
 - `index.html` 折叠标签间空白生成 **`src/webui/index.html`（898 字节）**，开头直接内联了一小段同步 `<script>`，在浏览器首帧绘制前读取 `localStorage.mygo_theme` 和系统深浅色偏好把 `dataset.theme` 设好，彻底杜绝深色模式下切白闪屏（FOUC）。
 
@@ -88,9 +89,9 @@ MyGo-Bot 的前端代码全在 `web/` 下，用到了极致克制的技术栈：
 
 ### 4. 四块界面能力速览
 
-- **侧边栏（`Sidebar.tsx`）**：按 `updated_at` 倒序排列，状态圆点一目了然（`idle`/`running` 呼吸灯/`pausing`/`paused`/带 `last_error` 红灯），运行中和暂停中隐藏删除按钮，删会话需 3 秒内二次确认；窄屏自动折叠为抽屉；底部保留 **Cluster** 入口，当存在未裁决的同步冲突（`conflict_count > 0`）时亮起冲突计数徽章。
+- **侧边栏（`Sidebar.tsx`）**：按 `updated_at` 倒序排列，状态圆点一目了然（`idle`/`running` 呼吸灯/`pausing`/`paused`/带 `last_error` 红灯），运行中、暂停中以及带有远端/后台占有权（`runner_node_id != null`）的会话一律禁用/隐藏删除按钮（附带占用提示），删会话需 3 秒内二次确认；窄屏自动折叠为抽屉；底部保留 **Cluster** 入口，当存在未裁决的同步冲突（`conflict_count > 0`）时亮起冲突计数徽章。
 - **时间线（`Timeline.tsx`、`markdown.tsx`）**：把 `withdrawal` 折叠并直接给对应用户消息画删除线；把同一组 `function_call` 与 `function_call_output` 配对成可展开工具卡片（专门把 `codemode` 的 `code`/`trigger_code` 高亮展示，也支持展示工具返回的图片音视频附件）；自研零依赖 Preact JSX Markdown 解析器——**全程零 `dangerouslySetInnerHTML`**，所有链接在行内通过单趟线性栈扫描配对括号提取目标地址并严格经 `new URL` 校验只放行显式 `http://`、`https://`、`mailto:`（彻底杜绝流式未闭合长链接引发正则回溯与平方级扫描卡死），且故意屏蔽 `![img](...)` 外链防跟踪像素；每条回复卡片和底部汇总栏统一按后端 `uncached + cache_read + cache_write` 口径计算总输入与缓存命中率。
-- **输入框与顶栏（`Composer.tsx`、`TopBar`）**：按会话独立保存未发草稿与粘贴/拖拽上传的待发附件；由于后端强制要求每场会话都带有有效模型，新建会话优先取 `localStorage`（`mygo_last_model_id` / `mygo_last_reasoning_effort`）里仍未归档的模型、否则自动回落到首个可用模型（若完全没有可用模型则提示并直接打开 `Settings -> Models`）；提交前锁定内容快照复用或生成 `Idempotency-Key`（4xx 报错重置 Key，网络/5xx 报错保留 Key 防重投），而且只有当用户在请求飞出期间**没继续打字改文本框（`textVersion` 未变）**时才清空输入，绝不吞掉用户刚续写的新字；上方在有活跃任务时展示可折叠的任务栏（每 2 秒轮询，直接展示 `running_commands` 实时终端尾部与 `Kill` 按钮）；顶栏集中放会话改名、模型切换（去掉“无模型”选项，切模型主动清零 `reasoning_effort`）、推理档位选择和基于 `last_input_tokens / context_window_tokens` 计算的上下文用量与花费统计。
+- **输入框与顶栏（`Composer.tsx`、`TopBar`）**：按会话独立保存未发草稿与粘贴/拖拽上传的待发附件；当集群存在多台节点时，输入框工具条直接出现**执行节点选择器**（可按当前集群在线成员指定由哪台机器跑下一轮，点击 Run 携带 `{ node }` 发出；当会话已由某节点占有时也会显示当前占有者，只读展示或按需切回）；由于后端强制要求每场会话都带有有效模型，新建会话优先取 `localStorage`（`mygo_last_model_id` / `mygo_last_reasoning_effort`）里仍未归档的模型、否则自动回落到首个可用模型（若完全没有可用模型则提示并直接打开 `Settings -> Models`）；提交前锁定内容快照复用或生成 `Idempotency-Key`（4xx 报错重置 Key，网络/5xx 报错保留 Key 防重投），而且只有当用户在请求飞出期间**没继续打字改文本框（`textVersion` 未变）**时才清空输入，绝不吞掉用户刚续写的新字；上方只要会话在跑、在暂停或 `runner_node_id` 非空就持续轮询并展示可折叠的任务栏（每 2 秒经控制面/执行面转发拉取，带 `[node]` 前缀展示 `running_commands` 实时终端尾部与 `Kill` 按钮）；顶栏在 `runner_node_id` 非空时展示 `@node` 实时运行徽标，旁边集中放会话改名、模型切换（去掉“无模型”选项，切模型主动清零 `reasoning_effort`）、推理档位选择和基于 `last_input_tokens / context_window_tokens` 计算的上下文用量与花费统计。
 - **设置弹窗（`Settings.tsx`）**：分 `Models`（去掉全局默认开关，保留显示归档、供应商密钥安全编辑、模型能力与定价 JSON）、`MCP`（新增 **`shared` 集群同步开关**与共享角标，编辑时屏蔽未改动的查询串/Headers/Args/Env/OAuth 防误覆盖且无改动不发 PATCH；关闭同步前显式提醒将克隆为新本地服务并清理他机旧共享副本；OAuth 既提供一键弹窗打开授权，也贴心留了粘贴远程回调 URL 的 `Submit Callback` 框方便跨机部署）、`Cluster`（修改本机节点名称与描述、复制 Node ID、一键全量同步、生成邀请码或输入邀请码加入集群——若已有同伴触发 `409` 会弹出带警告的 **`Force Switch Cluster`** 按钮二次确认以 `force: true` 切换、查看同伴在线/离线状态及移除成员、列出分叉冲突并通过脱敏的 `remote_summary` 与 `related_local_id` 对照后选 `Keep Local` 或 `Use Cluster (Overwrite)` 裁决）、`Usage`（按会话筛调用费和历史流水）与 `General`（主题、`/docs` 链接、登出）。
 
 ---

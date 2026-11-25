@@ -54,6 +54,14 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 **在这个程序里，“投信”和“点火”是分开的。** 会话停着时（`idle` 或 `paused`），客户端调 `POST /sessions/{sid}/messages` 发消息，只是往 `items` 流水账里塞进一条 `user_message`，就像把信投进门外信箱，不会自己去叫模型；真要让模型干活，得调一次 `PUT /sessions/{sid}/run` 点火开工。
 
+在多节点集群里，任何节点都能接 HTTP 请求（控制面），但不一定由它亲自干活（执行面）：`PUT /sessions/{sid}/run` 支持可选请求体 `{ "node": "<node_id或节点名>" }`（省略时默认由收到请求的节点自己来跑），如果指定了远端节点，控制面会自动把开工请求经 `mygo/exec/1` 单跳转发过去。真正点着火之前，执行节点如果发现集群里还有其他在线同伴，会先过一遍**四步执行门禁**（[src/cluster/exec.rs](../src/cluster/exec.rs)）：
+1. **看占有、抢工牌**：先核对内存里的全网在线占有表（发现疑似被他机占着就立即去对方实时复核一次，防止过期缓存误报），再在本机登记一枚三态临时工牌 `LocalClaim`（`Probing` -> `Committing` / `Yielded`——如果两个节点恰巧同一毫秒抢跑，按节点 ID 字典序确定性让步，确保最多只有一个节点胜出）；
+2. **拉齐最新账**：调 `sync_session_latest` 确保本机已 Watch 并追平会话最新提交、无分叉冲突且处于可写完整状态；
+3. **预检并发附件**：通过 `missing_session_context_attachments`（[src/media.rs](../src/media.rs)）一次性扫描上下文 `context_items` 和门外排队 `pending` 涉及的全部多模态附件，缺字节就当场从持有同行分块拉齐，源头离线拉不到就直接退回 `409` 且保持会话 `idle`；
+4. **全网打招呼再正式落牌**：向所有在线同行群发带工牌的 `CheckOccupancy`，二次核对无人跑着会话或后台任务、也没有比自己更新或分叉的头哈希，随后把工牌切进 `Committing` 并原子切为 `running`，再立刻同步推送一条带 `clear_claim` 的 `PresenceSync` 公布正式 Runner 身份并顺手摘掉临时工牌。
+
+对应的控制操作也统一按这套占有权自动寻址（[src/api.rs](../src/api.rs)）：只要会话眼下正被远端 Runner 占着（包括停在 `idle` 但还挂着未收尾后台 `codemode` 任务），`POST /messages`（连带发送方登记过的附件元数据 `AttachmentRef` 一起带上，免去附件还未全库同步时 `400` 拒收）、`DELETE /messages/{mid}`、`PATCH /sessions/{sid}`、`DELETE /run` 会全部单跳转发给那个 Runner 处理；如果全网没人占着，本地写操作会先追平最新提交再写库；而删会话 `DELETE /sessions/{sid}` 会过一道集群占有屏障，只要任意在线同行上还跑着会话或挂着后台任务，直接返回 `409`。
+
 不过一旦点火跑起来（进入 `running`），后面就不用再反复点火了——手头这一趟活收完尾，它自己会去翻门外信箱还有没有新信，有就接着跑。
 
 具体一趟活是怎么走的？
@@ -101,7 +109,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 ## 会话状态机与软暂停 / 硬暂停
 
-`sessions.status` 只有四个合法值：`idle`、`running`、`pausing`、`paused`。配合前面的积木，“暂停”这件事就只剩一个问题：**手头正在跑的这个 `step`，还让不让它做完？**
+`sessions.status` 只有四个合法持久化值：`idle`、`running`、`pausing`、`paused`。在多节点环境下，**临时运行态（`running` / `pausing`）故意不写进集群同步提交，也不会写进共享状态机账本**；非执行节点会在内存里维持一份随 `mygo/exec/1` 实时跳变的节点在线占有表 `PresenceState`，每次对外组装 `Session`（`Store::session_view`）时，动态把当前实际执行节点的 `runner_node_id` 和实时 `running`/`pausing` 状态叠加上去。这样即使某个 Runner 节点被 `SIGKILL` 强杀或突发断网，其他节点收到连接断开通知后当场清空该节点的在线占有记录，`runner_node_id` 自动清零，绝不会出现集群死锁占坑——幸存节点随时可以按照账本里留下的 `needs_model` 和 `pending` 队列把会话接过来重跑（前提是通过上面的预检且拿齐了需要用到的附件）。配合前面的积木，“暂停”这件事就只剩一个问题：**手头正在跑的这个 `step`，还让不让它做完？**
 
 ```mermaid
 stateDiagram-v2
@@ -123,9 +131,9 @@ stateDiagram-v2
     pausing --> paused: "进程崩溃重启（标 daemon restarted）"
 ```
 
-每个活动会话在内存里都挂着一份控制句柄 `Control { soft, hard, epoch }`（其中的 `epoch` 钉住开跑时的同步纪元，万一运行半途被集群高 `epoch` 覆盖或删会话，旧循环会检测到纪元失效并自动退出，绝不会把旧分支的尾账写进新历史）：
+每个活动会话在内存里都挂着一份控制句柄 `Control { soft, hard, epoch, run_gen }`（其中的 `epoch` 钉住开跑时的同步纪元，万一运行半途被集群高 `epoch` 覆盖或删会话，旧循环会检测到纪元失效并自动退出；`run_gen` 则是每次新拉起模型 Worker 递增的身份代数，专门用来区分“换人重跑”和“同纪元覆盖”，既能挡住慢一拍的旧输出越界写库，又不误伤跨回合的后台任务完成事件）：
 
-- **软暂停（`DELETE /sessions/{sid}/run` 或 `?mode=soft`）**：如果本机还只是未拉正文的目录节点，入口先调 `ensure_session_watched` 把完整正文拉齐才准开改账本。真要发暂停时，先把数据库状态提交为 `pausing`（写库失败则直接回滚，绝不半途误触取消），再拉响 `soft` 令牌。正在跑的这趟模型流和已经派出去的工具照常跑完、结果照常归档；只等这个 `step` 收完尾，循环看见 `soft` 已取消，就不再开下一步，把会话落成 `paused`（注意：如果是连发两次软暂停，因为 `soft` 已经拉响，不会重复发通知，意思依然是“做完这步就停”）。如果会话本来就没在跑，软暂停也会直接落成 `paused`。
+- **软暂停（`DELETE /sessions/{sid}/run` 或 `?mode=soft`）**：如果会话此刻正由集群里的远端 Runner 占着，控制面会先把暂停指令单跳转发到那个 Runner 上执行；如果本机接管且还只是未拉正文的目录节点，入口先调 `ensure_session_watched` 把完整正文拉齐才准开改账本。真要发暂停时，先把数据库状态提交为 `pausing`（写库失败则直接回滚，绝不半途误触取消），再拉响 `soft` 令牌。正在跑的这趟模型流和已经派出去的工具照常跑完、结果照常归档；只等这个 `step` 收完尾，循环看见 `soft` 已取消，就不再开下一步，把会话落成 `paused`（注意：如果是连发两次软暂停，因为 `soft` 已经拉响，不会重复发通知，意思依然是“做完这步就停”）。如果会话本来就没在跑，软暂停也会直接落成 `paused`。
 - **硬暂停（`DELETE /sessions/{sid}/run?mode=hard`）**：同时拉响 `soft` 和 `hard`（并顺手把该会话名下所有 `codemode` 任务按 `killed` 拉闸，见 [第 5 篇](05-codemode-lifecycle.md)）。模型请求流被 `tokio::select!` 当场掐断，正在跑的工具和等待器立刻松手。**硬暂停认的保存边界是 `item` 而不是 `step`**：
   - 流到一半还没凑齐的文本、思考碎片或半截工具参数，直接清草稿丢掉；
   - 已经拼完整并落库的 `item` 全都留着；

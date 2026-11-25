@@ -20,8 +20,8 @@
 | **`codemode_task_status`** | 模型工具 | 查单个任务的实时透视快照或已完工摘要 | 必填 `id`（严格格式 `cm_<26位小写 Crockford Base32 后缀>`，共 29 字符） |
 | **`codemode_task_renew`** | 模型工具 | 把活任务剩余租期从现在起重置为指定秒数 | 必填 `id` 和 `duration_seconds`（**1 到 86400 秒**） |
 | **`codemode_task_kill`** | 模型工具 | 停掉任务及其受管进程组，最多原地等 **3 秒**遗言 | 必填 `id` |
-| `GET /sessions/{sid}/tasks` | HTTP API | 供 WebUI 任务栏每 2 秒拉取本会话活跃任务全量快照 | 绕过“无变化去重”，总是返回最新完整文本尾部 |
-| `DELETE /sessions/{sid}/tasks/{tid}` | HTTP API | 人工从页面点 Stop 掐断指定任务 | 等同触发停止（超时标 `expired`，否则 `killed`），返回 `stopping` |
+| `GET /sessions/{sid}/tasks` | HTTP API | 供 WebUI 任务栏每 2 秒拉取本会话活跃任务全量快照（若由远端 Runner 占有则自动经 `mygo/exec/1` 转发过去拉取） | 绕过“无变化去重”，总是返回最新完整文本尾部 |
+| `DELETE /sessions/{sid}/tasks/{tid}` | HTTP API | 人工从页面点 Stop 掐断指定任务（同样按当前占有权透明转发至任务所在节点） | 等同触发停止（超时标 `expired`，否则 `killed`），返回 `stopping` |
 
 每个脚本开跑时，都会从它那笔 `function_call` 在 `items` 表里的 TypeID 主键 `origin`（形如 `itm_<26位后缀>`）直接换前缀命名，任务编号就是 **`cm_<26位后缀>`**。为了护住机器内存和 JS 线程池，系统锁死了两道并发配额：**全进程最多同时跑 256 个虚拟机任务，单个会话最多 32 个**——不仅记账员的 `s.tasks` 算这个数，连后面 `codemode_wait` 临时拉起来的 `trigger_code` 探针也会占一个 `VmSlot`（直到工人线程把进程组完全清场释放才摘名额）。
 
@@ -58,7 +58,7 @@
 
 **从哪一步开始分叉？分叉在两处：**
 
-1. **第一处分叉在“会话睡着时点不点火”**：用户往停着的会话发消息，“投信”和“点火”是分开的，得人工调 `PUT /sessions/{sid}/run` 才开工；可后台脚本半夜跑完交卷时，模型早就结束回合睡进 `idle` 了，外面没人替它点开关。所以只要新落盘的 `codemode_event` 带着 `notify = true`（且进程没关闭、会话没有活动 worker），宿主就会自动调 **`app.wake(sid)`** 把会话拉起来开跑下一轮。**但 `wake` 比手动 `/run` 克制得多**：要是会话正停在 `paused`（比如用户手动暂停或上次报了错），事件只安静进队排队，**绝不越权替用户解开暂停**；反过来，要是会话原本在 `idle`、自动唤醒时却发现当时选的模型已经被归档了，[src/agent.rs](../src/agent.rs#L37-L59) 会把会话切到 `paused` 并写明原因，免得事件卡在 `idle` 里装死。
+1. **第一处分叉在“会话睡着时点不点火”与“多节点任务占位”**：用户往停着的会话发消息，“投信”和“点火”是分开的，得人工调 `PUT /sessions/{sid}/run` 才开工；可后台脚本半夜跑完交卷时，模型早就结束回合睡进 `idle` 了，外面没人替它点开关。所以只要新落盘的 `codemode_event` 带着 `notify = true`（且进程没关闭、会话没有活动 worker），宿主就会先登记 `pending_wakes` 占位并自动调 **`app.wake(sid)`**（[src/agent.rs](../src/agent.rs#L58-L92)）把会话拉起来开跑下一轮。在多节点集群里，**只要本机还有未收尾的后台任务或正处于 `pending_wakes` 唤醒交接中，哪怕 `sessions.status` 已经退回 `idle`，`PresenceState` 照样算该节点“正占有此会话”**——全网 `runner_node_id` 会一直挂在这台机器上，不准别的节点并发抢跑或删会话（直接返回 `409 Conflict`），直到任务全退光或被杀掉才清零；同样，`wake` 自己也会先检查 `remote_owner`，绝不越权抢跑别的节点已经接手的会话。**但 `wake` 比手动 `/run` 克制得多**：要是会话正停在 `paused`（比如用户手动暂停或上次报了错），事件只安静进队排队，**绝不越权替用户解开暂停**；反过来，要是会话原本在 `idle`、自动唤醒时却发现当时选的模型已经被归档了，[src/agent.rs](../src/agent.rs#L65-L79) 会把会话切到 `paused` 并写明原因，免得事件卡在 `idle` 里装死。
 2. **第二处分叉在“门外未读的信怎么作废”**：用户消息靠 `withdrawal` 撤回，过期租期提醒靠下面要讲的 `invalidated_warnings` 作废表跳过。
 
 ---
