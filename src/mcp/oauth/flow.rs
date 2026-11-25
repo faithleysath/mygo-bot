@@ -27,6 +27,17 @@ pub(super) fn parameter(url: &Url, name: &str) -> Result<String> {
     Ok(value.1.into_owned())
 }
 
+pub(super) fn callback_initiator_node(url: &str) -> Result<Option<String>> {
+    let parsed = parse(url)?;
+    validate_endpoint(&parsed)?;
+    let state = parameter(&parsed, "state")?;
+    Ok(state
+        .split_once('.')
+        .map(|(prefix, _)| prefix)
+        .filter(|prefix| !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(str::to_owned))
+}
+
 #[derive(Deserialize)]
 struct Server {
     url: String,
@@ -40,7 +51,7 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
     getrandom::fill(&mut nonce).map_err(|_| Error::internal("OAuth nonce unavailable"))?;
     let generation: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
     let key = generation.clone();
-    let (revision, server, timeout) = app
+    let (revision, server, timeout, local_node_id) = app
         .db
         .write(
             move |conn| {
@@ -67,7 +78,8 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
                         "MCP OAuth already authorized; sign out before replacing the account",
                     ));
                 }
-                Ok((revision, server, Duration::from_millis(timeout.into())))
+                let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+                Ok((revision, server, Duration::from_millis(timeout.into()), local_node_id))
             },
             move |s, values| {
                 s.mcp.oauth().cancel_login(id);
@@ -84,7 +96,14 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
     };
     tokio::time::timeout(
         timeout,
-        prepare(app, &account, server.url, server.oauth, server.headers),
+        prepare(
+            app,
+            &account,
+            &local_node_id,
+            server.url,
+            server.oauth,
+            server.headers,
+        ),
     )
     .await
     .map_err(|_| Error::bad("OAuth discovery or registration timed out"))?
@@ -93,6 +112,7 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
 async fn prepare(
     app: &App,
     account: &Account,
+    local_node_id: &str,
     endpoint: String,
     config: Config,
     headers: BTreeMap<String, String>,
@@ -147,7 +167,7 @@ async fn prepare(
         client_secret,
         redirect_uri: redirect_uri.clone(),
     };
-    let (authorization_url, pending) = build_authorization_url(&binding, &scope_refs)?;
+    let (authorization_url, pending) = build_authorization_url(&binding, &scope_refs, local_node_id)?;
     let expires_at = pending.created_at + u64::from(LOGIN_TTL);
     let stop = CancellationToken::new();
     let listener_stop = listener.is_some().then(|| stop.clone());

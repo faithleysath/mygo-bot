@@ -340,8 +340,31 @@ pub fn materialize(conn: &Connection, sid: SessionId, blocks: &Blocks) -> Result
     result
 }
 
-pub fn recover(conn: &Connection) -> Result<()> {
+pub fn record_deferred_crash_session(
+    conn: &Connection,
+    sid: SessionId,
+    reason: &str,
+) -> Result<()> {
+    if let Some(head) = crate::cluster::ledger::stream_head(conn, sid.as_str())? {
+        conn.prepare_cached(
+            "INSERT INTO deferred_crash_sessions(session_id, head_epoch, head_seq, head_hash, reason)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id) DO NOTHING",
+        )?
+        .execute(params![
+            sid,
+            head.epoch,
+            head.head_seq,
+            head.head_hash.as_slice(),
+            reason
+        ])?;
+    }
+    Ok(())
+}
+
+pub fn recover(conn: &Connection, commit_sync: bool) -> Result<bool> {
     let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+    let mut deferred_any = false;
     // Foreground tasks may have emitted lease warnings too. No lease survives a restart.
     let warning_candidates = {
         let mut stmt = conn.prepare(
@@ -370,6 +393,11 @@ pub fn recover(conn: &Connection) -> Result<()> {
             if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
                 || !crate::cluster::ledger::is_session_writable_local(conn, sid)?
             {
+                continue;
+            }
+            if !commit_sync {
+                record_deferred_crash_session(conn, sid, "daemon restarted")?;
+                deferred_any = true;
                 continue;
             }
             crate::cluster::ledger::with_savepoint(conn, "recover_warnings", || {
@@ -413,6 +441,15 @@ pub fn recover(conn: &Connection) -> Result<()> {
         {
             continue;
         }
+        if !commit_sync {
+            conn.execute(
+                "UPDATE sessions SET status='paused',last_error='daemon restarted' WHERE id=? AND status='idle'",
+                [sid],
+            )?;
+            record_deferred_crash_session(conn, sid, "daemon restarted")?;
+            deferred_any = true;
+            continue;
+        }
         crate::cluster::ledger::with_savepoint(conn, "recover_receipt", || {
             let status = json!({"id":origin.task_id(),"status":"interrupted","error":"Daemon restarted; result unknown."});
             let content = json!([{"type":"text","text":status.to_string()}]);
@@ -450,6 +487,15 @@ pub fn recover(conn: &Connection) -> Result<()> {
         {
             continue;
         }
+        if !commit_sync {
+            conn.execute(
+                "UPDATE sessions SET status='paused',last_error='daemon restarted with pending codemode events' WHERE id=? AND status='idle'",
+                [sid],
+            )?;
+            record_deferred_crash_session(conn, sid, "daemon restarted with pending codemode events")?;
+            deferred_any = true;
+            continue;
+        }
         crate::cluster::ledger::with_savepoint(conn, "recover_pending", || {
             conn.execute(
                 "UPDATE sessions SET status='paused',last_error='daemon restarted with pending codemode events' WHERE id=?",
@@ -466,5 +512,147 @@ pub fn recover(conn: &Connection) -> Result<()> {
             Ok(())
         })?;
     }
-    Ok(())
+    Ok(deferred_any)
+}
+
+#[derive(Clone, Debug)]
+pub struct DeferredCrashSession {
+    pub session_id: SessionId,
+    pub head_epoch: i64,
+    pub head_seq: i64,
+    pub head_hash: [u8; 32],
+    pub reason: String,
+}
+
+pub fn list_deferred_crash_sessions(conn: &Connection) -> Result<Vec<DeferredCrashSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, head_epoch, head_seq, head_hash, reason FROM deferred_crash_sessions ORDER BY session_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let hash_blob: Vec<u8> = r.get(3)?;
+            let head_hash: [u8; 32] = hash_blob.try_into().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Blob,
+                    "invalid deferred crash head hash length".into(),
+                )
+            })?;
+            Ok(DeferredCrashSession {
+                session_id: r.get(0)?,
+                head_epoch: r.get(1)?,
+                head_seq: r.get(2)?,
+                head_hash,
+                reason: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn apply_deferred_crash_recovery(
+    conn: &Connection,
+    entry: &DeferredCrashSession,
+    expected_head: &crate::cluster::ledger::StreamHead,
+) -> Result<bool> {
+    let sid = entry.session_id;
+    let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+    crate::cluster::ledger::with_savepoint(conn, "deferred_crash_recovery", || {
+        conn.execute("DELETE FROM deferred_crash_sessions WHERE session_id=?", [sid])?;
+        if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
+            || !crate::cluster::ledger::is_session_writable_local(conn, sid)?
+        {
+            return Ok(false);
+        }
+        let Some(cur_head) = crate::cluster::ledger::stream_head(conn, sid.as_str())? else {
+            return Ok(false);
+        };
+        if cur_head.epoch != expected_head.epoch
+            || cur_head.head_seq != expected_head.head_seq
+            || cur_head.head_hash != expected_head.head_hash
+        {
+            return Err(Error::conflict("session head changed before crash recovery commit"));
+        }
+        let head_changed = cur_head.epoch != entry.head_epoch
+            || cur_head.head_seq != entry.head_seq
+            || cur_head.head_hash != entry.head_hash;
+
+        let invalidated = {
+            let mut stmt = conn.prepare_cached(
+                "INSERT INTO invalidated_warnings(item_id)
+                 SELECT i.id FROM items i JOIN sessions s ON s.id=i.session_id
+                 WHERE i.session_id=?1 AND i.kind='codemode_event'
+                   AND json_extract(i.payload,'$.event')='lease_warning'
+                   AND i.id>s.input_queue_cursor
+                   AND coalesce(i.origin_node_id, ?2) = ?2
+                 ON CONFLICT(item_id) DO NOTHING RETURNING item_id",
+            )?;
+            stmt.query_map(params![sid, &local_node_id], |r| r.get::<_, ItemId>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let missing_receipts = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT r.codemode_call_item_id FROM items r INDEXED BY codemode_receipts
+                 WHERE r.session_id=?1 AND r.kind='function_call_output'
+                   AND r.codemode_call_item_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM items e WHERE e.kind='codemode_event'
+                                   AND e.codemode_call_item_id=r.codemode_call_item_id
+                                   AND json_extract(e.payload,'$.event')='completed')
+                   AND coalesce(r.origin_node_id, ?2) = ?2
+                 ORDER BY r.id",
+            )?;
+            stmt.query_map(params![sid, &local_node_id], |r| r.get::<_, ItemId>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut added_items = Vec::new();
+        for origin in missing_receipts {
+            let status = json!({"id":origin.task_id(),"status":"interrupted","error":"Daemon restarted; result unknown."});
+            let content = json!([{"type":"text","text":status.to_string()}]);
+            let saved = event_at_epoch(
+                conn,
+                sid,
+                origin,
+                "completed",
+                &content,
+                true,
+                Some(cur_head.epoch),
+            )?;
+            added_items.push(saved);
+        }
+
+        let need_pause = if !added_items.is_empty() {
+            conn.execute(
+                "UPDATE sessions SET status='paused',last_error=?2 WHERE id=?1",
+                params![sid, &entry.reason],
+            )?;
+            true
+        } else if !head_changed {
+            // Nobody else touched this session since our crash: keep local paused status and publish it cleanly.
+            let changed_status: String = conn.query_row(
+                "SELECT status FROM sessions WHERE id=?",
+                [sid],
+                |r| r.get(0),
+            )?;
+            changed_status == "paused"
+        } else {
+            // Another node already took over and advanced this session while we were down.
+            false
+        };
+
+        if !added_items.is_empty() || !invalidated.is_empty() || need_pause {
+            crate::cluster::ledger::record_session_delta_at_epoch(
+                conn,
+                sid,
+                "session_delta",
+                &added_items,
+                Vec::new(),
+                invalidated,
+                Some(cur_head.epoch),
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    })
 }

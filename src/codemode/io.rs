@@ -38,7 +38,7 @@ pub(crate) struct PreparedHttpResponse {
     pub stream_deadline: Option<(tokio::time::Instant, &'static str)>,
 }
 
-pub(super) fn command_output(
+pub(crate) fn command_output(
     exit_code: Option<i64>,
     signal: Option<i32>,
     timed_out: bool,
@@ -595,7 +595,7 @@ async fn command_local(
     stdin: Option<Vec<u8>>,
 ) -> Result<Value, String> {
     let (program, argv, cwd) = validate_command(&host.app, args)?;
-    let guard = CommandGuard::start(&host.live, node_name, &program, &argv, cwd.to_str());
+    let guard = CommandGuard::start(&host.live, node_name, &program, cwd.to_str());
     let preview = CommandPreview::Local(&guard);
     execute_command_validated(
         &program,

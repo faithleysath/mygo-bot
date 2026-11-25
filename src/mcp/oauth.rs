@@ -294,11 +294,35 @@ async fn login(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<Js
     flow::start(&app, id).await.map(Json)
 }
 
+pub(crate) async fn complete_local(db: &Db, id: McpServerId, url: &str) -> Result<()> {
+    flow::complete(db, id, url, None).await
+}
+
 async fn callback(
     State(app): State<App>,
     Path(id): Path<McpServerId>,
     Json(body): Json<Callback>,
 ) -> Result<StatusCode> {
+    if let Some(initiator_node_id) = flow::callback_initiator_node(&body.url)? {
+        let local_node_id = app.exec.presence().local_node_id();
+        if initiator_node_id != local_node_id {
+            let target = initiator_node_id.clone();
+            let is_peer = app
+                .db
+                .call(move |s| {
+                    Ok(crate::cluster::identity::list_peers(&s.conn)?
+                        .into_iter()
+                        .any(|p| p.node_id == target))
+                })
+                .await?;
+            if is_peer {
+                app.exec
+                    .forward_oauth_callback(&initiator_node_id, id, body.url)
+                    .await?;
+                return Ok(StatusCode::NO_CONTENT);
+            }
+        }
+    }
     flow::complete(&app.db, id, &body.url, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }

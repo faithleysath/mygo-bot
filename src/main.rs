@@ -537,6 +537,7 @@ async fn serve(
                 client: client.clone(),
                 streams: streams.clone(),
                 signal,
+                presence: presence.clone(),
                 config: cluster::ClusterConfig {
                     local_only: options.cluster_local,
                     bind_addr: options.cluster_bind,

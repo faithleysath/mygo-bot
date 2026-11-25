@@ -53,6 +53,29 @@ enum ReadFrameErr {
     Transport(String),
 }
 
+struct PermittedBytes {
+    bytes: Vec<u8>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PermittedBytes {
+    fn into_parts(self) -> (Vec<u8>, Option<OwnedSemaphorePermit>) {
+        (self.bytes, self._permit)
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::ops::Deref for PermittedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 async fn write_cap_frame(
     send: &mut SendStream,
     header: &impl Serialize,
@@ -82,7 +105,7 @@ async fn read_cap_frame<T: DeserializeOwned>(
     max_header: usize,
     max_body: usize,
     byte_budget: &Arc<Semaphore>,
-) -> std::result::Result<(T, Vec<u8>), ReadFrameErr> {
+) -> std::result::Result<(T, PermittedBytes), ReadFrameErr> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
@@ -106,6 +129,8 @@ async fn read_cap_frame<T: DeserializeOwned>(
         .map_err(|e| ReadFrameErr::Transport(format!("cap read header failed: {e}")))?;
     let parsed: T = serde_json::from_slice(&header)
         .map_err(|e| ReadFrameErr::Protocol(format!("invalid capability frame header: {e}")))?;
+    drop(header);
+    drop(_hdr_permit);
 
     recv.read_exact(&mut len_buf)
         .await
@@ -135,7 +160,13 @@ async fn read_cap_frame<T: DeserializeOwned>(
             .await
             .map_err(|e| ReadFrameErr::Transport(format!("cap read body failed: {e}")))?;
     }
-    Ok((parsed, body))
+    Ok((
+        parsed,
+        PermittedBytes {
+            bytes: body,
+            _permit: _body_permit,
+        },
+    ))
 }
 
 async fn read_next_server_msg(
@@ -144,7 +175,7 @@ async fn read_next_server_msg(
     byte_budget: Arc<Semaphore>,
 ) -> (
     RecvStream,
-    std::result::Result<(CapServerMsg, Vec<u8>), ReadFrameErr>,
+    std::result::Result<(CapServerMsg, PermittedBytes), ReadFrameErr>,
 ) {
     let res = read_cap_frame(&mut recv, CAP_RESP_HEADER_MAX, max_body, &byte_budget).await;
     (recv, res)
@@ -237,6 +268,14 @@ enum CapServerMsg {
         kind: String,
     },
     End,
+    ProcResult {
+        exit_code: Option<i64>,
+        signal: Option<i32>,
+        timed_out: bool,
+        stdout_len: usize,
+        stderr_len: usize,
+        truncated: bool,
+    },
     Reply {
         value: Value,
         has_data: bool,
@@ -308,7 +347,7 @@ impl RemoteByteReader {
         )
         .await
         {
-            Ok((CapServerMsg::Chunk, data)) => Ok(Some(data)),
+            Ok((CapServerMsg::Chunk, data)) => Ok(Some(data.into_vec())),
             Ok((CapServerMsg::End, _)) => {
                 self.guard.mark_finished();
                 if let Some(send) = self.guard.send.as_mut() {
@@ -607,7 +646,7 @@ impl CapServer {
         &self,
         method: String,
         args: Value,
-        data: Option<Vec<u8>>,
+        data: Option<PermittedBytes>,
         sid: Option<String>,
         origin: Option<String>,
         mut send: SendStream,
@@ -622,12 +661,19 @@ impl CapServer {
             self.handle_proc_call(args, data, send, recv, call_cancel).await;
             return;
         }
+        let (data_vec, _data_permit) = match data {
+            Some(pb) => {
+                let (v, p) = pb.into_parts();
+                (Some(v), p)
+            }
+            None => (None, None),
+        };
         self.spawn_passive_cancel_watcher(&send, recv, call_cancel.clone());
         let reply = if method.starts_with("fs.") {
             tokio::select! {
                 biased;
                 _ = call_cancel.cancelled() => Err("cancelled".into()),
-                res = files::execute_local(&self.app, &call_cancel, None, &method, &args, data) => res,
+                res = files::execute_local(&self.app, &call_cancel, None, &method, &args, data_vec) => res,
             }
         } else if matches!(
             method.as_str(),
@@ -647,7 +693,7 @@ impl CapServer {
                 biased;
                 _ = call_cancel.cancelled() => Err("cancelled".into()),
                 res = async {
-                    let prep = cm_io::execute_http_prepared(self.app.codemode.client(), &args, None, data, false).await?;
+                    let prep = cm_io::execute_http_prepared(self.app.codemode.client(), &args, None, data_vec, false).await?;
                     cm_io::collect_http_body("http.request", prep).await
                 } => res,
             }
@@ -656,7 +702,7 @@ impl CapServer {
                 biased;
                 _ = call_cancel.cancelled() => Err("cancelled".into()),
                 res = async {
-                    let prep = cm_io::execute_mygo_prepared(&self.app, &args, None, data, false).await?;
+                    let prep = cm_io::execute_mygo_prepared(&self.app, &args, None, data_vec, false).await?;
                     cm_io::collect_http_body("mygo.request", prep).await
                 } => res,
             }
@@ -686,11 +732,18 @@ impl CapServer {
     async fn handle_proc_call(
         &self,
         args: Value,
-        stdin: Option<Vec<u8>>,
+        stdin: Option<PermittedBytes>,
         mut send: SendStream,
         mut recv: RecvStream,
         call_cancel: CancellationToken,
     ) {
+        let (stdin_vec, _stdin_permit) = match stdin {
+            Some(pb) => {
+                let (v, p) = pb.into_parts();
+                (Some(v), p)
+            }
+            None => (None, None),
+        };
         let (program, argv, cwd) = match cm_io::validate_command(&self.app, &args) {
             Ok(validated) => validated,
             Err(e) => {
@@ -727,8 +780,16 @@ impl CapServer {
         let cmd_cancel = call_cancel.clone();
         let mut cmd_handle = tokio::spawn(async move {
             let preview = CommandPreview::Remote(&cmd_progress);
-            cm_io::execute_command_validated(&program, &argv, &cwd, &args, stdin, cmd_cancel, &preview)
-                .await
+            cm_io::execute_command_validated(
+                &program,
+                &argv,
+                &cwd,
+                &args,
+                stdin_vec,
+                cmd_cancel,
+                &preview,
+            )
+            .await
         });
 
         let cmd_res = loop {
@@ -772,17 +833,35 @@ impl CapServer {
         };
 
         let result = match cmd_res {
-            Ok(Ok(val)) => Ok(Reply::value(val)),
+            Ok(Ok(val)) => Ok(val),
             Ok(Err(e)) => Err(HostError::from(e)),
             Err(e) => Err(HostError::from(format!("proc.exec worker panicked: {e}"))),
         };
         match result {
-            Ok(reply) => {
-                let msg = CapServerMsg::Reply {
-                    value: reply.value,
-                    has_data: false,
+            Ok(val) => {
+                let stdout_bytes = val.get("stdout").and_then(Value::as_str).unwrap_or_default().as_bytes();
+                let stderr_bytes = val.get("stderr").and_then(Value::as_str).unwrap_or_default().as_bytes();
+                let mut body = Vec::with_capacity(stdout_bytes.len() + stderr_bytes.len());
+                body.extend_from_slice(stdout_bytes);
+                body.extend_from_slice(stderr_bytes);
+                let msg = CapServerMsg::ProcResult {
+                    exit_code: val.get("exit_code").and_then(Value::as_i64),
+                    signal: val
+                        .get("signal")
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok()),
+                    timed_out: val
+                        .get("timed_out")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    stdout_len: stdout_bytes.len(),
+                    stderr_len: stderr_bytes.len(),
+                    truncated: val
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 };
-                if write_cap_frame(&mut send, &msg, None).await.is_ok() {
+                if write_cap_frame(&mut send, &msg, Some(&body)).await.is_ok() {
                     let _ = send.finish();
                 }
             }
@@ -1002,7 +1081,7 @@ impl CapServer {
         &self,
         method: String,
         args: Value,
-        data: Option<Vec<u8>>,
+        data: Option<PermittedBytes>,
         has_upload: bool,
         stream_response: bool,
         mut send: SendStream,
@@ -1017,8 +1096,15 @@ impl CapServer {
             Self::send_err(&mut send, format!("{method} expects an options object")).await;
             return;
         }
+        let (data_vec, _data_permit) = match data {
+            Some(pb) => {
+                let (v, p) = pb.into_parts();
+                (Some(v), p)
+            }
+            None => (None, None),
+        };
         let upload: Option<(cm_io::BoxUploadStream, Option<CancellationToken>)> = if has_upload {
-            let (tx, mut rx) = mpsc::channel::<std::result::Result<Vec<u8>, io::Error>>(2);
+            let (tx, mut rx) = mpsc::channel::<std::result::Result<PermittedBytes, io::Error>>(2);
             let upload_cancel = call_cancel.clone();
             let stopped = send.stopped();
             let budget = self.byte_budget.clone();
@@ -1088,7 +1174,7 @@ impl CapServer {
             });
             let stream = async_stream::stream! {
                 while let Some(part) = rx.recv().await {
-                    yield part;
+                    yield part.map(PermittedBytes::into_vec);
                 }
             };
             Some((Box::pin(stream), None))
@@ -1106,12 +1192,12 @@ impl CapServer {
                         self.app.codemode.client(),
                         &args,
                         upload,
-                        data,
+                        data_vec,
                         stream_response,
                     )
                     .await
                 } else {
-                    cm_io::execute_mygo_prepared(&self.app, &args, upload, data, stream_response)
+                    cm_io::execute_mygo_prepared(&self.app, &args, upload, data_vec, stream_response)
                         .await
                 }
             } => res,
@@ -1425,7 +1511,7 @@ async fn execute_remote_simple_call(
                 }
                 Ok(Reply {
                     value,
-                    data: has_data.then_some(body),
+                    data: has_data.then(|| body.into_vec()),
                 })
             }
             Ok((CapServerMsg::Err(e), _)) => {
@@ -1493,7 +1579,7 @@ async fn execute_remote_mcp(
                 }
                 return Ok(Reply {
                     value,
-                    data: has_data.then_some(body),
+                    data: has_data.then(|| body.into_vec()),
                 });
             }
             Ok((CapServerMsg::Err(e), _)) => {
@@ -1537,21 +1623,11 @@ async fn execute_remote_proc(
     if stdin.as_ref().is_some_and(|b| b.len() > CAP_REQ_BODY_MAX) {
         return Err("host data exceeds 8 MiB".into());
     }
-    let preview_argv = args
-        .get("args")
-        .and_then(Value::as_array)
-        .and_then(|arr| {
-            arr.iter()
-                .map(|v| v.as_str().map(str::to_owned))
-                .collect::<Option<Vec<String>>>()
-        })
-        .unwrap_or_default();
     let preview = args.get("program").and_then(Value::as_str).map(|program| {
         CommandGuard::start(
             &host.live,
             &peer.name,
             program,
-            &preview_argv,
             args.get("cwd").and_then(Value::as_str),
         )
     });
@@ -1639,6 +1715,42 @@ async fn execute_remote_proc(
                         }
                         reader = Box::pin(read_next_server_msg(recv, CAP_RESP_BODY_MAX, budget.clone()));
                     }
+                    Ok((
+                        CapServerMsg::ProcResult {
+                            exit_code,
+                            signal,
+                            timed_out,
+                            stdout_len,
+                            stderr_len,
+                            truncated,
+                        },
+                        body,
+                    )) => {
+                        if let Some(mut s) = send.take() {
+                            let _ = s.finish();
+                        }
+                        if host.cancel.is_cancelled() {
+                            return Err("cancelled".into());
+                        }
+                        let expected_total = stdout_len
+                            .checked_add(stderr_len)
+                            .ok_or_else(|| HostError::from("remote proc.exec output length overflow"))?;
+                        if body.len() != expected_total {
+                            return Err("remote proc.exec output length mismatch".into());
+                        }
+                        let (bytes, _permit) = body.into_parts();
+                        let stdout = String::from_utf8_lossy(&bytes[..stdout_len]).into_owned();
+                        let stderr =
+                            String::from_utf8_lossy(&bytes[stdout_len..expected_total]).into_owned();
+                        return Ok(Reply::value(cm_io::command_output(
+                            exit_code,
+                            signal,
+                            timed_out,
+                            stdout,
+                            stderr,
+                            truncated,
+                        )));
+                    }
                     Ok((CapServerMsg::Reply { value, has_data }, body)) => {
                         if let Some(mut s) = send.take() {
                             let _ = s.finish();
@@ -1648,7 +1760,7 @@ async fn execute_remote_proc(
                         }
                         return Ok(Reply {
                             value,
-                            data: has_data.then_some(body),
+                            data: has_data.then(|| body.into_vec()),
                         });
                     }
                     Ok((CapServerMsg::Err(e), _)) => {
@@ -1894,7 +2006,7 @@ async fn execute_remote_http_stream(
                         }
                         break Ok(Reply {
                             value,
-                            data: has_data.then_some(body),
+                            data: has_data.then(|| body.into_vec()),
                         });
                     }
                     (Ok((CapServerMsg::Err(e), _)), maybe_s) => {
@@ -1990,7 +2102,7 @@ async fn finish_remote_http_wait(
                 }
                 Ok(Reply {
                     value,
-                    data: has_data.then_some(body),
+                    data: has_data.then(|| body.into_vec()),
                 })
             }
             Ok((CapServerMsg::Err(e), _)) => {

@@ -1092,10 +1092,11 @@ fn dedup_scopes(scopes: Vec<String>) -> Vec<String> {
 pub(super) fn build_authorization_url(
     binding: &Binding,
     scopes: &[&str],
+    initiator_node_id: &str,
 ) -> Result<(String, PendingState)> {
     let mut auth_url = Url::parse(&binding.metadata.authorization_endpoint)
         .map_err(|_| Error::bad("OAuth authorization request failed"))?;
-    let csrf_token = random_token()?;
+    let csrf_token = format!("{initiator_node_id}.{}", random_token()?);
     let pkce_verifier = random_token()?;
     let challenge = BASE64_URL_SAFE_NO_PAD.encode(sha256(pkce_verifier.as_bytes()));
     {

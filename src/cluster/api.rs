@@ -203,11 +203,25 @@ async fn remove_peer(
     Path(node_id): Path<String>,
 ) -> Result<StatusCode> {
     let target = node_id.clone();
+    let presence = app.exec.presence().clone();
     let removed = app
         .db
         .write(
-            move |conn| delete_peer(conn, &target),
-            |_, removed| Ok(removed),
+            move |conn| {
+                let removed = delete_peer(conn, &target)?;
+                let count = if removed {
+                    crate::cluster::identity::list_peers(conn)?.len()
+                } else {
+                    0
+                };
+                Ok((removed, count))
+            },
+            move |_, (removed, count)| {
+                if removed {
+                    presence.set_known_peer_count(count);
+                }
+                Ok(removed)
+            },
         )
         .await?;
     if !removed {

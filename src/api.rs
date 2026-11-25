@@ -183,7 +183,9 @@ async fn create_session(
 }
 
 async fn get_session(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Session>> {
-    app.cluster.ensure_session_watched(sid).await?;
+    if app.exec.presence().known_peer_count() > 0 || !app.cluster.net.online_peer_ids().is_empty() {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
     app.db
         .call(move |s| Ok(Json(s.session_view(session(&s.conn, sid)?))))
         .await
@@ -265,14 +267,21 @@ async fn delete_session(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
 ) -> Result<StatusCode> {
-    app.cluster.ensure_session_watched(sid).await?;
-    app.exec.assert_cluster_unoccupied(sid).await?;
-    app.db
+    if app.exec.presence().known_peer_count() > 0 || !app.cluster.net.online_peer_ids().is_empty() {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
+    let delete_gate = app.exec.acquire_delete_gate(sid).await?;
+    let expected_head = delete_gate.expected_head();
+    let res = app
+        .db
         .call(move |s| {
             let current = session(&s.conn, sid)?;
             if s.active.contains_key(&sid)
+                || s.pending_wakes.contains(&sid)
                 || codemode::has_session_tasks(s, sid)
                 || matches!(current.status, SessionStatus::Running | SessionStatus::Pausing)
+                || s.presence.remote_owner(sid).is_some()
+                || s.presence.has_committed_remote_lease(sid)
             {
                 return Err(Error::conflict(
                     "pause the session and stop active tasks before deleting",
@@ -280,6 +289,19 @@ async fn delete_session(
             }
             let tx = s.conn.transaction()?;
             crate::cluster::ledger::assert_no_conflict(&tx, sid.as_str())?;
+            if let Some(ref exp) = expected_head {
+                let cur = crate::cluster::ledger::stream_head(&tx, sid.as_str())?;
+                let matches = cur.as_ref().is_some_and(|h| {
+                    h.epoch == exp.epoch
+                        && h.head_seq == exp.head_seq
+                        && h.head_hash == exp.head_hash
+                });
+                if !matches {
+                    return Err(Error::conflict(
+                        "session history changed concurrently before delete",
+                    ));
+                }
+            }
             let detached_calls = {
                 let mut stmt = tx.prepare("SELECT id FROM llm_calls WHERE session_id=? ORDER BY id")?;
                 stmt.query_map([sid], |r| r.get::<_, crate::id::CallId>(0))?
@@ -310,7 +332,9 @@ async fn delete_session(
             s.publish_global("session.deleted", json!({"id": sid}));
             Ok(())
         })
-        .await?;
+        .await;
+    delete_gate.release_now().await;
+    res?;
     app.streams.remove_session(sid);
     Ok(StatusCode::NO_CONTENT)
 }

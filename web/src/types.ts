@@ -285,7 +285,7 @@ export interface RunningCommand {
   id: number;
   node?: string;
   program: string;
-  args?: string[];
+  cwd?: string | null;
   stdout?: string;
   stderr?: string;
 }

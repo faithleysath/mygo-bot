@@ -145,7 +145,7 @@ impl LiveState {
         info["completed_commands"] = json!(self.completed_commands);
         info["running_commands"] = Value::Array(self.commands.iter_mut().map(|(id, c)| {
             let mut command = json!({
-                "id": id, "node": c.node, "program": c.program, "args": c.args, "args_truncated": c.args_truncated, "cwd": c.cwd,
+                "id": id, "node": c.node, "program": c.program, "cwd": c.cwd,
                 "started_at": c.started_at.to_rfc3339(), "elapsed_ms": c.started.elapsed().as_millis(),
                 "stdout_bytes": c.stdout.total, "stdout_truncated": c.stdout.truncated(),
                 "stderr_bytes": c.stderr.total, "stderr_truncated": c.stderr.truncated(),
@@ -223,8 +223,6 @@ impl Drop for McpGuard<'_> {
 struct Command {
     node: String,
     program: String,
-    args: Vec<String>,
-    args_truncated: bool,
     cwd: Option<String>,
     started: Instant,
     started_at: DateTime<Utc>,
@@ -247,27 +245,11 @@ impl<'a> CommandGuard<'a> {
         live: &'a Mutex<LiveState>,
         node: &str,
         program: &str,
-        args: &[String],
         cwd: Option<&str>,
     ) -> Self {
-        let mut args_truncated = args.len() > 16;
-        let preview_args = args
-            .iter()
-            .take(16)
-            .map(|arg| {
-                if arg.len() > 256 {
-                    args_truncated = true;
-                    format!("{}…", &arg[..arg.floor_char_boundary(256)])
-                } else {
-                    arg.clone()
-                }
-            })
-            .collect();
         let command = Command {
             node: node.to_owned(),
             program: program.to_owned(),
-            args: preview_args,
-            args_truncated,
             cwd: cwd.map(str::to_owned),
             started: Instant::now(),
             started_at: Utc::now(),

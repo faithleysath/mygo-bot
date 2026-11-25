@@ -246,4 +246,18 @@ CREATE TABLE sync_resolutions (
     resolved_at INTEGER NOT NULL
 );
 CREATE INDEX sync_resolutions_by_time ON sync_resolutions(resolved_at DESC, stream_id);
-PRAGMA user_version = 6;
+CREATE TABLE session_leases (
+    session_id TEXT PRIMARY KEY,
+    highest_term INTEGER NOT NULL DEFAULT 0 CHECK (highest_term >= 0),
+    holder_node_id TEXT NOT NULL DEFAULT '',
+    claim_id TEXT NOT NULL DEFAULT '',
+    expires_at_ms INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE deferred_crash_sessions (
+    session_id TEXT PRIMARY KEY,
+    head_epoch INTEGER NOT NULL,
+    head_seq INTEGER NOT NULL,
+    head_hash BLOB NOT NULL CHECK (length(head_hash) = 32),
+    reason TEXT NOT NULL DEFAULT 'daemon restarted'
+);
+PRAGMA user_version = 7;

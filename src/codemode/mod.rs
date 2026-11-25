@@ -264,7 +264,7 @@ impl Host {
                 if task.reason.is_some() || task.expired() || task.cancel.is_cancelled() {
                     return Err(Error::conflict("task stopped or expired"));
                 }
-                if task_superseded(&s.conn, s.reset_gen(sid), task)? {
+                if task_superseded(&s.conn, s.reset_gen(sid), task)? || !s.is_local_lease_valid(sid) {
                     return Err(Error::conflict("session superseded or conflicted"));
                 }
                 let expected_epoch = task.session_epoch;
@@ -942,7 +942,7 @@ fn task_superseded(conn: &Connection, reset_gen: u64, task: &Task) -> Result<boo
 fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
     let sid = s.tasks[&id].origin.sid;
     let cur_gen = s.reset_gen(sid);
-    if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? {
+    if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? || !s.is_local_lease_valid(sid) {
         s.tasks.get_mut(&id).unwrap().stop("superseded");
         return Ok(None);
     }
@@ -1087,7 +1087,7 @@ fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()
         let task = &s.tasks[&id];
         (task.origin.sid, task.session_epoch, s.reset_gen(task.origin.sid))
     };
-    if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? {
+    if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? || !s.is_local_lease_valid(sid) {
         let mut task = s.tasks.remove(&id).unwrap();
         s.refresh_local_presence(sid);
         if !s.active.contains_key(&sid)

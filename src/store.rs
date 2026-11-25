@@ -116,7 +116,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 6 {
+            if version != 7 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
@@ -126,6 +126,35 @@ impl Db {
         }
         let local_node_id = crate::cluster::identity::load_local_node(&tx)?.node_id;
         presence.set_local_node_id(local_node_id.clone());
+        let peer_count: usize = usize::try_from(tx.query_row(
+            "SELECT count(*) FROM cluster_peers",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?)
+        .unwrap_or(0);
+        presence.set_known_peer_count(peer_count);
+        let has_null_att: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachments WHERE data IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        presence.set_has_null_attachments(has_null_att);
+        let lease_rows = {
+            let mut stmt = tx.prepare(
+                "SELECT session_id, highest_term, holder_node_id, claim_id, expires_at_ms FROM session_leases",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, SessionId>(0)?,
+                    u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        presence.load_persisted_leases(lease_rows);
         let call_ids = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM llm_calls WHERE status='in_flight' AND origin_node_id=?1",
@@ -147,16 +176,39 @@ impl Db {
             stmt.query_map([], |r| r.get::<_, SessionId>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let has_peers = peer_count > 0;
+        let mut deferred_recovery: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deferred_crash_sessions)",
+            [],
+            |r| r.get(0),
+        )?;
         for sid in running_sids {
+            if has_peers
+                && !has_conflict(&tx, sid.as_str())?
+                && is_session_writable_local(&tx, sid)?
+            {
+                crate::codemode::ledger::record_deferred_crash_session(
+                    &tx,
+                    sid,
+                    "daemon restarted",
+                )?;
+                deferred_recovery = true;
+            }
             tx.execute(
                 "UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE id=?",
                 [sid],
             )?;
-            if !has_conflict(&tx, sid.as_str())? && is_session_writable_local(&tx, sid)? {
+            if !has_peers
+                && !has_conflict(&tx, sid.as_str())?
+                && is_session_writable_local(&tx, sid)?
+            {
                 record_session_delta(&tx, sid, "session_delta", &[], Vec::new(), Vec::new())?;
             }
         }
-        crate::codemode::ledger::recover(&tx)?;
+        if crate::codemode::ledger::recover(&tx, !has_peers)? {
+            deferred_recovery = true;
+        }
+        presence.set_deferred_recovery_pending(deferred_recovery);
         tx.commit()?;
         clear_staged();
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
@@ -248,12 +300,16 @@ impl Db {
         key: Option<String>,
         attachments: Vec<AttachmentRef>,
     ) -> Result<Enqueued> {
+        let has_refs = !attachments.is_empty();
         self.write(
             move |conn| {
                 merge_remote_attachment_refs(conn, &attachments)?;
                 Enqueue { sid, content, key }.insert(conn)
             },
             move |store, saved| {
+                if has_refs {
+                    store.presence.set_has_null_attachments(true);
+                }
                 if let Enqueued::Created(id) = saved {
                     store.wake_waiters(sid);
                     store.item_saved(sid, id)?;
@@ -429,10 +485,13 @@ impl Store {
             let mut tx = self.conn.transaction()?;
             for write in pending.by_ref() {
                 if let Some((sid, expected_gen)) = write.expected_run_gen
-                    && cur_gen_map.get(&sid).copied().unwrap_or(0) != expected_gen
+                    && (cur_gen_map.get(&sid).copied().unwrap_or(0) != expected_gen
+                        || !self.presence.is_local_lease_valid(sid))
                 {
                     let (_, reply) = (write.apply)(
-                        Err(Error::conflict("session superseded by cluster replacement")),
+                        Err(Error::conflict(
+                            "session superseded by cluster replacement or expired execution lease",
+                        )),
                         false,
                     );
                     replies.push(reply);
@@ -553,9 +612,19 @@ impl Store {
             }
             Ok(())
         })?;
-        self.refresh_local_presence(sid);
+        let status_enum = match state {
+            "running" => SessionStatus::Running,
+            "pausing" => SessionStatus::Pausing,
+            "paused" => SessionStatus::Paused,
+            _ => SessionStatus::Idle,
+        };
+        self.refresh_local_presence_with(sid, status_enum, reason, now);
         self.notify_status(sid, state, reason, now);
         Ok(())
+    }
+
+    pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
+        self.presence.is_local_lease_valid(sid)
     }
 
     pub fn effective_runner_node_id(&self, sid: SessionId) -> Option<String> {
@@ -564,6 +633,9 @@ impl Store {
             || crate::codemode::has_session_tasks(self, sid)
         {
             return Some(self.local_node_id.clone());
+        }
+        if self.presence.known_peer_count() == 0 {
+            return None;
         }
         self.presence.remote_owner(sid).map(|(id, _)| id)
     }
@@ -574,7 +646,9 @@ impl Store {
             || crate::codemode::has_session_tasks(self, s.id);
         if local_busy {
             s.runner_node_id = Some(self.local_node_id.clone());
-        } else if let Some((peer_id, occ)) = self.presence.remote_owner(s.id) {
+        } else if self.presence.known_peer_count() > 0
+            && let Some((peer_id, occ)) = self.presence.remote_owner(s.id)
+        {
             s.runner_node_id = Some(peer_id);
             if matches!(occ.status, SessionStatus::Running | SessionStatus::Pausing) {
                 let is_pausing = occ.status == SessionStatus::Pausing;
@@ -611,6 +685,35 @@ impl Store {
             updated_at: info.updated_at,
         });
         self.presence.set_local(sid, occ);
+    }
+
+    pub fn refresh_local_presence_with(
+        &self,
+        sid: SessionId,
+        status: SessionStatus,
+        reason: &str,
+        updated_at: i64,
+    ) {
+        let active = self.active.contains_key(&sid) || self.pending_wakes.contains(&sid);
+        let active_tasks = crate::codemode::count_session_tasks(self, sid);
+        if !active && active_tasks == 0 {
+            self.presence.set_local(sid, None);
+            return;
+        }
+        self.presence.set_local(
+            sid,
+            Some(SessionOccupancy {
+                session_id: sid,
+                status: if active && !matches!(status, SessionStatus::Running | SessionStatus::Pausing) {
+                    SessionStatus::Running
+                } else {
+                    status
+                },
+                reason: reason.to_owned(),
+                active_tasks,
+                updated_at,
+            }),
+        );
     }
 
     pub fn notify_status(&self, sid: SessionId, state: &str, reason: &str, updated_at: i64) {

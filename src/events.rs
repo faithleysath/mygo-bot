@@ -12,12 +12,14 @@ use futures_util::Stream;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, VecDeque},
     convert::Infallible,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::broadcast::{
     self,
@@ -377,7 +379,10 @@ fn take_older_deltas(
 }
 
 pub enum NextSessionNotice {
-    Event { event: String, data: String },
+    Event {
+        event: Cow<'static, str>,
+        data: Arc<str>,
+    },
     Closed,
 }
 
@@ -389,9 +394,9 @@ pub struct SessionEventStream {
     _delta: broadcast::Sender<Notice>,
     delta_rx: broadcast::Receiver<Notice>,
     initial_payload: String,
-    initial_snapshot: Option<String>,
+    initial_snapshot: Option<Arc<str>>,
     buffered_delta: Option<Notice>,
-    queued: VecDeque<(String, String)>,
+    queued: VecDeque<(Cow<'static, str>, Arc<str>)>,
     delta_open: bool,
     delta_lagged: bool,
     min_seq: u64,
@@ -430,7 +435,7 @@ impl SessionEventStream {
             _delta: delta_tx,
             delta_rx,
             initial_payload,
-            initial_snapshot: snapshot.map(|s| s.to_string()),
+            initial_snapshot: snapshot.map(|s| Arc::from(s.to_string())),
             buffered_delta: None,
             queued: VecDeque::new(),
             delta_open: true,
@@ -443,16 +448,16 @@ impl SessionEventStream {
         &self.initial_payload
     }
 
-    pub fn take_initial_snapshot(&mut self) -> Option<String> {
+    pub fn take_initial_snapshot(&mut self) -> Option<Arc<str>> {
         self.initial_snapshot.take()
     }
 
     fn push_notice(&mut self, notice: Notice) {
         self.queued
-            .push_back((notice.name.to_owned(), notice.data.to_string()));
+            .push_back((Cow::Borrowed(notice.name), notice.data));
     }
 
-    async fn resync_payload(&self) -> String {
+    async fn resync_payload(&self) -> Arc<str> {
         let sid = self.sid;
         let rev = self
             .app
@@ -460,7 +465,7 @@ impl SessionEventStream {
             .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
             .await
             .unwrap_or(0);
-        json!({"history_rev": rev}).to_string()
+        Arc::from(json!({"history_rev": rev}).to_string())
     }
 
     pub async fn next(&mut self) -> NextSessionNotice {
@@ -480,7 +485,7 @@ impl SessionEventStream {
                         }
                         Err(TryRecvError::Lagged(_)) => {
                             let data = self.resync_payload().await;
-                            self.queued.push_back(("resync".to_owned(), data));
+                            self.queued.push_back((Cow::Borrowed("resync"), data));
                         }
                         Err(TryRecvError::Closed) => {
                             if let Some((event, data)) = self.queued.pop_front() {
@@ -515,13 +520,13 @@ impl SessionEventStream {
                 match self.rx.try_recv() {
                     Ok(d) => {
                         return NextSessionNotice::Event {
-                            event: d.name.to_owned(),
-                            data: d.data.to_string(),
+                            event: Cow::Borrowed(d.name),
+                            data: d.data,
                         };
                     }
                     Err(TryRecvError::Lagged(_)) => {
                         return NextSessionNotice::Event {
-                            event: "resync".to_owned(),
+                            event: Cow::Borrowed("resync"),
                             data: self.resync_payload().await,
                         };
                     }
@@ -532,14 +537,14 @@ impl SessionEventStream {
                 match recovery {
                     DraftRecovery::Snapshot(snap) => {
                         return NextSessionNotice::Event {
-                            event: "stream.snapshot".to_owned(),
-                            data: snap.to_string(),
+                            event: Cow::Borrowed("stream.snapshot"),
+                            data: Arc::from(snap.to_string()),
                         };
                     }
                     DraftRecovery::Clear(call_id) => {
                         return NextSessionNotice::Event {
-                            event: "stream.clear".to_owned(),
-                            data: json!({"llm_call_id": call_id}).to_string(),
+                            event: Cow::Borrowed("stream.clear"),
+                            data: Arc::from(json!({"llm_call_id": call_id}).to_string()),
                         };
                     }
                     DraftRecovery::None => {}
@@ -572,7 +577,7 @@ impl SessionEventStream {
                         self.buffered_delta = None;
                         self.delta_lagged = true;
                         return NextSessionNotice::Event {
-                            event: "resync".to_owned(),
+                            event: Cow::Borrowed("resync"),
                             data: self.resync_payload().await,
                         };
                     }
@@ -581,8 +586,8 @@ impl SessionEventStream {
                             && b.seq >= self.min_seq
                         {
                             return NextSessionNotice::Event {
-                                event: b.name.to_owned(),
-                                data: b.data.to_string(),
+                                event: Cow::Borrowed(b.name),
+                                data: b.data,
                             };
                         }
                         return NextSessionNotice::Closed;
@@ -591,8 +596,8 @@ impl SessionEventStream {
                         let b = self.buffered_delta.take().unwrap();
                         if b.seq >= self.min_seq {
                             return NextSessionNotice::Event {
-                                event: b.name.to_owned(),
-                                data: b.data.to_string(),
+                                event: Cow::Borrowed(b.name),
+                                data: b.data,
                             };
                         }
                     }
@@ -636,7 +641,7 @@ impl SessionEventStream {
                     self.buffered_delta = None;
                     self.delta_lagged = true;
                     return NextSessionNotice::Event {
-                        event: "resync".to_owned(),
+                        event: Cow::Borrowed("resync"),
                         data: self.resync_payload().await,
                     };
                 }
@@ -708,45 +713,79 @@ pub async fn subscribe(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
-    app.cluster.ensure_session_watched(sid).await?;
+    let multi_node =
+        app.exec.presence().known_peer_count() > 0 || !app.cluster.net.online_peer_ids().is_empty();
+    if multi_node {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
     let mut local = SessionEventStream::open(&app, sid)
         .await?
         .ok_or_else(|| crate::Error::from(rusqlite::Error::QueryReturnedNoRows))?;
-    let mut runner_rx = app.exec.presence().watch_remote_runner(sid);
     let stream = async_stream::stream! {
         yield Ok(Event::default().event("ready").data(local.initial_payload()));
+        if !multi_node {
+            if let Some(snap) = local.take_initial_snapshot() {
+                yield Ok(Event::default().event("stream.snapshot").data(snap.as_ref()));
+            }
+            loop {
+                let ev = tokio::select! {
+                    biased;
+                    _ = app.stopping.cancelled() => break,
+                    ev = local.next() => ev,
+                };
+                match ev {
+                    NextSessionNotice::Event { event, data } => {
+                        yield Ok(Event::default().event(event).data(data.as_ref()));
+                    }
+                    NextSessionNotice::Closed => break,
+                }
+            }
+            return;
+        }
+        let mut runner_rx = app.exec.presence().watch_remote_runner(sid);
         let mut relay: Option<ActiveRelay> = None;
+        let mut seen: Option<SeenSavedItems> = None;
         if let Some(peer_id) = runner_rx.borrow().clone() {
             let cancel = app.stopping.child_token();
             let rx = app.exec.spawn_event_relay(peer_id.clone(), sid, cancel.clone());
             relay = Some(ActiveRelay { peer_id, cancel, rx });
+            seen = Some(SeenSavedItems::new());
+            local.take_initial_snapshot();
         } else if let Some(snap) = local.take_initial_snapshot() {
-            yield Ok(Event::default().event("stream.snapshot").data(snap));
+            yield Ok(Event::default().event("stream.snapshot").data(snap.as_ref()));
         } else {
             local.take_initial_snapshot();
         }
-        let mut seen = SeenSavedItems::new();
+        let mut retry_attempts: u32 = 0;
+        let mut retry_at: Option<tokio::time::Instant> = None;
         loop {
             enum SseTurn {
                 Local(NextSessionNotice),
                 RunnerChanged(std::result::Result<(), tokio::sync::watch::error::RecvError>),
                 Relayed(Option<RelayedEvent>),
+                RetryTimer,
             }
-            let turn = if let Some(active) = relay.as_mut() {
-                tokio::select! {
+            let turn = match (relay.as_mut(), retry_at) {
+                (Some(active), _) => tokio::select! {
                     biased;
                     _ = app.stopping.cancelled() => break,
                     ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
                     ev = active.rx.recv() => SseTurn::Relayed(ev),
                     ev = local.next() => SseTurn::Local(ev),
-                }
-            } else {
-                tokio::select! {
+                },
+                (None, Some(deadline)) => tokio::select! {
+                    biased;
+                    _ = app.stopping.cancelled() => break,
+                    ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
+                    _ = tokio::time::sleep_until(deadline) => SseTurn::RetryTimer,
+                    ev = local.next() => SseTurn::Local(ev),
+                },
+                (None, None) => tokio::select! {
                     biased;
                     _ = app.stopping.cancelled() => break,
                     ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
                     ev = local.next() => SseTurn::Local(ev),
-                }
+                },
             };
             match turn {
                 SseTurn::RunnerChanged(Ok(())) => {
@@ -755,16 +794,38 @@ pub async fn subscribe(
                         if let Some(old) = relay.take() {
                             old.cancel.cancel();
                         }
+                        retry_at = None;
+                        retry_attempts = 0;
                         if let Some(peer_id) = next_peer {
                             let cancel = app.stopping.child_token();
                             let rx = app.exec.spawn_event_relay(peer_id.clone(), sid, cancel.clone());
                             relay = Some(ActiveRelay { peer_id, cancel, rx });
+                            if seen.is_none() {
+                                seen = Some(SeenSavedItems::new());
+                            }
                         }
                     }
                 }
                 SseTurn::RunnerChanged(Err(_)) => break,
+                SseTurn::RetryTimer => {
+                    retry_at = None;
+                    if relay.is_none()
+                        && let Some(peer_id) = runner_rx.borrow().clone()
+                    {
+                        let cancel = app.stopping.child_token();
+                        let rx = app.exec.spawn_event_relay(peer_id.clone(), sid, cancel.clone());
+                        relay = Some(ActiveRelay { peer_id, cancel, rx });
+                        if seen.is_none() {
+                            seen = Some(SeenSavedItems::new());
+                        }
+                    }
+                }
                 SseTurn::Relayed(Some(RelayedEvent::Event { event, data })) => {
-                    if seen.accept(&event, &data) {
+                    retry_attempts = 0;
+                    let accept = seen
+                        .as_mut()
+                        .is_none_or(|s| s.accept(&event, &data));
+                    if accept {
                         yield Ok(Event::default().event(event).data(data));
                     }
                 }
@@ -778,10 +839,22 @@ pub async fn subscribe(
                         .await
                         .unwrap_or(0);
                     yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
+                    if runner_rx.borrow().is_some() {
+                        let shift = retry_attempts.min(3);
+                        let delay_ms = 250u64 << shift;
+                        retry_attempts = retry_attempts.saturating_add(1);
+                        retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(delay_ms));
+                    } else {
+                        retry_at = None;
+                        retry_attempts = 0;
+                    }
                 }
                 SseTurn::Local(NextSessionNotice::Event { event, data }) => {
-                    if seen.accept(&event, &data) {
-                        yield Ok(Event::default().event(event).data(data));
+                    let accept = seen
+                        .as_mut()
+                        .is_none_or(|s| s.accept(event.as_ref(), data.as_ref()));
+                    if accept {
+                        yield Ok(Event::default().event(event).data(data.as_ref()));
                     }
                 }
                 SseTurn::Local(NextSessionNotice::Closed) => break,

@@ -192,7 +192,7 @@ export function Composer({
                   {task.running_commands?.map((c) => (
                     <div key={c.id} class="task-cmd">
                       <div class="mono muted small">
-                        {c.node ? `[${c.node}] ` : ""}$ {c.program} {(c.args || []).join(" ")}
+                        {c.node ? `[${c.node}] ` : ""}$ {c.program}
                       </div>
                       {c.stdout && <pre class="code-box">{c.stdout}</pre>}
                       {c.stderr && <pre class="code-box err-text">{c.stderr}</pre>}

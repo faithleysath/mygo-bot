@@ -443,6 +443,9 @@ impl App {
             let Some(id) = id else {
                 return Ok(());
             };
+            if hard.is_cancelled() {
+                return Ok(());
+            }
             let app = self.clone();
             let hard = hard.clone();
             out.tasks.spawn(async move {

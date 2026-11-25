@@ -9,7 +9,7 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey,
-    endpoint::{Connection, RecvStream, SendStream, presets},
+    endpoint::{Connection, IdleTimeout, QuicTransportConfig, RecvStream, SendStream, presets},
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -332,12 +332,20 @@ impl ClusterNet {
         stopping: CancellationToken,
     ) -> Result<Arc<Self>> {
         let sk = SecretKey::from_bytes(&local.secret_key);
+        let transport = QuicTransportConfig::builder()
+            .keep_alive_interval(Duration::from_secs(2))
+            .max_idle_timeout(Some(
+                IdleTimeout::try_from(Duration::from_secs(6))
+                    .map_err(|e| Error::internal(format!("invalid QUIC idle timeout: {e}")))?,
+            ))
+            .build();
         let mut builder = if config.local_only {
             Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
         } else {
             Endpoint::builder(presets::N0)
         }
         .secret_key(sk)
+        .transport_config(transport)
         .alpns(vec![
             CLUSTER_ALPN.to_vec(),
             CAP_ALPN.to_vec(),
@@ -1168,7 +1176,9 @@ impl ClusterNet {
             .db
             .call(move |s| {
                 let now = chrono::Utc::now().timestamp_millis();
-                upsert_peer_if_gen(&s.conn, &self_id, &remote_peer, now, true, mgen)
+                upsert_peer_if_gen(&s.conn, &self_id, &remote_peer, now, true, mgen)?;
+                crate::cluster::exec::refresh_known_peer_count(&s.conn, &s.presence)?;
+                Ok(())
             })
             .await
             .is_ok();

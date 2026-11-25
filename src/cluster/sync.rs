@@ -57,6 +57,7 @@ const MAX_BLOCKING_CODEC: usize = 4;
 const OFFLOAD_BYTES_THRESHOLD: usize = 64 * 1024;
 const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(30);
 const RPC_TIMEOUT_SHORT: Duration = Duration::from_secs(10);
+const RPC_TIMEOUT_MANIFEST: Duration = Duration::from_secs(4);
 const RPC_TIMEOUT_DATA: Duration = Duration::from_secs(20);
 const RPC_TIMEOUT_OAUTH: Duration = Duration::from_secs(45);
 
@@ -245,6 +246,7 @@ pub struct SyncEngine {
     streams: Hub,
     net: Arc<ClusterNet>,
     signal: Arc<ClusterSignal>,
+    presence: Arc<crate::cluster::exec::PresenceState>,
     stream_locks: LockTable<String>,
     att_locks: LockTable<[u8; 32]>,
     att_byte_budget: Arc<Semaphore>,
@@ -262,6 +264,7 @@ impl SyncEngine {
         streams: Hub,
         net: Arc<ClusterNet>,
         signal: Arc<ClusterSignal>,
+        presence: Arc<crate::cluster::exec::PresenceState>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -269,6 +272,7 @@ impl SyncEngine {
             streams,
             net,
             signal,
+            presence,
             stream_locks: LockTable::default(),
             att_locks: LockTable::default(),
             att_byte_budget: Arc::new(Semaphore::new(MAX_ATT_BYTE_PERMITS)),
@@ -752,6 +756,7 @@ impl SyncEngine {
                         }
                         let my_info = self_peer_info(&local, &addr);
                         let mut my_peers = list_peers(&s.conn)?;
+                        s.presence.set_known_peer_count(my_peers.len());
                         my_peers.truncate(MAX_PEX_PEERS);
                         Ok((my_info, my_peers, changed))
                     })
@@ -1086,6 +1091,9 @@ impl SyncEngine {
                             mgen,
                         )?;
                     }
+                    if changed {
+                        crate::cluster::exec::refresh_known_peer_count(&s.conn, &s.presence)?;
+                    }
                     Ok(changed)
                 })
                 .await?;
@@ -1171,7 +1179,7 @@ impl SyncEngine {
                         after_stream_id: cursor.clone(),
                         limit: MANIFEST_PAGE_LIMIT,
                     },
-                    RPC_TIMEOUT_SHORT,
+                    RPC_TIMEOUT_MANIFEST,
                 )
                 .await?;
             if self.net.membership_gen() != mgen {
@@ -1253,24 +1261,24 @@ impl SyncEngine {
         let mgen = self.net.membership_gen();
         self.reconcile_open_conflicts_with_peers(&peer_ids, mgen).await?;
 
+        let manifest_results = futures_util::future::join_all(peer_ids.iter().map(|peer_id| async move {
+            (
+                peer_id.clone(),
+                self.fetch_full_manifest_from_peer(peer_id, mgen).await,
+            )
+        }))
+        .await;
+        if self.net.membership_gen() != mgen {
+            return Ok(SyncSummary {
+                peers_queried: 0,
+                streams_updated: 0,
+                conflicts: 0,
+            });
+        }
         let mut peer_manifests: Vec<(String, Vec<StreamHead>)> = Vec::new();
-        for peer_id in &peer_ids {
-            if self.net.membership_gen() != mgen {
-                return Ok(SyncSummary {
-                    peers_queried: 0,
-                    streams_updated: 0,
-                    conflicts: 0,
-                });
-            }
-            if let Ok(heads) = self.fetch_full_manifest_from_peer(peer_id, mgen).await {
-                if self.net.membership_gen() != mgen {
-                    return Ok(SyncSummary {
-                        peers_queried: 0,
-                        streams_updated: 0,
-                        conflicts: 0,
-                    });
-                }
-                peer_manifests.push((peer_id.clone(), heads));
+        for (peer_id, res) in manifest_results {
+            if let Ok(heads) = res {
+                peer_manifests.push((peer_id, heads));
             }
         }
         if self.net.membership_gen() != mgen {
@@ -1301,6 +1309,9 @@ impl SyncEngine {
                 Ok(usize::try_from(count).unwrap_or(0))
             })
             .await?;
+        if peers_queried > 0 && self.presence.is_deferred_recovery_pending() {
+            self.presence.notify_recovery();
+        }
         Ok(SyncSummary {
             peers_queried,
             streams_updated: updated_ids.len(),

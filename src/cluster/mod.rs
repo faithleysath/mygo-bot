@@ -102,6 +102,7 @@ pub struct ClusterStart {
     pub client: reqwest::Client,
     pub streams: Hub,
     pub signal: Arc<ClusterSignal>,
+    pub presence: Arc<exec::PresenceState>,
     pub config: ClusterConfig,
     pub stopping: CancellationToken,
 }
@@ -110,6 +111,7 @@ pub struct Cluster {
     db: Db,
     workers: TaskTracker,
     join_gate: Arc<AsyncMutex<()>>,
+    presence: Arc<exec::PresenceState>,
     pub net: Arc<net::ClusterNet>,
     pub sync: Arc<sync::SyncEngine>,
 }
@@ -133,6 +135,7 @@ impl Cluster {
             start.streams,
             net.clone(),
             start.signal.clone(),
+            start.presence.clone(),
         );
         net.attach_handler(Arc::downgrade(&sync));
         sync.spawn_loops(start.stopping.clone(), workers);
@@ -141,6 +144,7 @@ impl Cluster {
             db: start.db,
             workers: workers.clone(),
             join_gate: Arc::new(AsyncMutex::new(())),
+            presence: start.presence,
             net,
             sync,
         }))
@@ -155,16 +159,27 @@ impl Cluster {
         let net = self.net.clone();
         let sync = self.sync.clone();
         let join_gate = self.join_gate.clone();
+        let presence = self.presence.clone();
         self.workers
             .spawn(async move {
                 let _guard = join_gate.lock().await;
                 let local_only = net.is_local_only();
-                let (secret_changed, new_gen, new_secret, peer) = db
+                let presence_cb = presence.clone();
+                let (secret_changed, new_gen, new_secret, peer, peer_count) = db
                     .write(
-                        move |conn| identity::apply_join(conn, &invite, local_only, force),
-                        |_, res| Ok(res),
+                        move |conn| {
+                            let (changed, next_gen, secret, peer) =
+                                identity::apply_join(conn, &invite, local_only, force)?;
+                            let count = identity::list_peers(conn)?.len();
+                            Ok((changed, next_gen, secret, peer, count))
+                        },
+                        move |_, res| {
+                            presence_cb.set_known_peer_count(res.4);
+                            Ok(res)
+                        },
                     )
                     .await?;
+                presence.set_known_peer_count(peer_count);
                 if secret_changed {
                     net.switch_membership(new_gen, new_secret);
                     sync.on_membership_switched();
