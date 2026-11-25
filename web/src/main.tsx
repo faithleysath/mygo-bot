@@ -34,7 +34,7 @@ import {
   mergeItems,
   reconcileSubmittedComposer,
 } from "./state.ts";
-import type { GlobalSessionSync } from "./state.ts";
+import type { GlobalSessionSync, SessionSync } from "./state.ts";
 import { Timeline } from "./Timeline.tsx";
 import type {
   ActiveDraft,
@@ -338,7 +338,7 @@ function App() {
   const inFlightCallIdsRef = useRef<Set<string>>(new Set());
   const failedCallIdsRef = useRef<Set<string>>(new Set());
   const sessionEpochRef = useRef(0);
-  const loadMoreSeqRef = useRef(0);
+  const sessionSyncRef = useRef<SessionSync | null>(null);
 
   const updateComposer = (sid: string, fn: (cur: ComposerDraft) => ComposerDraft) => {
     setComposers((prev) => {
@@ -620,7 +620,6 @@ function App() {
 
   useEffect(() => {
     const epoch = ++sessionEpochRef.current;
-    loadMoreSeqRef.current += 1;
     setLoadingMore(false);
     itemsRef.current = [];
     callsByIdRef.current = new Map();
@@ -690,8 +689,8 @@ function App() {
       const n = Number(raw);
       return Number.isSafeInteger(n) && n >= 0 ? n : null;
     };
-    const fetchHistoryPage = async (url: string) => {
-      const { data, headers } = await apiFetchWithHeaders<HistoryItem[]>(url);
+    const fetchHistoryPage = async (url: string, signal?: AbortSignal) => {
+      const { data, headers } = await apiFetchWithHeaders<HistoryItem[]>(url, { signal });
       return { items: data, historyRev: parseHistoryRev(headers) };
     };
     const sessionSync = createSessionSync({
@@ -702,6 +701,9 @@ function App() {
             ? `/sessions/${sid}/history?after=${encodeURIComponent(afterId)}&limit=200`
             : `/sessions/${sid}/history?limit=200`
         ),
+      fetchBefore: (beforeId, signal) =>
+        fetchHistoryPage(`/sessions/${sid}/history?before=${encodeURIComponent(beforeId)}&limit=50`, signal),
+      onLoadingOlder: setLoadingMore,
       onItems: (page) => {
         if (activeIdRef.current === sid && sessionEpochRef.current === epoch) {
           setItemsState((prev) => ({
@@ -723,6 +725,7 @@ function App() {
         if (activeIdRef.current === sid && sessionEpochRef.current === epoch) setBannerErr(msg);
       },
     });
+    sessionSyncRef.current = sessionSync;
     sessionSync.start();
 
     const ctrl = new AbortController();
@@ -856,6 +859,7 @@ function App() {
 
     return () => {
       disposed = true;
+      sessionSyncRef.current = null;
       sessionSync.dispose();
       ctrl.abort();
     };
@@ -962,24 +966,8 @@ function App() {
   };
 
   const loadMore = async () => {
-    if (!activeId || !items.length || loadingMore) return;
-    const sid = activeId;
-    const mySeq = ++loadMoreSeqRef.current;
-    const firstId = items[0].id;
-    setLoadingMore(true);
-    try {
-      const older = await apiFetch<HistoryItem[]>(`/sessions/${sid}/history?before=${encodeURIComponent(firstId)}&limit=50`);
-      if (activeIdRef.current !== sid || loadMoreSeqRef.current !== mySeq) return;
-      setItemsState((prev) => (prev.sid === sid ? { sid, list: mergeItems(prev.list, older) } : prev));
-      setHasMore(older.length === 50);
-    } catch (e) {
-      if (activeIdRef.current === sid && loadMoreSeqRef.current === mySeq) {
-        setBannerErr(errorMessage(e));
-      }
-    } finally {
-      if (activeIdRef.current === sid && loadMoreSeqRef.current === mySeq) {
-        setLoadingMore(false);
-      }
+    if (activeId && itemsState.sid === activeId && items.length) {
+      await sessionSyncRef.current?.loadOlder(items[0].id);
     }
   };
 

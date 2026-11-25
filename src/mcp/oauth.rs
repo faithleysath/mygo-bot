@@ -34,6 +34,22 @@ pub(crate) struct PendingRefreshState {
     pub fp: String,
 }
 
+impl PendingRefreshState {
+    pub(crate) fn clear_if_current(
+        &self,
+        conn: &rusqlite::Connection,
+        id: McpServerId,
+        generation: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2
+             AND json_extract(pending_refresh,'$.coordinator')=?3 AND json_extract(pending_refresh,'$.fp')=?4",
+            params![id, generation, self.coordinator, self.fp],
+        )?;
+        Ok(())
+    }
+}
+
 pub(crate) fn credentials_fingerprint(raw_credentials: Option<&str>) -> Option<String> {
     let raw = raw_credentials?;
     let creds = decode::<client::StoredCredentials>(raw).ok()?;
@@ -156,16 +172,45 @@ impl Runtime {
             stop.cancel();
         }
     }
-    fn refresh_lock(&mut self, generation: &str) -> Arc<Mutex<()>> {
-        self.refresh.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = self.refresh.get(generation).and_then(Weak::upgrade) {
+}
+
+impl super::Connections {
+    pub(crate) fn refresh_gate(&mut self, generation: &str) -> Arc<Mutex<()>> {
+        let refresh = &mut self.oauth.refresh;
+        refresh.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = refresh.get(generation).and_then(Weak::upgrade) {
             return gate;
         }
         let gate = Arc::new(Mutex::new(()));
-        self.refresh
-            .insert(generation.to_owned(), Arc::downgrade(&gate));
+        refresh.insert(generation.to_owned(), Arc::downgrade(&gate));
         gate
     }
+}
+
+// Called on the SQLite worker in the same operation that copies the grant.
+// The generation gate also covers an issuer request whose response is still in flight.
+pub(crate) fn guard_grant_copy(
+    conn: &rusqlite::Connection,
+    mcp: &mut super::Connections,
+    id: McpServerId,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    let row: Option<(String, bool)> = conn
+        .prepare_cached(
+            "SELECT generation,pending_refresh IS NOT NULL FROM mcp_oauth
+             JOIN mcp_servers ON id=server_id WHERE server_id=? AND shared=1",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((generation, pending)) = row else {
+        return Ok(None);
+    };
+    if pending {
+        return Err(Error::conflict("OAuth refresh is awaiting confirmation; retry detaching later"));
+    }
+    mcp.refresh_gate(&generation)
+        .try_lock_owned()
+        .map(Some)
+        .map_err(|_| Error::conflict("OAuth refresh in progress; retry detaching later"))
 }
 
 fn parse(value: &str) -> Result<Url> {
@@ -309,7 +354,7 @@ pub(crate) async fn refresh_shared_as_coordinator(
 
     let gen_owned = generation.to_owned();
     let gate = db
-        .call(move |s| Ok(s.mcp.oauth().refresh_lock(&gen_owned)))
+        .call(move |s| Ok(s.mcp.refresh_gate(&gen_owned)))
         .await?;
     let _guard = gate.lock_owned().await;
 
@@ -371,23 +416,23 @@ pub(crate) async fn refresh_shared_as_coordinator(
                 }
             }
 
-            let row: Option<(i64, String, String, Option<String>, bool, bool)> = s
+            let row: Option<(i64, String, String, Option<String>, bool, bool, bool)> = s
                 .conn
                 .query_row(
                     &format!(
                         "SELECT m.revision, o.binding, json_extract(m.config_json,'$.url'),
                                 coalesce(o.staged_credentials,o.credentials), o.rejected,
-                                ({})
+                                ({}), o.pending_refresh IS NOT NULL
                          FROM mcp_servers m JOIN mcp_oauth o ON o.server_id=m.id
                          WHERE m.id=?1 AND m.shared=1 AND o.generation=?2",
                         storage::AUTHORIZED_SQL
                     ),
                     params![id, gen_owned],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
                 )
                 .optional()?;
 
-            let Some((revision, raw_binding, endpoint, raw_creds, rejected, authorized)) = row
+            let Some((revision, raw_binding, endpoint, raw_creds, rejected, authorized, pending_refresh)) = row
             else {
                 return Ok(Precheck::Early(CoordinatorRefreshOutcome {
                     status: OAuthRefreshStatus::ReauthRequired,
@@ -397,6 +442,9 @@ pub(crate) async fn refresh_shared_as_coordinator(
                     error: Some("MCP OAuth login changed or missing".into()),
                 }));
             };
+            if pending_refresh {
+                return Err(Error::conflict("OAuth refresh is awaiting confirmation"));
+            }
             let Some(raw_creds) = raw_creds else {
                 return Ok(Precheck::Early(CoordinatorRefreshOutcome {
                     status: OAuthRefreshStatus::ReauthRequired,

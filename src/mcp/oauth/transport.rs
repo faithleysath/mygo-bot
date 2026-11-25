@@ -48,7 +48,7 @@ impl HttpClient {
                             }
                             other => other.into(),
                         })?;
-                    let gate = s.mcp.oauth().refresh_lock(&generation);
+                    let gate = s.mcp.refresh_gate(&generation);
                     Ok((generation, decode::<Binding>(&raw)?, endpoint, gate))
                 })
                 .await

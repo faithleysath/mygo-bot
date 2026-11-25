@@ -989,10 +989,9 @@ impl JsonRows {
         db: Db,
         sid: SessionId,
         range: Option<(ItemId, ItemId)>,
-        prefix: Vec<u8>,
-        suffix: &'static [u8],
+        history_rev: i64,
     ) -> Result<Body> {
-        self.body_with_range(db, sid, range, prefix, suffix).await
+        self.body_with_range(db, sid, range, vec![b'['], b"]", Some(history_rev)).await
     }
 
     pub async fn context_body(
@@ -1003,7 +1002,7 @@ impl JsonRows {
         prefix: Vec<u8>,
         suffix: &'static [u8],
     ) -> Result<Body> {
-        self.body_with_range(db, sid, range, prefix, suffix).await
+        self.body_with_range(db, sid, range, prefix, suffix, None).await
     }
 
     async fn body_with_range<C: Cursor>(
@@ -1013,13 +1012,22 @@ impl JsonRows {
         range: Option<(C, C)>,
         mut prefix: Vec<u8>,
         suffix: &'static [u8],
+        history_rev: Option<i64>,
     ) -> Result<Body> {
         let Some((start, end)) = range else {
             prefix.extend_from_slice(suffix);
             return Ok(Body::from(prefix));
         };
+        let read_batch = move |conn: &Connection, cursor, inclusive, bytes, comma| {
+            if let Some(expected) = history_rev
+                && crate::cluster::ledger::session_history_rev(conn, sid)? != expected
+            {
+                return Err(Error::conflict("session history changed; retry this page"));
+            }
+            self.batch(conn, sid, cursor, end, inclusive, bytes, comma)
+        };
         let (mut bytes, mut position) = db
-            .call(move |s| self.batch(&s.conn, sid, start, end, true, prefix, false))
+            .call(move |s| read_batch(&s.conn, start, true, prefix, false))
             .await?;
         if position == end {
             bytes.extend_from_slice(suffix);
@@ -1029,7 +1037,7 @@ impl JsonRows {
             yield Ok::<Bytes, Error>(Bytes::from(bytes));
             while position < end {
                 let result = db
-                    .call(move |s| self.batch(&s.conn, sid, position, end, false, Vec::new(), true))
+                    .call(move |s| read_batch(&s.conn, position, false, Vec::new(), true))
                     .await;
                 match result {
                     Ok((mut bytes, next)) => {

@@ -217,6 +217,17 @@ pub struct ConflictRecord {
     pub remote_snapshot: Option<String>,
 }
 
+impl ConflictRecord {
+    pub fn detaches_mcp(&self) -> bool {
+        self.kind == StreamKind::Mcp
+            && self.reason != "name_conflict"
+            && (self.reason == "retired_diverged"
+                || self.remote_snapshot.as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .is_some_and(|v| v.get("base_epoch").is_some() || v.get("server").is_none()))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttachmentRef {
     pub id: AttachmentId,
@@ -4016,18 +4027,18 @@ fn record_resolution_receipt(conn: &Connection, r: &ResolutionReceipt) -> Result
     Ok(())
 }
 
-pub fn list_conflict_stream_ids_page(
+pub fn list_conflict_probes_page(
     conn: &Connection,
     after_stream_id: Option<&str>,
     limit: usize,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, [u8; 32])>> {
     let after = after_stream_id.unwrap_or("");
     let lim = i64::try_from(limit.clamp(1, 256)).unwrap_or(256);
     let mut stmt = conn.prepare_cached(
-        "SELECT stream_id FROM sync_conflicts WHERE stream_id>?1 ORDER BY stream_id ASC LIMIT ?2",
+        "SELECT stream_id,remote_hash FROM sync_conflicts WHERE stream_id>?1 ORDER BY stream_id ASC LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(params![after, lim], |r| r.get::<_, String>(0))?
+        .query_map(params![after, lim], |r| Ok((r.get(0)?, to_hash32(r.get(1)?)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -4089,16 +4100,15 @@ pub fn read_resolutions_and_converged(
     conn: &Connection,
     stream_ids: &[String],
 ) -> Result<(Vec<ResolutionReceipt>, Vec<StreamHead>)> {
+    // A cached receipt may settle a different fork. The current head can independently
+    // prove convergence to the counterparty that requested it.
     let receipts = read_resolutions_for_streams(conn, stream_ids)?;
-    let seen: HashSet<&str> = receipts.iter().map(|r| r.stream_id.as_str()).collect();
     let mut converged_heads = Vec::new();
     for sid in stream_ids.iter().take(256) {
-        if seen.contains(sid.as_str()) {
-            continue;
-        }
         if !has_conflict(conn, sid)?
-            && let Some(head) = stream_head_wire(conn, sid)?
+            && let Some(mut head) = stream_head_wire(conn, sid)?
         {
+            head.head_snapshot = None;
             converged_heads.push(head);
         }
     }
@@ -4107,7 +4117,6 @@ pub fn read_resolutions_and_converged(
 
 pub fn apply_resolution_receipt(
     conn: &Connection,
-    from_peer: &str,
     receipt: &ResolutionReceipt,
 ) -> Result<bool> {
     with_savepoint(conn, "apply_res_receipt", || {
@@ -4138,12 +4147,7 @@ pub fn apply_resolution_receipt(
                 && c.remote_epoch == receipt.local_epoch
                 && c.remote_seq == receipt.local_seq
                 && c.remote_hash == receipt.local_hash);
-        let peer_matched = c.remote_node_id == from_peer
-            && receipt.resolver_node_id == from_peer
-            && c.local_epoch == receipt.winner_epoch
-            && c.local_seq == receipt.winner_seq
-            && c.local_hash == receipt.winner_hash;
-        if exact_pair || peer_matched {
+        if exact_pair {
             let deleted =
                 conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [&receipt.stream_id])? > 0;
             if deleted {
@@ -4159,13 +4163,14 @@ pub fn apply_counterparty_convergence(
     conn: &Connection,
     from_peer: &str,
     peer_head: &StreamHead,
+    expected_remote_hash: [u8; 32],
     ancestor_proof: AncestorProof,
 ) -> Result<bool> {
     with_savepoint(conn, "apply_peer_conv", || {
         let Some(c) = get_conflict_opt(conn, &peer_head.stream_id)? else {
             return Ok(false);
         };
-        if c.remote_node_id != from_peer {
+        if c.remote_node_id != from_peer || c.remote_hash != expected_remote_hash {
             return Ok(false);
         }
         let Some(l) = stream_head(conn, &peer_head.stream_id)? else {
@@ -4619,16 +4624,11 @@ pub fn resolve_conflict_local(
                 StreamKind::Mcp => {
                     let mid: McpServerId =
                         stream_id.parse().map_err(|_| Error::bad("invalid mcp id"))?;
-                    let is_remote_retired = c.reason == "retired_diverged"
-                        || c.remote_snapshot
-                            .as_deref()
-                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                            .is_some_and(|v| v.get("base_epoch").is_some() || v.get("server").is_none());
                     let exists_local: Option<bool> = conn
                         .prepare_cached("SELECT shared FROM mcp_servers WHERE id=?")?
                         .query_row([mid], |r| r.get(0))
                         .optional()?;
-                    if is_remote_retired {
+                    if c.detaches_mcp() {
                         // P1-09: Never resurrect a retired mcp_* ID! Detach local edits to a fresh private
                         // McpServerId and accept retirement on the old stream ID.
                         let (ancestor_start_seq, ancestor_hashes_hex) =

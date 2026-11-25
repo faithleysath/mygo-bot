@@ -334,12 +334,13 @@ fn validate(c: &mut McpServerConfig) -> Result<()> {
 }
 fn save(
     conn: &Connection,
-    id: Option<McpServerId>,
+    update: Option<(McpServerId, &mut super::Connections)>,
     fields: Fields,
 ) -> Result<(McpServerInfo, bool, Option<McpServerId>)> {
     if fields.is_empty() {
         return Err(Error::bad("expected MCP configuration fields"));
     }
+    let id = update.as_ref().map(|(id, _)| *id);
     let old = id.map(|id| load(conn, id)).transpose()?;
     let mut doc = json!({});
     if let Some(row) = &old {
@@ -382,10 +383,15 @@ fn save(
         McpTransport::Stdio => "stdio",
     };
 
-    if let Some(old_id) = id
+    if let Some((old_id, mcp)) = update
         && old.as_ref().is_some_and(|s| s.cfg.shared && !c.shared)
     {
         crate::cluster::ledger::assert_no_conflict(conn, old_id.as_str())?;
+        let _grant_guard = if auth_changed {
+            None
+        } else {
+            oauth::guard_grant_copy(conn, mcp, old_id)?
+        };
         let old_oauth = if !auth_changed {
             conn.query_row(
                 "SELECT generation,binding,credentials,rejected FROM mcp_oauth
@@ -511,21 +517,16 @@ async fn patch_server(
     fields: Fields,
 ) -> Result<Json<McpServerInfo>> {
     app.db
-        .write(
-            move |conn| save(conn, Some(id), fields),
-            move |s, (value, auth_changed, detached_from)| {
-                if let Some(old_id) = detached_from {
-                    s.mcp.oauth().cancel_login(old_id);
-                    s.mcp.forget(old_id);
-                } else {
-                    if auth_changed || !value.enabled {
-                        s.mcp.oauth().cancel_login(id);
-                    }
-                    s.mcp.forget(id);
-                }
-                Ok(Json(value))
-            },
-        )
+        .call(move |s| {
+            let tx = s.conn.transaction()?;
+            let (value, auth_changed, detached_from) = save(&tx, Some((id, &mut s.mcp)), fields)?;
+            tx.commit()?;
+            if detached_from.is_some() || auth_changed || !value.enabled {
+                s.mcp.oauth().cancel_login(id);
+            }
+            s.mcp.forget(id);
+            Ok(Json(value))
+        })
         .await
 }
 

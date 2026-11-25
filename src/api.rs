@@ -569,7 +569,7 @@ async fn history(
         })
         .await?;
     let body = store::JsonRows::History
-        .history_body(app.db, sid, range, vec![b'['], b"]")
+        .history_body(app.db, sid, range, history_rev)
         .await?;
     let mut resp = json_response(body);
     resp.headers_mut().insert(

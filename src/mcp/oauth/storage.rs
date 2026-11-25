@@ -23,10 +23,22 @@ pub(super) const AUTHORIZED_SQL: &str = "coalesce(coalesce(staged_credentials,cr
      json_extract(coalesce(staged_credentials,credentials),'$.token_received_at') + json_extract(coalesce(staged_credentials,credentials),'$.token_response.expires_in') > unixepoch()))),0)";
 
 impl Account {
-    pub async fn has_conflict(&self) -> Result<bool> {
+    // Both issuer paths hold the generation gate through the network request and save.
+    async fn can_refresh(&self, token: &str) -> Result<bool> {
         let id = self.id;
+        let revision = self.revision;
+        let generation = self.generation.clone();
+        let token = token.to_owned();
         self.db
-            .call(move |s| crate::cluster::ledger::has_conflict(&s.conn, id.as_str()))
+            .call(move |s| {
+                let sql = format!(
+                    "SELECT EXISTS(SELECT 1 FROM mcp_oauth WHERE {CURRENT}
+                     AND pending_refresh IS NULL AND NOT EXISTS(SELECT 1 FROM sync_conflicts WHERE stream_id=?1)
+                     AND json_extract(coalesce(staged_credentials,credentials),'$.token_response.refresh_token')=?4)"
+                );
+                Ok(s.conn.prepare_cached(&sql)?
+                    .query_row(params![id, generation, revision, token], |r| r.get(0))?)
+            })
             .await
     }
 
@@ -246,8 +258,8 @@ pub(super) async fn acquire_valid_token(
     let Some(refresh) = token_resp.refresh_token.as_deref() else {
         return Err(true);
     };
-    if account.has_conflict().await.unwrap_or(false) {
-        return Err(true);
+    if !account.can_refresh(refresh).await.map_err(|_| false)? {
+        return Err(false);
     }
     let next_token = match oauth_http.refresh_token(binding, refresh).await {
         Ok(tok) => tok,

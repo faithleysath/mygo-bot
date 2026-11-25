@@ -25,7 +25,7 @@ use crate::{
             apply_counterparty_convergence, apply_remote_commits_page, apply_resolution_receipt,
             apply_terminal_mcp_delete, apply_terminal_session_delete,
             apply_unwatched_session_head, clear_staging_for_stream, commit_hash_at,
-            commit_staged_epoch, get_conflict, get_conflict_opt, list_conflict_stream_ids_page,
+            commit_staged_epoch, get_conflict, get_conflict_opt, list_conflict_probes_page,
             local_manifest_page, mark_session_watched, pin_session_target_head,
             read_commit_payload_chunk, read_commits_page, read_delete_commit,
             read_resolutions_and_converged, read_resolutions_for_streams, record_fork_conflict,
@@ -1006,13 +1006,12 @@ impl SyncEngine {
                 ))
             }
             RpcReq::NotifyConflictResolved(receipt) => {
-                let peer = from_peer.to_owned();
                 let sid = receipt.stream_id.clone();
                 let cleared = self
                     .db
                     .call(move |s| {
                         assert_membership_gen(&s.conn, conn_gen)?;
-                        let cleared = apply_resolution_receipt(&s.conn, &peer, &receipt)?;
+                        let cleared = apply_resolution_receipt(&s.conn, &receipt)?;
                         if cleared {
                             s.publish_global(
                                 "sync.conflict",
@@ -1315,20 +1314,20 @@ impl SyncEngine {
             if self.net.membership_gen() != mgen {
                 break;
             }
-            let conflict_sids = self
+            let probes = self
                 .db
                 .call({
                     let after_cur = after.clone();
-                    move |s| list_conflict_stream_ids_page(&s.conn, after_cur.as_deref(), 256)
+                    move |s| list_conflict_probes_page(&s.conn, after_cur.as_deref(), 256)
                 })
                 .await?;
-            if conflict_sids.is_empty() {
+            if probes.is_empty() {
                 break;
             }
-            let page_len = conflict_sids.len();
-            after = conflict_sids.last().cloned();
+            let page_len = probes.len();
+            after = probes.last().map(|(id, _)| id.clone());
             let req = RpcReq::GetResolutions {
-                stream_ids: conflict_sids,
+                stream_ids: probes.iter().map(|(id, _)| id.clone()).collect(),
             };
             for peer_id in peer_ids {
                 if self.net.membership_gen() != mgen {
@@ -1343,13 +1342,12 @@ impl SyncEngine {
                 )) = self.rpc(peer_id, &req, RPC_TIMEOUT_SHORT).await
                 {
                     if !receipts.is_empty() {
-                        let peer = peer_id.clone();
                         self.db
                             .call(move |s| {
                                 assert_membership_gen(&s.conn, mgen)?;
                                 for receipt in receipts {
                                     let sid = receipt.stream_id.clone();
-                                    if apply_resolution_receipt(&s.conn, &peer, &receipt)? {
+                                    if apply_resolution_receipt(&s.conn, &receipt)? {
                                         s.publish_global(
                                             "sync.conflict",
                                             json!({ "stream_id": sid, "resolved": true }),
@@ -1364,6 +1362,10 @@ impl SyncEngine {
                         if self.net.membership_gen() != mgen {
                             break;
                         }
+                        let Ok(index) = probes.binary_search_by(|(id, _)| id.cmp(&head.stream_id)) else {
+                            continue;
+                        };
+                        let expected_remote_hash = probes[index].1;
                         let conflict = self
                             .db
                             .call({
@@ -1374,7 +1376,10 @@ impl SyncEngine {
                         let Some(c) = conflict else {
                             continue;
                         };
-                        if c.remote_node_id != *peer_id || head.epoch != c.local_epoch {
+                        if c.remote_node_id != *peer_id
+                            || c.remote_hash != expected_remote_hash
+                            || head.epoch != c.local_epoch
+                        {
                             continue;
                         }
                         let proof = if head.head_seq > c.local_seq {
@@ -1407,7 +1412,9 @@ impl SyncEngine {
                             .call(move |s| {
                                 assert_membership_gen(&s.conn, mgen)?;
                                 let sid = head.stream_id.clone();
-                                if apply_counterparty_convergence(&s.conn, &peer, &head, proof)? {
+                                if apply_counterparty_convergence(
+                                    &s.conn, &peer, &head, expected_remote_hash, proof,
+                                )? {
                                     s.publish_global(
                                         "sync.conflict",
                                         json!({ "stream_id": sid, "resolved": true }),
@@ -2979,6 +2986,12 @@ impl SyncEngine {
                     .db
                     .call(move |s| {
                         assert_membership_gen(&s.conn, mgen)?;
+                        let _grant_guard = if exp_c.detaches_mcp() {
+                            let id = sid_owned.parse().map_err(|_| Error::bad("invalid MCP stream id"))?;
+                            crate::mcp::oauth::guard_grant_copy(&s.conn, &mut s.mcp, id)?
+                        } else {
+                            None
+                        };
                         let out = resolve_conflict_local(&s.conn, &sid_owned, &exp_c)?;
                         for ch in &out.mcp_changes {
                             s.mcp.apply_sync_change(*ch);
@@ -3459,7 +3472,7 @@ impl SyncEngine {
             server_id: McpServerId,
             generation: &str,
             stream_id: &str,
-            expected_fp: &str,
+            pending: &PendingRefreshState,
             clear_if_same_and_valid: bool,
         ) -> Result<ReconciledOAuth> {
             assert_membership_gen(conn, mgen)?;
@@ -3474,20 +3487,14 @@ impl SyncEngine {
                 return Ok(ReconciledOAuth::GoneOrReauth);
             };
             let Some(new_fp) = credentials_fingerprint(raw_creds.as_deref()) else {
-                conn.execute(
-                    "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
-                    params![server_id, generation],
-                )?;
+                pending.clear_if_current(conn, server_id, generation)?;
                 return Ok(ReconciledOAuth::GoneOrReauth);
             };
-            if new_fp != expected_fp
+            if new_fp != pending.fp
                 || (clear_if_same_and_valid
                     && !credentials_need_refresh(raw_creds.as_deref(), rejected))
             {
-                conn.execute(
-                    "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
-                    params![server_id, generation],
-                )?;
+                pending.clear_if_current(conn, server_id, generation)?;
                 return Ok(ReconciledOAuth::Rotated);
             }
             Ok(ReconciledOAuth::Unchanged(stream_head(conn, stream_id)?))
@@ -3542,7 +3549,7 @@ impl SyncEngine {
             .and_then(|raw| serde_json::from_str::<PendingRefreshState>(raw).ok())
             .filter(|pr| pr.fp == current_fp);
 
-        let (coordinator, cur_st) = if let Some(pr) = active_pending {
+        let (delegation, cur_st) = if let Some(pr) = active_pending {
             if self.net.is_peer_online(&pr.coordinator) {
                 let _ = self.sync_with_peers(Some(&pr.coordinator), None).await;
             }
@@ -3553,7 +3560,7 @@ impl SyncEngine {
                 .call({
                     let sid = stream_id.clone();
                     let gen_q = gen_owned.clone();
-                    let fp = current_fp.clone();
+                    let pending = pr.clone();
                     move |s| {
                         evaluate_oauth_after_sync(
                             &s.conn,
@@ -3561,7 +3568,7 @@ impl SyncEngine {
                             server_id,
                             &gen_q,
                             &sid,
-                            &fp,
+                            &pending,
                             false,
                         )
                     }
@@ -3582,7 +3589,7 @@ impl SyncEngine {
                     if !remote_holders.iter().any(|p| p == &pr.coordinator) {
                         return Ok(RefreshCoordination::PendingConfirmation);
                     }
-                    (pr.coordinator, st_now)
+                    (pr, st_now)
                 }
             }
         } else {
@@ -3594,18 +3601,22 @@ impl SyncEngine {
             if chosen == self.net.local_node_id() || chosen.is_empty() {
                 return Ok(RefreshCoordination::Local);
             }
-            let pending_json = serde_json::to_string(&PendingRefreshState {
-                coordinator: chosen.clone(),
-                fp: current_fp.clone(),
-            })
-            .map_err(|e| Error::internal(e.to_string()))?;
-            let early = self
-                .db
+            let pending = PendingRefreshState { coordinator: chosen, fp: current_fp };
+            let pending_json = serde_json::to_string(&pending)
+                .map_err(|e| Error::internal(e.to_string()))?;
+            // Serialize the durable delegation claim with local and inbound issuer calls.
+            let gate = self.db
+                .call({
+                    let generation = gen_owned.clone();
+                    move |s| Ok(s.mcp.refresh_gate(&generation))
+                })
+                .await?;
+            let _claim_guard = gate.lock_owned().await;
+            let claim = self.db
                 .write(
                     {
                         let gen_q = gen_owned.clone();
-                        let fp = current_fp.clone();
-                        let pj = pending_json;
+                        let fp = pending.fp.clone();
                         let sid = stream_id.clone();
                         move |conn| {
                             assert_membership_gen(conn, mgen)?;
@@ -3617,28 +3628,35 @@ impl SyncEngine {
                                 .query_row(params![server_id, gen_q], |r| r.get(0))
                                 .optional()?;
                             let Some(raw) = cur else {
-                                return Ok((Some(true), None));
+                                return Ok(Err(RefreshCoordination::Delegated { reauth_required: true }));
                             };
                             let latest_fp = credentials_fingerprint(raw.as_deref());
                             if latest_fp.as_deref() != Some(fp.as_str()) {
-                                return Ok((Some(latest_fp.is_none()), None));
+                                return Ok(Err(RefreshCoordination::Delegated {
+                                    reauth_required: latest_fp.is_none(),
+                                }));
                             }
-                            conn.execute(
-                                "UPDATE mcp_oauth SET pending_refresh=?1 WHERE server_id=?2 AND generation=?3",
-                                params![pj, server_id, gen_q],
+                            ledger::assert_no_conflict(conn, &sid)?;
+                            let changed = conn.execute(
+                                "UPDATE mcp_oauth SET pending_refresh=?1 WHERE server_id=?2 AND generation=?3 AND pending_refresh IS ?4",
+                                params![pending_json, server_id, gen_q, pending_raw],
                             )?;
-                            Ok((None, stream_head(conn, &sid)?))
+                            if changed == 0 {
+                                return Ok(Err(RefreshCoordination::PendingConfirmation));
+                            }
+                            Ok(Ok(stream_head(conn, &sid)?))
                         }
                     },
                     |_, res| Ok(res),
                 )
                 .await?;
-            if let Some(reauth_required) = early.0 {
-                return Ok(RefreshCoordination::Delegated { reauth_required });
+            match claim {
+                Ok(head) => (pending, head.or(st)),
+                Err(outcome) => return Ok(outcome),
             }
-            (chosen, early.1.or(st))
         };
 
+        let coordinator = &delegation.coordinator;
         let (expected_epoch, expected_seq, expected_hash) = match cur_st {
             Some(l) => (l.epoch, l.synced_seq, Some(l.synced_hash)),
             None => (0, 0, None),
@@ -3646,7 +3664,7 @@ impl SyncEngine {
 
         let rpc_res = self
             .rpc(
-                &coordinator,
+                coordinator,
                 &RpcReq::OAuthRefresh {
                     server_id,
                     generation: gen_owned.clone(),
@@ -3683,10 +3701,7 @@ impl SyncEngine {
                                     let gen_q = gen_owned.clone();
                                     move |conn| {
                                         assert_membership_gen(conn, mgen)?;
-                                        conn.execute(
-                                            "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
-                                            params![server_id, gen_q],
-                                        )?;
+                                        delegation.clear_if_current(conn, server_id, &gen_q)?;
                                         Ok(())
                                     }
                                 },
@@ -3701,7 +3716,7 @@ impl SyncEngine {
                     // rather than falling back to local refresh.
                     self.broadcast_heads(std::slice::from_ref(&stream_id), None)
                         .await;
-                    let _ = self.sync_with_peers(Some(&coordinator), None).await;
+                    let _ = self.sync_with_peers(Some(coordinator), None).await;
                     return Ok(RefreshCoordination::PendingConfirmation);
                 };
 
@@ -3786,10 +3801,7 @@ impl SyncEngine {
                         .write(
                             move |conn| {
                                 assert_membership_gen(conn, mgen)?;
-                                conn.execute(
-                                    "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
-                                    params![server_id, gen_owned],
-                                )?;
+                                delegation.clear_if_current(conn, server_id, &gen_owned)?;
                                 Ok(())
                             },
                             |_, ()| Ok(()),
@@ -3808,7 +3820,7 @@ impl SyncEngine {
                             server_id,
                             &gen_owned,
                             &stream_id,
-                            &current_fp,
+                            &delegation,
                             true,
                         )
                     })
@@ -3826,7 +3838,7 @@ impl SyncEngine {
             _ => {
                 // Coordinator disconnected/timed out: keep pending_refresh persisted unless credentials
                 // actually rotated or authorization changed. Ordinary config commits never clear it.
-                let _ = self.sync_with_peers(Some(&coordinator), None).await;
+                let _ = self.sync_with_peers(Some(coordinator), None).await;
                 let _ = self.sync_with_peers(None, None).await;
                 let post = self
                     .db
@@ -3837,7 +3849,7 @@ impl SyncEngine {
                             server_id,
                             &gen_owned,
                             &stream_id,
-                            &current_fp,
+                            &delegation,
                             false,
                         )
                     })

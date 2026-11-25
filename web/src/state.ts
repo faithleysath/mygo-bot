@@ -634,6 +634,8 @@ function normalizeHistoryResult(
 export interface SessionSyncOptions {
   fetchInitial: () => Promise<HistoryFetchResult>;
   fetchAfter: (afterId: string) => Promise<HistoryFetchResult>;
+  fetchBefore?: (beforeId: string, signal: AbortSignal) => Promise<HistoryFetchResult>;
+  onLoadingOlder?: (loading: boolean) => void;
   onItems: (items: HistoryItem[]) => void;
   onReplaceItems?: (items: HistoryItem[]) => void;
   onHasMore: (hasMore: boolean) => void;
@@ -644,6 +646,7 @@ export interface SessionSyncOptions {
 }
 
 export interface SessionSync {
+  loadOlder: (beforeId: string) => Promise<void>;
   start: () => void;
   onReady: (historyRev?: number) => void;
   onResync: (historyRev?: number) => void;
@@ -656,6 +659,8 @@ export interface SessionSync {
 export function createSessionSync({
   fetchInitial,
   fetchAfter,
+  fetchBefore,
+  onLoadingOlder,
   onItems,
   onReplaceItems,
   onHasMore,
@@ -673,6 +678,14 @@ export function createSessionSync({
   let replaceNext = false;
   let resetGen = 0;
   let knownHistoryRev: number | null = null;
+  let olderRequest: AbortController | null = null;
+
+  const cancelOlder = (): void => {
+    if (!olderRequest) return;
+    olderRequest.abort();
+    olderRequest = null;
+    onLoadingOlder?.(false);
+  };
   let retryTimer: TimerId | null = null;
   let retryDelay = 1000;
 
@@ -810,6 +823,7 @@ export function createSessionSync({
 
   const onReset = (historyRev?: number): void => {
     if (disposed) return;
+    cancelOlder();
     if (typeof historyRev === "number") {
       knownHistoryRev = historyRev;
     }
@@ -827,6 +841,34 @@ export function createSessionSync({
     }
   };
 
+  const loadOlder = async (beforeId: string): Promise<void> => {
+    if (disposed || !initialLoaded || olderRequest || !fetchBefore) return;
+    const request = new AbortController();
+    olderRequest = request;
+    onLoadingOlder?.(true);
+    try {
+      const page = normalizeHistoryResult(await fetchBefore(beforeId, request.signal));
+      if (request.signal.aborted) return;
+      if (page.historyRev !== knownHistoryRev) {
+        onReset(page.historyRev === null ? undefined : Math.max(knownHistoryRev ?? 0, page.historyRev));
+        return;
+      }
+      onItems(page.items);
+      onHasMore(page.items.length === 50);
+    } catch (e) {
+      if (!request.signal.aborted) {
+        onError?.(errorMessage(e));
+        // An interrupted body can mean the server replaced history between batches.
+        onResync();
+      }
+    } finally {
+      if (olderRequest === request) {
+        olderRequest = null;
+        onLoadingOlder?.(false);
+      }
+    }
+  };
+
   const onLiveItem = (item: HistoryItem): void => {
     if (disposed) return;
     onItems([item]);
@@ -837,10 +879,11 @@ export function createSessionSync({
 
   const dispose = (): void => {
     disposed = true;
+    cancelOlder();
     clearRetry();
   };
 
   const getState = () => ({ initialLoaded, syncedThroughId, gapOpen });
 
-  return { start, onReady, onResync, onReset, onLiveItem, dispose, getState };
+  return { start, onReady, onResync, onReset, onLiveItem, loadOlder, dispose, getState };
 }

@@ -161,7 +161,7 @@ pub(super) async fn logout(app: &App, id: McpServerId) -> Result<()> {
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let gate = generation.as_ref().map(|g| s.mcp.oauth().refresh_lock(g));
+            let gate = generation.as_ref().map(|g| s.mcp.refresh_gate(g));
             Ok((generation, gate, Duration::from_millis(ms.min(5_000).into())))
         })
         .await?;
