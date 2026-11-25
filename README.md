@@ -6,7 +6,7 @@
 
 可执行文件叫 `mygo`。运行 `mygo daemon` 在后台启动，或用 `mygo daemon --foreground` 在终端看日志。TCP 默认从 `127.0.0.1:26946` 开始监听。
 
-单节点启动天然构成一个 1 节点私有集群；可通过 WebUI 或 `/cluster/*` 接口生成一次性邀请码把多台设备/实例接入同一集群自动同步状态。局域网或本机多实例联调可按需传入：
+单节点启动天然构成一个 1 节点私有集群；可通过 WebUI 或 `/cluster/*` 接口生成一次性邀请码把多台设备/实例接入同一集群自动同步状态。加入同一集群的多节点会通过 `iroh` QUIC 对等暴露统一节点寻址的能力接口，模型在 `codemode` 中通过 `cluster.nodes()` 与 `cluster.node(target)` 即可无差别调度任意在线节点上的 `fs`、`proc`、`http`、`mcp` 与 `mygo` 能力。局域网或本机多实例联调可按需传入：
 
 - `--cluster-local`：禁用公共中继与 DNS 发现，仅走本地直连集群模式；
 - `--cluster-bind <IP:PORT>`：把 `iroh` QUIC 集群端点固定绑定到指定 UDP 地址。

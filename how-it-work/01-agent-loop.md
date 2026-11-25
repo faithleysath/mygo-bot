@@ -12,7 +12,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 - **供应商与模型目录（`llm_providers` 与 `llm_models`）**：模型的上游地址 `base_url`、密钥 `api_key`、模型代号 `model_key`、上下文窗口大小、支持的输入模态（`text`、`image`、`audio`、`video`）、推理强度档位以及价格表，都登记在独立的目录表里。
 - **不再维护全局默认表 `config`**：为了免去多节点同步全局配置的耦合与状态同步包袱，系统直接移除全局 `config` 表，改为在建会话时显式选模：数据库里 `sessions.model_id` 是 `NOT NULL`，调 `POST /sessions` **必须传入**一个当前可用（自己和所属供应商都没有被归档）的 `model_id`（缺省或传 `null` 直接返 `400`），可选再带上该模型支持的 `reasoning_effort`；WebUI 会在浏览器 `localStorage` 里记住上次使用的模型并自动回落到首个可用模型（若尚无可用模型则弹窗引导先添加），已有会话随时可以通过 `PATCH /sessions/{sid}` 改换别的有效模型，但不允许把 `model_id` 改回 `null`。
-- **发给上游的静态前缀**：会话跑起来发请求时，除了在 `input` 最前面实时拼入一条静态英文 `role: "developer"` 指南消息（位于 [src/model.rs](../src/model.rs#L55-L107)；内含编译期静态写入的宿主 OS/架构，不含动态环境信息、不写进流水账，同时可稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
+- **发给上游的静态前缀**：会话跑起来发请求时，除了在 `input` 最前面实时拼入一条**云原生跨平台静态英文 `role: "developer"` 指南消息**（位于 [src/model.rs](../src/model.rs#L55-L72)；刻意不包含任何宿主 OS/架构假定或动态环境信息、也不写进流水账，引导模型通过 `cluster.nodes()` 与 `cluster.node(target)` 发现并驱动任意集群节点，同时可跨异构节点稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
 
 ---
 

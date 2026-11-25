@@ -8,12 +8,12 @@
 
 ## 先看脚本里怎么找到并调用远端工具
 
-拿一次实际的联网搜索来说。用户问了 SQLite 3.50.0 的发布日期和两个新函数的名字。模型手里仍是那 6 个工具，它先调 `codemode`，在脚本里问一句 `await mcp.servers()`。宿主直接从 SQLite 的 `mcp_servers` 表读出已启用服务的名字和用途，这一步根本不用联网。模型看到 `exa` 能搜网页，才用 `await mcp.tools('exa')` 看它有哪些工具、每个工具要填什么参数（目录大时可以传 `{ query: 'search' }` 筛选，或把上页 `nextCursor` 作为 `cursor` 传回去继续翻）。
+拿一次实际的联网搜索来说。用户问了 SQLite 3.50.0 的发布日期和两个新函数的名字。模型手里仍是那 6 个工具，它先调 `codemode`，在脚本里用 `await cluster.nodes()` 找到合适节点，再用 `const node = cluster.node(target)` 取出节点句柄问一句 `await node.mcp.servers()`（或者用同节点的 `await node.mcp.tools('exa')` 看工具有哪些、需要填什么参数；目录大时可传 `{ query: 'search' }` 筛选或传 `nextCursor` 翻页）。宿主从**目标节点** SQLite 的 `mcp_servers` 表读出已启用服务（**同时包含全集群共享与该节点本地私有的 MCP 服务**），这一步根本不用连远端 MCP 服务端。
 
 Exa 的 `web_search_exa` 要求脚本用 `query` 写想找什么，用 `objective` 写希望从结果里核实什么。摸清参数后，模型在脚本里直接调用：
 
 ```js
-const result = await mcp.call('exa', 'web_search_exa', {
+const result = await node.mcp.call('exa', 'web_search_exa', {
     query: 'SQLite 3.50.0 official release notes Unicode escape functions',
     objective: 'Find the release date and both new SQL function names in the official notes.',
     numResults: 5,
@@ -42,7 +42,7 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 
 ### 懒连接、配置共用与会话隔离池（`src/mcp/mod.rs`）
 
-**配置全进程共用，连接按会话单独建。** 登记服务时程序压根不连网；直到某个会话里的脚本第一次调 `mcp.tools` 或 `mcp.call` 等操作，记账员线程管理的 **`Connections` 连接池**才按 **`(session_id, server_id)`** 现开一条懒连接。同一会话后面的新脚本复用这条连接，别的会话则另开自己的连接。
+**配置全节点各自管理（共享项集群同步），连接按 `(目标节点, session_id, server_id)` 懒建隔离。** 登记服务时程序压根不连网；直到某个会话里的脚本对某节点调 `node.mcp.tools` 或 `node.mcp.call` 等操作（本机直调或经 `mygo/cap/1` 传到目标节点带上 `session_id`），目标节点记账员线程管理的 **`Connections` 连接池**才按 **`(session_id, server_id)`** 现开一条懒连接。同一会话后面发往该节点的脚本复用这条连接，别的会话则另开自己的连接。
 
 连接池全进程上限 **64 条**（`MAX_CONNECTIONS`）：满了优先驱逐最近最少使用且无人持有的空闲槽位；如果 64 条全在忙着干活，直接返回 `409 Conflict`（`"MCP connection limit reached"`）。后台还有一条每 **60 秒**巡检一次的 `reap_idle` 协程，把空闲满 **10 分钟**或已坏掉的连接清掉。
 
@@ -56,7 +56,7 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 
 | 维度 | `streamable-http`（[src/mcp/client.rs](../src/mcp/client.rs)） | `stdio`（[src/mcp/stdio.rs](../src/mcp/stdio.rs)） |
 | :--- | :--- | :--- |
-| **建连与环境隔离** | 独立 `reqwest` POST，不跟重定向、不自动重试 | `spawn_blocking` 启动子进程；Windows **拒 `.cmd`/`.bat`**；先 `env_clear()` 只继承最少必要系统变量（如 `PATH`/`HOME` 等），`stderr` 直接接**空设备**防日志泄密和写满管道死锁 |
+| **建连与环境隔离** | 独立 `reqwest` POST，不跟重定向、不自动重试 | `spawn_blocking` 启动子进程（未指定 `cwd` 时统一以目标节点服务用户的 **`HOME`** 为工作目录）；Windows **拒 `.cmd`/`.bat`**；先 `env_clear()` 只继承最少必要系统变量（如 `PATH`/`HOME` 等），`stderr` 直接接**空设备**防日志泄密和写满管道死锁 |
 | **协议握手协商** | **两阶段握手**：先试现代 **`server/discover`**（支持 `2026-07-28` 等 5 个版本，遇 `-32022` 按服务端列表降级）；不认则回退经典 **`initialize` + `notifications/initialized`** | 经典 `initialize` + `notifications/initialized`（或按协议版本协商） |
 | **会话与协议头** | 跟踪服务端返回的 `Mcp-Session-Id`（遇 `404` 判会话过期立刻淘汰连接）；退场发 HTTP `DELETE`（`Drop` 最多等 5 秒，`close` 等 1 秒）。`2026-07-28+` 协议自动带 `_meta`、`Mcp-Method`、`Mcp-Name`，还能按工具 `inputSchema` 声明的 **`x-mcp-header`** 抽出参数塞进 `Mcp-Param-*` 请求头（RFC `tchar` 校验 + `=?base64?...?=` 编码，缓存 512 个工具 schema） | 无 HTTP 头；通过 **Unix 进程组（`process_group(0)` + `waitid(NOWAIT)`）** 或 **Windows `JobObject`（`CREATE_SUSPENDED` 挂起绑作业再恢复线程防孙子逃逸）** 关进笼子 |
 | **消息收发与背压** | 每个 `POST` 可回普通 `application/json` 或 **`text/event-stream` SSE**（16 MiB 线限额）；流里自动答复服务端 `ping`，收到 `list_changed` 通知刷新缓存纪元；不建单独 `GET` 监听流 | 换行分隔 JSON-RPC（16 MiB 单行上限）；单写协程配 **128 容量通道**。发请求前原子**预占 2 个槽位**：1 槽写请求、1 槽留给 **`PendingGuard`**——就算 stdin 被堵满，超时或取消时析构函数也能立刻把 `notifications/cancelled` 稳稳排在原请求后面发出去！ |
@@ -66,21 +66,21 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 
 ## 全量能力、内容打包、错误脱敏与体检
 
-### 1. 八个 JS 接口与翻页保护
+### 1. 八个节点 MCP 接口与翻页保护
 
-车间里的 `mcp` 对象不止能调工具，覆盖 MCP 三大原语的全部 8 个方法（[src/mcp/capabilities.rs](../src/mcp/capabilities.rs)）：
-- `mcp.servers()`、`mcp.tools(server, { query?, cursor? })`、`mcp.call(server, tool, args?)`
-- `mcp.resources(server, { cursor? })`、`mcp.resourceTemplates(server, { cursor? })`、`mcp.readResource(server, uri)`
-- `mcp.prompts(server, { cursor? })`、`mcp.getPrompt(server, name, args?)`（参数值要求全是字符串）
+节点句柄上的 `node.mcp` 对象不止能调工具，覆盖 MCP 三大原语的全部 8 个方法（[src/mcp/capabilities.rs](../src/mcp/capabilities.rs)）：
+- `node.mcp.servers()`、`node.mcp.tools(server, { query?, cursor? })`、`node.mcp.call(server, tool, args?)`
+- `node.mcp.resources(server, { cursor? })`、`node.mcp.resourceTemplates(server, { cursor? })`、`node.mcp.readResource(server, uri)`
+- `node.mcp.prompts(server, { cursor? })`、`node.mcp.getPrompt(server, name, args?)`（参数值要求全是字符串）
 
-其中 `mcp.tools` 在宿主层做了一次强防御：单次最多自动翻 **64 页**、单页超过 **4096 个**原始工具直接报错、用哈希集合记下看过的 `cursor`（最大 16 KiB）防止死循环、先按 `allowed_tools` 白名单再按 `query` 模糊过滤、并顺手把工具 `inputSchema` 的顶层属性名记进 `slot.public_fields` 白名单。
+其中 `node.mcp.tools` 在宿主层做了一次强防御：单次最多自动翻 **64 页**、单页超过 **4096 个**原始工具直接报错、用哈希集合记下看过的 `cursor`（最大 16 KiB）防止死循环、先按 `allowed_tools` 白名单再按 `query` 模糊过滤、并顺手把工具 `inputSchema` 的顶层属性名记进 `slot.public_fields` 白名单。
 
 ### 2. 二进制打包与不支持扩展（`src/mcp/content.rs`）
 
 当远端返回图片、音频、视频或二进制资源时，宿主先拦截掉 MyGo 暂不支持的 `input_required` 和服务端后台 `task` 扩展（`resultType` 必须是缺省或 `"complete"`）。然后把响应里所有解码出来的 Base64 字节紧凑拼成一整块连续缓冲区 **`BinaryData`**，再通过 `bootstrap.js` 里的 `mcpResult` 精准地只把受信任内容槽位里的 `[start, end]` 偏移量替换成 `bytes.subarray(start, end)`（`structuredContent` 和 `resource_link` 绝不篡改）。
 
 - 具体合法的 `image/*`、`audio/*`、`video/*` 块会变成跟第 4 篇完全同款的块，脚本可以直接 `return` 或 `emitEvent` 喂给多模态模型；
-- 其余 MIME 类型（如 PDF 或 `application/octet-stream`）变成 **`{ type: 'blob', mime_type, data: Uint8Array }`**，供脚本就地分析或用 `fs.write` 落盘，禁止直接扔进模型输出；
+- 其余 MIME 类型（如 PDF 或 `application/octet-stream`）变成 **`{ type: 'blob', mime_type, data: Uint8Array }`**，供脚本就地分析或用 `node.fs.write` 落盘，禁止直接扔进模型输出；
 - 整套解码受限于 **16 MiB** 线协议总长（`WIRE_LIMIT`）、**2 MiB** 元数据 JSON 壳（`BYTE_LIMIT`）、单块 **50 MiB** 与单次回复 **52 MiB** 预算。
 
 ### 3. 错误三层分治、脱敏与“结果未知”语义（`src/mcp/errors.rs`）
@@ -88,7 +88,7 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 外部 MCP 报错绝不瞎处理，分成三层看待：
 1. **工具业务失败（`isError: true`）**：通信正常完成，服务明确说这单业务失败，原因全在 `result.content` 里，交给脚本自己 `if (result.isError)` 决定怎么处理；
 2. **协议报错脱敏**：绝对不直接把远端 JSON-RPC 返回的原始报错文字原封不动传给模型——因为有些烂服务会把请求头、Token 或内网 URL 吐进错误详情里！宿主先把错误信息截到 1024 字节，只抽取结构化的“缺少/非法字段名”，而且**只有字段名属于 8 个常规固定名或刚才在 `tools/list` 里声明过的公开属性名（`public_fields`）才允许带出去**，其余一律换成按错误码映射的安全提示；
-3. **写操作断线绝不自动重发**：整次操作包在服务配置的 `timeout_ms` 超时里（硬暂停也会立刻取消本地等待）。程序用了一个布尔标志 **`sent`**：只有当 `mcp.call` 确认跳过本地校验并把请求发出去那一刻才把 `sent` 置为 `true`。一旦在这之后遇上超时、断线或响应超限，MyGo 会明确报错 **`"; result unknown; request was not replayed"`**——比如远端可能已经把工单建好了、只是回信丢在半路，MyGo 绝不会擅自重放请求，提醒模型先去远端核对状态再决定。
+3. **写操作断线绝不自动重发**：整次操作包在服务配置的 `timeout_ms` 超时里（硬暂停也会立刻取消本地等待）。程序用了一个布尔标志 **`sent`**：只有当 `mcp.call` 确认跳过本地校验并把请求发出去那一刻才把 `sent` 置为 `true`。一旦在这之后遇上超时、断线或响应超限（包括跨节点调用时目标节点在 `mcp.call` 中途失联），MyGo 会明确报错 **`"; result unknown; request was not replayed"`**——比如远端可能已经把工单建好了、只是回信丢在半路，MyGo 绝不会擅自重放请求，提醒模型先去远端核对状态再决定。
 
 ### 4. 一键诊断体检 `POST /mcp/servers/{id}/test`（`src/mcp/diagnostics.rs`）
 

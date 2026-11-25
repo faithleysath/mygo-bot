@@ -103,10 +103,11 @@
 
 光看 `codemode_task_list` 只能知道“还在跑”，光看 `console.log` 也会扑空——因为脚本一旦停在 `await proc.exec(...)` 等子进程退出，JS 代码根本还没往下走到打印那一行，`console` 里一个字都没有。
 
-所以每个任务诞生时，虚拟机、`io::drain` 管道读取器和 `Task` 台账之间共用一块内存实时板 **`LiveState`**（[src/codemode/live.rs](../src/codemode/live.rs)）：
+因为 [第 4 篇](04-codemode-sandbox.md) 里把 `node.fs` / `node.proc` / `node.http` / `node.mcp` / `node.mygo` 都接进了统一的节点句柄，就算模型把多台机器混在同一个脚本里跑，**每条正在跑的子进程和 MCP 调用都会带上一个 `node` 目标节点标签**（[src/codemode/live.rs](../src/codemode/live.rs)）：
+
 - **`console` 环形尾部**：攒着最新 **256 KiB** 日志，支持 `console.clear()` 推进 `console_epoch`。如果日志绕圈截断了，输出文本前会先跳过开头的 0~3 个 UTF-8 续字节（`b & 0xc0 == 0x80`），防止半截汉字乱码；
-- **`CommandGuard` 子进程透视**：每启动一个 `proc.exec`，RAII 守卫立刻在 `LiveState` 挂牌（保存命令名、最多 **16 个**截断至 256 字节的参数预览、`cwd`、`started_at`），每次从管道读到新字节，**先于 1 MiB 返回上限**实时抄送一份到各 **64 KiB** 的 `stdout`/`stderr` 环形尾部里，命令一退不管成功超时必摘牌并累加 `completed_commands`；
-- **`McpGuard` 阶段透视**：调 `mcp.*` 时只记操作名、服务器名、可选工具名（截断至 256B）和阶段（`looking_up` -> `connecting` -> `discovering` / `requesting`）及耗时——**刻意不记参数、URI 和游标**，防监控快照把敏感凭据泄漏出去。
+- **`CommandGuard` 子进程透视**：每启动一个 `node.proc.exec`，RAII 守卫立刻在 `LiveState` 挂牌（保存目标 **`node`**、命令名、最多 **16 个**截断至 256 字节的参数预览、`cwd`、`started_at`），每次从管道读到新字节，**先于 1 MiB 返回上限**实时抄送一份到各 **64 KiB** 的 `stdout`/`stderr` 环形尾部里（如果是远端节点执行，远端读管道时还会沿 `mygo/cap/1` QUIC 双向流实时推送 `CommandProgress` 帧到当前执行节点刷新该尾部），命令一退不管成功超时必摘牌并累加 `completed_commands`；
+- **`McpGuard` 阶段透视**：调 `node.mcp.*` 时只记目标 **`node`**、操作名、服务器名、可选工具名（截断至 256B）和阶段（`looking_up` -> `connecting` -> `discovering` / `requesting`；远端调用同样通过 `McpPhase` 帧实时同步阶段）及耗时——**刻意不记参数、URI 和游标**，防监控快照把敏感凭据泄漏出去。
 
 为了防止模型拿着 `codemode_task_status` 反复瞎轮询把上下文填满，模型工具专用的 `status` 藏了两招**防刷屏机关**（注：JS 内的 `task.status` 和 HTTP 的 `GET /sessions/{sid}/tasks` 绕过这两招，总是拿完整快照）：
 
