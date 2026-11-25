@@ -40,6 +40,7 @@ CREATE TABLE mcp_oauth (
     pending TEXT,
     credentials TEXT,
     staged_credentials TEXT,
+    pending_refresh TEXT CHECK (pending_refresh IS NULL OR json_valid(pending_refresh)),
     rejected INTEGER NOT NULL DEFAULT 0 CHECK (rejected IN (0,1))
 );
 -- Credentials belong to a particular endpoint, authentication settings and HTTP headers.
@@ -245,4 +246,4 @@ CREATE TABLE sync_resolutions (
     resolved_at INTEGER NOT NULL
 );
 CREATE INDEX sync_resolutions_by_time ON sync_resolutions(resolved_at DESC, stream_id);
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;

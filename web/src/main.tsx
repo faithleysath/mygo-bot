@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   ApiError,
   apiFetch,
+  apiFetchWithHeaders,
   connectSse,
   consumeHashToken,
   errorMessage,
@@ -683,10 +684,20 @@ function App() {
     const isCallClosed = (callId: string) =>
       closedCalls.has(callId) || (clearedThroughCallId !== "" && callId <= clearedThroughCallId);
 
+    const parseHistoryRev = (headers: Headers): number | null => {
+      const raw = headers.get("x-history-rev");
+      if (raw == null || raw === "") return null;
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
+    };
+    const fetchHistoryPage = async (url: string) => {
+      const { data, headers } = await apiFetchWithHeaders<HistoryItem[]>(url);
+      return { items: data, historyRev: parseHistoryRev(headers) };
+    };
     const sessionSync = createSessionSync({
-      fetchInitial: () => apiFetch<HistoryItem[]>(`/sessions/${sid}/history?tail=true&limit=50`),
+      fetchInitial: () => fetchHistoryPage(`/sessions/${sid}/history?tail=true&limit=50`),
       fetchAfter: (afterId) =>
-        apiFetch<HistoryItem[]>(
+        fetchHistoryPage(
           afterId
             ? `/sessions/${sid}/history?after=${encodeURIComponent(afterId)}&limit=200`
             : `/sessions/${sid}/history?limit=200`

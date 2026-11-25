@@ -57,7 +57,7 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
                 server.oauth.validate()?;
                 let sql = format!(
                     "INSERT INTO mcp_oauth(server_id,generation) VALUES(?,?) ON CONFLICT(server_id)
-                     DO UPDATE SET generation=excluded.generation,binding=NULL,pending=NULL,credentials=NULL,rejected=0
+                     DO UPDATE SET generation=excluded.generation,binding=NULL,pending=NULL,credentials=NULL,staged_credentials=NULL,pending_refresh=NULL,rejected=0
                      WHERE NOT {}",
                     super::storage::AUTHORIZED_SQL
                 );

@@ -72,6 +72,7 @@ pub struct Store {
     pub channels: HashMap<SessionId, broadcast::WeakSender<Notice>>,
     pub wake_sequences: HashMap<SessionId, watch::Sender<u64>>,
     pub session_run_gen: HashMap<SessionId, u64>,
+    pub session_reset_gen: HashMap<SessionId, u64>,
     pub global_events: broadcast::Sender<Notice>,
     pub sync_tx: Arc<ClusterSignal>,
     pub closing: bool,
@@ -104,7 +105,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 5 {
+            if version != 6 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
@@ -160,6 +161,7 @@ impl Db {
                     channels: HashMap::new(),
                     wake_sequences: HashMap::new(),
                     session_run_gen: HashMap::new(),
+                    session_reset_gen: HashMap::new(),
                     global_events,
                     sync_tx,
                     closing: false,
@@ -368,6 +370,16 @@ impl Store {
 
     pub fn run_gen(&self, sid: SessionId) -> u64 {
         self.session_run_gen.get(&sid).copied().unwrap_or(0)
+    }
+
+    pub fn bump_reset_gen(&mut self, sid: SessionId) -> u64 {
+        let next = self.session_reset_gen.get(&sid).copied().unwrap_or(0) + 1;
+        self.session_reset_gen.insert(sid, next);
+        next
+    }
+
+    pub fn reset_gen(&self, sid: SessionId) -> u64 {
+        self.session_reset_gen.get(&sid).copied().unwrap_or(0)
     }
 
     fn commit_batch(&mut self, batch: &mut Vec<Write>) {

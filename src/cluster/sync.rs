@@ -20,16 +20,17 @@ use crate::{
             self_peer_info, upsert_peer_if_gen,
         },
         ledger::{
-            self, ApplyOutcome, COMMIT_CHUNK_BYTES, CommitMeta, CommitWire, ConflictRecord,
-            MAX_COMMIT_PAYLOAD_BYTES, ResolutionReceipt, StreamHead, StreamKind,
-            apply_remote_commits_page, apply_resolution_receipt, apply_terminal_mcp_delete,
-            apply_terminal_session_delete, apply_unwatched_session_head, clear_staging_for_stream,
-            commit_hash_at, commit_staged_epoch, get_conflict, list_conflict_stream_ids,
+            self, AncestorProof, ApplyOutcome, COMMIT_CHUNK_BYTES, CommitMeta, CommitWire,
+            ConflictRecord, MAX_COMMIT_PAYLOAD_BYTES, ResolutionReceipt, StreamHead, StreamKind,
+            apply_counterparty_convergence, apply_remote_commits_page, apply_resolution_receipt,
+            apply_terminal_mcp_delete, apply_terminal_session_delete,
+            apply_unwatched_session_head, clear_staging_for_stream, commit_hash_at,
+            commit_staged_epoch, get_conflict, get_conflict_opt, list_conflict_stream_ids_page,
             local_manifest_page, mark_session_watched, pin_session_target_head,
             read_commit_payload_chunk, read_commits_page, read_delete_commit,
-            read_resolutions_for_streams, record_fork_conflict, resolve_conflict_local,
-            session_history_rev, stage_remote_commits_page, stream_head, stream_head_wire,
-            verify_local_prefix,
+            read_resolutions_and_converged, read_resolutions_for_streams, record_fork_conflict,
+            resolve_conflict_local, session_history_rev, stage_remote_commits_page, stream_head,
+            stream_head_wire, verify_local_prefix,
         },
         net::{
             ClusterNet, RPC_BODY_MAX, RPC_READ_DEADLINE, RPC_REQ_HEADER_MAX, RPC_RESP_HEADER_MAX,
@@ -184,6 +185,8 @@ enum RpcResp {
     },
     Resolutions {
         receipts: Vec<ResolutionReceipt>,
+        #[serde(default)]
+        converged_heads: Vec<StreamHead>,
     },
     Error {
         message: String,
@@ -221,11 +224,13 @@ impl<K: Eq + std::hash::Hash + Clone> LockTable<K> {
     }
 }
 
+type InboundItem = (i64, String, StreamHead);
+
 #[derive(Default)]
 struct InboundState {
-    by_stream: HashMap<String, Vec<(String, StreamHead)>>,
+    by_stream: HashMap<String, Vec<InboundItem>>,
     fifo: VecDeque<String>,
-    full_sync_peers: HashSet<String>,
+    full_sync_peers: HashSet<(i64, String)>,
     total_entries: usize,
 }
 
@@ -334,7 +339,10 @@ impl SyncEngine {
             RpcResp::DeleteCommit { commit } => commit
                 .as_ref()
                 .is_some_and(|c| c.payload.len() > OFFLOAD_BYTES_THRESHOLD),
-            RpcResp::Resolutions { receipts } => receipts.len() > 16,
+            RpcResp::Resolutions {
+                receipts,
+                converged_heads,
+            } => receipts.len() > 16 || converged_heads.len() > 16,
             _ => false,
         };
         if needs_offload {
@@ -420,8 +428,10 @@ impl SyncEngine {
                     if stop.is_cancelled() {
                         break;
                     }
-                    if let Some(peer_id) = eng.pop_full_sync_peer() {
-                        let _ = eng.sync_with_peers(Some(&peer_id), None).await;
+                    if let Some((mgen, peer_id)) = eng.pop_full_sync_peer() {
+                        if eng.net.membership_gen() == mgen {
+                            let _ = eng.sync_with_peers(Some(&peer_id), None).await;
+                        }
                         continue;
                     }
                     if let Some((stream_id, candidates)) = eng.pop_inbound_stream() {
@@ -480,10 +490,16 @@ impl SyncEngine {
         }
     }
 
-    fn enqueue_inbound_heads(&self, from_peer: String, heads: Vec<StreamHead>) {
+    fn enqueue_inbound_heads(&self, conn_gen: i64, from_peer: String, heads: Vec<StreamHead>) {
+        if self.net.membership_gen() != conn_gen {
+            return;
+        }
         let mut st = self.inbound.lock().unwrap();
+        if self.net.membership_gen() != conn_gen {
+            return;
+        }
         if st.total_entries >= MAX_INBOUND_QUEUE {
-            st.full_sync_peers.insert(from_peer);
+            st.full_sync_peers.insert((conn_gen, from_peer));
             drop(st);
             self.inbound_notify.notify_waiters();
             return;
@@ -497,8 +513,8 @@ impl SyncEngine {
             let exists_from_peer = st
                 .by_stream
                 .get_mut(&sid)
-                .and_then(|vec| vec.iter_mut().find(|(p, _)| p == &from_peer));
-            if let Some((_, prev)) = exists_from_peer {
+                .and_then(|vec| vec.iter_mut().find(|(g, p, _)| *g == conn_gen && p == &from_peer));
+            if let Some((_, _, prev)) = exists_from_peer {
                 if (h.epoch, h.head_seq, h.body_complete)
                     >= (prev.epoch, prev.head_seq, prev.body_complete)
                 {
@@ -507,13 +523,13 @@ impl SyncEngine {
                 continue;
             }
             if st.total_entries >= MAX_INBOUND_QUEUE {
-                st.full_sync_peers.insert(from_peer);
+                st.full_sync_peers.insert((conn_gen, from_peer));
                 break;
             }
             st.by_stream
                 .entry(sid.clone())
                 .or_default()
-                .push((from_peer.clone(), h));
+                .push((conn_gen, from_peer.clone(), h));
             st.total_entries += 1;
             if is_new {
                 st.fifo.push_back(sid);
@@ -523,16 +539,16 @@ impl SyncEngine {
         self.inbound_notify.notify_waiters();
     }
 
-    fn pop_full_sync_peer(&self) -> Option<String> {
+    fn pop_full_sync_peer(&self) -> Option<(i64, String)> {
         let mut st = self.inbound.lock().unwrap();
         let next = st.full_sync_peers.iter().next().cloned();
-        if let Some(ref p) = next {
-            st.full_sync_peers.remove(p);
+        if let Some(ref key) = next {
+            st.full_sync_peers.remove(key);
         }
         next
     }
 
-    fn pop_inbound_stream(&self) -> Option<(String, Vec<(String, StreamHead)>)> {
+    fn pop_inbound_stream(&self) -> Option<(String, Vec<InboundItem>)> {
         let mut st = self.inbound.lock().unwrap();
         while let Some(sid) = st.fifo.pop_front() {
             if let Some(cands) = st.by_stream.remove(&sid) {
@@ -543,31 +559,41 @@ impl SyncEngine {
         None
     }
 
-    async fn process_inbound_stream(&self, _stream_id: &str, items: Vec<(String, StreamHead)>) {
-        let Some((from_peer, _)) = items.last().cloned() else {
+    async fn process_inbound_stream(&self, _stream_id: &str, items: Vec<InboundItem>) {
+        let cur_mgen = self.net.membership_gen();
+        let filtered: Vec<(String, StreamHead)> = items
+            .into_iter()
+            .filter_map(|(g, p, h)| (g == cur_mgen).then_some((p, h)))
+            .collect();
+        let Some((from_peer, _)) = filtered.last().cloned() else {
             return;
         };
         let mut peer_heads: HashMap<String, Vec<StreamHead>> = HashMap::new();
-        for (p, h) in items {
+        for (p, h) in filtered {
             peer_heads.entry(p).or_default().push(h);
         }
         let manifest_list: Vec<(String, Vec<StreamHead>)> = peer_heads.into_iter().collect();
         let Ok((updated_ids, still_blocked)) = self
-            .reconcile_multi_manifests_with_ids(manifest_list, None)
+            .reconcile_multi_manifests_with_ids(manifest_list, None, cur_mgen)
             .await
         else {
-            self.inbound
-                .lock()
-                .unwrap()
-                .full_sync_peers
-                .insert(from_peer);
-            self.inbound_notify.notify_waiters();
+            if self.net.membership_gen() == cur_mgen {
+                self.inbound
+                    .lock()
+                    .unwrap()
+                    .full_sync_peers
+                    .insert((cur_mgen, from_peer));
+                self.inbound_notify.notify_waiters();
+            }
             return;
         };
+        if self.net.membership_gen() != cur_mgen {
+            return;
+        }
         if still_blocked {
             let _ = self.sync_with_peers(Some(&from_peer), None).await;
         }
-        if !updated_ids.is_empty() {
+        if !updated_ids.is_empty() && self.net.membership_gen() == cur_mgen {
             self.broadcast_heads(&updated_ids, Some(&from_peer)).await;
         }
     }
@@ -776,7 +802,7 @@ impl SyncEngine {
                 ))
             }
             RpcReq::NotifyHeads { heads } => {
-                self.enqueue_inbound_heads(from_peer.to_owned(), heads);
+                self.enqueue_inbound_heads(conn_gen, from_peer.to_owned(), heads);
                 Ok((RpcResp::Ack, None))
             }
             RpcReq::GetCommitHash {
@@ -967,11 +993,17 @@ impl SyncEngine {
             }
             RpcReq::GetResolutions { stream_ids } => {
                 let limited: Vec<String> = stream_ids.into_iter().take(256).collect();
-                let receipts = self
+                let (receipts, converged_heads) = self
                     .db
-                    .call(move |s| read_resolutions_for_streams(&s.conn, &limited))
+                    .call(move |s| read_resolutions_and_converged(&s.conn, &limited))
                     .await?;
-                Ok((RpcResp::Resolutions { receipts }, None))
+                Ok((
+                    RpcResp::Resolutions {
+                        receipts,
+                        converged_heads,
+                    },
+                    None,
+                ))
             }
             RpcReq::NotifyConflictResolved(receipt) => {
                 let peer = from_peer.to_owned();
@@ -1126,10 +1158,13 @@ impl SyncEngine {
         }
     }
 
-    async fn fetch_full_manifest_from_peer(&self, peer_id: &str) -> Result<Vec<StreamHead>> {
+    async fn fetch_full_manifest_from_peer(&self, peer_id: &str, mgen: i64) -> Result<Vec<StreamHead>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..4096 {
+            if self.net.membership_gen() != mgen {
+                return Err(Error::conflict("membership generation superseded"));
+            }
             let (resp, _) = self
                 .rpc(
                     peer_id,
@@ -1140,6 +1175,9 @@ impl SyncEngine {
                     RPC_TIMEOUT_SHORT,
                 )
                 .await?;
+            if self.net.membership_gen() != mgen {
+                return Err(Error::conflict("membership generation superseded"));
+            }
             match resp {
                 RpcResp::Manifest { heads, next_cursor } => {
                     let exhausted = next_cursor.is_none() || heads.is_empty();
@@ -1218,21 +1256,44 @@ impl SyncEngine {
 
         let mut peer_manifests: Vec<(String, Vec<StreamHead>)> = Vec::new();
         for peer_id in &peer_ids {
-            if let Ok(heads) = self.fetch_full_manifest_from_peer(peer_id).await {
+            if self.net.membership_gen() != mgen {
+                return Ok(SyncSummary {
+                    peers_queried: 0,
+                    streams_updated: 0,
+                    conflicts: 0,
+                });
+            }
+            if let Ok(heads) = self.fetch_full_manifest_from_peer(peer_id, mgen).await {
+                if self.net.membership_gen() != mgen {
+                    return Ok(SyncSummary {
+                        peers_queried: 0,
+                        streams_updated: 0,
+                        conflicts: 0,
+                    });
+                }
                 peer_manifests.push((peer_id.clone(), heads));
             }
         }
+        if self.net.membership_gen() != mgen {
+            return Ok(SyncSummary {
+                peers_queried: 0,
+                streams_updated: 0,
+                conflicts: 0,
+            });
+        }
         let peers_queried = peer_manifests.len();
         let (updated_ids, _) = self
-            .reconcile_multi_manifests_with_ids(peer_manifests, watch_sid)
+            .reconcile_multi_manifests_with_ids(peer_manifests, watch_sid, mgen)
             .await?;
-        // P1-12: propagate updates discovered via manifest sync to other online peers!
-        if !updated_ids.is_empty() && peer_ids.len() < self.net.online_peer_ids().len().max(1) {
-            self.signal.notify_streams(updated_ids.clone());
-        } else if !updated_ids.is_empty() && only_peer.is_some() {
-            self.broadcast_heads(&updated_ids, only_peer).await;
+        if self.net.membership_gen() == mgen {
+            // P1-12: propagate updates discovered via manifest sync to other online peers!
+            if !updated_ids.is_empty() && peer_ids.len() < self.net.online_peer_ids().len().max(1) {
+                self.signal.notify_streams(updated_ids.clone());
+            } else if !updated_ids.is_empty() && only_peer.is_some() {
+                self.broadcast_heads(&updated_ids, only_peer).await;
+            }
         }
-            let conflicts = self
+        let conflicts = self
             .db
             .call(|s| {
                 let count = s.conn.query_row("SELECT count(*) FROM sync_conflicts", [], |r| {
@@ -1249,40 +1310,117 @@ impl SyncEngine {
     }
 
     async fn reconcile_open_conflicts_with_peers(&self, peer_ids: &[String], mgen: i64) -> Result<()> {
-        let conflict_sids = self
-            .db
-            .call(|s| list_conflict_stream_ids(&s.conn))
-            .await?;
-        if conflict_sids.is_empty() {
-            return Ok(());
-        }
-        let req = RpcReq::GetResolutions {
-            stream_ids: conflict_sids,
-        };
-        for peer_id in peer_ids {
+        let mut after: Option<String> = None;
+        for _page in 0..4096 {
             if self.net.membership_gen() != mgen {
                 break;
             }
-            if let Ok((RpcResp::Resolutions { receipts }, _)) =
-                self.rpc(peer_id, &req, RPC_TIMEOUT_SHORT).await
-                && !receipts.is_empty()
-            {
-                let peer = peer_id.clone();
-                self.db
-                    .call(move |s| {
-                        assert_membership_gen(&s.conn, mgen)?;
-                        for receipt in receipts {
-                            let sid = receipt.stream_id.clone();
-                            if apply_resolution_receipt(&s.conn, &peer, &receipt)? {
-                                s.publish_global(
-                                    "sync.conflict",
-                                    json!({ "stream_id": sid, "resolved": true }),
-                                );
-                            }
+            let conflict_sids = self
+                .db
+                .call({
+                    let after_cur = after.clone();
+                    move |s| list_conflict_stream_ids_page(&s.conn, after_cur.as_deref(), 256)
+                })
+                .await?;
+            if conflict_sids.is_empty() {
+                break;
+            }
+            let page_len = conflict_sids.len();
+            after = conflict_sids.last().cloned();
+            let req = RpcReq::GetResolutions {
+                stream_ids: conflict_sids,
+            };
+            for peer_id in peer_ids {
+                if self.net.membership_gen() != mgen {
+                    break;
+                }
+                if let Ok((
+                    RpcResp::Resolutions {
+                        receipts,
+                        converged_heads,
+                    },
+                    _,
+                )) = self.rpc(peer_id, &req, RPC_TIMEOUT_SHORT).await
+                {
+                    if !receipts.is_empty() {
+                        let peer = peer_id.clone();
+                        self.db
+                            .call(move |s| {
+                                assert_membership_gen(&s.conn, mgen)?;
+                                for receipt in receipts {
+                                    let sid = receipt.stream_id.clone();
+                                    if apply_resolution_receipt(&s.conn, &peer, &receipt)? {
+                                        s.publish_global(
+                                            "sync.conflict",
+                                            json!({ "stream_id": sid, "resolved": true }),
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .await?;
+                    }
+                    for head in converged_heads {
+                        if self.net.membership_gen() != mgen {
+                            break;
                         }
-                        Ok(())
-                    })
-                    .await?;
+                        let conflict = self
+                            .db
+                            .call({
+                                let sid = head.stream_id.clone();
+                                move |s| get_conflict_opt(&s.conn, &sid)
+                            })
+                            .await?;
+                        let Some(c) = conflict else {
+                            continue;
+                        };
+                        if c.remote_node_id != *peer_id || head.epoch != c.local_epoch {
+                            continue;
+                        }
+                        let proof = if head.head_seq > c.local_seq {
+                            match self
+                                .query_commit_hash_from_holders(
+                                    std::slice::from_ref(peer_id),
+                                    &head.stream_id,
+                                    c.local_epoch,
+                                    c.local_seq,
+                                )
+                                .await
+                            {
+                                Some(h) if h == c.local_hash => AncestorProof::Verified {
+                                    epoch: c.local_epoch,
+                                    seq: c.local_seq,
+                                    hash: c.local_hash,
+                                },
+                                Some(_) => AncestorProof::Diverged {
+                                    epoch: c.local_epoch,
+                                    seq: c.local_seq,
+                                    hash: c.local_hash,
+                                },
+                                None => AncestorProof::None,
+                            }
+                        } else {
+                            AncestorProof::None
+                        };
+                        let peer = peer_id.clone();
+                        self.db
+                            .call(move |s| {
+                                assert_membership_gen(&s.conn, mgen)?;
+                                let sid = head.stream_id.clone();
+                                if apply_counterparty_convergence(&s.conn, &peer, &head, proof)? {
+                                    s.publish_global(
+                                        "sync.conflict",
+                                        json!({ "stream_id": sid, "resolved": true }),
+                                    );
+                                }
+                                Ok(())
+                            })
+                            .await?;
+                    }
+                }
+            }
+            if page_len < 256 {
+                break;
             }
         }
         Ok(())
@@ -1292,8 +1430,11 @@ impl SyncEngine {
         &self,
         peer_manifests: Vec<(String, Vec<StreamHead>)>,
         watch_sid: Option<SessionId>,
+        mgen: i64,
     ) -> Result<(Vec<String>, bool)> {
-        let mgen = self.net.membership_gen();
+        if self.net.membership_gen() != mgen {
+            return Ok((Vec::new(), false));
+        }
 
         #[derive(Clone)]
         struct Candidate {
@@ -1499,7 +1640,7 @@ impl SyncEngine {
                     }
 
                     // Check ancestry against local directory head if same epoch & remote longer!
-                    let mut verified_ancestor_same_epoch = None;
+                    let mut ancestor_proof = AncestorProof::None;
                     if let Some(ref l) = local_state
                         && l.epoch == best.head.epoch
                         && best.head.head_seq > l.head_seq
@@ -1511,17 +1652,15 @@ impl SyncEngine {
                                 check_holders.push(h.clone());
                             }
                         }
-                        if let Some(h) = self
-                            .query_commit_hash_from_holders(
+                        ancestor_proof = self
+                            .prove_local_ancestor(
                                 &check_holders,
                                 &stream_id,
                                 l.epoch,
                                 l.head_seq,
+                                l.head_hash,
                             )
-                            .await
-                        {
-                            verified_ancestor_same_epoch = Some(h == l.head_hash);
-                        }
+                            .await;
                     }
 
                     let head_clone = best.head.clone();
@@ -1536,7 +1675,7 @@ impl SyncEngine {
                                 &s.conn,
                                 &head_clone,
                                 &peer_clone,
-                                verified_ancestor_same_epoch,
+                                ancestor_proof,
                             )?;
                             let tag = match &outcome {
                                 ApplyOutcome::BlockedOnDependency => 1u8,
@@ -1781,6 +1920,27 @@ impl SyncEngine {
         None
     }
 
+    async fn prove_local_ancestor(
+        &self,
+        holders: &[String],
+        stream_id: &str,
+        epoch: i64,
+        seq: i64,
+        hash: [u8; 32],
+    ) -> AncestorProof {
+        if seq <= 0 {
+            return AncestorProof::None;
+        }
+        match self
+            .query_commit_hash_from_holders(holders, stream_id, epoch, seq)
+            .await
+        {
+            Some(h) if h == hash => AncestorProof::Verified { epoch, seq, hash },
+            Some(_) => AncestorProof::Diverged { epoch, seq, hash },
+            None => AncestorProof::None,
+        }
+    }
+
     async fn pull_and_apply_terminal_delete(
         &self,
         remote_head: &StreamHead,
@@ -1799,98 +1959,97 @@ impl SyncEngine {
         holders: &[String],
         expected_mgen: i64,
     ) -> Result<PullResult> {
-        if self.net.membership_gen() != expected_mgen {
-            return Ok(PullResult::Ignored);
-        }
-        let local = self
-            .db
-            .call({
-                let sid = remote_head.stream_id.clone();
-                move |s| stream_head(&s.conn, &sid)
-            })
-            .await?;
-        let mut ancestor_verified = false;
-        if let Some(ref l) = local {
-            if remote_head.epoch < l.epoch {
+        let mut cached_delete: Option<(String, CommitWire)> = None;
+        for _attempt in 0..3 {
+            if self.net.membership_gen() != expected_mgen {
                 return Ok(PullResult::Ignored);
             }
-            if remote_head.epoch == l.epoch && l.deleted && l.head_hash == remote_head.head_hash {
-                return Ok(PullResult::UpToDate);
+            let local = self
+                .db
+                .call({
+                    let sid = remote_head.stream_id.clone();
+                    move |s| stream_head(&s.conn, &sid)
+                })
+                .await?;
+            let mut ancestor_proof = AncestorProof::None;
+            if let Some(ref l) = local {
+                if remote_head.epoch < l.epoch {
+                    return Ok(PullResult::Ignored);
+                }
+                if remote_head.epoch == l.epoch && l.deleted && l.head_hash == remote_head.head_hash
+                {
+                    return Ok(PullResult::UpToDate);
+                }
+                if remote_head.epoch == l.epoch
+                    && l.head_seq > 0
+                    && l.head_seq < remote_head.head_seq
+                {
+                    ancestor_proof = self
+                        .prove_local_ancestor(
+                            holders,
+                            &remote_head.stream_id,
+                            l.epoch,
+                            l.head_seq,
+                            l.head_hash,
+                        )
+                        .await;
+                }
             }
-            if remote_head.epoch == l.epoch && l.head_seq > 0 && l.head_seq < remote_head.head_seq
-                && let Some(h) = self
-                    .query_commit_hash_from_holders(
-                        holders,
-                        &remote_head.stream_id,
-                        l.epoch,
-                        l.head_seq,
-                    )
-                    .await
-            {
-                ancestor_verified = h == l.head_hash;
-            }
-        }
 
-        let mut got = None;
-        for peer in holders {
-            if let Ok((RpcResp::DeleteCommit { commit: Some(c) }, _)) = self
-                .rpc(
-                    peer,
-                    &RpcReq::GetDeleteCommit {
-                        stream_id: remote_head.stream_id.clone(),
-                        epoch: remote_head.epoch,
-                        seq: remote_head.head_seq,
-                    },
-                    RPC_TIMEOUT_DATA,
-                )
-                .await
-            {
-                got = Some((peer.clone(), c));
-                break;
+            if cached_delete.is_none() {
+                cached_delete = self.fetch_delete_commit(remote_head, holders).await;
+            }
+            let Some((used_peer, delete_commit)) = cached_delete.clone() else {
+                return Ok(PullResult::Ignored);
+            };
+            if self.net.membership_gen() != expected_mgen {
+                return Ok(PullResult::Ignored);
+            }
+
+            let head_clone = remote_head.clone();
+            let streams = self.streams.clone();
+            let outcome_res = self
+                .db
+                .call(move |s| {
+                    assert_membership_gen(&s.conn, expected_mgen)?;
+                    let outcome = match head_clone.kind {
+                        StreamKind::Session => apply_terminal_session_delete(
+                            &s.conn,
+                            &head_clone,
+                            &delete_commit,
+                            ancestor_proof,
+                            &used_peer,
+                            None,
+                        )?,
+                        StreamKind::Mcp => apply_terminal_mcp_delete(
+                            &s.conn,
+                            &head_clone,
+                            &delete_commit,
+                            ancestor_proof,
+                            &used_peer,
+                            None,
+                        )?,
+                        _ => ApplyOutcome::Ignored,
+                    };
+                    if matches!(outcome, ApplyOutcome::StaleProof) {
+                        return Ok(None);
+                    }
+                    let res = match &outcome {
+                        ApplyOutcome::Applied { updated: true, .. } => PullResult::Updated,
+                        ApplyOutcome::Applied { updated: false, .. } => PullResult::UpToDate,
+                        ApplyOutcome::Conflict { .. } => PullResult::Conflict,
+                        ApplyOutcome::BlockedOnDependency => PullResult::Blocked,
+                        ApplyOutcome::Ignored | ApplyOutcome::StaleProof => PullResult::Ignored,
+                    };
+                    publish_outcome(s, &streams, head_clone.kind, &head_clone.stream_id, outcome)?;
+                    Ok(Some(res))
+                })
+                .await?;
+            if let Some(res) = outcome_res {
+                return Ok(res);
             }
         }
-        let Some((used_peer, delete_commit)) = got else {
-            return Ok(PullResult::Ignored);
-        };
-        if self.net.membership_gen() != expected_mgen {
-            return Ok(PullResult::Ignored);
-        }
-
-        let head_clone = remote_head.clone();
-        let streams = self.streams.clone();
-        self.db
-            .call(move |s| {
-                assert_membership_gen(&s.conn, expected_mgen)?;
-                let outcome = match head_clone.kind {
-                    StreamKind::Session => apply_terminal_session_delete(
-                        &s.conn,
-                        &head_clone,
-                        &delete_commit,
-                        ancestor_verified,
-                        &used_peer,
-                        None,
-                    )?,
-                    StreamKind::Mcp => apply_terminal_mcp_delete(
-                        &s.conn,
-                        &head_clone,
-                        &delete_commit,
-                        ancestor_verified,
-                        &used_peer,
-                        None,
-                    )?,
-                    _ => ApplyOutcome::Ignored,
-                };
-                let res = match &outcome {
-                    ApplyOutcome::Applied { updated: true, .. } => PullResult::Updated,
-                    ApplyOutcome::Applied { updated: false, .. } => PullResult::UpToDate,
-                    ApplyOutcome::Conflict { .. } => PullResult::Conflict,
-                    ApplyOutcome::BlockedOnDependency => PullResult::Blocked,
-                    ApplyOutcome::Ignored => PullResult::Ignored,
-                };
-                publish_outcome(s, &streams, head_clone.kind, &head_clone.stream_id, outcome)?;
-                Ok(res)
-            })
-            .await
+        Ok(PullResult::Ignored)
     }
 
     pub async fn ensure_session_watched(&self, sid: SessionId) -> Result<()> {
@@ -2488,7 +2647,7 @@ impl SyncEngine {
                             ApplyOutcome::Applied { updated: false, .. } => PullResult::UpToDate,
                             ApplyOutcome::BlockedOnDependency => PullResult::Blocked,
                             ApplyOutcome::Conflict { .. } => PullResult::Conflict,
-                            ApplyOutcome::Ignored => PullResult::Ignored,
+                            ApplyOutcome::Ignored | ApplyOutcome::StaleProof => PullResult::Ignored,
                         };
                         publish_outcome(
                             s,
@@ -2542,7 +2701,7 @@ impl SyncEngine {
                         ApplyOutcome::Applied { updated: false, .. } => PullResult::UpToDate,
                         ApplyOutcome::BlockedOnDependency => PullResult::Blocked,
                         ApplyOutcome::Conflict { .. } => PullResult::Conflict,
-                        ApplyOutcome::Ignored => PullResult::Ignored,
+                        ApplyOutcome::Ignored | ApplyOutcome::StaleProof => PullResult::Ignored,
                     };
                     publish_outcome(
                         s,
@@ -2908,28 +3067,29 @@ impl SyncEngine {
                 // P1-08: Verify each candidate proves exact remote branch or its descendant!
                 let mut qualified = Vec::new();
                 for (head, holders) in candidates {
-                    let is_valid = if (head.epoch == conflict.remote_epoch
-                        && head.head_seq == conflict.remote_seq
-                        && head.head_hash == conflict.remote_hash)
-                        || head.epoch > conflict.remote_epoch
-                    {
-                        true
-                    } else if head.epoch == conflict.remote_epoch
+                    let descendant_proof = if head.epoch == conflict.remote_epoch
                         && head.head_seq > conflict.remote_seq
                     {
-                        self.query_commit_hash_from_holders(
+                        self.prove_local_ancestor(
                             &holders,
                             stream_id,
                             conflict.remote_epoch,
                             conflict.remote_seq,
+                            conflict.remote_hash,
                         )
                         .await
-                        .is_some_and(|h| h == conflict.remote_hash)
                     } else {
-                        false
+                        AncestorProof::None
                     };
+                    let is_valid = (head.epoch == conflict.remote_epoch
+                        && head.head_seq == conflict.remote_seq
+                        && head.head_hash == conflict.remote_hash)
+                        || head.epoch > conflict.remote_epoch
+                        || (head.epoch == conflict.remote_epoch
+                            && head.head_seq > conflict.remote_seq
+                            && matches!(descendant_proof, AncestorProof::Verified { .. }));
                     if is_valid {
-                        qualified.push((head, holders));
+                        qualified.push((head, holders, descendant_proof));
                     }
                 }
                 if qualified.is_empty() {
@@ -2945,7 +3105,7 @@ impl SyncEngine {
                         .then_with(|| b_pref.cmp(&a_pref))
                         .then_with(|| b.0.head_seq.cmp(&a.0.head_seq))
                 });
-                let (remote_head, holders) = qualified.remove(0);
+                let (remote_head, holders, descendant_proof) = qualified.remove(0);
 
                 // Special path for deleted session/MCP tombstone resolved as "cluster".
                 if remote_head.deleted {
@@ -2968,7 +3128,7 @@ impl SyncEngine {
                                         &s.conn,
                                         &remote_head,
                                         &delete_commit,
-                                        true,
+                                        descendant_proof,
                                         &used_peer,
                                         Some(&exp_c),
                                     )?,
@@ -2976,7 +3136,7 @@ impl SyncEngine {
                                         &s.conn,
                                         &remote_head,
                                         &delete_commit,
-                                        true,
+                                        descendant_proof,
                                         &used_peer,
                                         Some(&exp_c),
                                     )?,
@@ -3254,19 +3414,95 @@ impl SyncEngine {
         .await;
     }
 
+    async fn query_mcp_participants(&self, stream_id: &str) -> Vec<String> {
+        let online = self.net.online_peer_ids();
+        let req = RpcReq::GetHeads {
+            stream_ids: vec![stream_id.to_owned()],
+        };
+        let replies = futures_util::future::join_all(online.iter().map(|peer_id| {
+            let req_ref = &req;
+            async move { (peer_id.clone(), self.rpc(peer_id, req_ref, RPC_TIMEOUT_SHORT).await) }
+        }))
+        .await;
+        let mut holders = Vec::new();
+        for (peer_id, reply) in replies {
+            if let Ok((RpcResp::Manifest { heads, .. }, _)) = reply
+                && heads
+                    .iter()
+                    .any(|h| h.stream_id == stream_id && !h.deleted && !h.retired)
+            {
+                holders.push(peer_id);
+            }
+        }
+        holders
+    }
+
     pub async fn coordinate_mcp_oauth_refresh(
         &self,
         server_id: McpServerId,
         generation: &str,
         rejected_token_hash: Option<[u8; 32]>,
     ) -> Result<RefreshCoordination> {
+        use crate::mcp::oauth::{
+            PendingRefreshState, credentials_fingerprint, credentials_need_refresh,
+        };
+
+        enum ReconciledOAuth {
+            GoneOrReauth,
+            Rotated,
+            Unchanged(Option<ledger::LocalStreamState>),
+        }
+
+        fn evaluate_oauth_after_sync(
+            conn: &rusqlite::Connection,
+            mgen: i64,
+            server_id: McpServerId,
+            generation: &str,
+            stream_id: &str,
+            expected_fp: &str,
+            clear_if_same_and_valid: bool,
+        ) -> Result<ReconciledOAuth> {
+            assert_membership_gen(conn, mgen)?;
+            let row: Option<(Option<String>, bool)> = conn
+                .prepare_cached(
+                    "SELECT coalesce(staged_credentials,credentials), rejected
+                     FROM mcp_oauth WHERE server_id=?1 AND generation=?2",
+                )?
+                .query_row(params![server_id, generation], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            let Some((raw_creds, rejected)) = row else {
+                return Ok(ReconciledOAuth::GoneOrReauth);
+            };
+            let Some(new_fp) = credentials_fingerprint(raw_creds.as_deref()) else {
+                conn.execute(
+                    "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
+                    params![server_id, generation],
+                )?;
+                return Ok(ReconciledOAuth::GoneOrReauth);
+            };
+            if new_fp != expected_fp
+                || (clear_if_same_and_valid
+                    && !credentials_need_refresh(raw_creds.as_deref(), rejected))
+            {
+                conn.execute(
+                    "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
+                    params![server_id, generation],
+                )?;
+                return Ok(ReconciledOAuth::Rotated);
+            }
+            Ok(ReconciledOAuth::Unchanged(stream_head(conn, stream_id)?))
+        }
+
         let mgen = self.net.membership_gen();
         let stream_id = server_id.to_string();
-        let (shared, conflicted, st) = self
+        let gen_owned = generation.to_owned();
+        let (shared, conflicted, st, raw_creds, pending_raw) = self
             .db
             .call({
                 let sid = stream_id.clone();
+                let gen_q = gen_owned.clone();
                 move |s| {
+                    assert_membership_gen(&s.conn, mgen)?;
                     let shared: bool = s
                         .conn
                         .prepare_cached("SELECT shared FROM mcp_servers WHERE id=?")?
@@ -3275,7 +3511,16 @@ impl SyncEngine {
                         .unwrap_or(false);
                     let conflicted = ledger::has_conflict(&s.conn, &sid)?;
                     let st = stream_head(&s.conn, &sid)?;
-                    Ok((shared, conflicted, st))
+                    let oauth_row: Option<(Option<String>, Option<String>)> = s
+                        .conn
+                        .prepare_cached(
+                            "SELECT coalesce(staged_credentials,credentials), pending_refresh
+                             FROM mcp_oauth WHERE server_id=?1 AND generation=?2",
+                        )?
+                        .query_row(params![server_id, gen_q], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .optional()?;
+                    let (raw_creds, pending_raw) = oauth_row.unwrap_or((None, None));
+                    Ok((shared, conflicted, st, raw_creds, pending_raw))
                 }
             })
             .await?;
@@ -3287,42 +3532,124 @@ impl SyncEngine {
         if !shared {
             return Ok(RefreshCoordination::Local);
         }
-
-        let online = self.net.online_peer_ids();
-        let req = RpcReq::GetHeads {
-            stream_ids: vec![stream_id.clone()],
+        let Some(current_fp) = credentials_fingerprint(raw_creds.as_deref()) else {
+            return Ok(RefreshCoordination::Delegated {
+                reauth_required: true,
+            });
         };
-        let replies = futures_util::future::join_all(online.iter().map(|peer_id| {
-            let req_ref = &req;
-            async move { (peer_id.clone(), self.rpc(peer_id, req_ref, RPC_TIMEOUT_SHORT).await) }
-        }))
-        .await;
-        let mut participants = vec![self.net.local_node_id().to_owned()];
-        for (peer_id, reply) in replies {
-            if let Ok((RpcResp::Manifest { heads, .. }, _)) = reply
-                && heads.iter().any(|h| !h.deleted && !h.retired)
-            {
-                participants.push(peer_id);
-            }
-        }
-        participants.sort();
-        participants.dedup();
-        let coordinator = participants.first().map(String::as_str).unwrap_or("");
-        if coordinator == self.net.local_node_id() || coordinator.is_empty() {
-            return Ok(RefreshCoordination::Local);
-        }
+        let active_pending = pending_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<PendingRefreshState>(raw).ok())
+            .filter(|pr| pr.fp == current_fp);
 
-        let (expected_epoch, expected_seq, expected_hash) = match st {
+        let (coordinator, cur_st) = if let Some(pr) = active_pending {
+            if self.net.is_peer_online(&pr.coordinator) {
+                let _ = self.sync_with_peers(Some(&pr.coordinator), None).await;
+            }
+            let _ = self.sync_with_peers(None, None).await;
+            let remote_holders = self.query_mcp_participants(&stream_id).await;
+            let recheck = self
+                .db
+                .call({
+                    let sid = stream_id.clone();
+                    let gen_q = gen_owned.clone();
+                    let fp = current_fp.clone();
+                    move |s| {
+                        evaluate_oauth_after_sync(
+                            &s.conn,
+                            mgen,
+                            server_id,
+                            &gen_q,
+                            &sid,
+                            &fp,
+                            false,
+                        )
+                    }
+                })
+                .await?;
+            match recheck {
+                ReconciledOAuth::GoneOrReauth => {
+                    return Ok(RefreshCoordination::Delegated {
+                        reauth_required: true,
+                    });
+                }
+                ReconciledOAuth::Rotated => {
+                    return Ok(RefreshCoordination::Delegated {
+                        reauth_required: false,
+                    });
+                }
+                ReconciledOAuth::Unchanged(st_now) => {
+                    if !remote_holders.iter().any(|p| p == &pr.coordinator) {
+                        return Ok(RefreshCoordination::PendingConfirmation);
+                    }
+                    (pr.coordinator, st_now)
+                }
+            }
+        } else {
+            let mut participants = self.query_mcp_participants(&stream_id).await;
+            participants.push(self.net.local_node_id().to_owned());
+            participants.sort();
+            participants.dedup();
+            let chosen = participants.first().cloned().unwrap_or_default();
+            if chosen == self.net.local_node_id() || chosen.is_empty() {
+                return Ok(RefreshCoordination::Local);
+            }
+            let pending_json = serde_json::to_string(&PendingRefreshState {
+                coordinator: chosen.clone(),
+                fp: current_fp.clone(),
+            })
+            .map_err(|e| Error::internal(e.to_string()))?;
+            let early = self
+                .db
+                .write(
+                    {
+                        let gen_q = gen_owned.clone();
+                        let fp = current_fp.clone();
+                        let pj = pending_json;
+                        let sid = stream_id.clone();
+                        move |conn| {
+                            assert_membership_gen(conn, mgen)?;
+                            let cur: Option<Option<String>> = conn
+                                .prepare_cached(
+                                    "SELECT coalesce(staged_credentials,credentials)
+                                     FROM mcp_oauth WHERE server_id=?1 AND generation=?2",
+                                )?
+                                .query_row(params![server_id, gen_q], |r| r.get(0))
+                                .optional()?;
+                            let Some(raw) = cur else {
+                                return Ok((Some(true), None));
+                            };
+                            let latest_fp = credentials_fingerprint(raw.as_deref());
+                            if latest_fp.as_deref() != Some(fp.as_str()) {
+                                return Ok((Some(latest_fp.is_none()), None));
+                            }
+                            conn.execute(
+                                "UPDATE mcp_oauth SET pending_refresh=?1 WHERE server_id=?2 AND generation=?3",
+                                params![pj, server_id, gen_q],
+                            )?;
+                            Ok((None, stream_head(conn, &sid)?))
+                        }
+                    },
+                    |_, res| Ok(res),
+                )
+                .await?;
+            if let Some(reauth_required) = early.0 {
+                return Ok(RefreshCoordination::Delegated { reauth_required });
+            }
+            (chosen, early.1.or(st))
+        };
+
+        let (expected_epoch, expected_seq, expected_hash) = match cur_st {
             Some(l) => (l.epoch, l.synced_seq, Some(l.synced_hash)),
             None => (0, 0, None),
         };
 
         let rpc_res = self
             .rpc(
-                coordinator,
+                &coordinator,
                 &RpcReq::OAuthRefresh {
                     server_id,
-                    generation: generation.to_owned(),
+                    generation: gen_owned.clone(),
                     expected_epoch,
                     expected_seq,
                     expected_hash,
@@ -3350,18 +3677,37 @@ impl SyncEngine {
                 }
                 let Some(target_head) = head else {
                     if status == OAuthRefreshStatus::ReauthRequired {
+                        self.db
+                            .write(
+                                {
+                                    let gen_q = gen_owned.clone();
+                                    move |conn| {
+                                        assert_membership_gen(conn, mgen)?;
+                                        conn.execute(
+                                            "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
+                                            params![server_id, gen_q],
+                                        )?;
+                                        Ok(())
+                                    }
+                                },
+                                |_, ()| Ok(()),
+                            )
+                            .await?;
                         return Ok(RefreshCoordination::Delegated {
                             reauth_required: true,
                         });
                     }
-                    // Coordinator lost the stream or didn't have it: reconcile then retry locally.
-                    let _ = self.sync_with_peers(Some(coordinator), None).await;
-                    return Ok(RefreshCoordination::Local);
+                    // Coordinator lagged behind caller: push heads and sync, keeping pending_refresh
+                    // rather than falling back to local refresh.
+                    self.broadcast_heads(std::slice::from_ref(&stream_id), None)
+                        .await;
+                    let _ = self.sync_with_peers(Some(&coordinator), None).await;
+                    return Ok(RefreshCoordination::PendingConfirmation);
                 };
 
                 let lock = self.stream_locks.lock_for(stream_id.clone());
                 let _guard = lock.lock().await;
-                let coord_id = coordinator.to_owned();
+                let coord_id = coordinator.clone();
                 let streams = self.streams.clone();
                 let need_full_pull = self
                     .db
@@ -3370,6 +3716,7 @@ impl SyncEngine {
                         let sid_clone = stream_id.clone();
                         let cc = coord_id.clone();
                         move |s| {
+                            assert_membership_gen(&s.conn, mgen)?;
                             if let Some(l) = stream_head(&s.conn, &sid_clone)?
                                 && l.epoch == head_clone.epoch
                                 && l.synced_seq == head_clone.head_seq
@@ -3388,7 +3735,6 @@ impl SyncEngine {
                                         })
                             });
                             if contiguous && !has_more && head_clone.epoch == expected_epoch {
-                                assert_membership_gen(&s.conn, mgen)?;
                                 let outcome = apply_remote_commits_page(
                                     &s.conn,
                                     &head_clone,
@@ -3421,11 +3767,11 @@ impl SyncEngine {
                         ));
                     }
                 }
-                // Verify we actually converged to target_head!
+                let sid_check = stream_id.clone();
                 let converged = self
                     .db
                     .call(move |s| {
-                        Ok(stream_head(&s.conn, &stream_id)?.is_some_and(|l| {
+                        Ok(stream_head(&s.conn, &sid_check)?.is_some_and(|l| {
                             l.epoch == target_head.epoch
                                 && l.synced_seq == target_head.head_seq
                                 && l.synced_hash == target_head.head_hash
@@ -3435,45 +3781,75 @@ impl SyncEngine {
                 if !converged {
                     return Err(Error::conflict("failed to converge delegated OAuth state"));
                 }
-                Ok(RefreshCoordination::Delegated {
-                    reauth_required: status == OAuthRefreshStatus::ReauthRequired,
-                })
-            }
-            _ => {
-                // Coordinator disconnected/timed out: it might still have rotated a single-use token!
-                // Reconcile with coordinator / peers first; never fall back to local refresh while
-                // delegated refresh remains in doubt (P1 #7).
-                let _ = self.sync_with_peers(Some(coordinator), None).await;
-                let _ = self.sync_with_peers(None, None).await;
-                let (advanced, reauth_required) = self
+                if status == OAuthRefreshStatus::ReauthRequired {
+                    self.db
+                        .write(
+                            move |conn| {
+                                assert_membership_gen(conn, mgen)?;
+                                conn.execute(
+                                    "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
+                                    params![server_id, gen_owned],
+                                )?;
+                                Ok(())
+                            },
+                            |_, ()| Ok(()),
+                        )
+                        .await?;
+                    return Ok(RefreshCoordination::Delegated {
+                        reauth_required: true,
+                    });
+                }
+                let post = self
                     .db
-                    .call({
-                        let sid = stream_id.clone();
-                        move |s| {
-                            assert_membership_gen(&s.conn, mgen)?;
-                            let adv = stream_head(&s.conn, &sid)?.is_some_and(|l| {
-                                l.epoch > expected_epoch
-                                    || (l.epoch == expected_epoch
-                                        && (l.synced_seq > expected_seq
-                                            || expected_hash
-                                                .is_some_and(|eh| l.synced_hash != eh)))
-                            });
-                            let rej: bool = s
-                                .conn
-                                .prepare_cached(
-                                    "SELECT rejected FROM mcp_oauth WHERE server_id=?",
-                                )?
-                                .query_row([server_id], |r| r.get(0))
-                                .optional()?
-                                .unwrap_or(false);
-                            Ok((adv, rej))
-                        }
+                    .call(move |s| {
+                        evaluate_oauth_after_sync(
+                            &s.conn,
+                            mgen,
+                            server_id,
+                            &gen_owned,
+                            &stream_id,
+                            &current_fp,
+                            true,
+                        )
                     })
                     .await?;
-                if advanced {
-                    Ok(RefreshCoordination::Delegated { reauth_required })
-                } else {
-                    Ok(RefreshCoordination::PendingConfirmation)
+                match post {
+                    ReconciledOAuth::GoneOrReauth => Ok(RefreshCoordination::Delegated {
+                        reauth_required: true,
+                    }),
+                    ReconciledOAuth::Rotated => Ok(RefreshCoordination::Delegated {
+                        reauth_required: false,
+                    }),
+                    ReconciledOAuth::Unchanged(_) => Ok(RefreshCoordination::PendingConfirmation),
+                }
+            }
+            _ => {
+                // Coordinator disconnected/timed out: keep pending_refresh persisted unless credentials
+                // actually rotated or authorization changed. Ordinary config commits never clear it.
+                let _ = self.sync_with_peers(Some(&coordinator), None).await;
+                let _ = self.sync_with_peers(None, None).await;
+                let post = self
+                    .db
+                    .call(move |s| {
+                        evaluate_oauth_after_sync(
+                            &s.conn,
+                            mgen,
+                            server_id,
+                            &gen_owned,
+                            &stream_id,
+                            &current_fp,
+                            false,
+                        )
+                    })
+                    .await?;
+                match post {
+                    ReconciledOAuth::GoneOrReauth => Ok(RefreshCoordination::Delegated {
+                        reauth_required: true,
+                    }),
+                    ReconciledOAuth::Rotated => Ok(RefreshCoordination::Delegated {
+                        reauth_required: false,
+                    }),
+                    ReconciledOAuth::Unchanged(_) => Ok(RefreshCoordination::PendingConfirmation),
                 }
             }
         }
@@ -3540,6 +3916,7 @@ fn abort_active_session_worker(s: &mut Store, streams: &Hub, sid: SessionId) {
     }
     crate::codemode::stop_session(s, sid);
     s.bump_run_gen(sid);
+    s.bump_reset_gen(sid);
     streams.remove_session(sid);
 }
 
@@ -3625,6 +4002,8 @@ fn publish_outcome(
             }
             Ok(())
         }
-        ApplyOutcome::BlockedOnDependency | ApplyOutcome::Ignored => Ok(()),
+        ApplyOutcome::BlockedOnDependency | ApplyOutcome::Ignored | ApplyOutcome::StaleProof => {
+            Ok(())
+        }
     }
 }

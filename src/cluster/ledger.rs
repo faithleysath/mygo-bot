@@ -356,6 +356,21 @@ pub struct McpChange {
     pub cancel_login: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AncestorProof {
+    None,
+    Verified {
+        epoch: i64,
+        seq: i64,
+        hash: [u8; 32],
+    },
+    Diverged {
+        epoch: i64,
+        seq: i64,
+        hash: [u8; 32],
+    },
+}
+
 pub enum ApplyOutcome {
     Applied {
         updated: bool,
@@ -372,6 +387,7 @@ pub enum ApplyOutcome {
     },
     BlockedOnDependency,
     Ignored,
+    StaleProof,
 }
 
 pub struct CommitHashInput<'a> {
@@ -2072,7 +2088,7 @@ pub fn apply_unwatched_session_head(
     conn: &Connection,
     remote: &StreamHead,
     remote_node_id: &str,
-    verified_ancestor_same_epoch: Option<bool>,
+    ancestor_proof: AncestorProof,
 ) -> Result<ApplyOutcome> {
     if remote.kind != StreamKind::Session {
         return Err(Error::internal("expected session stream head"));
@@ -2118,27 +2134,37 @@ pub fn apply_unwatched_session_head(
                     return Ok(ApplyOutcome::Conflict { newly_recorded });
                 }
                 if l.head_seq > 0 {
-                    match verified_ancestor_same_epoch {
-                        Some(true) => {}
-                        None => return Ok(ApplyOutcome::Ignored),
-                        Some(false) => {
-                            let newly_recorded = record_conflict_row(
-                                conn,
-                                &ConflictWrite {
-                                    stream_id: &remote.stream_id,
-                                    kind: StreamKind::Session,
-                                    local_epoch: l.epoch,
-                                    local_seq: l.head_seq,
-                                    local_hash: &l.head_hash,
-                                    remote,
-                                    remote_node_id,
-                                    reason: "diverged",
-                                    related_local_id: None,
-                                    remote_snapshot: remote.head_snapshot.as_deref(),
-                                },
-                            )?;
-                            return Ok(ApplyOutcome::Conflict { newly_recorded });
-                        }
+                    let verified = matches!(
+                        ancestor_proof,
+                        AncestorProof::Verified { epoch, seq, hash }
+                            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
+                    );
+                    let diverged = matches!(
+                        ancestor_proof,
+                        AncestorProof::Diverged { epoch, seq, hash }
+                            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
+                    );
+                    if verified {
+                        // Exact CAS match: local unwatched directory head is a proven ancestor.
+                    } else if diverged {
+                        let newly_recorded = record_conflict_row(
+                            conn,
+                            &ConflictWrite {
+                                stream_id: &remote.stream_id,
+                                kind: StreamKind::Session,
+                                local_epoch: l.epoch,
+                                local_seq: l.head_seq,
+                                local_hash: &l.head_hash,
+                                remote,
+                                remote_node_id,
+                                reason: "diverged",
+                                related_local_id: None,
+                                remote_snapshot: remote.head_snapshot.as_deref(),
+                            },
+                        )?;
+                        return Ok(ApplyOutcome::Conflict { newly_recorded });
+                    } else {
+                        return Ok(ApplyOutcome::Ignored);
                     }
                 }
             } else {
@@ -2205,9 +2231,9 @@ pub fn apply_unwatched_session_head(
 fn mcp_local_is_ancestor_of_tombstone(
     local: &LocalStreamState,
     delete_payload: &str,
-    ancestor_verified: bool,
+    proof_verified_for_local: bool,
 ) -> bool {
-    if local.head_seq == 0 || ancestor_verified {
+    if local.head_seq == 0 || proof_verified_for_local {
         return true;
     }
     let val: Value = match serde_json::from_str(delete_payload) {
@@ -2243,25 +2269,77 @@ fn mcp_local_is_ancestor_of_tombstone(
         .is_some_and(|h| h == local_hex)
 }
 
+fn mcp_tombstone_covers_seq(local_epoch: i64, local_seq: i64, delete_payload: &str) -> bool {
+    if local_seq == 0 {
+        return true;
+    }
+    let Ok(val) = serde_json::from_str::<Value>(delete_payload) else {
+        return false;
+    };
+    let base_epoch = val.get("base_epoch").and_then(Value::as_i64).unwrap_or(0);
+    let base_seq = val.get("base_seq").and_then(Value::as_i64).unwrap_or(0);
+    if local_epoch != base_epoch || base_seq <= 0 {
+        return true;
+    }
+    if local_seq >= base_seq {
+        return true;
+    }
+    let start_seq = val
+        .get("ancestor_start_seq")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let Some(hashes) = val.get("ancestor_hashes_hex").and_then(Value::as_array) else {
+        return false;
+    };
+    start_seq > 0
+        && local_seq >= start_seq
+        && usize::try_from(local_seq - start_seq).is_ok_and(|idx| idx < hashes.len())
+}
+
+fn proof_matches_head(proof: AncestorProof, l: &LocalStreamState) -> (bool, bool, bool) {
+    let verified = matches!(
+        proof,
+        AncestorProof::Verified { epoch, seq, hash }
+            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
+    );
+    let diverged = matches!(
+        proof,
+        AncestorProof::Diverged { epoch, seq, hash }
+            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
+    );
+    let stale = matches!(
+        proof,
+        AncestorProof::Verified { epoch, seq, hash } | AncestorProof::Diverged { epoch, seq, hash }
+            if epoch != l.epoch || seq != l.head_seq || hash != l.head_hash
+    );
+    (verified, diverged, stale)
+}
+
 fn remote_matches_expected_conflict(
     remote_head: &StreamHead,
     exp_c: &ConflictRecord,
-    ancestor_verified: bool,
+    ancestor_proof: AncestorProof,
 ) -> bool {
+    let proof_matches = ancestor_proof
+        == AncestorProof::Verified {
+            epoch: exp_c.remote_epoch,
+            seq: exp_c.remote_seq,
+            hash: exp_c.remote_hash,
+        };
     (remote_head.epoch == exp_c.remote_epoch
         && remote_head.head_seq == exp_c.remote_seq
         && remote_head.head_hash == exp_c.remote_hash)
         || remote_head.epoch > exp_c.remote_epoch
         || (remote_head.epoch == exp_c.remote_epoch
             && remote_head.head_seq > exp_c.remote_seq
-            && ancestor_verified)
+            && proof_matches)
 }
 
 pub fn apply_terminal_session_delete(
     conn: &Connection,
     remote_head: &StreamHead,
     delete_commit: &CommitWire,
-    ancestor_verified: bool,
+    ancestor_proof: AncestorProof,
     remote_node_id: &str,
     expected_conflict: Option<&ConflictRecord>,
 ) -> Result<ApplyOutcome> {
@@ -2293,7 +2371,7 @@ pub fn apply_terminal_session_delete(
                     "sync conflict state changed concurrently; retry resolution",
                 ));
             }
-            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_verified) {
+            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_proof) {
                 return Err(Error::conflict(
                     "remote terminal delete does not match conflicted branch",
                 ));
@@ -2318,13 +2396,22 @@ pub fn apply_terminal_session_delete(
                     {
                         return Ok(ApplyOutcome::Ignored);
                     }
-                    // Check whether local branch is an ancestor of remote_head.
+                    let (proof_verified_local, _proof_diverged_local, proof_stale) =
+                        proof_matches_head(ancestor_proof, l);
+                    let direct_parent_match = l.head_seq + 1 == remote_head.head_seq
+                        && delete_commit.parent_hash == l.head_hash;
+                    let direct_parent_mismatch = l.head_seq + 1 == remote_head.head_seq
+                        && delete_commit.parent_hash != l.head_hash;
                     let is_ancestor = l.head_seq == 0
                         || (l.head_seq < remote_head.head_seq
-                            && (ancestor_verified
-                                || (l.head_seq + 1 == remote_head.head_seq
-                                    && delete_commit.parent_hash == l.head_hash)));
+                            && (proof_verified_local || direct_parent_match));
                     if !is_ancestor {
+                        if l.head_seq < remote_head.head_seq
+                            && proof_stale
+                            && !direct_parent_mismatch
+                        {
+                            return Ok(ApplyOutcome::StaleProof);
+                        }
                         let newly_recorded = record_conflict_row(
                             conn,
                             &ConflictWrite {
@@ -2429,7 +2516,7 @@ pub fn apply_terminal_mcp_delete(
     conn: &Connection,
     remote_head: &StreamHead,
     delete_commit: &CommitWire,
-    ancestor_verified: bool,
+    ancestor_proof: AncestorProof,
     remote_node_id: &str,
     expected_conflict: Option<&ConflictRecord>,
 ) -> Result<ApplyOutcome> {
@@ -2461,7 +2548,7 @@ pub fn apply_terminal_mcp_delete(
                     "sync conflict state changed concurrently; retry resolution",
                 ));
             }
-            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_verified) {
+            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_proof) {
                 return Err(Error::conflict(
                     "remote terminal MCP delete does not match conflicted branch",
                 ));
@@ -2475,6 +2562,8 @@ pub fn apply_terminal_mcp_delete(
             if remote_head.epoch < l.epoch {
                 return Ok(ApplyOutcome::Ignored);
             }
+            let (proof_verified_local, _proof_diverged_local, proof_stale) =
+                proof_matches_head(ancestor_proof, l);
             if l.retired && l.deleted {
                 if l.epoch == remote_head.epoch
                     && l.head_seq == remote_head.head_seq
@@ -2485,8 +2574,12 @@ pub fn apply_terminal_mcp_delete(
             } else if !mcp_local_is_ancestor_of_tombstone(
                 l,
                 &delete_commit.payload,
-                ancestor_verified,
+                proof_verified_local,
             ) {
+                if proof_stale && !mcp_tombstone_covers_seq(l.epoch, l.head_seq, &delete_commit.payload)
+                {
+                    return Ok(ApplyOutcome::StaleProof);
+                }
                 // Detect any offline edits (shorter, equal, or longer) without proven ancestry.
                 let newly_recorded = record_conflict_row(
                     conn,
@@ -2760,9 +2853,9 @@ fn apply_one_commit(conn: &Connection, c: &CommitWire) -> Result<CommitEffect> {
                 .prepare_cached("SELECT transport,config_json FROM mcp_servers WHERE id=?")?
                 .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
-            let old_oauth_gen: Option<String> = conn
-                .prepare_cached("SELECT generation FROM mcp_oauth WHERE server_id=?")?
-                .query_row([id], |r| r.get(0))
+            let old_oauth: Option<(String, Option<String>)> = conn
+                .prepare_cached("SELECT generation,pending_refresh FROM mcp_oauth WHERE server_id=?")?
+                .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
             let snap: McpSyncSnapshot = serde_json::from_str(&c.payload)
                 .map_err(|e| Error::bad(format!("invalid mcp commit: {e}")))?;
@@ -2811,20 +2904,36 @@ fn apply_one_commit(conn: &Connection, c: &CommitWire) -> Result<CommitEffect> {
                 .is_some_and(|(t, cfg)| t != &s.transport || cfg != &s.config_json);
             let mut oauth_cancel = auth_changed;
             if let Some(oauth) = &snap.oauth {
-                if old_oauth_gen.as_deref() != Some(oauth.generation.as_str()) {
+                let old_oauth_gen = old_oauth.as_ref().map(|(g, _)| g.as_str());
+                if old_oauth_gen != Some(oauth.generation.as_str()) {
                     oauth_cancel = true;
                 }
+                let snap_fp =
+                    crate::mcp::oauth::credentials_fingerprint(oauth.credentials.as_deref());
+                let kept_pending_refresh: Option<String> = if !auth_changed
+                    && old_oauth_gen == Some(oauth.generation.as_str())
+                {
+                    old_oauth.and_then(|(_, pr)| pr).filter(|raw| {
+                        serde_json::from_str::<crate::mcp::oauth::PendingRefreshState>(raw)
+                            .ok()
+                            .is_some_and(|st| snap_fp.as_deref() == Some(st.fp.as_str()))
+                    })
+                } else {
+                    None
+                };
                 conn.execute(
-                    "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,staged_credentials,rejected)
-                     VALUES(?1,?2,?3,NULL,?4,NULL,?5)
+                    "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,staged_credentials,pending_refresh,rejected)
+                     VALUES(?1,?2,?3,NULL,?4,NULL,?5,?6)
                      ON CONFLICT(server_id) DO UPDATE SET
                        generation=excluded.generation,binding=excluded.binding,pending=NULL,
-                       credentials=excluded.credentials,staged_credentials=NULL,rejected=excluded.rejected",
+                       credentials=excluded.credentials,staged_credentials=NULL,
+                       pending_refresh=excluded.pending_refresh,rejected=excluded.rejected",
                     params![
                         s.id,
                         oauth.generation,
                         oauth.binding,
                         oauth.credentials,
+                        kept_pending_refresh,
                         oauth.rejected
                     ],
                 )?;
@@ -3884,9 +3993,21 @@ fn record_resolution_receipt(conn: &Connection, r: &ResolutionReceipt) -> Result
             r.resolved_at,
         ],
     )?;
+    // Clean up receipts whose stream has moved into a strictly higher epoch.
+    conn.execute(
+        "DELETE FROM sync_resolutions
+         WHERE EXISTS (
+             SELECT 1 FROM sync_streams s
+             WHERE s.stream_id = sync_resolutions.stream_id
+               AND s.epoch > sync_resolutions.winner_epoch
+         )",
+        [],
+    )?;
+    // Bound only epoch-bumping receipts; keep same-epoch receipts while stream stays at winner_epoch.
     conn.execute(
         "DELETE FROM sync_resolutions WHERE stream_id IN (
             SELECT stream_id FROM sync_resolutions
+            WHERE winner_epoch > local_epoch AND winner_epoch > remote_epoch
             ORDER BY resolved_at DESC, stream_id DESC
             LIMIT -1 OFFSET ?1
         )",
@@ -3895,12 +4016,18 @@ fn record_resolution_receipt(conn: &Connection, r: &ResolutionReceipt) -> Result
     Ok(())
 }
 
-pub fn list_conflict_stream_ids(conn: &Connection) -> Result<Vec<String>> {
+pub fn list_conflict_stream_ids_page(
+    conn: &Connection,
+    after_stream_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let after = after_stream_id.unwrap_or("");
+    let lim = i64::try_from(limit.clamp(1, 256)).unwrap_or(256);
     let mut stmt = conn.prepare_cached(
-        "SELECT stream_id FROM sync_conflicts ORDER BY detected_at ASC LIMIT 256",
+        "SELECT stream_id FROM sync_conflicts WHERE stream_id>?1 ORDER BY stream_id ASC LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map(params![after, lim], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -3958,15 +4085,32 @@ pub fn read_resolutions_for_streams(
     Ok(out)
 }
 
+pub fn read_resolutions_and_converged(
+    conn: &Connection,
+    stream_ids: &[String],
+) -> Result<(Vec<ResolutionReceipt>, Vec<StreamHead>)> {
+    let receipts = read_resolutions_for_streams(conn, stream_ids)?;
+    let seen: HashSet<&str> = receipts.iter().map(|r| r.stream_id.as_str()).collect();
+    let mut converged_heads = Vec::new();
+    for sid in stream_ids.iter().take(256) {
+        if seen.contains(sid.as_str()) {
+            continue;
+        }
+        if !has_conflict(conn, sid)?
+            && let Some(head) = stream_head_wire(conn, sid)?
+        {
+            converged_heads.push(head);
+        }
+    }
+    Ok((receipts, converged_heads))
+}
+
 pub fn apply_resolution_receipt(
     conn: &Connection,
     from_peer: &str,
     receipt: &ResolutionReceipt,
 ) -> Result<bool> {
     with_savepoint(conn, "apply_res_receipt", || {
-        let Some(c) = get_conflict_opt(conn, &receipt.stream_id)? else {
-            return Ok(false);
-        };
         let Some(l) = stream_head(conn, &receipt.stream_id)? else {
             return Ok(false);
         };
@@ -3976,6 +4120,12 @@ pub fn apply_resolution_receipt(
         if !local_matches_winner {
             return Ok(false);
         }
+        let Some(c) = get_conflict_opt(conn, &receipt.stream_id)? else {
+            // Converged peers with matching winner head cache the receipt so they can relay it
+            // to long-offline peers even if the original resolver is later unavailable.
+            record_resolution_receipt(conn, receipt)?;
+            return Ok(false);
+        };
         let exact_pair = (c.local_epoch == receipt.local_epoch
             && c.local_seq == receipt.local_seq
             && c.local_hash == receipt.local_hash
@@ -3996,6 +4146,50 @@ pub fn apply_resolution_receipt(
         if exact_pair || peer_matched {
             let deleted =
                 conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [&receipt.stream_id])? > 0;
+            if deleted {
+                record_resolution_receipt(conn, receipt)?;
+            }
+            return Ok(deleted);
+        }
+        Ok(false)
+    })
+}
+
+pub fn apply_counterparty_convergence(
+    conn: &Connection,
+    from_peer: &str,
+    peer_head: &StreamHead,
+    ancestor_proof: AncestorProof,
+) -> Result<bool> {
+    with_savepoint(conn, "apply_peer_conv", || {
+        let Some(c) = get_conflict_opt(conn, &peer_head.stream_id)? else {
+            return Ok(false);
+        };
+        if c.remote_node_id != from_peer {
+            return Ok(false);
+        }
+        let Some(l) = stream_head(conn, &peer_head.stream_id)? else {
+            return Ok(false);
+        };
+        if l.epoch != c.local_epoch || l.head_seq != c.local_seq || l.head_hash != c.local_hash {
+            return Ok(false);
+        }
+        let exact_match = peer_head.epoch == c.local_epoch
+            && peer_head.head_seq == c.local_seq
+            && peer_head.head_hash == c.local_hash
+            && peer_head.deleted == l.deleted;
+        let verified_descendant = peer_head.epoch == c.local_epoch
+            && peer_head.head_seq > c.local_seq
+            && ancestor_proof
+                == AncestorProof::Verified {
+                    epoch: c.local_epoch,
+                    seq: c.local_seq,
+                    hash: c.local_hash,
+                };
+        if exact_match || verified_descendant {
+            let deleted =
+                conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [&peer_head.stream_id])?
+                    > 0;
             return Ok(deleted);
         }
         Ok(false)
@@ -4643,7 +4837,7 @@ pub fn resolve_conflict_local(
 fn promote_staged_oauth_credentials(conn: &Connection, mid: McpServerId) -> Result<()> {
     conn.execute(
         "UPDATE mcp_oauth
-         SET credentials=staged_credentials, staged_credentials=NULL, rejected=0
+         SET credentials=staged_credentials, staged_credentials=NULL, pending_refresh=NULL, rejected=0
          WHERE server_id=? AND staged_credentials IS NOT NULL",
         [mid],
     )?;

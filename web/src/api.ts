@@ -60,7 +60,10 @@ export interface ApiFetchOptions {
   signal?: AbortSignal;
 }
 
-export async function apiFetch<T = unknown>(path: string, opts: ApiFetchOptions = {}): Promise<T> {
+export async function apiFetchWithHeaders<T = unknown>(
+  path: string,
+  opts: ApiFetchOptions = {}
+): Promise<{ data: T; headers: Headers }> {
   const headers = new Headers(opts.headers || {});
   const token = opts.token !== undefined ? opts.token : getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
@@ -111,7 +114,12 @@ export async function apiFetch<T = unknown>(path: string, opts: ApiFetchOptions 
       `HTTP ${res.status}`;
     throw new ApiError(msg, res.status);
   }
-  return data as T;
+  return { data: data as T, headers: res.headers };
+}
+
+export async function apiFetch<T = unknown>(path: string, opts: ApiFetchOptions = {}): Promise<T> {
+  const { data } = await apiFetchWithHeaders<T>(path, opts);
+  return data;
 }
 
 export interface SseOptions {

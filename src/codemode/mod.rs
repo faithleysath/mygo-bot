@@ -241,13 +241,10 @@ impl Host {
                 if task.reason.is_some() || task.expired() || task.cancel.is_cancelled() {
                     return Err(Error::conflict("task stopped or expired"));
                 }
-                let expected_epoch = task.session_epoch;
-                let expected_run_gen = task.session_run_gen;
-                if s.run_gen(sid) != expected_run_gen
-                    || crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?
-                {
+                if task_superseded(&s.conn, s.reset_gen(sid), task)? {
                     return Err(Error::conflict("session superseded or conflicted"));
                 }
+                let expected_epoch = task.session_epoch;
                 if blocks.parts.is_empty() {
                     return Err(Error::bad("empty event"));
                 }
@@ -339,7 +336,8 @@ pub struct Task {
     live: Arc<Mutex<LiveState>>,
     origin: Call,
     session_epoch: i64,
-    session_run_gen: u64,
+    session_reset_gen: u64,
+    history_rev: i64,
     label: String,
     created: Instant,
     started_at: DateTime<Utc>,
@@ -752,8 +750,7 @@ pub async fn renew(
                 );
             }
             let session_epoch = task.session_epoch;
-            let session_run_gen = task.session_run_gen;
-            if s.run_gen(call.sid) != session_run_gen {
+            if task_superseded(&s.conn, s.reset_gen(call.sid), task)? {
                 return Err(Error::conflict("session superseded"));
             }
             let duration = Duration::from_secs(seconds.into());
@@ -835,7 +832,8 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
         }
         let session_epoch = crate::cluster::ledger::stream_head(&s.conn, call.sid.as_str())?
             .map_or(1, |h| h.epoch);
-        let session_run_gen = s.run_gen(call.sid);
+        let session_reset_gen = s.reset_gen(call.sid);
+        let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, call.sid)?;
         let now = Instant::now();
         let (deadline, lease) = watch::channel(now + LEASE);
         let cancel = CancellationToken::new();
@@ -852,7 +850,8 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             live: host.live.clone(),
             origin: call,
             session_epoch,
-            session_run_gen,
+            session_reset_gen,
+            history_rev,
             label: script.label,
             created: now,
             started_at: Utc::now(),
@@ -898,9 +897,12 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
     Ok(())
 }
 
-fn task_superseded(conn: &Connection, run_gen: u64, task: &Task) -> Result<bool> {
+fn task_superseded(conn: &Connection, reset_gen: u64, task: &Task) -> Result<bool> {
     let sid = task.origin.sid;
-    if run_gen != task.session_run_gen || crate::cluster::ledger::has_conflict(conn, sid.as_str())? {
+    if reset_gen != task.session_reset_gen
+        || crate::cluster::ledger::has_conflict(conn, sid.as_str())?
+        || crate::cluster::ledger::session_history_rev(conn, sid)? != task.history_rev
+    {
         return Ok(true);
     }
     Ok(crate::cluster::ledger::stream_head(conn, sid.as_str())?
@@ -909,7 +911,7 @@ fn task_superseded(conn: &Connection, run_gen: u64, task: &Task) -> Result<bool>
 
 fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
     let sid = s.tasks[&id].origin.sid;
-    let cur_gen = s.run_gen(sid);
+    let cur_gen = s.reset_gen(sid);
     if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? {
         s.tasks.get_mut(&id).unwrap().stop("superseded");
         return Ok(None);
@@ -1053,7 +1055,7 @@ fn pack_output(
 fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()> {
     let (sid, exp_epoch, cur_gen) = {
         let task = &s.tasks[&id];
-        (task.origin.sid, task.session_epoch, s.run_gen(task.origin.sid))
+        (task.origin.sid, task.session_epoch, s.reset_gen(task.origin.sid))
     };
     if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? {
         let mut task = s.tasks.remove(&id).unwrap();

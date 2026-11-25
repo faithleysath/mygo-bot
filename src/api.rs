@@ -281,6 +281,8 @@ async fn delete_session(
             s.mcp.forget_session(sid);
             s.channels.remove(&sid);
             s.wake_sequences.remove(&sid);
+            s.bump_run_gen(sid);
+            s.bump_reset_gen(sid);
             s.publish_global("session.deleted", json!({"id": sid}));
             Ok(())
         })
@@ -550,24 +552,32 @@ async fn history(
         page.limit,
     )?;
     app.cluster.ensure_session_watched(sid).await?;
-    let range = app
+    let (range, history_rev) = app
         .db
         .call(move |s| {
             session(&s.conn, sid)?;
-            store::JsonRows::history_range(
+            let range = store::JsonRows::history_range(
                 &s.conn,
                 sid,
                 page.after,
                 page.before,
                 page.tail,
                 page.limit,
-            )
+            )?;
+            let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, sid)?;
+            Ok((range, history_rev))
         })
         .await?;
     let body = store::JsonRows::History
         .history_body(app.db, sid, range, vec![b'['], b"]")
         .await?;
-    Ok(json_response(body))
+    let mut resp = json_response(body);
+    resp.headers_mut().insert(
+        header::HeaderName::from_static("x-history-rev"),
+        header::HeaderValue::from_str(&history_rev.to_string())
+            .map_err(|e| Error::internal(e.to_string()))?,
+    );
+    Ok(resp)
 }
 
 async fn context(

@@ -225,7 +225,12 @@ pub async fn execute(
         Ok(Action::Renew(id, seconds)) => codemode::renew(app, call, id, seconds, hard).await,
         Err(e) => {
             app.db
-                .call(move |s| call.reply(s, json!({"status":"error","error":e})))
+                .call(move |s| {
+                    if hard.is_cancelled() {
+                        return Ok(());
+                    }
+                    call.reply(s, json!({"status":"error","error":e}))
+                })
                 .await
         }
     }

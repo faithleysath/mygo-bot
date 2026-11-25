@@ -164,8 +164,8 @@ impl Cluster {
                     )
                     .await?;
                 if secret_changed {
-                    sync.on_membership_switched();
                     net.switch_membership(new_gen, new_secret);
+                    sync.on_membership_switched();
                 } else {
                     net.wake_dialer();
                 }

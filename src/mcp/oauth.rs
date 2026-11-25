@@ -28,6 +28,61 @@ use tokio_util::sync::CancellationToken;
 
 const LOGIN_TTL: u32 = 600;
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct PendingRefreshState {
+    pub coordinator: String,
+    pub fp: String,
+}
+
+pub(crate) fn credentials_fingerprint(raw_credentials: Option<&str>) -> Option<String> {
+    let raw = raw_credentials?;
+    let creds = decode::<client::StoredCredentials>(raw).ok()?;
+    let tr = creds.token_response.as_ref()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mygo-oauth-cred-fp-v1\0");
+    let update_opt_str = |h: &mut blake3::Hasher, s: Option<&str>| match s {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&(v.len() as u64).to_le_bytes());
+            h.update(v.as_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    };
+    update_opt_str(&mut hasher, tr.refresh_token.as_deref());
+    update_opt_str(&mut hasher, Some(tr.access_token.as_str()));
+    match tr.expires_in {
+        Some(v) => {
+            hasher.update(&[1]);
+            hasher.update(&v.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    match creds.token_received_at {
+        Some(v) => {
+            hasher.update(&[1]);
+            hasher.update(&v.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+pub(crate) fn credentials_need_refresh(raw_credentials: Option<&str>, rejected: bool) -> bool {
+    let Some(raw) = raw_credentials else {
+        return false;
+    };
+    let Ok(creds) = decode::<client::StoredCredentials>(raw) else {
+        return false;
+    };
+    storage::needs_refresh(&creds, rejected)
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Config {

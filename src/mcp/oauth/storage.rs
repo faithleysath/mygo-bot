@@ -85,7 +85,7 @@ impl Account {
             .write(
                 move |conn| {
                     if crate::cluster::ledger::has_conflict(conn, id.as_str())? {
-                        let sql = "UPDATE mcp_oauth SET staged_credentials=?4
+                        let sql = "UPDATE mcp_oauth SET staged_credentials=?4,pending_refresh=NULL
                             WHERE server_id=?1 AND generation=?2 AND pending IS NULL AND
                             (credentials IS NOT NULL OR staged_credentials IS NOT NULL
                              OR EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND revision=?3))
@@ -94,7 +94,7 @@ impl Account {
                             row.get::<_, bool>(0)
                         })?);
                     }
-                    let sql = "UPDATE mcp_oauth SET credentials=?4,staged_credentials=NULL,rejected=0
+                    let sql = "UPDATE mcp_oauth SET credentials=?4,staged_credentials=NULL,pending_refresh=NULL,rejected=0
                         WHERE server_id=?1 AND generation=?2 AND pending IS NULL AND
                         (credentials IS NOT NULL OR staged_credentials IS NOT NULL
                          OR EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND revision=?3))
@@ -157,7 +157,7 @@ impl Account {
             .write(
                 move |conn| {
                     conn.execute(
-                        "UPDATE mcp_oauth SET credentials=NULL,staged_credentials=NULL,rejected=0 WHERE server_id=? AND generation=?
+                        "UPDATE mcp_oauth SET credentials=NULL,staged_credentials=NULL,pending_refresh=NULL,rejected=0 WHERE server_id=? AND generation=?
                         AND json_extract(coalesce(staged_credentials,credentials),'$.token_response.refresh_token')=?",
                         params![id, generation, token],
                     )?;

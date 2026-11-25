@@ -615,9 +615,25 @@ export function createGlobalSessionSync({
   };
 }
 
+export type HistoryFetchResult =
+  | HistoryItem[]
+  | { items: HistoryItem[]; historyRev?: number | null };
+
+function normalizeHistoryResult(
+  res: HistoryFetchResult
+): { items: HistoryItem[]; historyRev: number | null } {
+  if (Array.isArray(res)) {
+    return { items: res, historyRev: null };
+  }
+  return {
+    items: res.items,
+    historyRev: typeof res.historyRev === "number" ? res.historyRev : null,
+  };
+}
+
 export interface SessionSyncOptions {
-  fetchInitial: () => Promise<HistoryItem[]>;
-  fetchAfter: (afterId: string) => Promise<HistoryItem[]>;
+  fetchInitial: () => Promise<HistoryFetchResult>;
+  fetchAfter: (afterId: string) => Promise<HistoryFetchResult>;
   onItems: (items: HistoryItem[]) => void;
   onReplaceItems?: (items: HistoryItem[]) => void;
   onHasMore: (hasMore: boolean) => void;
@@ -686,8 +702,21 @@ export function createSessionSync({
     let shouldScheduleRetry = false;
     try {
       if (!initialLoaded) {
-        const hist = await fetchInitial();
+        const { items: hist, historyRev: respRev } = normalizeHistoryResult(await fetchInitial());
         if (disposed || myGen !== resetGen) return;
+        if (respRev !== null && knownHistoryRev !== null && respRev !== knownHistoryRev) {
+          knownHistoryRev = Math.max(knownHistoryRev, respRev);
+          resetGen += 1;
+          initialLoaded = false;
+          syncedThroughId = "";
+          gapOpen = true;
+          replaceNext = true;
+          runAgain = true;
+          return;
+        }
+        if (respRev !== null) {
+          knownHistoryRev = respRev;
+        }
         if (replaceNext && onReplaceItems) {
           onReplaceItems(hist);
         } else {
@@ -703,8 +732,17 @@ export function createSessionSync({
         if (!runAgain) triggerSidecars();
       } else {
         while (!disposed) {
-          const page = await fetchAfter(syncedThroughId);
+          const { items: page, historyRev: pageRev } = normalizeHistoryResult(
+            await fetchAfter(syncedThroughId)
+          );
           if (disposed || myGen !== resetGen) return;
+          if (pageRev !== null && knownHistoryRev !== null && pageRev !== knownHistoryRev) {
+            onReset(pageRev);
+            return;
+          }
+          if (pageRev !== null) {
+            knownHistoryRev = pageRev;
+          }
           if (page.length) {
             onItems(page);
             const last = page[page.length - 1].id;
@@ -747,10 +785,14 @@ export function createSessionSync({
     void runSync();
   };
 
-  const onReady = (historyRev?: number): void => {
+  const syncWithRev = (historyRev?: number): void => {
     if (disposed) return;
     if (typeof historyRev === "number") {
       if (knownHistoryRev !== null && historyRev !== knownHistoryRev) {
+        onReset(historyRev);
+        return;
+      }
+      if (knownHistoryRev === null && (initialLoaded || inFlight)) {
         onReset(historyRev);
         return;
       }
@@ -762,20 +804,9 @@ export function createSessionSync({
     void runSync();
   };
 
-  const onResync = (historyRev?: number): void => {
-    if (disposed) return;
-    if (typeof historyRev === "number") {
-      if (knownHistoryRev !== null && historyRev !== knownHistoryRev) {
-        onReset(historyRev);
-        return;
-      }
-      knownHistoryRev = historyRev;
-    }
-    gapOpen = true;
-    retryDelay = 1000;
-    clearRetry();
-    void runSync();
-  };
+  const onReady = (historyRev?: number): void => syncWithRev(historyRev);
+
+  const onResync = (historyRev?: number): void => syncWithRev(historyRev);
 
   const onReset = (historyRev?: number): void => {
     if (disposed) return;

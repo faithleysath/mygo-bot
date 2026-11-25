@@ -482,20 +482,24 @@ impl App {
         }
         .to_owned();
         self.db
-            .call(move |s| {
-                let tx = s.conn.transaction()?;
-                let id = store::add_context_item(
-                    &tx,
-                    sid,
-                    &kind,
-                    &item,
-                    llm_call_id,
-                    Some(run_epoch),
-                )?;
-                tx.commit()?;
-                s.item_saved(sid, id)?;
-                Ok(())
-            })
+            .write_for_run(
+                sid,
+                run_gen,
+                move |conn| {
+                    store::add_context_item(
+                        conn,
+                        sid,
+                        &kind,
+                        &item,
+                        llm_call_id,
+                        Some(run_epoch),
+                    )
+                },
+                move |s, id| {
+                    s.item_saved(sid, id)?;
+                    Ok(())
+                },
+            )
             .await
     }
 }
