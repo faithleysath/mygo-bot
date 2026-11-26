@@ -68,7 +68,31 @@ fn git_build() -> Option<String> {
     ))
 }
 
+fn embed_codemode() {
+    let out = env::var_os("OUT_DIR").expect("Cargo OUT_DIR");
+    let files = ["bootstrap.js", "decoder.js"];
+    for file in files {
+        println!("cargo::rerun-if-changed=src/codemode/{file}");
+    }
+    println!("cargo::rerun-if-changed=tools/minify-codemode.mjs");
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        match Command::new("bun").arg("tools/minify-codemode.mjs").arg(&out).status() {
+            Ok(status) if status.success() => return,
+            Ok(status) => panic!("Bun could not minify codemode scripts: {status}"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                println!("cargo::warning=Bun unavailable; embedding original codemode scripts");
+            }
+            Err(err) => panic!("starting Bun: {err}"),
+        }
+    }
+    for file in files {
+        std::fs::copy(Path::new("src/codemode").join(file), Path::new(&out).join(file))
+            .expect("copy codemode script");
+    }
+}
+
 fn main() {
+    embed_codemode();
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=MYGO_BUILD");
     let mut version = env::var("CARGO_PKG_VERSION").unwrap();

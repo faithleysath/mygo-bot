@@ -1115,6 +1115,14 @@ impl SyncEngine {
         if stream_ids.is_empty() {
             return;
         }
+        let online = self.net.online_peer_ids();
+        let targets: Vec<String> = online
+            .into_iter()
+            .filter(|peer_id| exclude_peer != Some(peer_id.as_str()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
         let ids = stream_ids.to_vec();
         let Ok(heads) = self
             .db
@@ -1132,14 +1140,6 @@ impl SyncEngine {
             return;
         };
         if heads.is_empty() {
-            return;
-        }
-        let online = self.net.online_peer_ids();
-        let targets: Vec<String> = online
-            .into_iter()
-            .filter(|peer_id| exclude_peer != Some(peer_id.as_str()))
-            .collect();
-        if targets.is_empty() {
             return;
         }
 

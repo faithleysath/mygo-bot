@@ -150,7 +150,7 @@ impl Hub {
         (self.0.global.clone(), self.0.global.subscribe())
     }
 
-    pub fn subscribe_delta(
+    fn subscribe_delta(
         &self,
         sid: SessionId,
     ) -> (
@@ -329,9 +329,16 @@ impl Hub {
                 Notice::publish(&tx, "stream.clear", json!({"llm_call_id": llm_call_id}));
             }
         }
-        sessions.retain(|_, s| {
-            s.draft.is_some() || s.tx.as_ref().is_some_and(|w| w.strong_count() > 0)
-        });
+        Self::remove_idle_stream(&mut sessions, sid);
+    }
+
+    fn remove_idle_stream(sessions: &mut HashMap<SessionId, SessionStream>, sid: SessionId) {
+        if let std::collections::hash_map::Entry::Occupied(entry) = sessions.entry(sid) {
+            let stream = entry.get();
+            if stream.draft.is_none() && stream.tx.as_ref().is_none_or(|w| w.strong_count() == 0) {
+                entry.remove();
+            }
+        }
     }
 
     pub fn remove_session(&self, sid: SessionId) {
@@ -407,7 +414,8 @@ pub struct SessionEventStream {
     sid: SessionId,
     _channel: broadcast::Sender<Notice>,
     rx: broadcast::Receiver<Notice>,
-    _delta: broadcast::Sender<Notice>,
+    hub: Hub,
+    delta_sender: Option<broadcast::Sender<Notice>>,
     delta_rx: broadcast::Receiver<Notice>,
     initial_payload: String,
     initial_snapshot: Option<Arc<str>>,
@@ -416,6 +424,13 @@ pub struct SessionEventStream {
     delta_open: bool,
     delta_lagged: bool,
     min_seq: u64,
+}
+
+impl Drop for SessionEventStream {
+    fn drop(&mut self) {
+        drop(self.delta_sender.take());
+        Hub::remove_idle_stream(&mut self.hub.0.sessions.lock().unwrap(), self.sid);
+    }
 }
 
 impl SessionEventStream {
@@ -450,7 +465,8 @@ impl SessionEventStream {
             sid,
             _channel: channel,
             rx,
-            _delta: delta_tx,
+            hub: app.streams.clone(),
+            delta_sender: Some(delta_tx),
             delta_rx,
             initial_payload,
             initial_snapshot: snapshot.map(|s| Arc::from(s.to_string())),

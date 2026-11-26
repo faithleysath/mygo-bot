@@ -1329,8 +1329,7 @@ impl ExecPlane {
         lock
     }
 
-    pub async fn on_peer_connected(&self, peer_id: String, peer_count: usize) {
-        self.presence.set_known_peer_count(peer_count);
+    pub async fn on_peer_connected(&self, peer_id: String) {
         let app = self.app_slot.lock().unwrap().clone();
         if let Some(app) = app {
             self.reconcile_standalone_leases(&app).await;

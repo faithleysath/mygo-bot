@@ -417,7 +417,7 @@ impl App {
                             }
                             return Ok(None);
                         }
-                        let id = store::add_item(
+                        let saved = store::add_item(
                             conn,
                             sid,
                             "function_call",
@@ -425,11 +425,12 @@ impl App {
                             None,
                             Some(llm_call_id),
                         )?;
+                        let id = saved.id;
                         crate::cluster::ledger::record_session_delta_at_epoch(
                             conn,
                             sid,
                             "session_delta",
-                            &[id],
+                            vec![saved],
                             Vec::new(),
                             Vec::new(),
                             Some(run_epoch),

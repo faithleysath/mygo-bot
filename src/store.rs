@@ -23,8 +23,8 @@ use crate::{
         ClusterSignal, SyncSignal,
         exec::{PresenceState, SessionOccupancy, merge_remote_attachment_refs},
         ledger::{
-            AttachmentRef, ContextPos, clear_staged, has_conflict, is_session_writable_local,
-            record_call, record_session_delta, take_staged, with_savepoint,
+            AttachmentRef, ContextPos, ItemSnapshot, clear_staged, has_conflict, is_session_writable_local,
+            record_call, record_session_delta, returning_item_snapshot, take_staged, with_savepoint,
         },
     },
     events::Notice,
@@ -125,7 +125,8 @@ impl Db {
             crate::id::seed_from_db(&tx)?;
             crate::cluster::identity::ensure_local_node(&tx)?;
         }
-        let local_node_id = crate::cluster::identity::load_local_node(&tx)?.node_id;
+        crate::cluster::ledger::init_verified_tips(&tx)?;
+        let local_node_id = crate::cluster::identity::local_node_id(&tx)?.to_string();
         presence.set_local_node_id(local_node_id.clone());
         let peer_count: usize = usize::try_from(tx.query_row(
             "SELECT count(*) FROM cluster_peers",
@@ -203,7 +204,7 @@ impl Db {
                 && !has_conflict(&tx, sid.as_str())?
                 && is_session_writable_local(&tx, sid)?
             {
-                record_session_delta(&tx, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+                record_session_delta(&tx, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
             }
         }
         if crate::codemode::ledger::recover(&tx, !has_peers)? {
@@ -234,6 +235,7 @@ impl Db {
                     sync_tx,
                     closing: false,
                 };
+                crate::cluster::identity::set_writer_node_id(&store.conn, &store.local_node_id);
                 let mut next = None;
                 let mut batch = Vec::new();
                 while let Some(command) = next.take().or_else(|| receiver.blocking_recv()) {
@@ -431,17 +433,16 @@ impl Enqueue {
             .query_row([self.sid], |row| row.get(0))?;
         let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
         crate::media::validate_message(conn, &self.content, &modalities)?;
-        let origin = crate::cluster::identity::load_local_node(conn)?.node_id;
+        let origin = crate::cluster::identity::local_node_id(conn)?;
         let id = ItemId::new()?;
-        conn.prepare_cached(
+        let item = conn.prepare_cached(returning_item_snapshot!(
             "INSERT INTO items(id,session_id,kind,payload,idempotency_key,origin_node_id)
-             VALUES(?1,?2,'user_message',json_object('content',json(?3),'role','user'),?4,?5)",
-        )?
-        .execute(params![id, self.sid, self.content, self.key, origin])?;
+             VALUES(?1,?2,'user_message',json_object('content',json(?3),'role','user'),?4,?5)"
+        ))?.query_row(params![id, self.sid, self.content, self.key, origin], ItemSnapshot::from_row)?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute((self.sid, now))?;
-        record_session_delta(conn, self.sid, "session_delta", &[id], Vec::new(), Vec::new())?;
+        record_session_delta(conn, self.sid, "session_delta", vec![item], Vec::new(), Vec::new())?;
         Ok(Enqueued::Created(id))
     }
 }
@@ -454,7 +455,9 @@ impl Store {
     }
 
     pub fn notify_streams(&self, ids: Vec<String>) {
-        self.sync_tx.notify_streams(ids);
+        if self.presence.known_peer_count() > 0 {
+            self.sync_tx.notify_streams(ids);
+        }
     }
 
     pub fn bump_run_gen(&mut self, sid: SessionId) -> u64 {
@@ -627,7 +630,7 @@ impl Store {
                 (sid, state, reason, now),
             )?;
             if matches!(state, "idle" | "paused") {
-                record_session_delta(&self.conn, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+                record_session_delta(&self.conn, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
             }
             before_commit(self)
         })?;
@@ -895,7 +898,7 @@ pub fn has_pending(conn: &Connection, sid: SessionId) -> Result<bool> {
     if !ready {
         with_savepoint(conn, "advance_pending", || {
             if advance_queue(conn, sid, false)? {
-                record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+                record_session_delta(conn, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
             }
             Ok(())
         })?;
@@ -917,7 +920,7 @@ pub fn pending_reason(conn: &Connection, sid: SessionId) -> Result<Option<&'stat
         (false, false) => {
             with_savepoint(conn, "advance_pending_reason", || {
                 if advance_queue(conn, sid, false)? {
-                    record_session_delta(conn, sid, "session_delta", &[], Vec::new(), Vec::new())?;
+                    record_session_delta(conn, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
                 }
                 Ok(())
             })?;
@@ -956,7 +959,7 @@ pub fn take_pending(tx: &Connection, sid: SessionId) -> Result<()> {
     }
     let advanced = advance_queue(tx, sid, added > 0)?;
     if !ctx_added.is_empty() || advanced {
-        record_session_delta(tx, sid, "session_delta", &[], ctx_added, Vec::new())?;
+        record_session_delta(tx, sid, "session_delta", Vec::new(), ctx_added, Vec::new())?;
     }
     Ok(())
 }
@@ -988,14 +991,12 @@ pub fn add_item(
     payload: &Value,
     target: Option<ItemId>,
     llm_call_id: Option<CallId>,
-) -> Result<ItemId> {
+) -> Result<ItemSnapshot> {
     let id = ItemId::new()?;
-    let origin = crate::cluster::identity::load_local_node(conn)?.node_id;
-    conn.execute(
-        "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id,origin_node_id) VALUES(?,?,?,?,?,?,?)",
-        params![id, sid, kind, payload, target, llm_call_id, origin],
-    )?;
-    Ok(id)
+    let origin = crate::cluster::identity::local_node_id(conn)?;
+    Ok(conn.prepare_cached(returning_item_snapshot!(
+        "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id,origin_node_id) VALUES(?,?,?,?,?,?,?)"
+    ))?.query_row(params![id, sid, kind, payload, target, llm_call_id, origin], ItemSnapshot::from_row)?)
 }
 
 pub fn add_context_item_raw(
@@ -1004,14 +1005,14 @@ pub fn add_context_item_raw(
     kind: &str,
     item: &Value,
     call_id: CallId,
-) -> Result<(ItemId, i64)> {
-    let id = add_item(tx, sid, kind, item, None, Some(call_id))?;
+) -> Result<(ItemSnapshot, i64)> {
+    let saved = add_item(tx, sid, kind, item, None, Some(call_id))?;
     let pos = max_context_position(tx, sid)? + 1;
     tx.execute(
         "INSERT INTO context_items(session_id,position,item_id) VALUES(?,?,?)",
-        (sid, pos, id),
+        (sid, pos, saved.id),
     )?;
-    Ok((id, pos))
+    Ok((saved, pos))
 }
 
 pub fn add_context_item(
@@ -1022,12 +1023,13 @@ pub fn add_context_item(
     call_id: CallId,
     expected_epoch: Option<i64>,
 ) -> Result<ItemId> {
-    let (id, pos) = add_context_item_raw(tx, sid, kind, item, call_id)?;
+    let (saved, pos) = add_context_item_raw(tx, sid, kind, item, call_id)?;
+    let id = saved.id;
     crate::cluster::ledger::record_session_delta_at_epoch(
         tx,
         sid,
         "session_delta",
-        &[id],
+        vec![saved],
         vec![ContextPos {
             position: pos,
             item_id: id,
@@ -1068,8 +1070,9 @@ pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Resul
             None if recovering => {
                 let payload = json!({"type":"function_call_output","call_id":call,"output":"Execution interrupted; result unknown."});
                 let result = add_item(tx, sid, "function_call_output", &payload, Some(id), None)?;
+                let result_id = result.id;
                 recovered.push(result);
-                result
+                result_id
             }
             None => return Err(Error::internal("missing tool result")),
         };
@@ -1087,17 +1090,18 @@ pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Resul
         });
         pos += 2;
     }
+    let recovered_ids = recovered.iter().map(|item| item.id).collect();
     if !recovered.is_empty() || !ctx_added.is_empty() {
         record_session_delta(
             tx,
             sid,
             "session_delta",
-            &recovered,
+            recovered,
             ctx_added,
             Vec::new(),
         )?;
     }
-    Ok(recovered)
+    Ok(recovered_ids)
 }
 
 const BATCH_ITEMS: i64 = 256;

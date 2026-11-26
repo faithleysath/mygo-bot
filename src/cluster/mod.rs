@@ -164,8 +164,7 @@ impl Cluster {
             .spawn(async move {
                 let _guard = join_gate.lock().await;
                 let local_only = net.is_local_only();
-                let presence_cb = presence.clone();
-                let (secret_changed, new_gen, new_secret, peer, peer_count) = db
+                let (secret_changed, new_gen, new_secret, peer, _) = db
                     .write(
                         move |conn| {
                             let (changed, next_gen, secret, peer) =
@@ -174,12 +173,11 @@ impl Cluster {
                             Ok((changed, next_gen, secret, peer, count))
                         },
                         move |_, res| {
-                            presence_cb.set_known_peer_count(res.4);
+                            presence.set_known_peer_count(res.4);
                             Ok(res)
                         },
                     )
                     .await?;
-                presence.set_known_peer_count(peer_count);
                 if secret_changed {
                     net.switch_membership(new_gen, new_secret);
                     sync.on_membership_switched();

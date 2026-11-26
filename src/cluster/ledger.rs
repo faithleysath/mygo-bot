@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
 };
 
 use reqwest::Url;
@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Error, Result,
-    cluster::identity::load_local_node,
+    cluster::identity::{load_local_node, local_node_id},
     id::{self, AttachmentId, CallId, ItemId, McpServerId, ModelId, ProviderId, SessionId},
 };
 
@@ -563,6 +563,52 @@ pub fn verify_local_prefix(
     Ok(count == expected_len && &last_hash == target_hash)
 }
 
+/// The store holds an exclusive SQLite connection. Its temporary proofs follow the
+/// same transactions (including ROLLBACK TO) as the rows they describe.
+/// Mutations to sync_commits use SQL DML. SQLite's incremental BLOB writer
+/// bypasses triggers and must not be used on that table.
+pub(crate) fn init_verified_tips(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        // REPLACE implicitly deletes conflicting rows. SQLite fires DELETE
+        // triggers for these rows only when recursive triggers are enabled.
+        "PRAGMA recursive_triggers=ON;
+         CREATE TEMP TABLE verified_tips (
+             slot INTEGER PRIMARY KEY CHECK (slot BETWEEN 0 AND 255),
+             stream_id TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
+             epoch INTEGER NOT NULL, seq INTEGER NOT NULL, hash BLOB NOT NULL
+         );
+         CREATE TEMP TRIGGER tip_delete AFTER DELETE ON main.sync_commits BEGIN
+             DELETE FROM verified_tips WHERE stream_id=OLD.stream_id AND epoch=OLD.epoch
+                 AND (OLD.seq=1 OR seq=OLD.seq);
+         END;
+         CREATE TEMP TRIGGER tip_update AFTER UPDATE ON main.sync_commits BEGIN
+             DELETE FROM verified_tips WHERE stream_id=OLD.stream_id AND epoch=OLD.epoch
+                 AND (OLD.seq=1 OR seq=OLD.seq);
+         END;",
+    )?;
+    Ok(())
+}
+
+fn remember_verified_tip(
+    conn: &Connection,
+    stream_id: &str,
+    kind: StreamKind,
+    epoch: i64,
+    seq: i64,
+    hash: &[u8; 32],
+) -> Result<()> {
+    // Local IDs are 30 bytes. Keep even a malformed remote ID from growing this cache.
+    if stream_id.len() > 64 {
+        return Ok(());
+    }
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO temp.verified_tips(slot,stream_id,kind,epoch,seq,hash)
+         VALUES(?,?,?,?,?,?)",
+    )?
+    .execute(params![hash[0], stream_id, kind.as_str(), epoch, seq, hash])?;
+    Ok(())
+}
+
 fn verify_local_tip_commit(conn: &Connection, st: &LocalStreamState) -> Result<bool> {
     if st.checkpoint_seq != 1 || !st.is_body_complete() {
         return Ok(false);
@@ -570,51 +616,51 @@ fn verify_local_tip_commit(conn: &Connection, st: &LocalStreamState) -> Result<b
     if st.head_seq == 0 {
         return Ok(st.head_hash == [0u8; 32]);
     }
-    let has_base: bool = conn
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=1)",
-        )?
-        .query_row(params![&st.stream_id, st.epoch], |r| r.get(0))?;
-    if !has_base {
+    if st.epoch <= 0 || !st.stream_id.starts_with(st.kind.prefix()) {
         return Ok(false);
     }
-    let row = conn
+    let cached: bool = conn
         .prepare_cached(
-            "SELECT parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-             FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=?3",
+            "SELECT EXISTS(SELECT 1 FROM temp.verified_tips
+             WHERE slot=? AND stream_id=? AND kind=? AND epoch=? AND seq=? AND hash=?)",
         )?
-        .query_row(params![&st.stream_id, st.epoch, st.head_seq], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        })
-        .optional()?;
-    let Some((pvec, cvec, author_node_id, op_type, payload, created_at)) = row else {
-        return Ok(false);
-    };
-    let parent_hash = to_hash32(pvec)?;
-    let commit_hash = to_hash32(cvec)?;
-    if st.head_seq == 1 && parent_hash != [0u8; 32] {
-        return Ok(false);
+        .query_row(
+            params![st.head_hash[0], &st.stream_id, st.kind.as_str(), st.epoch, st.head_seq, &st.head_hash],
+            |r| r.get(0),
+        )?;
+    if cached {
+        return Ok(true);
     }
-    let wire = CommitWire {
-        stream_id: st.stream_id.clone(),
-        kind: st.kind,
-        epoch: st.epoch,
-        seq: st.head_seq,
-        parent_hash,
-        commit_hash,
-        author_node_id,
-        op_type,
-        payload,
-        created_at,
-    };
-    Ok(commit_hash == st.head_hash && verify_commit(&wire, st.head_seq, &parent_hash))
+    let mut stmt = conn.prepare_cached(
+        "SELECT parent_hash,commit_hash,author_node_id,op_type,payload,created_at
+         FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=?3 AND
+             (?3=1 OR EXISTS(SELECT 1 FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=1))",
+    )?;
+    let valid = stmt.query_row(params![&st.stream_id, st.epoch, st.head_seq], |r| {
+        let parent_hash: [u8; 32] = r.get(0)?;
+        let commit_hash: [u8; 32] = r.get(1)?;
+        if commit_hash != st.head_hash || (st.head_seq == 1 && parent_hash != [0; 32]) {
+            return Ok(false);
+        }
+        let computed = compute_commit_hash(&CommitHashInput {
+            stream_id: &st.stream_id,
+            kind: st.kind,
+            epoch: st.epoch,
+            seq: st.head_seq,
+            parent_hash: &parent_hash,
+            author_node_id: r.get_ref(2)?.as_str()?,
+            op_type: r.get_ref(3)?.as_str()?,
+            payload: r.get_ref(4)?.as_str()?,
+            created_at: r.get(5)?,
+        });
+        Ok(computed == commit_hash)
+    }).optional()?.unwrap_or(false);
+    if valid {
+        remember_verified_tip(
+            conn, &st.stream_id, st.kind, st.epoch, st.head_seq, &st.head_hash,
+        )?;
+    }
+    Ok(valid)
 }
 
 pub fn is_session_writable_local(conn: &Connection, sid: SessionId) -> Result<bool> {
@@ -627,24 +673,25 @@ pub fn is_session_writable_local(conn: &Connection, sid: SessionId) -> Result<bo
     verify_local_tip_commit(conn, &st)
 }
 
-pub fn record_commit_with_epoch(
+fn encode_commit(value: &impl Serialize) -> Result<String> {
+    serde_json::to_string(value).map_err(|e| Error::internal(format!("commit encode failed: {e}")))
+}
+
+fn record_commit_with_epoch(
     conn: &Connection,
     stream_id: &str,
     kind: StreamKind,
     op_type: &str,
-    payload_val: &impl Serialize,
     deleted: bool,
-    head_snapshot: Option<&str>,
     expected_epoch: Option<i64>,
+    build: impl FnOnce(Option<&LocalStreamState>) -> Result<(String, Option<String>)>,
 ) -> Result<()> {
-    let payload = serde_json::to_string(payload_val)
-        .map_err(|e| Error::internal(format!("commit encode failed: {e}")))?;
     with_savepoint(conn, "cluster_commit", || {
         assert_no_conflict(conn, stream_id)?;
-        let author = load_local_node(conn)?.node_id;
+        let author = local_node_id(conn)?;
         let now = chrono::Utc::now().timestamp_millis();
         let existing = stream_head(conn, stream_id)?;
-        let (epoch, seq, parent_hash, checkpoint_seq) = match existing {
+        let (epoch, seq, parent_hash, checkpoint_seq) = match existing.as_ref() {
             Some(e) => {
                 if e.deleted || e.retired {
                     return Err(Error::conflict(format!(
@@ -656,7 +703,7 @@ pub fn record_commit_with_epoch(
                         "stream {stream_id} epoch superseded; aborting stale write"
                     )));
                 }
-                if kind == StreamKind::Session && !verify_local_tip_commit(conn, &e)? {
+                if kind == StreamKind::Session && !verify_local_tip_commit(conn, e)? {
                     return Err(Error::conflict(format!(
                         "session {stream_id} history is incomplete; sync full history before writing"
                     )));
@@ -672,6 +719,7 @@ pub fn record_commit_with_epoch(
                 (1, 1, [0u8; 32], 1)
             }
         };
+        let (payload, head_snapshot) = build(existing.as_ref())?;
         let commit_hash = compute_commit_hash(&CommitHashInput {
             stream_id,
             kind,
@@ -683,7 +731,12 @@ pub fn record_commit_with_epoch(
             payload: &payload,
             created_at: now,
         });
-        conn.execute(
+        // Install the computed proof in this savepoint. Triggers invalidate a changed row,
+        // and rolling back the write also rolls back the proof.
+        if kind == StreamKind::Session {
+            remember_verified_tip(conn, stream_id, kind, epoch, seq, &commit_hash)?;
+        }
+        conn.prepare_cached(
             "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
              VALUES(?1,?2,?3,?4,?5,?3,?4,?5,?6,1,?7,0,?8,?9)
              ON CONFLICT(stream_id) DO UPDATE SET
@@ -699,7 +752,7 @@ pub fn record_commit_with_epoch(
                retired=0,
                head_snapshot=coalesce(excluded.head_snapshot, sync_streams.head_snapshot),
                updated_at=excluded.updated_at",
-            params![
+        )?.execute(params![
                 stream_id,
                 kind.as_str(),
                 epoch,
@@ -709,12 +762,11 @@ pub fn record_commit_with_epoch(
                 deleted,
                 head_snapshot,
                 now
-            ],
-        )?;
-        conn.execute(
+            ])?;
+        let inserted = conn.prepare_cached(
             "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
              VALUES(?,?,?,?,?,?,?,?,?)",
-            params![
+        )?.execute(params![
                 stream_id,
                 epoch,
                 seq,
@@ -724,32 +776,27 @@ pub fn record_commit_with_epoch(
                 op_type,
                 payload,
                 now
-            ],
-        )?;
+            ])?;
+        if inserted != 1 {
+            return Err(Error::internal("commit row was not inserted"));
+        }
         stage_stream(stream_id);
         Ok(())
     })
 }
 
-pub fn record_commit(
+fn record_commit(
     conn: &Connection,
     stream_id: &str,
     kind: StreamKind,
     op_type: &str,
     payload_val: &impl Serialize,
     deleted: bool,
-    head_snapshot: Option<&str>,
 ) -> Result<()> {
-    record_commit_with_epoch(
-        conn,
-        stream_id,
-        kind,
-        op_type,
-        payload_val,
-        deleted,
-        head_snapshot,
-        None,
-    )
+    let payload = encode_commit(payload_val)?;
+    record_commit_with_epoch(conn, stream_id, kind, op_type, deleted, None, |_| {
+        Ok((payload, None))
+    })
 }
 
 // --- Per-table Snapshot & Record Helpers ---
@@ -779,7 +826,6 @@ pub fn record_provider(conn: &Connection, id: ProviderId) -> Result<()> {
         "provider_upsert",
         &snap,
         false,
-        None,
     )
 }
 
@@ -812,7 +858,6 @@ pub fn record_model(conn: &Connection, id: ModelId) -> Result<()> {
         "model_upsert",
         &snap,
         false,
-        None,
     )
 }
 
@@ -869,7 +914,6 @@ pub fn record_mcp_if_shared(conn: &Connection, id: McpServerId) -> Result<()> {
             "mcp_upsert",
             &snap,
             false,
-            None,
         )?;
     }
     Ok(())
@@ -997,7 +1041,6 @@ pub fn record_call(conn: &Connection, id: CallId) -> Result<()> {
         "call_upsert",
         &snap,
         false,
-        None,
     )
 }
 
@@ -1029,7 +1072,7 @@ fn read_session_snapshot_with_modalities(
             model_id: r.get(7)?,
             input_queue_cursor: r.get(8)?,
             needs_model: r.get(9)?,
-            required_modalities: required_modalities.clone(),
+            required_modalities,
         })
     })
     .map_err(Into::into)
@@ -1040,13 +1083,16 @@ pub fn read_session_snapshot(conn: &Connection, sid: SessionId) -> Result<Sessio
     read_session_snapshot_with_modalities(conn, sid, required_modalities)
 }
 
-pub fn read_item_snapshot(conn: &Connection, id: ItemId) -> Result<ItemSnapshot> {
-    conn.prepare_cached(
-        "SELECT id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id
-         FROM items WHERE id=?",
-    )?
-    .query_row([id], |r| {
-        Ok(ItemSnapshot {
+macro_rules! returning_item_snapshot {
+    ($insert:literal) => {
+        concat!($insert, " RETURNING id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id")
+    };
+}
+pub(crate) use returning_item_snapshot;
+
+impl ItemSnapshot {
+    pub fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
             id: r.get(0)?,
             session_id: r.get(1)?,
             kind: r.get(2)?,
@@ -1057,21 +1103,24 @@ pub fn read_item_snapshot(conn: &Connection, id: ItemId) -> Result<ItemSnapshot>
             codemode_call_item_id: r.get(7)?,
             origin_node_id: r.get(8)?,
         })
-    })
-    .map_err(Into::into)
+    }
 }
 
-fn collect_attachment_ids_from_item(item: &ItemSnapshot, out: &mut HashSet<AttachmentId>) {
-    let Ok(val) = serde_json::from_str::<Value>(&item.payload) else {
-        return;
+pub fn read_item_snapshot(conn: &Connection, id: ItemId) -> Result<ItemSnapshot> {
+    Ok(conn.prepare_cached(
+        "SELECT id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id
+         FROM items WHERE id=?",
+    )?.query_row([id], ItemSnapshot::from_row)?)
+}
+
+fn collect_attachment_ids(kind: &str, payload: &Value, out: &mut HashSet<AttachmentId>) {
+    let parts = match kind {
+        "user_message" | "codemode_event" => &payload["content"],
+        "function_call_output" => &payload["output"],
+        _ => return,
     };
-    let parts = match item.kind.as_str() {
-        "user_message" | "codemode_event" => val.get("content").and_then(Value::as_array),
-        "function_call_output" => val.get("output").and_then(Value::as_array),
-        _ => None,
-    };
-    if let Some(arr) = parts {
-        for part in arr {
+    if let Some(parts) = parts.as_array() {
+        for part in parts {
             if let Some(id_str) = part.get("attachment_id").and_then(Value::as_str)
                 && let Ok(id) = id_str.parse::<AttachmentId>()
             {
@@ -1081,23 +1130,24 @@ fn collect_attachment_ids_from_item(item: &ItemSnapshot, out: &mut HashSet<Attac
     }
 }
 
-pub fn load_attachment_refs(
-    conn: &Connection,
-    items: &[ItemSnapshot],
-) -> Result<Vec<AttachmentRef>> {
-    let mut ids = HashSet::new();
-    for item in items {
-        collect_attachment_ids_from_item(item, &mut ids);
+fn collect_attachment_ids_from_item(item: &ItemSnapshot, out: &mut HashSet<AttachmentId>) {
+    if let Ok(payload) = serde_json::from_str::<Value>(&item.payload) {
+        collect_attachment_ids(&item.kind, &payload, out);
     }
+}
+
+fn load_attachment_refs(
+    conn: &Connection,
+    ids: HashSet<AttachmentId>,
+) -> Result<Vec<AttachmentRef>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let mut sorted: Vec<AttachmentId> = ids.into_iter().collect();
     sorted.sort();
     let mut refs = Vec::with_capacity(sorted.len());
-    let mut stmt = conn.prepare_cached(
-        "SELECT id,mime_type,content_hash,byte_len FROM attachments WHERE id=?",
-    )?;
+    let mut stmt = conn
+        .prepare_cached("SELECT id,mime_type,content_hash,byte_len FROM attachments WHERE id=?")?;
     for id in sorted {
         if let Some(r) = stmt
             .query_row([id], |r| {
@@ -1121,7 +1171,7 @@ pub fn record_session_delta(
     conn: &Connection,
     sid: SessionId,
     op_type: &str,
-    item_ids: &[ItemId],
+    items: Vec<ItemSnapshot>,
     context_items: Vec<ContextPos>,
     invalidated_warnings: Vec<ItemId>,
 ) -> Result<()> {
@@ -1129,7 +1179,7 @@ pub fn record_session_delta(
         conn,
         sid,
         op_type,
-        item_ids,
+        items,
         context_items,
         invalidated_warnings,
         None,
@@ -1140,83 +1190,82 @@ pub fn record_session_delta_at_epoch(
     conn: &Connection,
     sid: SessionId,
     op_type: &str,
-    item_ids: &[ItemId],
+    mut items: Vec<ItemSnapshot>,
     context_items: Vec<ContextPos>,
     invalidated_warnings: Vec<ItemId>,
     expected_epoch: Option<i64>,
 ) -> Result<()> {
-    let mut items = Vec::with_capacity(item_ids.len());
-    for &id in item_ids {
-        items.push(read_item_snapshot(conn, id)?);
-    }
-    items.sort_by_key(|item| item.id);
-    let attachments = load_attachment_refs(conn, &items)?;
-    let prev_snap: Option<SessionSnapshot> = if invalidated_warnings.is_empty()
-        && items.iter().all(|it| it.kind != "withdrawal")
-    {
-        conn.prepare_cached("SELECT head_snapshot FROM sync_streams WHERE stream_id=?")?
-            .query_row([sid.as_str()], |r| r.get::<_, Option<String>>(0))
-            .optional()?
-            .flatten()
-            .and_then(|raw| serde_json::from_str::<SessionSnapshot>(&raw).ok())
-    } else {
-        None
-    };
-    let required_modalities = if let Some(prev) = prev_snap {
-        let mut mods: std::collections::BTreeSet<String> =
-            prev.required_modalities.into_iter().collect();
-        for item in &items {
-            if let Ok(payload) = serde_json::from_str::<Value>(&item.payload) {
-                if item.kind == "codemode_event"
-                    && payload.get("notify").and_then(Value::as_bool) != Some(true)
-                    && !context_items.iter().any(|c| c.item_id == item.id)
-                {
-                    continue;
-                }
-                crate::media::item_required_modalities(conn, &item.kind, &payload, &mut mods)?;
-            }
-        }
-        for ctx in &context_items {
-            if items.iter().any(|it| it.id == ctx.item_id) {
-                continue;
-            }
-            if let Some((kind, raw_payload)) = conn
-                .prepare_cached("SELECT kind, payload FROM items WHERE id=?")?
-                .query_row([ctx.item_id], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
-                .optional()?
-                && let Ok(payload) = serde_json::from_str::<Value>(&raw_payload)
-            {
-                crate::media::item_required_modalities(conn, &kind, &payload, &mut mods)?;
-            }
-        }
-        mods.into_iter().collect()
-    } else {
-        crate::media::session_required_modalities(conn, sid)?
-    };
-    let snap = read_session_snapshot_with_modalities(conn, sid, required_modalities)?;
-    let head_snap_json = serde_json::to_string(&snap)
-        .map_err(|e| Error::internal(format!("session snapshot encode failed: {e}")))?;
-    // Always include canonical normalized SessionSnapshot so author and all receivers produce the
-    // exact same head_snapshot for the same commit hash (P1-18, P1-19).
-    let delta = SessionDelta {
-        attachments,
-        items,
-        context_items,
-        invalidated_warnings,
-        session: Some(snap),
-        detached_call_ids: Vec::new(),
-    };
     record_commit_with_epoch(
         conn,
         sid.as_str(),
         StreamKind::Session,
         op_type,
-        &delta,
         false,
-        Some(&head_snap_json),
         expected_epoch,
+        |existing| {
+            items.sort_by_key(|item| item.id);
+            let previous = existing
+                .and_then(|s| s.head_snapshot.as_deref())
+                .filter(|_| {
+                    invalidated_warnings.is_empty() && items.iter().all(|i| i.kind != "withdrawal")
+                })
+                .and_then(|raw| serde_json::from_str::<SessionSnapshot>(raw).ok());
+            let mut modalities =
+                previous.map(|s| s.required_modalities.into_iter().collect::<BTreeSet<_>>());
+            let mut attachment_ids = HashSet::new();
+            let mut new_modalities = std::collections::BTreeMap::new();
+            for item in &items {
+                if let Ok(payload) = serde_json::from_str::<Value>(&item.payload) {
+                    collect_attachment_ids(&item.kind, &payload, &mut attachment_ids);
+                    let mods = if let Some(mods) = &mut modalities {
+                        if item.kind == "codemode_event"
+                            && payload.get("notify").and_then(Value::as_bool) != Some(true)
+                            && !context_items.iter().any(|c| c.item_id == item.id)
+                        {
+                            continue;
+                        }
+                        mods
+                    } else {
+                        new_modalities.entry(item.id).or_default()
+                    };
+                    crate::media::item_required_modalities(conn, &item.kind, &payload, mods)?;
+                }
+            }
+            let attachments = load_attachment_refs(conn, attachment_ids)?;
+            let required_modalities = if let Some(mut mods) = modalities {
+                for ctx in &context_items {
+                    if items.iter().any(|it| it.id == ctx.item_id) {
+                        continue;
+                    }
+                    if let Some((kind, raw_payload)) = conn
+                        .prepare_cached("SELECT kind, payload FROM items WHERE id=?")?
+                        .query_row([ctx.item_id], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .optional()?
+                        && let Ok(payload) = serde_json::from_str::<Value>(&raw_payload)
+                    {
+                        crate::media::item_required_modalities(conn, &kind, &payload, &mut mods)?;
+                    }
+                }
+                mods.into_iter().collect()
+            } else {
+                crate::media::session_required_modalities_with_items(conn, sid, &new_modalities)?
+            };
+            let snap = read_session_snapshot_with_modalities(conn, sid, required_modalities)?;
+            let head_snapshot = serde_json::to_string(&snap)
+                .map_err(|e| Error::internal(format!("session snapshot encode failed: {e}")))?;
+            // All receivers derive the same head snapshot from the canonical session in the delta.
+            let delta = SessionDelta {
+                attachments,
+                items,
+                context_items,
+                invalidated_warnings,
+                session: Some(snap),
+                detached_call_ids: Vec::new(),
+            };
+            Ok((encode_commit(&delta)?, Some(head_snapshot)))
+        },
     )
 }
 
@@ -1232,7 +1281,6 @@ pub fn record_session_deleted(
         "session_delete",
         &json!({ "id": sid, "detached_call_ids": detached_call_ids }),
         true,
-        None,
     )
 }
 
@@ -1252,19 +1300,7 @@ fn load_full_session_rows(
          FROM items WHERE session_id=? ORDER BY id",
     )?;
     let items = item_stmt
-        .query_map([sid], |r| {
-            Ok(ItemSnapshot {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                kind: r.get(2)?,
-                payload: r.get(3)?,
-                target_id: r.get(4)?,
-                llm_call_id: r.get(5)?,
-                idempotency_key: r.get(6)?,
-                codemode_call_item_id: r.get(7)?,
-                origin_node_id: r.get(8)?,
-            })
-        })?
+        .query_map([sid], ItemSnapshot::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut ctx_stmt = conn.prepare_cached(
         "SELECT position,item_id FROM context_items WHERE session_id=? ORDER BY position",
@@ -1284,7 +1320,11 @@ fn load_full_session_rows(
     let invalidated_warnings = warn_stmt
         .query_map([sid], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<ItemId>>>()?;
-    let refs: HashMap<AttachmentId, AttachmentRef> = load_attachment_refs(conn, &items)?
+    let mut attachment_ids = HashSet::new();
+    for item in &items {
+        collect_attachment_ids_from_item(item, &mut attachment_ids);
+    }
+    let refs: HashMap<AttachmentId, AttachmentRef> = load_attachment_refs(conn, attachment_ids)?
         .into_iter()
         .map(|a| (a.id, a))
         .collect();

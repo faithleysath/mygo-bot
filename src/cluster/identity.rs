@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, net::SocketAddr};
+use std::{cell::RefCell, collections::HashSet, fs, net::SocketAddr, rc::Rc};
 
 use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine as _};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
@@ -133,6 +133,27 @@ pub fn ensure_local_node(conn: &Connection) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+thread_local! {
+    static WRITER_NODE: RefCell<Option<(*const Connection, Rc<str>)>> = const { RefCell::new(None) };
+}
+
+// Set once after the Store is in place on its dedicated thread. That thread exits with the Store.
+pub fn set_writer_node_id(conn: &Connection, id: &str) {
+    WRITER_NODE.set(Some((std::ptr::from_ref(conn), Rc::from(id))));
+}
+
+pub fn local_node_id(conn: &Connection) -> Result<Rc<str>> {
+    WRITER_NODE.with_borrow(|writer| match writer {
+        Some((owner, id)) if std::ptr::eq(*owner, conn) => Ok(Rc::clone(id)),
+        // Startup recovery runs before the writer starts.
+        _ => Ok(
+            conn.query_row("SELECT node_id FROM local_node WHERE id=1", [], |r| {
+                r.get(0)
+            })?,
+        ),
+    })
 }
 
 pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {

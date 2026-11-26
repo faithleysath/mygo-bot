@@ -1172,18 +1172,19 @@ impl ClusterNet {
         }
         let remote_id = remote_peer.node_id.clone();
         let self_id = self.local_node_id.clone();
-        let peer_count = self
+        let registered = self
             .db
             .call(move |s| {
                 let now = chrono::Utc::now().timestamp_millis();
                 upsert_peer_if_gen(&s.conn, &self_id, &remote_peer, now, true, mgen)?;
-                Ok(list_peers(&s.conn)?.len())
+                // Enable write notifications before the first manifest can be read.
+                crate::cluster::exec::refresh_known_peer_count(&s.conn, &s.presence)
             })
             .await;
-        let Ok(peer_count) = peer_count else {
+        if registered.is_err() {
             conn.close(2u32.into(), b"cluster changed");
             return;
-        };
+        }
         if gen_cancel.is_cancelled() || self.membership_gen() != mgen {
             conn.close(2u32.into(), b"cluster changed");
             return;
@@ -1271,12 +1272,7 @@ impl ClusterNet {
 
         let plane = self.exec_plane.lock().unwrap().as_ref().and_then(Weak::upgrade);
         if let Some(plane) = plane {
-            plane.on_peer_connected(remote_id, peer_count).await;
-        } else {
-            let _ = self
-                .db
-                .call(|s| crate::cluster::exec::refresh_known_peer_count(&s.conn, &s.presence))
-                .await;
+            plane.on_peer_connected(remote_id).await;
         }
     }
 }

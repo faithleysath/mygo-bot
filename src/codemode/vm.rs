@@ -439,10 +439,10 @@ fn install<'js>(ctx: &Ctx<'js>, scope: &Rc<Scope>, resolvers: &Rc<Resolvers>) ->
         wtf8_to_utf8(&mut owned);
         TypedArray::<u8>::new_copy(ctx, &owned)
     })?;
-    let decoder: Function = ctx.eval(include_str!("decoder.js"))?;
+    let decoder: Function = ctx.eval(include_str!(concat!(env!("OUT_DIR"), "/decoder.js")))?;
     decoder.call::<_, ()>((decode.clone(), encode))?;
     let task_id = (!scope.host.trigger).then(|| scope.host.origin.task_id());
-    let init: Function = ctx.eval(include_str!("bootstrap.js"))?;
+    let init: Function = ctx.eval(include_str!(concat!(env!("OUT_DIR"), "/bootstrap.js")))?;
     init.call((
         io,
         emit,

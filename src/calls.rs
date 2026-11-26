@@ -39,7 +39,7 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
         .as_ref()
         .and_then(|p| pricing::snapshot(p, started_at));
     let call_id = CallId::new()?;
-    let origin_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+    let origin_node_id = crate::cluster::identity::local_node_id(conn)?;
     conn.prepare_cached(
         "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot,origin_node_id)
          VALUES(?,?,?,?,?,?,'in_flight',?,?)",

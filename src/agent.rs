@@ -233,7 +233,7 @@ impl App {
                                 conn,
                                 sid,
                                 "session_delta",
-                                &[],
+                                Vec::new(),
                                 Vec::new(),
                                 Vec::new(),
                                 Some(run_epoch),
@@ -576,7 +576,7 @@ impl App {
                                 conn,
                                 sid,
                                 "session_delta",
-                                &[],
+                                Vec::new(),
                                 Vec::new(),
                                 Vec::new(),
                                 Some(run_epoch),
@@ -756,14 +756,15 @@ impl App {
                         let mut added_items = Vec::new();
                         let mut added_ctx = Vec::new();
                         let saved = if let Some(item) = output.final_item {
-                            let (id, pos) = store::add_context_item_raw(
+                            let (saved, pos) = store::add_context_item_raw(
                                 conn,
                                 sid,
                                 "assistant_message",
                                 &item,
                                 call_id,
                             )?;
-                            added_items.push(id);
+                            let id = saved.id;
+                            added_items.push(saved);
                             added_ctx.push(crate::cluster::ledger::ContextPos {
                                 position: pos,
                                 item_id: id,
@@ -788,7 +789,7 @@ impl App {
                             conn,
                             sid,
                             "session_delta",
-                            &added_items,
+                            added_items,
                             added_ctx,
                             Vec::new(),
                             Some(run_epoch),

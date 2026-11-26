@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use axum::{
     Json, Router,
     body::Bytes,
@@ -12,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     App, Error, Result,
-    id::{AttachmentId, SessionId},
+    id::{AttachmentId, ItemId, SessionId},
 };
 
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
@@ -482,22 +484,38 @@ pub fn item_required_modalities(
 }
 
 pub fn session_required_modalities(conn: &Connection, sid: SessionId) -> Result<Vec<String>> {
+    session_required_modalities_with_items(conn, sid, &BTreeMap::new())
+}
+
+// A withdrawal or invalidated warning needs a full scan of the *effective* inputs. Membership
+// still comes from SQLite, but newly appended rows already had their payload inspected.
+pub fn session_required_modalities_with_items(
+    conn: &Connection,
+    sid: SessionId,
+    new_items: &BTreeMap<ItemId, BTreeSet<String>>,
+) -> Result<Vec<String>> {
     let mut mods = std::collections::BTreeSet::new();
     let queries = [
-        "SELECT i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
+        "SELECT i.kind,i.payload,i.id FROM context_items c JOIN items i ON i.id=c.item_id
          WHERE c.session_id=? AND i.kind IN ('user_message','codemode_event','assistant_message','reasoning','function_call_output','image_generation_call')
          ORDER BY c.position",
-        "SELECT r.kind,r.payload FROM items c JOIN items r ON r.target_id=c.id AND r.kind='function_call_output'
+        "SELECT r.kind,r.payload,r.id FROM items c JOIN items r ON r.target_id=c.id AND r.kind='function_call_output'
          WHERE c.session_id=? AND c.kind='function_call'
            AND NOT EXISTS (SELECT 1 FROM context_items WHERE item_id=c.id)
          ORDER BY c.id",
-        "SELECT i.kind,i.payload FROM pending p JOIN items i ON i.id=p.id
+        "SELECT i.kind,i.payload,i.id FROM pending p JOIN items i ON i.id=p.id
          WHERE p.session_id=? ORDER BY p.id",
     ];
     for query in queries {
         let mut stmt = conn.prepare_cached(query)?;
         let mut rows = stmt.query([sid])?;
         while let Some(row) = rows.next()? {
+            if !new_items.is_empty()
+                && let Some(known) = new_items.get(&row.get::<_, ItemId>(2)?)
+            {
+                mods.extend(known.iter().cloned());
+                continue;
+            }
             let kind: String = row.get(0)?;
             let payload: Value = row.get(1)?;
             item_required_modalities(conn, &kind, &payload, &mut mods)?;

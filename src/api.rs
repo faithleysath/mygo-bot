@@ -166,7 +166,7 @@ async fn create_session(
                     conn,
                     id,
                     "session_delta",
-                    &[],
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 )?;
@@ -246,7 +246,7 @@ pub(crate) async fn patch_session_local(
                     conn,
                     sid,
                     "session_delta",
-                    &[],
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 )?;
@@ -571,12 +571,13 @@ pub(crate) async fn withdraw_local(app: &App, sid: SessionId, mid: ItemId) -> Re
                     return Err(Error::conflict("message already included"));
                 }
                 if !withdrawn {
-                    let id = store::add_item(conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
+                    let item = store::add_item(conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
+                    let id = item.id;
                     crate::cluster::ledger::record_session_delta(
                         conn,
                         sid,
                         "session_delta",
-                        &[id],
+                        vec![item],
                         Vec::new(),
                         Vec::new(),
                     )?;

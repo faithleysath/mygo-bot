@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use super::{Blocks, Part};
 use crate::{
     Error, Result,
+    cluster::ledger::{ItemSnapshot, returning_item_snapshot},
     id::{ItemId, SessionId},
     media,
 };
@@ -55,13 +56,12 @@ pub fn tool_at_epoch(
         }
         let id = ItemId::new()?;
         let payload = json!({"type":"function_call_output","call_id":call,"output":output});
-        let origin_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
-        let id = conn.prepare_cached(
+        let origin_node_id = crate::cluster::identity::local_node_id(conn)?;
+        let item = conn.prepare_cached(returning_item_snapshot!(
             "INSERT INTO items(id,session_id,kind,payload,target_id,codemode_call_item_id,origin_node_id)
              SELECT ?6,session_id,'function_call_output',?4,id,?5,?7 FROM items
-             WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.call_id')=?3
-             RETURNING id",
-        )?.query_row(params![sid, original, call, payload, background.then_some(original), id, origin_node_id], |r| r.get(0))?;
+             WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.call_id')=?3"
+        ))?.query_row(params![sid, original, call, payload, background.then_some(original), id, origin_node_id], ItemSnapshot::from_row)?;
         let invalidated = if !background {
             invalidate_only(conn, sid, original)?
         } else {
@@ -71,7 +71,7 @@ pub fn tool_at_epoch(
             conn,
             sid,
             "session_delta",
-            &[id],
+            vec![item],
             Vec::new(),
             invalidated,
             expected_epoch,
@@ -107,7 +107,7 @@ pub fn invalidate_at_epoch(
                 conn,
                 sid,
                 "session_delta",
-                &[],
+                Vec::new(),
                 Vec::new(),
                 ids,
                 expected_epoch,
@@ -137,6 +137,28 @@ pub fn event_at_epoch(
     notify: bool,
     expected_epoch: Option<i64>,
 ) -> Result<ItemId> {
+    record_event(
+        conn,
+        sid,
+        origin,
+        kind,
+        content,
+        notify,
+        expected_epoch,
+        None,
+    )
+}
+
+fn record_event(
+    conn: &Connection,
+    sid: SessionId,
+    origin: ItemId,
+    kind: &str,
+    content: &Value,
+    notify: bool,
+    expected_epoch: Option<i64>,
+    recovery_items: Option<&mut Vec<ItemSnapshot>>,
+) -> Result<ItemId> {
     if !matches!(kind, "message" | "lease_warning" | "completed")
         || (!notify && kind != "completed")
         || !content.is_array()
@@ -145,11 +167,13 @@ pub fn event_at_epoch(
     }
     crate::cluster::ledger::with_savepoint(conn, "codemode_event", || {
         if let Some(id) = completed_id(conn, sid, origin)? {
-            return if kind == "completed" {
-                Ok(id)
-            } else {
-                Err(Error::conflict("codemode task already completed"))
-            };
+            if kind != "completed" {
+                return Err(Error::conflict("codemode task already completed"));
+            }
+            if let Some(items) = recovery_items {
+                items.push(crate::cluster::ledger::read_item_snapshot(conn, id)?);
+            }
+            return Ok(id);
         }
         let background: Option<bool> = conn
             .prepare_cached(
@@ -174,13 +198,16 @@ pub fn event_at_epoch(
             .query_row([origin], |r| r.get(0))?;
         let id = ItemId::new()?;
         let payload = json!({"event":kind,"task_id":origin.task_id(),"sequence":sequence,"notify":notify,"content":content});
-        let origin_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
-        let id = conn.prepare_cached(
+        let origin_node_id = crate::cluster::identity::local_node_id(conn)?;
+        let item = conn.prepare_cached(returning_item_snapshot!(
             "INSERT INTO items(id,session_id,kind,payload,codemode_call_item_id,origin_node_id)
              SELECT ?4,session_id,'codemode_event',?3,id,?5 FROM items
-             WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.name')='codemode'
-             RETURNING id",
-        )?.query_row(params![sid, origin, payload, id, origin_node_id], |r| r.get(0))?;
+             WHERE session_id=?1 AND id=?2 AND kind='function_call' AND json_extract(payload,'$.name')='codemode'"
+        ))?.query_row(params![sid, origin, payload, id, origin_node_id], ItemSnapshot::from_row)?;
+        // Recovery also includes the completed events in its final session delta.
+        if let Some(items) = recovery_items {
+            items.push(item.clone());
+        }
         let invalidated = if kind == "completed" {
             invalidate_only(conn, sid, origin)?
         } else {
@@ -190,7 +217,7 @@ pub fn event_at_epoch(
             conn,
             sid,
             "session_delta",
-            &[id],
+            vec![item],
             Vec::new(),
             invalidated,
             expected_epoch,
@@ -363,7 +390,7 @@ pub fn record_deferred_crash_session(
 }
 
 pub fn recover(conn: &Connection, commit_sync: bool) -> Result<bool> {
-    let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+    let local_node_id = crate::cluster::identity::local_node_id(conn)?;
     let mut deferred_any = false;
     // Foreground tasks may have emitted lease warnings too. No lease survives a restart.
     let warning_candidates = {
@@ -415,7 +442,7 @@ pub fn recover(conn: &Connection, commit_sync: bool) -> Result<bool> {
                         conn,
                         sid,
                         "session_delta",
-                        &[],
+                        Vec::new(),
                         Vec::new(),
                         inserted,
                     )?;
@@ -462,7 +489,7 @@ pub fn recover(conn: &Connection, commit_sync: bool) -> Result<bool> {
                 conn,
                 sid,
                 "session_delta",
-                &[],
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )?;
@@ -505,7 +532,7 @@ pub fn recover(conn: &Connection, commit_sync: bool) -> Result<bool> {
                 conn,
                 sid,
                 "session_delta",
-                &[],
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )?;
@@ -556,7 +583,7 @@ pub fn apply_deferred_crash_recovery(
     expected_head: &crate::cluster::ledger::StreamHead,
 ) -> Result<bool> {
     let sid = entry.session_id;
-    let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
+    let local_node_id = crate::cluster::identity::local_node_id(conn)?;
     crate::cluster::ledger::with_savepoint(conn, "deferred_crash_recovery", || {
         conn.execute("DELETE FROM deferred_crash_sessions WHERE session_id=?", [sid])?;
         if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
@@ -610,7 +637,7 @@ pub fn apply_deferred_crash_recovery(
         for origin in missing_receipts {
             let status = json!({"id":origin.task_id(),"status":"interrupted","error":"Daemon restarted; result unknown."});
             let content = json!([{"type":"text","text":status.to_string()}]);
-            let saved = event_at_epoch(
+            record_event(
                 conn,
                 sid,
                 origin,
@@ -618,8 +645,8 @@ pub fn apply_deferred_crash_recovery(
                 &content,
                 true,
                 Some(cur_head.epoch),
+                Some(&mut added_items),
             )?;
-            added_items.push(saved);
         }
 
         let need_pause = if !added_items.is_empty() {
@@ -646,7 +673,7 @@ pub fn apply_deferred_crash_recovery(
                 conn,
                 sid,
                 "session_delta",
-                &added_items,
+                added_items,
                 Vec::new(),
                 invalidated,
                 Some(cur_head.epoch),
