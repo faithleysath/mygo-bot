@@ -140,6 +140,8 @@ stateDiagram-v2
   - 已经派出去的工具就算正在收尾，先等正在退出的工具任务收净，刚好赶上写库的结果也保留；
   - 那些有 `function_call` 却没拿到 `function_call_output` 的调用，由 `store::publish_tools(..., recovering=true)` 按调用顺序成对归入上下文，并当场补上一句冰冷但诚实的工具结果：**`"Execution interrupted; result unknown."`**。
 
+在集群里，Runner 因用户请求或模型报错而暂停时，先在租约有效期内把 `paused` 和暂停原因（`last_error`）一起提交到共享账本。等会话里的工作都结束，包括仍在收尾的后台任务，Runner 才释放租约。若提交前已经失租，Runner 只在本机记录 `paused`。多数派恢复后，原节点可以重新申请租约继续运行。
+
 还有一个很贴心的细节：如果会话先前因为报错停在 `paused`，但账面其实已经平了（`needs_model = 0` 且门外没新信，比如后来你把门外错发的信撤回了），这时调一次 `PUT /sessions/{sid}/run`，程序发现没活可干，会直接帮你把 `last_error` 清空、状态归回 `idle`。如果会话停在 `pausing`，调 `/run` 会直接返回 `409 Conflict`（`"session is pausing"`），让你等这步收完再开。
 
 ---
