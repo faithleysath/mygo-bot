@@ -1,20 +1,25 @@
+mod wire;
+pub(crate) use wire::model_input;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    body::{Body, Bytes},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use base64::prelude::{BASE64_STANDARD, Engine as _};
-use rusqlite::{Connection, OptionalExtension, types::ValueRef};
-use serde_json::{Value, json};
+use futures_util::{Stream, StreamExt};
+use rusqlite::{Connection, OptionalExtension, blob::ZeroBlob};
+use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use crate::{
     App, Error, Result,
-    id::{AttachmentId, ItemId, SessionId},
+    id::{AttachmentId, ItemId, ModelId, SessionId},
+    store::Db,
 };
 
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
@@ -22,7 +27,6 @@ pub(crate) const MAX_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/attachments", post(upload))
-        .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES))
         .route("/attachments/{id}", get(download))
 }
 
@@ -72,32 +76,125 @@ pub enum ContentBlock<'a> {
     },
 }
 
-async fn upload(
-    State(app): State<App>,
-    headers: HeaderMap,
-    data: Bytes,
-) -> Result<(StatusCode, Json<Attachment>)> {
+// Count slow clients before reading their bodies. Byte permits travel with the buffers
+// until the database worker has consumed them, including when the HTTP task is dropped.
+static UPLOAD_SLOTS: Semaphore = Semaphore::const_new(8);
+static UPLOAD_BYTES: Semaphore = Semaphore::const_new(2 * MAX_ATTACHMENT_BYTES);
+const UPLOAD_BLOCK: usize = 64 * 1024;
+
+async fn upload(State(app): State<App>, headers: HeaderMap, body: Body) -> Result<Response> {
     let mut types = headers.get_all(header::CONTENT_TYPE).iter();
     let mime = attachment_mime(types.next().and_then(|v| v.to_str().ok()).unwrap_or(""))?;
-    if types.next().is_some() || data.is_empty() {
-        return Err(Error::bad(
-            "expected one Content-Type and a nonempty attachment",
-        ));
+    if types.next().is_some() {
+        return Err(Error::bad("expected one Content-Type"));
     }
+    let too_large = || {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Failed to buffer the request body: length limit exceeded",
+        )
+            .into_response()
+    };
+    let busy = |_| {
+        Error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "upload capacity exhausted".into(),
+        )
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .map(|v| {
+            v.to_str()
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| Error::bad("invalid Content-Length"))
+        })
+        .transpose()?;
+    if declared.is_some_and(|n| n > MAX_ATTACHMENT_BYTES as u64) {
+        return Ok(too_large());
+    }
+    let declared = declared.map(|n| n as usize);
+    let slot = UPLOAD_SLOTS.try_acquire().map_err(busy)?;
+    let mut budget = UPLOAD_BYTES
+        .try_acquire_many(declared.unwrap_or(0) as u32)
+        .map_err(busy)?;
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    let mut bytes = 0;
+    let mut hash = blake3::Hasher::new();
+    let mut stream = body.into_data_stream();
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = app.stopping.cancelled() => return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "daemon stopping".into())),
+            next = stream.next() => next,
+        };
+        let Some(frame) = frame else { break };
+        let frame = frame.map_err(|_| Error::bad("incomplete attachment body"))?;
+        if frame.len() > MAX_ATTACHMENT_BYTES - bytes {
+            return Ok(too_large());
+        }
+        if declared.is_some_and(|n| bytes + frame.len() > n) {
+            return Err(Error::bad("attachment length differs from Content-Length"));
+        }
+        hash.update(&frame);
+        let mut slice = frame.as_ref();
+        while !slice.is_empty() {
+            if blocks.last().is_none_or(|b| b.len() == b.capacity()) {
+                let capacity = UPLOAD_BLOCK.min(declared.unwrap_or(MAX_ATTACHMENT_BYTES) - bytes);
+                if declared.is_none() {
+                    budget.merge(
+                        UPLOAD_BYTES
+                            .try_acquire_many(capacity as u32)
+                            .map_err(busy)?,
+                    );
+                }
+                blocks.push(Vec::with_capacity(capacity));
+            }
+            let block = blocks.last_mut().unwrap();
+            let n = slice.len().min(block.capacity() - block.len());
+            block.extend_from_slice(&slice[..n]);
+            slice = &slice[n..];
+            bytes += n;
+        }
+    }
+    if bytes == 0 || declared.is_some_and(|n| n != bytes) {
+        return Err(Error::bad("expected a complete, nonempty attachment"));
+    }
+    let hash = hash.finalize();
     let saved = app
         .db
         .write(
             move |conn| {
+                let _permits = (slot, budget);
+                let id = AttachmentId::new()?;
+                let rowid = conn.prepare_cached(INSERT_ATTACHMENT)?.insert((
+                    id,
+                    mime.as_ref(),
+                    hash.as_bytes().as_slice(),
+                    bytes as i64,
+                    ZeroBlob(bytes as u64),
+                ))?;
+                let mut blob =
+                    conn.blob_open(rusqlite::MAIN_DB, "attachments", "data", rowid, false)?;
+                let mut offset = 0;
+                for block in blocks {
+                    blob.write_at(&block, offset)?;
+                    offset += block.len();
+                }
+                blob.close()?;
                 Ok(Attachment {
-                    id: save_attachment(conn, &mime, &data)?,
+                    id,
                     mime_type: mime.to_string(),
                 })
             },
             |_, saved| Ok(saved),
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(saved)))
+    Ok((StatusCode::CREATED, Json(saved)).into_response())
 }
+
+const INSERT_ATTACHMENT: &str =
+    "INSERT INTO attachments(id,mime_type,content_hash,byte_len,data) VALUES(?,?,?,?,?)";
 
 pub fn attachment_mime(value: &str) -> Result<mime::Mime> {
     value
@@ -117,10 +214,7 @@ pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Res
     let hash = blake3::hash(data);
     let byte_len = i64::try_from(data.len()).map_err(|_| Error::bad("attachment too large"))?;
     let id = AttachmentId::new()?;
-    conn.prepare_cached(
-        "INSERT INTO attachments(id,mime_type,content_hash,byte_len,data) VALUES(?,?,?,?,?)",
-    )?
-    .execute((
+    conn.prepare_cached(INSERT_ATTACHMENT)?.execute((
         id,
         mime.as_ref(),
         hash.as_bytes().as_slice(),
@@ -130,25 +224,65 @@ pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Res
     Ok(id)
 }
 
+#[derive(Clone, Copy)]
+struct AttachmentBlob {
+    rowid: i64,
+    len: usize,
+}
+
+impl AttachmentBlob {
+    fn lookup(conn: &Connection, id: AttachmentId) -> Result<(String, Self)> {
+        let (mime, rowid, len): (String, i64, Option<u32>) = conn
+            .prepare_cached("SELECT mime_type,rowid,length(data) FROM attachments WHERE id=?")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let len = len.ok_or_else(|| {
+            Error::conflict(format!("attachment {id} bytes are unavailable locally"))
+        })?;
+        Ok((
+            mime,
+            Self {
+                rowid,
+                len: len as usize,
+            },
+        ))
+    }
+
+    fn chunks(self, db: Db) -> impl Stream<Item = Result<Bytes>> {
+        // Each fresh blob handle walks the overflow chain to its offset. Read four
+        // frames per open, then release SQLite before yielding any network bytes.
+        const FRAME: usize = 192 * 1024; // multiple of three for unpadded interior base64
+        const READ: usize = 4 * FRAME;
+        async_stream::try_stream! {
+            for offset in (0..self.len).step_by(READ) {
+                let n = READ.min(self.len - offset);
+                let mut bytes = db.call(move |s| {
+                    let blob = s.conn.blob_open(rusqlite::MAIN_DB, "attachments", "data", self.rowid, true)?;
+                    let mut bytes = vec![0; n];
+                    blob.read_at_exact(&mut bytes, offset)?;
+                    Ok(Bytes::from(bytes))
+                }).await?;
+                while !bytes.is_empty() {
+                    yield bytes.split_to(FRAME.min(bytes.len()));
+                }
+            }
+        }
+    }
+}
+
 async fn download(State(app): State<App>, Path(id): Path<AttachmentId>) -> Result<Response> {
     app.cluster.ensure_attachment_data(id).await?;
-    let (mime, data) = app
+    let (mime, blob) = app
         .db
-        .call(move |store| {
-            Ok(store.conn.query_row(
-                "SELECT mime_type,data FROM attachments WHERE id=? AND data IS NOT NULL",
-                [id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )?)
-        })
+        .call(move |s| AttachmentBlob::lookup(&s.conn, id))
         .await?;
     Ok((
         [
-            (header::CONTENT_TYPE, mime.as_str()),
-            (header::CONTENT_DISPOSITION, "attachment"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_LENGTH, blob.len.to_string()),
+            (header::CONTENT_DISPOSITION, "attachment".to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
         ],
-        data,
+        Body::from_stream(blob.chunks(app.db)),
     )
         .into_response())
 }
@@ -213,57 +347,6 @@ impl<'a> ContentBlock<'a> {
                 Ok(kind)
             }
         }
-    }
-
-    fn wire(self, conn: &Connection) -> Result<Value> {
-        let (kind, id) = match self {
-            Self::Text { text, .. } => return Ok(json!({"type":"input_text","text":text})),
-            Self::Media {
-                kind,
-                attachment_id,
-            } => (kind.as_str(), attachment_id),
-        };
-        let mut stmt = conn.prepare_cached("SELECT mime_type,data FROM attachments WHERE id=?")?;
-        let mut rows = stmt.query([id])?;
-        let row = rows
-            .next()?
-            .ok_or_else(|| Error::bad(format!("attachment {id} does not exist")))?;
-        let mime: String = row.get(0)?;
-        let data = match row.get_ref(1)? {
-            ValueRef::Blob(data) => data,
-            ValueRef::Null => {
-                return Err(Error::conflict(format!(
-                    "attachment {id} bytes are unavailable locally"
-                )));
-            }
-            value => {
-                return Err(rusqlite::Error::InvalidColumnType(
-                    1,
-                    "data".into(),
-                    value.data_type(),
-                )
-                .into());
-            }
-        };
-        check_mime(kind, id, &mime)?;
-        let essence = mime.split(';').next().unwrap_or(&mime);
-        let mut url = format!("data:{essence};base64,");
-        BASE64_STANDARD.encode_string(data, &mut url);
-        drop(rows);
-        if kind == "image" {
-            return Ok(json!({"type":"input_image","image_url":url,"detail":"auto"}));
-        }
-        // The endpoint must support this audio/video format as a Responses file input.
-        let extension = match essence {
-            "audio/mpeg" => "mp3",
-            "audio/x-wav" | "audio/vnd.wave" => "wav",
-            "audio/mp4" => "m4a",
-            "video/quicktime" => "mov",
-            other => other.split_once('/').map_or("bin", |(_, ext)| ext),
-        };
-        Ok(
-            json!({"type":"input_file","filename":format!("attachment-{id}.{extension}"),"file_data":url}),
-        )
     }
 }
 
@@ -352,12 +435,71 @@ pub fn check_event(conn: &Connection, content: &Value, modalities: &Value) -> Re
     check_parts(conn, content, modalities)
 }
 
+// Evidence is local to the SQLite connection. Savepoint/transaction rollbacks restore
+// the prefix and its invalidations together with the rows that justified them.
+// Only ordered context is reusable: queued inputs and unattached tool results are
+// checked on every call, including items with IDs older than the latest context item.
+pub fn init_validation_cache(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE checked_input (
+            sid TEXT UNIQUE, model TEXT, modalities TEXT, revision INTEGER, position INTEGER
+         );
+         CREATE TEMP TRIGGER trim_checked_input AFTER INSERT ON checked_input
+         WHEN (SELECT count(*) FROM checked_input)>256 BEGIN
+            DELETE FROM checked_input WHERE rowid=(SELECT min(rowid) FROM checked_input);
+         END;
+         CREATE TEMP TRIGGER invalidate_context_insert AFTER INSERT ON main.context_items BEGIN
+            DELETE FROM checked_input WHERE sid=NEW.session_id AND position>=NEW.position;
+         END;
+         CREATE TEMP TRIGGER invalidate_context_replace AFTER UPDATE ON main.context_items BEGIN
+            DELETE FROM checked_input WHERE sid IN (OLD.session_id,NEW.session_id);
+         END;
+         CREATE TEMP TRIGGER invalidate_context_delete AFTER DELETE ON main.context_items BEGIN
+            DELETE FROM checked_input WHERE sid=OLD.session_id;
+         END;
+         CREATE TEMP TRIGGER invalidate_item_edit AFTER UPDATE OF kind,payload ON main.items BEGIN
+            DELETE FROM checked_input WHERE sid=OLD.session_id;
+         END;
+         CREATE TEMP TRIGGER invalidate_withdrawal AFTER INSERT ON main.items WHEN NEW.kind='withdrawal' BEGIN
+            DELETE FROM checked_input WHERE sid=NEW.session_id;
+         END;
+         CREATE TEMP TRIGGER invalidate_attachment_edit AFTER UPDATE ON main.attachments BEGIN
+            DELETE FROM checked_input;
+         END;
+         CREATE TEMP TRIGGER invalidate_attachment_delete AFTER DELETE ON main.attachments BEGIN
+            DELETE FROM checked_input;
+         END;",
+    )?;
+    Ok(())
+}
+
+pub fn check_call_input(
+    conn: &Connection,
+    sid: SessionId,
+    model: ModelId,
+    modalities: &Value,
+    end: i64,
+) -> Result<()> {
+    let revision = crate::cluster::ledger::session_history_rev(conn, sid)?;
+    let prefix = conn.prepare_cached(
+        "SELECT position FROM checked_input WHERE sid=? AND model=? AND modalities=? AND revision=? AND position<=?",
+    )?.query_row((sid, model, modalities, revision, end), |row| row.get(0)).optional()?.unwrap_or(0);
+    check_session_after(conn, sid, modalities, prefix)?;
+    conn.prepare_cached("INSERT OR REPLACE INTO checked_input(sid,model,modalities,revision,position) VALUES(?,?,?,?,?)")?
+        .execute((sid, model, modalities, revision, end))?;
+    Ok(())
+}
+
 pub fn check_session(conn: &Connection, sid: SessionId, modalities: &Value) -> Result<()> {
+    check_session_after(conn, sid, modalities, 0)
+}
+
+fn check_session_after(conn: &Connection, sid: SessionId, modalities: &Value, position: i64) -> Result<()> {
     // Match context order first, then the tool results publish_tools will append in
     // call order, and finally the unwithdrawn queue take_pending will append by id.
     let queries = [
         "SELECT i.id,i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
-         WHERE c.session_id=? AND i.kind IN ('user_message','codemode_event','assistant_message','reasoning','function_call_output','image_generation_call')
+         WHERE c.session_id=?1 AND c.position>?2 AND i.kind IN ('user_message','codemode_event','assistant_message','reasoning','function_call_output','image_generation_call')
          ORDER BY c.position",
         "SELECT r.id,r.kind,r.payload FROM items c JOIN items r ON r.target_id=c.id AND r.kind='function_call_output'
          WHERE c.session_id=? AND c.kind='function_call'
@@ -366,9 +508,9 @@ pub fn check_session(conn: &Connection, sid: SessionId, modalities: &Value) -> R
         "SELECT i.id,i.kind,i.payload FROM pending p JOIN items i ON i.id=p.id
          WHERE p.session_id=? ORDER BY p.id",
     ];
-    for query in queries {
+    for (index, query) in queries.into_iter().enumerate() {
         let mut stmt = conn.prepare_cached(query)?;
-        let mut rows = stmt.query([sid])?;
+        let mut rows = if index == 0 { stmt.query((sid, position))? } else { stmt.query([sid])? };
         while let Some(row) = rows.next()? {
             let id: crate::id::ItemId = row.get(0)?;
             let kind: String = row.get(1)?;
@@ -524,57 +666,6 @@ pub fn session_required_modalities_with_items(
     Ok(mods.into_iter().collect())
 }
 
-pub fn wire_message(conn: &Connection, kind: &str, mut payload: Value) -> Result<Value> {
-    if kind == "codemode_event" {
-        let source = format!(
-            "Codemode {} event from {} (sequence {}).",
-            payload["event"]
-                .as_str()
-                .ok_or_else(|| Error::internal("missing event kind"))?,
-            payload["task_id"]
-                .as_str()
-                .ok_or_else(|| Error::internal("missing task ID"))?,
-            payload["sequence"]
-                .as_i64()
-                .ok_or_else(|| Error::internal("missing event sequence"))?
-        );
-        let mut content = payload["content"].take();
-        content
-            .as_array_mut()
-            .ok_or_else(|| Error::internal("missing event content"))?
-            .insert(0, json!({"type":"text","text":source}));
-        payload = json!({"role":"user","content":content});
-    }
-    let is_tool = kind == "function_call_output";
-    let field = if is_tool {
-        "output"
-    } else if payload["role"] == "user" {
-        "content"
-    } else {
-        return Ok(payload);
-    };
-    if is_tool && payload[field].is_string() {
-        return Ok(payload);
-    }
-    let parts = payload[field]
-        .as_array_mut()
-        .ok_or_else(|| Error::bad("expected content parts"))?;
-    for (index, part) in parts.iter_mut().enumerate() {
-        if is_tool
-            && !matches!(
-                part["type"].as_str(),
-                Some("text" | "image" | "audio" | "video")
-            )
-        {
-            continue;
-        }
-        *part = ContentBlock::parse(part)
-            .and_then(|block| block.wire(conn))
-            .map_err(|e| at_part(index, e))?;
-    }
-    Ok(payload)
-}
-
 pub fn missing_session_context_attachments(
     conn: &Connection,
     sid: SessionId,
@@ -639,9 +730,8 @@ pub fn collect_content_attachment_meta(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare_cached(
-        "SELECT mime_type, content_hash, byte_len FROM attachments WHERE id=?",
-    )?;
+    let mut stmt = conn
+        .prepare_cached("SELECT mime_type, content_hash, byte_len FROM attachments WHERE id=?")?;
     let mut refs = Vec::new();
     for id in ids {
         if let Some((mime_type, hash_blob, byte_len)) = stmt

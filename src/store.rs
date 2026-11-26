@@ -79,6 +79,7 @@ pub struct Store {
     pub pending_wakes: HashSet<SessionId>,
     pub active: HashMap<SessionId, Control>,
     pub tasks: HashMap<ItemId, crate::codemode::Task>,
+    pub task_counts: HashMap<SessionId, usize>,
     pub mcp: crate::mcp::Connections,
     pub channels: HashMap<SessionId, broadcast::WeakSender<Notice>>,
     pub wake_sequences: HashMap<SessionId, watch::Sender<u64>>,
@@ -126,6 +127,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         }
         crate::cluster::ledger::init_verified_tips(&tx)?;
+        crate::media::init_validation_cache(&tx)?;
         let local_node_id = crate::cluster::identity::local_node_id(&tx)?.to_string();
         presence.set_local_node_id(local_node_id.clone());
         let peer_count: usize = usize::try_from(tx.query_row(
@@ -226,6 +228,7 @@ impl Db {
                     pending_wakes: HashSet::new(),
                     active: HashMap::new(),
                     tasks: HashMap::new(),
+                    task_counts: HashMap::new(),
                     mcp: Default::default(),
                     channels: HashMap::new(),
                     wake_sequences: HashMap::new(),
@@ -1115,7 +1118,6 @@ impl Cursor for ItemId {}
 pub enum JsonRows {
     History,
     Context,
-    ModelInput,
 }
 
 fn page_bounds<C: Cursor>(
@@ -1210,10 +1212,6 @@ impl JsonRows {
     ) -> Result<(Vec<u8>, C)> {
         let cmp = if inclusive { ">=" } else { ">" };
         let sql = match self {
-            Self::ModelInput => format!(
-                "SELECT c.position,i.payload,i.kind FROM context_items c JOIN items i ON i.id=c.item_id
-                 WHERE c.session_id=? AND c.position{cmp}? AND c.position<=? ORDER BY c.position LIMIT ?"
-            ),
             Self::Context => format!(
                 "SELECT c.position,json_object('position',c.position,'item_id',i.id,'llm_call_id',i.llm_call_id,'payload',json(i.payload))
                  FROM context_items c JOIN items i ON i.id=c.item_id
@@ -1228,18 +1226,7 @@ impl JsonRows {
         let mut rows = stmt.query((sid, cursor, end, BATCH_ITEMS))?;
         let mut position = None;
         while let Some(row) = rows.next()? {
-            let encoded;
-            let raw = if matches!(self, Self::ModelInput)
-                && let Some(kind @ ("user_message" | "function_call_output" | "codemode_event")) =
-                    row.get_ref(2)?.as_str().ok()
-            {
-                encoded = crate::media::wire_message(conn, kind, row.get(1)?)?.to_string();
-                encoded.as_bytes()
-            } else {
-                row.get_ref(1)?
-                    .as_bytes()
-                    .map_err(|e| Error::internal(e.to_string()))?
-            };
+            let raw = row.get_ref(1)?.as_bytes().map_err(|e| Error::internal(e.to_string()))?;
             if position.is_some() && bytes.len() + raw.len() + 1 > BATCH_BYTES {
                 break;
             }

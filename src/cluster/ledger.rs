@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
+    io::{self, Write},
 };
 
 use reqwest::Url;
@@ -1284,53 +1285,6 @@ pub fn record_session_deleted(
     )
 }
 
-fn load_full_session_rows(
-    conn: &Connection,
-    sid: SessionId,
-) -> Result<(
-    SessionSnapshot,
-    Vec<ItemSnapshot>,
-    Vec<ContextPos>,
-    Vec<ItemId>,
-    HashMap<AttachmentId, AttachmentRef>,
-)> {
-    let snap = read_session_snapshot(conn, sid)?;
-    let mut item_stmt = conn.prepare_cached(
-        "SELECT id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id
-         FROM items WHERE session_id=? ORDER BY id",
-    )?;
-    let items = item_stmt
-        .query_map([sid], ItemSnapshot::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut ctx_stmt = conn.prepare_cached(
-        "SELECT position,item_id FROM context_items WHERE session_id=? ORDER BY position",
-    )?;
-    let context_items = ctx_stmt
-        .query_map([sid], |r| {
-            Ok(ContextPos {
-                position: r.get(0)?,
-                item_id: r.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut warn_stmt = conn.prepare_cached(
-        "SELECT w.item_id FROM invalidated_warnings w JOIN items i ON i.id=w.item_id
-         WHERE i.session_id=? ORDER BY w.item_id",
-    )?;
-    let invalidated_warnings = warn_stmt
-        .query_map([sid], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<ItemId>>>()?;
-    let mut attachment_ids = HashSet::new();
-    for item in &items {
-        collect_attachment_ids_from_item(item, &mut attachment_ids);
-    }
-    let refs: HashMap<AttachmentId, AttachmentRef> = load_attachment_refs(conn, attachment_ids)?
-        .into_iter()
-        .map(|a| (a.id, a))
-        .collect();
-    Ok((snap, items, context_items, invalidated_warnings, refs))
-}
-
 // --- Manifest, Commit Queries, and Staging ---
 
 pub fn local_manifest_page(
@@ -1343,12 +1297,13 @@ pub fn local_manifest_page(
     let mut stmt = conn.prepare_cached(
         "SELECT stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at
          FROM sync_streams
-         WHERE (?1 IS NULL OR stream_id > ?1)
+         WHERE stream_id > ?1
          ORDER BY stream_id ASC
          LIMIT ?2",
     )?;
+    // Every stream id begins with its kind prefix, so the empty cursor starts at the first id.
     let rows = stmt
-        .query_map(params![after_stream_id, fetch], |r| {
+        .query_map(params![after_stream_id.unwrap_or(""), fetch], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1515,6 +1470,53 @@ pub fn read_commits_range(
     Ok((page.commits, page.has_more))
 }
 
+#[derive(Default)]
+struct ByteCount(usize);
+
+impl Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_len(value: &(impl Serialize + ?Sized)) -> Result<usize> {
+    let mut count = ByteCount::default();
+    serde_json::to_writer(&mut count, value).map_err(|e| Error::internal(e.to_string()))?;
+    Ok(count.0)
+}
+
+fn read_inline_payload(
+    stmt: &mut rusqlite::Statement<'_>,
+    rowid: i64,
+    len: usize,
+    budget: usize,
+) -> Result<Option<(String, usize)>> {
+    // Keep the existing small-commit estimate. Larger strings need at least two JSON quotes.
+    let small = len <= 256 * 1024;
+    let lower_bound = if small {
+        len * 2 + 256
+    } else {
+        len.saturating_add(258)
+    };
+    if lower_bound > budget {
+        return Ok(None);
+    }
+    let mut rows = stmt.query([rowid])?;
+    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let payload = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+    let estimate = if small {
+        lower_bound
+    } else {
+        encoded_len(payload)?.saturating_add(256)
+    };
+    Ok((estimate <= budget).then(|| (payload.to_owned(), estimate)))
+}
+
 pub fn read_commits_page(
     conn: &Connection,
     stream_id: &str,
@@ -1538,68 +1540,65 @@ pub fn read_commits_page(
     let kind = StreamKind::from_db(&kind_str)?;
     let max_count = max_count.clamp(1, 256);
     let inline_single_limit = max_bytes.min(MAX_INLINE_COMMIT_PAYLOAD_BYTES);
-    // Do NOT prefetch count+1 rows with .collect(): stream row-by-row and enforce serialized byte
-    // budget incrementally so bounded RPC budgets are strictly respected (P1-03 / P1-13).
+    // octet_length on a table column reads its byte length from the record header, even for TEXT.
     let mut stmt = conn.prepare_cached(
-        "SELECT seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
+        "SELECT seq,parent_hash,commit_hash,author_node_id,op_type,octet_length(payload),created_at,rowid
          FROM sync_commits
          WHERE stream_id=?1 AND epoch=?2 AND seq>?3 AND (?4 IS NULL OR seq<=?4)
          ORDER BY seq ASC",
     )?;
+    let mut payload_stmt = conn.prepare_cached("SELECT payload FROM sync_commits WHERE rowid=?")?;
     let mut rows = stmt.query(params![stream_id, epoch, after_seq, up_to_seq])?;
-
     let mut out = Vec::new();
     let mut oversized_next = None;
-    let mut total_bytes = 0usize;
+    let mut remaining = max_bytes;
     let mut has_more = false;
     while let Some(row) = rows.next()? {
-        let seq: i64 = row.get(0)?;
-        let parent_vec: Vec<u8> = row.get(1)?;
-        let commit_vec: Vec<u8> = row.get(2)?;
-        let author_node_id: String = row.get(3)?;
-        let op_type: String = row.get(4)?;
-        let payload: String = row.get(5)?;
-        let created_at: i64 = row.get(6)?;
-        let wire_estimate = if payload.len() > 256 * 1024 {
-            serde_json::to_string(&payload)
-                .map(|s| s.len() + 256)
-                .unwrap_or_else(|_| payload.len().saturating_mul(2).saturating_add(256))
-        } else {
-            payload.len().saturating_mul(2).saturating_add(256)
-        };
-        if out.is_empty() && wire_estimate > inline_single_limit {
-            oversized_next = Some(CommitMeta {
-                stream_id: stream_id.to_owned(),
-                kind,
-                epoch,
-                seq,
-                parent_hash: to_hash32(parent_vec)?,
-                commit_hash: to_hash32(commit_vec)?,
-                author_node_id,
-                op_type,
-                payload_len: i64::try_from(payload.len())
-                    .map_err(|_| Error::internal("commit payload size overflow"))?,
-                created_at,
-            });
-            has_more = rows.next()?.is_some();
-            break;
-        }
-        if !out.is_empty() && (out.len() >= max_count || total_bytes + wire_estimate > max_bytes) {
+        if out.len() == max_count {
             has_more = true;
             break;
         }
-        total_bytes += wire_estimate;
+        let budget = if out.is_empty() {
+            inline_single_limit
+        } else {
+            remaining
+        };
+        let len = usize::try_from(row.get::<_, i64>(5)?)
+            .map_err(|_| Error::internal("invalid commit payload length"))?;
+        let Some((payload, estimate)) =
+            read_inline_payload(&mut payload_stmt, row.get(7)?, len, budget)?
+        else {
+            if out.is_empty() {
+                oversized_next = Some(CommitMeta {
+                    stream_id: stream_id.to_owned(),
+                    kind,
+                    epoch,
+                    seq: row.get(0)?,
+                    parent_hash: row.get(1)?,
+                    commit_hash: row.get(2)?,
+                    author_node_id: row.get(3)?,
+                    op_type: row.get(4)?,
+                    payload_len: row.get(5)?,
+                    created_at: row.get(6)?,
+                });
+                has_more = rows.next()?.is_some();
+            } else {
+                has_more = true;
+            }
+            break;
+        };
+        remaining -= estimate;
         out.push(CommitWire {
             stream_id: stream_id.to_owned(),
             kind,
             epoch,
-            seq,
-            parent_hash: to_hash32(parent_vec)?,
-            commit_hash: to_hash32(commit_vec)?,
-            author_node_id,
-            op_type,
+            seq: row.get(0)?,
+            parent_hash: row.get(1)?,
+            commit_hash: row.get(2)?,
+            author_node_id: row.get(3)?,
+            op_type: row.get(4)?,
             payload,
-            created_at,
+            created_at: row.get(6)?,
         });
     }
     Ok(CommitsPage {
@@ -2067,28 +2066,19 @@ fn is_unique_constraint(err: &rusqlite::Error) -> bool {
 
 fn upsert_attachment_meta(conn: &Connection, att: &AttachmentRef) -> Result<()> {
     id::observe_id(att.id);
-    let existing: Option<bool> = conn
-        .prepare_cached("SELECT data IS NOT NULL FROM attachments WHERE id=?")?
-        .query_row([att.id], |r| r.get(0))
-        .optional()?;
-    if existing.is_some() {
-        return Ok(());
-    }
-    let cached_data: Option<Vec<u8>> = conn
-        .prepare_cached("SELECT data FROM attachments WHERE content_hash=? AND data IS NOT NULL LIMIT 1")?
-        .query_row([att.content_hash.as_slice()], |r| r.get(0))
-        .optional()?;
-    conn.execute(
-        "INSERT INTO attachments(id,mime_type,content_hash,byte_len,data) VALUES(?,?,?,?,?)
+    conn.prepare_cached(
+        "INSERT INTO attachments(id,mime_type,content_hash,byte_len,data)
+         SELECT ?1,?2,?3,?4,(SELECT data FROM attachments WHERE content_hash=?3
+                             AND data IS NOT NULL AND length(data)=?4 LIMIT 1)
+         WHERE NOT EXISTS (SELECT 1 FROM attachments WHERE id=?1)
          ON CONFLICT(id) DO NOTHING",
-        params![
-            att.id,
-            att.mime_type,
-            att.content_hash.as_slice(),
-            att.byte_len,
-            cached_data
-        ],
-    )?;
+    )?
+    .execute(params![
+        att.id,
+        att.mime_type,
+        att.content_hash,
+        att.byte_len
+    ])?;
     Ok(())
 }
 
@@ -3636,6 +3626,35 @@ pub fn stage_remote_commits_page(
     })
 }
 
+fn verify_staged_chain(
+    conn: &Connection,
+    head: &StreamHead,
+    invalid: impl Fn(&'static str) -> Error,
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT seq,parent_hash,commit_hash FROM sync_staging_commits
+         WHERE stream_id=?1 AND epoch=?2 ORDER BY seq",
+    )?;
+    let mut rows = stmt.query(params![head.stream_id, head.epoch])?;
+    let mut last_seq = 0i64;
+    let mut last_hash = [0u8; 32];
+    while let Some(row) = rows.next()? {
+        let seq: i64 = row.get(0)?;
+        if last_seq.checked_add(1) != Some(seq) || row.get::<_, [u8; 32]>(1)? != last_hash {
+            return Err(invalid("non-contiguous staged commit chain"));
+        }
+        last_seq = seq;
+        last_hash = row.get(2)?;
+    }
+    if last_seq != head.head_seq {
+        return Err(invalid("incomplete staged commit chain"));
+    }
+    if last_hash != head.head_hash {
+        return Err(invalid("staged chain head_hash mismatch"));
+    }
+    Ok(())
+}
+
 pub fn commit_staged_epoch(
     conn: &Connection,
     target_head: &StreamHead,
@@ -3644,33 +3663,7 @@ pub fn commit_staged_epoch(
     expected_conflict: Option<&ConflictRecord>,
 ) -> Result<ApplyOutcome> {
     with_savepoint(conn, "commit_staged", || {
-        // Verify full staged chain 1..=target_head.head_seq exists and ends at target_head.head_hash.
-        let mut check_stmt = conn.prepare_cached(
-            "SELECT seq,parent_hash,commit_hash FROM sync_staging_commits
-             WHERE stream_id=?1 AND epoch=?2 ORDER BY seq ASC",
-        )?;
-        let staged_hdrs = check_stmt
-            .query_map(params![&target_head.stream_id, target_head.epoch], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if staged_hdrs.len() != usize::try_from(target_head.head_seq).unwrap_or(usize::MAX) {
-            return Err(Error::bad("incomplete staged epoch commits"));
-        }
-        let mut exp_parent = [0u8; 32];
-        let mut last_hash = [0u8; 32];
-        for (idx, (seq, pvec, cvec)) in staged_hdrs.into_iter().enumerate() {
-            let p = to_hash32(pvec)?;
-            let ch = to_hash32(cvec)?;
-            if seq != (idx as i64) + 1 || p != exp_parent {
-                return Err(Error::bad("non-contiguous staged epoch chain"));
-            }
-            exp_parent = ch;
-            last_hash = ch;
-        }
-        if last_hash != target_head.head_hash {
-            return Err(Error::bad("staged chain head_hash mismatch"));
-        }
+        verify_staged_chain(conn, target_head, Error::bad)?;
 
         let mut extra_mcp_changes = Vec::new();
         let mut resolved_conflict = false;
@@ -4312,116 +4305,136 @@ fn replace_stream_with_epoch_snapshot(conn: &Connection, snap: EpochSnapshot<'_>
     Ok(())
 }
 
-/// Write a full session snapshot across bounded `<= 1 MiB` commits in `new_epoch` (P1-13).
+/// Build the new epoch in staging. resolve_conflict_local's savepoint covers the stable source
+/// cursors, the attachment index, the head switch and the resolution receipt.
 fn replace_session_with_chunked_epoch_snapshot(
     conn: &Connection,
     sid: SessionId,
     new_epoch: i64,
 ) -> Result<()> {
-    let (snap, items, context_items, invalidated_warnings, att_refs) =
-        load_full_session_rows(conn, sid)?;
+    let snap = read_session_snapshot(conn, sid)?;
     let head_snap_json = serde_json::to_string(&snap)
         .map_err(|e| Error::internal(format!("session snapshot encode failed: {e}")))?;
-
-    let mut deltas: Vec<SessionDelta> = Vec::new();
-    let mut cur = SessionDelta::default();
-    let mut cur_bytes = 0usize;
-    let mut seen_atts = HashSet::new();
-
-    for item in items {
-        let mut att_ids = HashSet::new();
-        collect_attachment_ids_from_item(&item, &mut att_ids);
-        let mut item_atts = Vec::new();
-        for id in att_ids {
-            if seen_atts.insert(id)
-                && let Some(r) = att_refs.get(&id)
-            {
-                item_atts.push(r.clone());
-            }
-        }
-        let approx = item.payload.len() + item_atts.len() * 128 + 256;
-        if (!cur.items.is_empty())
-            && (cur.items.len() >= MAX_SESSION_CHUNK_ITEMS
-                || cur_bytes + approx > MAX_SESSION_CHUNK_BYTES)
-        {
-            cur.session = Some(snap.clone());
-            deltas.push(std::mem::take(&mut cur));
-            cur_bytes = 0;
-        }
-        cur.attachments.extend(item_atts);
-        cur.items.push(item);
-        cur_bytes += approx;
-    }
-
-    for ctx in context_items {
-        let approx = 48;
-        if (!cur.items.is_empty() || !cur.context_items.is_empty())
-            && (cur.items.len() + cur.context_items.len() >= MAX_SESSION_CHUNK_ITEMS * 2
-                || cur_bytes + approx > MAX_SESSION_CHUNK_BYTES)
-        {
-            cur.session = Some(snap.clone());
-            deltas.push(std::mem::take(&mut cur));
-            cur_bytes = 0;
-        }
-        cur.context_items.push(ctx);
-        cur_bytes += approx;
-    }
-
-    for warn_id in invalidated_warnings {
-        let approx = 48;
-        if (!cur.items.is_empty() || !cur.context_items.is_empty() || !cur.invalidated_warnings.is_empty())
-            && cur_bytes + approx > MAX_SESSION_CHUNK_BYTES
-        {
-            cur.session = Some(snap.clone());
-            deltas.push(std::mem::take(&mut cur));
-            cur_bytes = 0;
-        }
-        cur.invalidated_warnings.push(warn_id);
-        cur_bytes += approx;
-    }
-
-    cur.session = Some(snap.clone());
-    deltas.push(cur);
-
+    let mut chunk = SessionDelta {
+        session: Some(snap),
+        ..Default::default()
+    };
+    let base_bytes = head_snap_json.len() + 12; // {"session": ...}
+    let mut chunk_bytes = base_bytes;
     let stream_id = sid.as_str();
     let author = load_local_node(conn)?.node_id;
     let now = chrono::Utc::now().timestamp_millis();
-    conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [stream_id])?;
-    conn.execute(
-        "DELETE FROM sync_staging_commits WHERE stream_id=?",
-        [stream_id],
-    )?;
-
-    let total = deltas.len();
-    let mut parent_hash = [0u8; 32];
+    let mut seq = 0;
     let mut final_hash = [0u8; 32];
-    let mut seq = 0i64;
-    let mut staged_rows = Vec::with_capacity(total);
-    for (idx, delta) in deltas.into_iter().enumerate() {
-        seq += 1;
-        let op_type = if idx == 0 {
+    clear_staging_for_stream(conn, stream_id)?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO sync_staging_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
+         VALUES(?,?,?,?,?,?,?,?,?)",
+    )?;
+    let mut stage_chunk = |chunk: &SessionDelta| -> Result<()> {
+        let op_type = if seq == 0 {
             "session_reset_snapshot"
         } else {
             "session_delta"
         };
-        let payload = serde_json::to_string(&delta)
+        seq += 1;
+        let payload = serde_json::to_string(chunk)
             .map_err(|e| Error::internal(format!("chunk encode failed: {e}")))?;
-        let commit_hash = compute_commit_hash(&CommitHashInput {
+        let hash = compute_commit_hash(&CommitHashInput {
             stream_id,
             kind: StreamKind::Session,
             epoch: new_epoch,
             seq,
-            parent_hash: &parent_hash,
+            parent_hash: &final_hash,
             author_node_id: &author,
             op_type,
             payload: &payload,
             created_at: now,
         });
-        staged_rows.push((seq, parent_hash, commit_hash, op_type, payload));
-        parent_hash = commit_hash;
-        final_hash = commit_hash;
-    }
+        insert.execute(params![
+            stream_id, new_epoch, seq, final_hash, hash, author, op_type, payload, now
+        ])?;
+        final_hash = hash;
+        Ok(())
+    };
+    // Reserve room before adding a row. An indivisible large item can use the chunked RPC path.
+    let mut make_room = |chunk: &mut SessionDelta, bytes: usize| -> Result<()> {
+        let rows = chunk.items.len() + chunk.context_items.len() + chunk.invalidated_warnings.len();
+        // Includes array field names, brackets and separators, even when adding both items and attachments.
+        let bytes = bytes.saturating_add(32);
+        if rows > 0
+            && (rows >= MAX_SESSION_CHUNK_ITEMS
+                || chunk_bytes.saturating_add(bytes) > MAX_SESSION_CHUNK_BYTES)
+        {
+            stage_chunk(chunk)?;
+            chunk.items.clear();
+            chunk.attachments.clear();
+            chunk.context_items.clear();
+            chunk.invalidated_warnings.clear();
+            chunk_bytes = base_bytes;
+        }
+        chunk_bytes = chunk_bytes.saturating_add(bytes);
+        Ok(())
+    };
 
+    // Keep the cross-chunk attachment set in SQLite. Each reference precedes its first item on replay.
+    conn.execute_batch(
+        "CREATE TEMP TABLE snapshot_attachment_ids(id TEXT PRIMARY KEY) WITHOUT ROWID",
+    )?;
+    {
+        let mut remember =
+            conn.prepare("INSERT OR IGNORE INTO temp.snapshot_attachment_ids VALUES(?)")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id
+             FROM items WHERE session_id=? ORDER BY id",
+        )?;
+        let mut rows = stmt.query([sid])?;
+        while let Some(row) = rows.next()? {
+            let item = ItemSnapshot::from_row(row)?;
+            let mut attachments = Vec::new();
+            let mut ids = HashSet::new();
+            collect_attachment_ids_from_item(&item, &mut ids);
+            for attachment in load_attachment_refs(conn, ids)? {
+                if remember.execute([attachment.id])? != 0 {
+                    attachments.push(attachment);
+                }
+            }
+            let bytes = encoded_len(&item)?.saturating_add(encoded_len(&attachments)?);
+            make_room(&mut chunk, bytes)?;
+            chunk.attachments.extend(attachments);
+            chunk.items.push(item);
+        }
+    }
+    conn.execute_batch("DROP TABLE temp.snapshot_attachment_ids")?;
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT position,item_id FROM context_items WHERE session_id=? ORDER BY position",
+        )?;
+        let mut rows = stmt.query([sid])?;
+        while let Some(row) = rows.next()? {
+            let ctx = ContextPos {
+                position: row.get(0)?,
+                item_id: row.get(1)?,
+            };
+            make_room(&mut chunk, encoded_len(&ctx)?)?;
+            chunk.context_items.push(ctx);
+        }
+    }
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT i.id FROM items i WHERE i.session_id=? AND EXISTS
+             (SELECT 1 FROM invalidated_warnings w WHERE w.item_id=i.id) ORDER BY i.id",
+        )?;
+        let mut rows = stmt.query([sid])?;
+        while let Some(row) = rows.next()? {
+            let id: ItemId = row.get(0)?;
+            make_room(&mut chunk, id.as_str().len() + 2)?;
+            chunk.invalidated_warnings.push(id);
+        }
+    }
+    stage_chunk(&chunk)?; // An empty session still has its initial reset snapshot.
+
+    conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [stream_id])?;
     conn.execute(
         "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,reset_gen,head_snapshot,updated_at)
          VALUES(?1,'session',?2,?3,?4,?2,?3,?4,1,1,0,0,0,?5,?6)
@@ -4440,25 +4453,14 @@ fn replace_session_with_chunked_epoch_snapshot(
             now
         ],
     )?;
-    for (seq, p_hash, c_hash, op_type, payload) in staged_rows {
-        conn.execute(
-            "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-             VALUES(?,?,?,?,?,?,?,?,?)",
-            params![
-                stream_id,
-                new_epoch,
-                seq,
-                p_hash.as_slice(),
-                c_hash.as_slice(),
-                author,
-                op_type,
-                payload,
-                now
-            ],
-        )?;
-    }
+    conn.execute(
+        "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
+         SELECT stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
+         FROM sync_staging_commits WHERE stream_id=?1 AND epoch=?2 ORDER BY seq",
+        params![stream_id, new_epoch],
+    )?;
+    clear_staging_for_stream(conn, stream_id)?;
     conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [stream_id])?;
-    stage_stream(stream_id);
     Ok(())
 }
 
@@ -4872,6 +4874,7 @@ pub fn resolve_conflict_local(
             new_head,
         })
     })
+    .inspect(|_| stage_stream(stream_id))
 }
 
 fn promote_staged_oauth_credentials(conn: &Connection, mid: McpServerId) -> Result<()> {
@@ -4951,32 +4954,7 @@ pub fn commit_staged_branch_preserving_conflict(
         .parse()
         .map_err(|_| Error::internal("invalid session stream_id"))?;
     with_savepoint(conn, "commit_staged_preserve_conflict", || {
-        let mut check_stmt = conn.prepare_cached(
-            "SELECT seq,parent_hash,commit_hash FROM sync_staging_commits
-             WHERE stream_id=?1 AND epoch=?2 ORDER BY seq ASC",
-        )?;
-        let staged_hdrs = check_stmt
-            .query_map(params![stream_id, target_head.epoch], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if staged_hdrs.len() != usize::try_from(target_head.head_seq).unwrap_or(usize::MAX) {
-            return Err(Error::conflict("incomplete staged local branch history"));
-        }
-        let mut exp_parent = [0u8; 32];
-        let mut last_hash = [0u8; 32];
-        for (idx, (seq, pvec, cvec)) in staged_hdrs.into_iter().enumerate() {
-            let p = to_hash32(pvec)?;
-            let ch = to_hash32(cvec)?;
-            if seq != (idx as i64) + 1 || p != exp_parent {
-                return Err(Error::conflict("non-contiguous staged local branch chain"));
-            }
-            exp_parent = ch;
-            last_hash = ch;
-        }
-        if last_hash != target_head.head_hash {
-            return Err(Error::conflict("staged local branch head_hash mismatch"));
-        }
+        verify_staged_chain(conn, target_head, Error::conflict)?;
 
         clear_session_body_rows(conn, sid)?;
         conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [stream_id])?;

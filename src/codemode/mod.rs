@@ -446,15 +446,15 @@ pub fn stop_session(s: &mut Store, sid: SessionId) {
 }
 
 pub fn has_session_tasks(s: &Store, sid: SessionId) -> bool {
-    s.tasks.values().any(|t| t.origin.sid == sid)
+    s.task_counts.contains_key(&sid)
 }
 
 pub fn task_session_ids(s: &Store) -> impl Iterator<Item = SessionId> + '_ {
-    s.tasks.values().map(|t| t.origin.sid)
+    s.task_counts.keys().copied()
 }
 
 pub fn count_session_tasks(s: &Store, sid: SessionId) -> usize {
-    s.tasks.values().filter(|t| t.origin.sid == sid).count()
+    s.task_counts.get(&sid).copied().unwrap_or(0)
 }
 
 pub fn session_tasks_snapshot(s: &Store, sid: SessionId) -> Value {
@@ -601,7 +601,7 @@ impl Wait {
                     "message": message,
                 })
             } else {
-                let active = s.tasks.values().filter(|t| t.origin.sid == sid).count();
+                let active = count_session_tasks(s, sid);
                 let has_tasks = active > 0 || ledger::starting_sibling(&s.conn, sid, self.call.id)?;
                 if !has_tasks && had_tasks == Some(true) {
                     json!({"status":"woke", "reason":"no_active_tasks", "waited_ms":waited_ms})
@@ -844,11 +844,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
         }
         if s.closing
             || s.tasks.len() >= MAX_TASKS
-            || s.tasks
-                .values()
-                .filter(|t| t.origin.sid == call.sid)
-                .count()
-                >= MAX_SESSION_TASKS
+            || count_session_tasks(s, call.sid) >= MAX_SESSION_TASKS
         {
             return call.reply(
                 s,
@@ -911,7 +907,9 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             task.delivered();
         }
         let (done, finish) = oneshot::channel();
-        s.tasks.insert(id, task);
+        if s.tasks.insert(id, task).is_none() {
+            *s.task_counts.entry(sid).or_default() += 1;
+        }
         s.refresh_local_presence(sid);
         s.wake_waiters(sid);
         let submitted = app.codemode.pool.submit(Job {
@@ -1086,13 +1084,24 @@ fn pack_output(
     (Value::Array(parts), text)
 }
 
+fn remove_task(s: &mut Store, id: ItemId) -> Task {
+    let task = s.tasks.remove(&id).unwrap();
+    let sid = task.origin.sid;
+    let count = s.task_counts.get_mut(&sid).expect("registered task count");
+    *count -= 1;
+    if *count == 0 {
+        s.task_counts.remove(&sid);
+    }
+    task
+}
+
 fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()> {
     let (sid, exp_epoch, cur_gen) = {
         let task = &s.tasks[&id];
         (task.origin.sid, task.session_epoch, s.reset_gen(task.origin.sid))
     };
     if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? || !s.is_local_lease_valid(sid) {
-        let mut task = s.tasks.remove(&id).unwrap();
+        let mut task = remove_task(s, id);
         s.refresh_local_presence(sid);
         if !s.active.contains_key(&sid)
             && !s.pending_wakes.contains(&sid)
@@ -1174,7 +1183,7 @@ fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()
         saved.push((k.call.save_at_epoch(&tx, wire, false, Some(exp_epoch))?, false));
     }
     tx.commit()?;
-    let mut task = s.tasks.remove(&id).unwrap();
+    let mut task = remove_task(s, id);
     s.wake_waiters(sid);
     task.delivered();
     if let Some(k) = task.kill {

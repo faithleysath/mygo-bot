@@ -33,7 +33,7 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
             ))
         })?;
     let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
-    media::check_session(conn, sid, &modalities)?;
+    media::check_call_input(conn, sid, model_id, &modalities, end)?;
     let started_at = Utc::now().timestamp_millis();
     let snapshot = prices
         .as_ref()

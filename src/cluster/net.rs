@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use axum::body::Bytes;
 use iroh::{
     Endpoint, EndpointAddr, RelayMode, SecretKey,
     endpoint::{Connection, IdleTimeout, QuicTransportConfig, RecvStream, SendStream, presets},
@@ -182,32 +183,27 @@ fn auth_mac(
 
 pub async fn write_frame_timed(
     send: &mut SendStream,
-    header: &[u8],
-    body: Option<&[u8]>,
+    header: Bytes,
+    body: Option<Bytes>,
     deadline: Duration,
 ) -> Result<()> {
-    tokio::time::timeout(deadline, write_frame(send, header, body))
+    let h_len = u32::try_from(header.len()).map_err(|_| Error::internal("frame header too large"))?;
+    let body = body.unwrap_or_default();
+    let b_len = u32::try_from(body.len()).map_err(|_| Error::internal("frame body too large"))?;
+    let mut chunks = [
+        Bytes::copy_from_slice(&h_len.to_be_bytes()),
+        header,
+        if b_len == 0 {
+            Bytes::from_static(&[0; 4])
+        } else {
+            Bytes::copy_from_slice(&b_len.to_be_bytes())
+        },
+        body,
+    ];
+    tokio::time::timeout(deadline, send.write_all_chunks(&mut chunks))
         .await
         .map_err(|_| Error::internal("cluster stream write timed out"))?
-}
-
-pub async fn write_frame(send: &mut SendStream, header: &[u8], body: Option<&[u8]>) -> Result<()> {
-    let h_len = u32::try_from(header.len()).map_err(|_| Error::internal("frame header too large"))?;
-    let b_slice = body.unwrap_or(&[]);
-    let b_len =
-        u32::try_from(b_slice.len()).map_err(|_| Error::internal("frame body too large"))?;
-    let mut prefix = Vec::with_capacity(8 + header.len());
-    prefix.extend_from_slice(&h_len.to_be_bytes());
-    prefix.extend_from_slice(header);
-    prefix.extend_from_slice(&b_len.to_be_bytes());
-    send.write_all(&prefix)
-        .await
         .map_err(|e| Error::internal(format!("cluster stream write failed: {e}")))?;
-    if !b_slice.is_empty() {
-        send.write_all(b_slice)
-            .await
-            .map_err(|e| Error::internal(format!("cluster stream body write failed: {e}")))?;
-    }
     send.finish()
         .map_err(|e| Error::internal(format!("cluster stream finish failed: {e}")))?;
     Ok(())

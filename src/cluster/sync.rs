@@ -1,14 +1,19 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::Seek,
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
-use iroh::endpoint::Connection;
+use axum::body::Bytes;
+use futures_util::{StreamExt, stream};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex as AsyncMutex, Notify, Semaphore},
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
@@ -47,7 +52,9 @@ const _: usize = RPC_REQ_HEADER_MAX;
 
 const ATT_CHUNK_SIZE: usize = 256 * 1024;
 const MAX_CHUNK_CONCURRENCY: usize = 4;
-const MAX_ATT_BYTE_PERMITS: usize = 512; // 128 MiB global concurrent attachment budget (256 KiB units)
+const MAX_ATT_BYTE_PERMITS: usize = 512; // 128 MiB across temporary files (256 KiB units)
+const ATTACHMENT_HASH_BATCH: usize = 64;
+const MAX_ATTACHMENT_PROBES: usize = 8;
 const MANIFEST_PAGE_LIMIT: usize = 256;
 const COMMIT_BATCH_COUNT: usize = 64;
 const COMMIT_BATCH_BYTES: usize = 2 * 1024 * 1024;
@@ -240,6 +247,52 @@ struct RetryEntry {
     due: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MissingAttachment {
+    id: AttachmentId,
+    hash: [u8; 32],
+    len: i64,
+}
+
+fn fill_attachment_aliases(
+    conn: &rusqlite::Connection,
+    att: &MissingAttachment,
+    rowid: i64,
+) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE attachments SET data=(SELECT data FROM attachments WHERE rowid=?1)
+         WHERE content_hash=?2 AND byte_len=?3 AND data IS NULL",
+    )?
+    .execute(params![rowid, att.hash, att.len])?;
+    Ok(())
+}
+
+fn missing_attachment(
+    conn: &rusqlite::Connection,
+    id: AttachmentId,
+) -> Result<Option<MissingAttachment>> {
+    let (hash, len, has_data) = conn
+        .prepare_cached(
+            "SELECT content_hash,byte_len,data IS NOT NULL FROM attachments WHERE id=?",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, bool>(2)?)))?;
+    if has_data {
+        return Ok(None);
+    }
+    if !(1..=crate::media::MAX_ATTACHMENT_BYTES as i64).contains(&len) {
+        return Err(Error::bad("attachment exceeds allowed byte budget"));
+    }
+    let att = MissingAttachment { id, hash, len };
+    let source = conn.prepare_cached(
+        "SELECT rowid FROM attachments WHERE content_hash=?1 AND data IS NOT NULL AND length(data)=?2 LIMIT 1",
+    )?.query_row(params![hash, len], |r| r.get(0)).optional()?;
+    if let Some(rowid) = source {
+        fill_attachment_aliases(conn, &att, rowid)?;
+        return Ok(None);
+    }
+    Ok(Some(att))
+}
+
 pub struct SyncEngine {
     db: Db,
     client: reqwest::Client,
@@ -250,6 +303,7 @@ pub struct SyncEngine {
     stream_locks: LockTable<String>,
     att_locks: LockTable<[u8; 32]>,
     att_byte_budget: Arc<Semaphore>,
+    attachment_probes: Semaphore,
     blocking_sem: Arc<Semaphore>,
     inbound: Mutex<InboundState>,
     inbound_notify: Notify,
@@ -276,6 +330,7 @@ impl SyncEngine {
             stream_locks: LockTable::default(),
             att_locks: LockTable::default(),
             att_byte_budget: Arc::new(Semaphore::new(MAX_ATT_BYTE_PERMITS)),
+            attachment_probes: Semaphore::new(MAX_ATTACHMENT_PROBES),
             blocking_sem: Arc::new(Semaphore::new(MAX_BLOCKING_CODEC)),
             inbound: Mutex::default(),
             inbound_notify: Notify::new(),
@@ -299,15 +354,18 @@ impl SyncEngine {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let _permit = self
+        let permit = self
             .blocking_sem
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| Error::internal("blocking worker pool closed"))?;
-        tokio::task::spawn_blocking(f)
-            .await
-            .map_err(|e| Error::internal(format!("blocking task panicked: {e}")))
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(|e| Error::internal(format!("blocking task panicked: {e}")))
     }
 
     async fn encode_resp_owned(&self, resp: RpcResp) -> Result<Vec<u8>> {
@@ -603,19 +661,19 @@ impl SyncEngine {
     }
 
     async fn rpc(&self, peer_id: &str, req: &RpcReq, timeout: Duration) -> Result<(RpcResp, Vec<u8>)> {
+        let bytes = serde_json::to_vec(req).map_err(|e| Error::internal(e.to_string()))?;
+        self.rpc_encoded(peer_id, bytes.into(), timeout).await
+    }
+
+    async fn rpc_encoded(
+        &self,
+        peer_id: &str,
+        req_bytes: Bytes,
+        timeout: Duration,
+    ) -> Result<(RpcResp, Vec<u8>)> {
         let Some(conn) = self.net.get_connection(peer_id) else {
             return Err(Error::conflict(format!("peer {peer_id} is offline")));
         };
-        self.rpc_on_conn(&conn, req, timeout).await
-    }
-
-    async fn rpc_on_conn(
-        &self,
-        conn: &Connection,
-        req: &RpcReq,
-        timeout: Duration,
-    ) -> Result<(RpcResp, Vec<u8>)> {
-        let req_bytes = serde_json::to_vec(req).map_err(|e| Error::internal(e.to_string()))?;
         if req_bytes.len() > RPC_REQ_HEADER_MAX {
             return Err(Error::bad("RPC request header exceeds bound"));
         }
@@ -625,7 +683,7 @@ impl SyncEngine {
                 .open_bi()
                 .await
                 .map_err(|e| Error::internal(format!("open RPC stream failed: {e}")))?;
-            write_frame_timed(&mut send, &req_bytes, None, RPC_WRITE_DEADLINE).await?;
+            write_frame_timed(&mut send, req_bytes, None, RPC_WRITE_DEADLINE).await?;
             read_frame_bounded(
                 &mut recv,
                 RPC_RESP_HEADER_MAX,
@@ -699,13 +757,13 @@ impl SyncEngine {
         match res {
             Ok((resp, bin)) => {
                 if let Ok(hdr) = self.encode_resp_owned(resp).await {
-                    let _ = write_frame_timed(&mut send, &hdr, bin.as_deref(), RPC_WRITE_DEADLINE).await;
+                    let _ = write_frame_timed(&mut send, hdr.into(), bin.map(Bytes::from), RPC_WRITE_DEADLINE).await;
                 }
             }
             Err(err) => {
                 tracing::warn!(peer = %from_peer, status = %err.0, error = %err.1, "cluster RPC failed");
                 if let Ok(hdr) = serde_json::to_vec(&RpcResp::Error { message: err.1 }) {
-                    let _ = write_frame_timed(&mut send, &hdr, None, RPC_WRITE_DEADLINE).await;
+                    let _ = write_frame_timed(&mut send, hdr.into(), None, RPC_WRITE_DEADLINE).await;
                 }
             }
         }
@@ -897,20 +955,22 @@ impl SyncEngine {
                 Ok((RpcResp::CommitChunk, Some(bytes)))
             }
             RpcReq::HasAttachments { hashes } => {
-                let limited: Vec<[u8; 32]> = hashes.into_iter().take(64).collect();
+                let mut limited = hashes;
+                limited.truncate(ATTACHMENT_HASH_BATCH);
                 let available = self
                     .db
                     .call(move |s| {
-                        let mut stmt = s.conn.prepare_cached(
-                            "SELECT EXISTS(SELECT 1 FROM attachments WHERE content_hash=? AND data IS NOT NULL)",
-                        )?;
-                        let mut found = Vec::new();
-                        for hash in limited {
-                            if stmt.query_row([hash.as_slice()], |r| r.get::<_, bool>(0))? {
-                                found.push(hash);
-                            }
+                        if limited.is_empty() {
+                            return Ok(Vec::new());
                         }
-                        Ok(found)
+                        let values = std::iter::repeat_n("(?)", limited.len()).collect::<Vec<_>>().join(",");
+                        let sql = format!(
+                            "WITH requested(hash) AS (VALUES {values}) SELECT hash FROM requested
+                             WHERE EXISTS(SELECT 1 FROM attachments WHERE content_hash=hash AND data IS NOT NULL)"
+                        );
+                        let mut stmt = s.conn.prepare_cached(&sql)?;
+                        let rows = stmt.query_map(rusqlite::params_from_iter(limited), |r| r.get(0))?;
+                        Ok(rows.collect::<rusqlite::Result<_>>()?)
                     })
                     .await?;
                 Ok((RpcResp::AttachmentsAvailable { hashes: available }, None))
@@ -1148,12 +1208,14 @@ impl SyncEngine {
             let req = RpcReq::NotifyHeads {
                 heads: chunk.to_vec(),
             };
-            let req_ref = &req;
-            let results = futures_util::future::join_all(
-                targets
-                    .iter()
-                    .map(|peer_id| async move { self.rpc(peer_id, req_ref, RPC_TIMEOUT_SHORT).await }),
-            )
+            let Ok(bytes) = serde_json::to_vec(&req) else {
+                failed_any = true;
+                continue;
+            };
+            let bytes = Bytes::from(bytes);
+            let results = futures_util::future::join_all(targets.iter().map(|peer_id| {
+                self.rpc_encoded(peer_id, bytes.clone(), RPC_TIMEOUT_SHORT)
+            }))
             .await;
             if results.iter().any(Result::is_err) {
                 failed_any = true;
@@ -1454,7 +1516,6 @@ impl SyncEngine {
             return Ok((Vec::new(), false));
         }
 
-        #[derive(Clone)]
         struct Candidate {
             head: StreamHead,
             holders: Vec<String>,
@@ -1492,6 +1553,17 @@ impl SyncEngine {
             }
         }
 
+        for cands in by_stream.values_mut() {
+            cands.sort_by(|a, b| {
+                b.head
+                    .epoch
+                    .cmp(&a.head.epoch)
+                    .then_with(|| b.head.deleted.cmp(&a.head.deleted))
+                    .then_with(|| (!b.full_holders.is_empty()).cmp(&!a.full_holders.is_empty()))
+                    .then_with(|| b.head.head_seq.cmp(&a.head.head_seq))
+            });
+        }
+
         // Strict 8-phase dependency order:
         // 0: Provider
         // 1: Model
@@ -1512,7 +1584,7 @@ impl SyncEngine {
             }
             let mut progress = false;
             let mut blocked_in_pass: HashSet<String> = HashSet::new();
-            let mut work: Vec<(u8, String, Vec<Candidate>)> = Vec::new();
+            let mut work: Vec<(u8, &String, &[Candidate])> = Vec::new();
 
             for (stream_id, cands) in &by_stream {
                 if resolved_or_done.contains(stream_id) {
@@ -1522,40 +1594,33 @@ impl SyncEngine {
                     continue;
                 };
                 match first.head.kind {
-                    StreamKind::Provider => work.push((0, stream_id.clone(), cands.clone())),
-                    StreamKind::Model => work.push((1, stream_id.clone(), cands.clone())),
-                    StreamKind::Mcp => work.push((2, stream_id.clone(), cands.clone())),
+                    StreamKind::Provider => work.push((0, stream_id, cands)),
+                    StreamKind::Model => work.push((1, stream_id, cands)),
+                    StreamKind::Mcp => work.push((2, stream_id, cands)),
                     StreamKind::Session => {
                         let any_deleted = cands.iter().any(|c| c.head.deleted);
                         if any_deleted {
-                            work.push((5, stream_id.clone(), cands.clone()));
+                            work.push((5, stream_id, cands));
                         }
-                        work.push((3, stream_id.clone(), cands.clone()));
-                        work.push((7, stream_id.clone(), cands.clone()));
+                        work.push((3, stream_id, cands));
+                        work.push((7, stream_id, cands));
                     }
                     StreamKind::Call => {
-                        work.push((4, stream_id.clone(), cands.clone()));
-                        work.push((6, stream_id.clone(), cands.clone()));
+                        work.push((4, stream_id, cands));
+                        work.push((6, stream_id, cands));
                     }
                 }
             }
-            work.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            work.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
 
-            for (phase, stream_id, mut cands) in work {
+            for (phase, stream_id, cands) in work {
                 if self.net.membership_gen() != mgen {
                     break;
                 }
-                if resolved_or_done.contains(&stream_id) || blocked_in_pass.contains(&stream_id) {
+                if resolved_or_done.contains(stream_id) || blocked_in_pass.contains(stream_id) {
                     continue;
                 }
-                cands.sort_by(|a, b| {
-                    b.head
-                        .epoch
-                        .cmp(&a.head.epoch)
-                        .then_with(|| b.head.deleted.cmp(&a.head.deleted))
-                        .then_with(|| (!b.full_holders.is_empty()).cmp(&!a.full_holders.is_empty()))
-                        .then_with(|| b.head.head_seq.cmp(&a.head.head_seq))
-                });
+                let stream_id = stream_id.clone();
 
                 let force_watch = watch_sid.is_some_and(|sid| sid.as_str() == stream_id);
 
@@ -1764,7 +1829,7 @@ impl SyncEngine {
                 // Phases 0, 1, 2, 4, 6, 7: pull commits per candidate cleanly.
                 let mut stream_updated = false;
                 let mut stream_blocked = false;
-                for cand in &cands {
+                for cand in cands {
                     if cand.head.deleted {
                         if matches!(cand.head.kind, StreamKind::Mcp | StreamKind::Session) {
                             let res = self
@@ -2762,193 +2827,181 @@ impl SyncEngine {
         ))
     }
 
-    pub async fn ensure_attachment_data(self: &Arc<Self>, id: AttachmentId) -> Result<()> {
-        let info: Option<(Vec<u8>, i64, bool)> = self
+    pub async fn ensure_attachment_data(&self, id: AttachmentId) -> Result<()> {
+        self.ensure_attachment_batch(&[id]).await
+    }
+
+    async fn ensure_attachment_batch(&self, ids: &[AttachmentId]) -> Result<()> {
+        let ids = ids.to_vec();
+        let missing = self
             .db
             .call(move |s| {
-                s.conn
-                    .prepare_cached(
-                        "SELECT content_hash,byte_len,data IS NOT NULL FROM attachments WHERE id=?",
-                    )?
-                    .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                    .optional()
-                    .map_err(Into::into)
+                let mut missing = Vec::new();
+                for id in ids {
+                    if let Some(att) = missing_attachment(&s.conn, id)? {
+                        missing.push(att);
+                    }
+                }
+                Ok(missing)
             })
             .await?;
-        let Some((hash_vec, byte_len, has_data)) = info else {
-            return Err(rusqlite::Error::QueryReturnedNoRows.into());
-        };
-        if has_data {
+        if missing.is_empty() {
             return Ok(());
         }
-        let content_hash: [u8; 32] = hash_vec
-            .try_into()
-            .map_err(|_| Error::internal("invalid attachment content_hash"))?;
-        let lock = self.att_locks.lock_for(content_hash);
-        let _guard = lock.lock().await;
-
-        let already = self
-            .db
-            .call(move |s| {
-                let has: bool = s.conn.query_row(
-                    "SELECT data IS NOT NULL FROM attachments WHERE id=?",
-                    [id],
-                    |r| r.get(0),
-                )?;
-                if has {
-                    return Ok(true);
+        let mut hashes: Vec<_> = missing.iter().map(|att| att.hash).collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        let req = serde_json::to_vec(&RpcReq::HasAttachments {
+            hashes: hashes.clone(),
+        })
+        .map_err(|e| Error::internal(e.to_string()))?;
+        let req = Bytes::from(req);
+        let mut probes = stream::iter(self.net.online_peer_ids())
+            .map(|peer| {
+                let req = req.clone();
+                async move {
+                    let _permit = self.attachment_probes.acquire().await.ok()?;
+                    match self.rpc_encoded(&peer, req, RPC_TIMEOUT_SHORT).await {
+                        Ok((RpcResp::AttachmentsAvailable { hashes }, _)) => Some((peer, hashes)),
+                        _ => None,
+                    }
                 }
-                let local_copy: Option<Vec<u8>> = s
-                    .conn
-                    .prepare_cached(
-                        "SELECT data FROM attachments WHERE content_hash=? AND data IS NOT NULL LIMIT 1",
-                    )?
-                    .query_row([content_hash.as_slice()], |r| r.get(0))
-                    .optional()?;
-                if let Some(bytes) = local_copy {
-                    s.conn.execute(
-                        "UPDATE attachments SET data=? WHERE content_hash=? AND data IS NULL",
-                        params![bytes, content_hash.as_slice()],
-                    )?;
-                    return Ok(true);
-                }
-                Ok(false)
             })
-            .await?;
-        if already {
-            return Ok(());
-        }
-
-        let online = self.net.online_peer_ids();
-        let mut holders = Vec::new();
-        for peer_id in online {
-            if let Ok((RpcResp::AttachmentsAvailable { hashes }, _)) = self
-                .rpc(
-                    &peer_id,
-                    &RpcReq::HasAttachments {
-                        hashes: vec![content_hash],
-                    },
-                    RPC_TIMEOUT_SHORT,
-                )
-                .await
-                && hashes.contains(&content_hash)
-            {
-                holders.push(peer_id);
+            .buffer_unordered(MAX_ATTACHMENT_PROBES);
+        let mut holders = HashMap::<[u8; 32], Vec<String>>::new();
+        while let Some(reply) = probes.next().await {
+            if let Some((peer, mut available)) = reply {
+                available.truncate(ATTACHMENT_HASH_BATCH);
+                for hash in &hashes {
+                    if available.contains(hash) {
+                        holders.entry(*hash).or_default().push(peer.clone());
+                    }
+                }
             }
         }
-        if holders.is_empty() {
-            return Err(Error::conflict(format!(
-                "attachment {id} bytes are unavailable on online peers"
-            )));
+        for att in missing {
+            let lock = self.att_locks.lock_for(att.hash);
+            let _guard = lock.lock().await;
+            let Some(current) = self
+                .db
+                .call(move |s| missing_attachment(&s.conn, att.id))
+                .await?
+            else {
+                continue;
+            };
+            if current != att {
+                return Err(Error::conflict(
+                    "attachment metadata changed during download",
+                ));
+            }
+            let Some(peers) = holders.get(&att.hash) else {
+                return Err(Error::conflict(format!(
+                    "attachment {} bytes are unavailable on online peers",
+                    att.id
+                )));
+            };
+            self.download_attachment(att, peers).await?;
         }
+        Ok(())
+    }
 
-        let total_len = usize::try_from(byte_len)
-            .map_err(|_| Error::internal("attachment byte_len overflow"))?;
-        if total_len == 0 || total_len > crate::media::MAX_ATTACHMENT_BYTES {
-            return Err(Error::bad("attachment exceeds allowed byte budget"));
-        }
+    async fn download_attachment(&self, att: MissingAttachment, holders: &[String]) -> Result<()> {
+        let total_len = att.len as usize;
         let num_chunks = total_len.div_ceil(ATT_CHUNK_SIZE);
-        let permits_needed = u32::try_from(num_chunks)
-            .map_err(|_| Error::bad("attachment chunk count overflow"))?;
-        let _att_budget_permit = tokio::time::timeout(
+        // Reserve the whole temporary file before opening it, including time queued for SQLite.
+        let budget = tokio::time::timeout(
             RPC_TIMEOUT_DATA,
-            self.att_byte_budget.clone().acquire_many_owned(permits_needed),
+            self.att_byte_budget
+                .clone()
+                .acquire_many_owned(num_chunks as u32),
         )
         .await
-        .map_err(|_| Error::conflict("attachment download memory budget saturated"))?
+        .map_err(|_| Error::conflict("attachment staging budget saturated"))?
         .map_err(|_| Error::internal("attachment budget closed"))?;
-
-        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let holders = Arc::new(holders);
-        let results: Arc<Mutex<Vec<Option<Vec<u8>>>>> =
-            Arc::new(Mutex::new(vec![None; num_chunks]));
-
-        let worker_count = MAX_CHUNK_CONCURRENCY.min(num_chunks);
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..worker_count {
-            let eng = Arc::clone(self);
-            let holders = holders.clone();
-            let next_idx = next_idx.clone();
-            let results = results.clone();
-            set.spawn(async move {
-                loop {
-                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= num_chunks {
-                        return Ok::<(), Error>(());
+        let file = self.run_blocking(tempfile::tempfile).await??;
+        let mut file = tokio::fs::File::from_std(file);
+        // Ordered delivery lets a single writer append while up to four requests are in flight.
+        let mut chunks = stream::iter(0..num_chunks)
+            .map(|idx| async move {
+                let offset = idx * ATT_CHUNK_SIZE;
+                let len = (total_len - offset).min(ATT_CHUNK_SIZE);
+                let req = RpcReq::GetAttachmentChunk {
+                    content_hash: att.hash,
+                    offset: offset as u64,
+                    len: len as u32,
+                };
+                for attempt in 0..holders.len() {
+                    let peer = &holders[(idx + attempt) % holders.len()];
+                    if let Ok((RpcResp::AttachmentChunk, bytes)) =
+                        self.rpc(peer, &req, RPC_TIMEOUT_DATA).await
+                        && bytes.len() == len
+                    {
+                        return Ok(bytes);
                     }
-                    let offset = idx * ATT_CHUNK_SIZE;
-                    let len = (total_len - offset).min(ATT_CHUNK_SIZE);
-                    let mut chunk = None;
-                    for attempt in 0..holders.len() {
-                        let peer_id = &holders[(idx + attempt) % holders.len()];
-                        let res = eng
-                            .rpc(
-                                peer_id,
-                                &RpcReq::GetAttachmentChunk {
-                                    content_hash,
-                                    offset: offset as u64,
-                                    len: len as u32,
-                                },
-                                RPC_TIMEOUT_DATA,
-                            )
-                            .await;
-                        if let Ok((RpcResp::AttachmentChunk, body)) = res
-                            && body.len() == len
-                        {
-                            chunk = Some(body);
-                            break;
-                        }
-                    }
-                    let Some(bytes) = chunk else {
-                        return Err(Error::conflict(format!(
-                            "failed to download chunk {idx} of attachment {id}"
-                        )));
-                    };
-                    results.lock().unwrap()[idx] = Some(bytes);
                 }
-            });
+                Err(Error::conflict(format!(
+                    "failed to download chunk {idx} of attachment {}",
+                    att.id
+                )))
+            })
+            .buffered(MAX_CHUNK_CONCURRENCY);
+        while let Some(chunk) = chunks.next().await {
+            file.write_all(&chunk?).await?;
         }
-        while let Some(res) = set.join_next().await {
-            res.map_err(|e| Error::internal(e.to_string()))??;
-        }
-
-        // P1-14: Offload buffer assembly and BLAKE3 verification off the Tokio current-thread loop.
-        let parts = std::mem::take(&mut *results.lock().unwrap());
-        let assembled = self
-            .run_blocking(move || -> Result<Vec<u8>> {
-                let mut assembled = Vec::with_capacity(total_len);
-                for part in parts {
-                    let bytes =
-                        part.ok_or_else(|| Error::internal("missing attachment chunk"))?;
-                    assembled.extend_from_slice(&bytes);
-                }
-                if blake3::hash(&assembled).as_bytes() != &content_hash {
+        file.flush().await?;
+        let mut file = file.into_std().await;
+        let (mut file, budget) = self
+            .run_blocking(move || -> Result<_> {
+                file.rewind()?;
+                let mut hash = blake3::Hasher::new();
+                hash.update_reader(&mut file)?;
+                if hash.count() != att.len as u64 || hash.finalize().as_bytes() != &att.hash {
                     return Err(Error::bad(format!(
-                        "attachment {id} failed BLAKE3 integrity verification"
+                        "attachment {} failed BLAKE3 integrity verification",
+                        att.id
                     )));
                 }
-                Ok(assembled)
+                file.rewind()?;
+                Ok((file, budget))
             })
             .await??;
 
-        self.db
-            .call(move |s| {
-                s.conn.execute(
-                    "UPDATE attachments SET data=?1 WHERE content_hash=?2 AND data IS NULL",
-                    params![assembled, content_hash.as_slice()],
-                )?;
-                Ok(())
-            })
-            .await
+        let cancelled = CancellationToken::new();
+        let _guard = cancelled.clone().drop_guard();
+        self.db.call(move |s| {
+            let _budget = budget;
+            let tx = s.conn.transaction()?;
+            if cancelled.is_cancelled() {
+                return Err(Error::conflict("attachment download cancelled"));
+            }
+            let rowid: Option<i64> = tx.query_row(
+                "UPDATE attachments SET data=zeroblob(?3) WHERE id=?1 AND content_hash=?2 AND byte_len=?3 AND data IS NULL RETURNING rowid",
+                params![att.id, att.hash, att.len], |row| row.get(0),
+            ).optional()?;
+            if let Some(rowid) = rowid {
+                let mut blob = tx.blob_open(rusqlite::MAIN_DB, "attachments", "data", rowid, false)?;
+                if std::io::copy(&mut file, &mut blob)? != att.len as u64 {
+                    return Err(Error::internal("attachment staging file length changed"));
+                }
+                blob.close()?;
+                fill_attachment_aliases(&tx, &att, rowid)?;
+            } else if missing_attachment(&tx, att.id)?.is_some() {
+                return Err(Error::conflict("attachment metadata changed during download"));
+            }
+            if cancelled.is_cancelled() {
+                return Err(Error::conflict("attachment download cancelled"));
+            }
+            Ok(tx.commit()?)
+        }).await
     }
 
-    pub async fn ensure_session_attachments(self: &Arc<Self>, sid: SessionId) -> Result<()> {
+    pub async fn ensure_session_attachments(&self, sid: SessionId) -> Result<()> {
         let missing = self
             .db
             .call(move |s| crate::media::missing_session_context_attachments(&s.conn, sid))
             .await?;
-        for att_id in missing {
-            self.ensure_attachment_data(att_id).await?;
+        for ids in missing.chunks(ATTACHMENT_HASH_BATCH) {
+            self.ensure_attachment_batch(ids).await?;
         }
         Ok(())
     }

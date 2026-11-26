@@ -90,12 +90,7 @@ async fn body(db: Db, sid: SessionId, input: &Input) -> Result<reqwest::Body> {
         prefix.push(b'}');
     }
     prefix.extend_from_slice(tools_and_dev);
-    if input.end > 0 {
-        prefix.push(b',');
-    }
-    store::JsonRows::ModelInput
-        .context_body(db, sid, (input.end > 0).then_some((1, input.end)), prefix, b"]}")
-        .await
+    crate::media::model_input(db, sid, input.end, prefix).await
 }
 #[derive(Deserialize)]
 struct Frame {
