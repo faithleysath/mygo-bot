@@ -405,10 +405,11 @@ pub fn recover(conn: &Connection) -> Result<()> {
             event(conn, sid, origin, "completed", &content, true)?;
             let now = chrono::Utc::now().timestamp_millis();
             let ts = tick_hlc(conn)?;
-            let rev = next_catalog_rev();
+            let rev = next_catalog_rev(conn)?;
             let changed = conn.execute(
                 "UPDATE sessions
                  SET status='paused', last_error='daemon restarted',
+                     local_status=NULL, local_error='',
                      updated_at=max(updated_at,?2), status_ts=?3, sync_rev=?4
                  WHERE id=?1 AND deleted=0",
                 params![sid, now, ts, rev],
@@ -423,7 +424,7 @@ pub fn recover(conn: &Connection) -> Result<()> {
     // A crash after committing an event can precede the idle worker's wake-up.
     let pending_sids = {
         let mut stmt = conn.prepare(
-            "SELECT id FROM sessions WHERE status='idle' AND deleted=0 AND EXISTS (
+            "SELECT id FROM sessions WHERE coalesce(local_status, status)='idle' AND deleted=0 AND EXISTS (
                  SELECT 1 FROM pending_inputs p JOIN items i ON i.id=p.item_id
                  WHERE p.session_id=sessions.id AND p.kind='codemode_event'
                    AND coalesce(i.origin_node_id, ?1) = ?1
@@ -436,10 +437,11 @@ pub fn recover(conn: &Connection) -> Result<()> {
         with_savepoint(conn, "recover_pending", || {
             let now = chrono::Utc::now().timestamp_millis();
             let ts = tick_hlc(conn)?;
-            let rev = next_catalog_rev();
+            let rev = next_catalog_rev(conn)?;
             let changed = conn.execute(
                 "UPDATE sessions
                  SET status='paused', last_error='daemon restarted with pending codemode events',
+                     local_status=NULL, local_error='',
                      updated_at=max(updated_at,?2), status_ts=?3, sync_rev=?4
                  WHERE id=?1 AND deleted=0",
                 params![sid, now, ts, rev],

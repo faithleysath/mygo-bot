@@ -6,7 +6,11 @@ use crate::{
 };
 use axum::{
     extract::{Path, State},
-    response::sse::{Event, KeepAlive, Sse},
+    http::HeaderValue,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use futures_util::Stream;
 use serde::Serialize;
@@ -418,6 +422,7 @@ pub struct SessionEventStream {
     delta_sender: Option<broadcast::Sender<Notice>>,
     delta_rx: broadcast::Receiver<Notice>,
     initial_payload: String,
+    initial_view: String,
     initial_snapshot: Option<Arc<str>>,
     buffered_delta: Option<Notice>,
     queued: VecDeque<(Cow<'static, str>, Arc<str>)>,
@@ -446,12 +451,13 @@ impl SessionEventStream {
                 let initial = s.session_view(info);
                 let payload = serde_json::to_string(&initial)
                     .map_err(|e| crate::Error::internal(e.to_string()))?;
+                let initial_view = s.view_token(sid);
                 let channel = s.channel(sid);
                 let rx = channel.subscribe();
-                Ok(Some((channel, rx, payload)))
+                Ok(Some((channel, rx, payload, initial_view)))
             })
             .await?;
-        let Some((channel, rx, initial_payload)) = opened else {
+        let Some((channel, rx, initial_payload, initial_view)) = opened else {
             return Ok(None);
         };
         let (delta_tx, delta_rx, snapshot, min_seq) = app.streams.subscribe_delta(sid);
@@ -463,6 +469,7 @@ impl SessionEventStream {
             delta_sender: Some(delta_tx),
             delta_rx,
             initial_payload,
+            initial_view,
             initial_snapshot: snapshot.map(|s| Arc::from(s.to_string())),
             buffered_delta: None,
             queued: VecDeque::new(),
@@ -476,6 +483,10 @@ impl SessionEventStream {
         &self.initial_payload
     }
 
+    pub fn initial_view(&self) -> &str {
+        &self.initial_view
+    }
+
     pub fn take_initial_snapshot(&mut self) -> Option<Arc<str>> {
         self.initial_snapshot.take()
     }
@@ -485,8 +496,14 @@ impl SessionEventStream {
             .push_back((Cow::Borrowed(notice.name), notice.data));
     }
 
-    async fn resync_payload(&self) -> Arc<str> {
-        Arc::from("{}")
+    async fn resync_payload(&self, app: &App) -> Arc<str> {
+        let sid = self.sid;
+        let view = app
+            .db
+            .call(move |s| Ok(s.view_token(sid)))
+            .await
+            .unwrap_or_default();
+        Arc::from(json!({ "view": view }).to_string())
     }
 
     pub async fn next(&mut self, app: &App) -> NextSessionNotice {
@@ -521,7 +538,7 @@ impl SessionEventStream {
                             self.push_notice(d);
                         }
                         Err(TryRecvError::Lagged(_)) => {
-                            let data = self.resync_payload().await;
+                            let data = self.resync_payload(app).await;
                             self.queued.push_back((Cow::Borrowed("resync"), data));
                         }
                         Err(TryRecvError::Closed) => {
@@ -564,7 +581,7 @@ impl SessionEventStream {
                     Err(TryRecvError::Lagged(_)) => {
                         return NextSessionNotice::Event {
                             event: Cow::Borrowed("resync"),
-                            data: self.resync_payload().await,
+                            data: self.resync_payload(app).await,
                         };
                     }
                     Err(TryRecvError::Closed) => return NextSessionNotice::Closed,
@@ -615,7 +632,7 @@ impl SessionEventStream {
                         self.delta_lagged = true;
                         return NextSessionNotice::Event {
                             event: Cow::Borrowed("resync"),
-                            data: self.resync_payload().await,
+                            data: self.resync_payload(app).await,
                         };
                     }
                     Err(TryRecvError::Closed) => {
@@ -697,7 +714,7 @@ impl SessionEventStream {
                     self.delta_lagged = true;
                     return NextSessionNotice::Event {
                         event: Cow::Borrowed("resync"),
-                        data: self.resync_payload().await,
+                        data: self.resync_payload(app).await,
                     };
                 }
                 Incoming::Durable(Err(RecvError::Closed)) => return NextSessionNotice::Closed,
@@ -764,10 +781,7 @@ impl Drop for ActiveRelay {
     }
 }
 
-pub async fn subscribe(
-    State(app): State<App>,
-    Path(sid): Path<SessionId>,
-) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
+pub async fn subscribe(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Response> {
     let multi_node = app.exec.presence().known_peer_count() > 0;
     if multi_node {
         app.cluster.ensure_session_watched(sid).await?;
@@ -775,9 +789,10 @@ pub async fn subscribe(
     let mut local = SessionEventStream::open(&app, sid)
         .await?
         .ok_or_else(|| crate::Error::from(rusqlite::Error::QueryReturnedNoRows))?;
+    let initial_view = local.initial_view().to_owned();
     let mut cluster_rx = app.exec.presence().subscribe_cluster_active();
     let stream = async_stream::stream! {
-        yield Ok(Event::default().event("ready").data(local.initial_payload()));
+        yield Ok::<Event, Infallible>(Event::default().event("ready").data(local.initial_payload()));
         let mut snapshot_sent = false;
         if !multi_node && !*cluster_rx.borrow_and_update() {
             if let Some(snap) = local.take_initial_snapshot() {
@@ -889,7 +904,13 @@ pub async fn subscribe(
                     if let Some(old) = relay.take() {
                         old.cancel.cancel();
                     }
-                    yield Ok(Event::default().event("resync").data("{}"));
+                    let view = app
+                        .db
+                        .call(move |s| Ok(s.view_token(sid)))
+                        .await
+                        .unwrap_or_default();
+                    let payload = json!({ "view": view }).to_string();
+                    yield Ok(Event::default().event("resync").data(payload));
                     if runner_rx.borrow().is_some() {
                         let shift = retry_attempts.min(3);
                         let delay_ms = 250u64 << shift;
@@ -916,5 +937,9 @@ pub async fn subscribe(
             old.cancel.cancel();
         }
     };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    let mut res = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    if let Ok(hv) = HeaderValue::from_str(&initial_view) {
+        res.headers_mut().insert("x-history-view", hv);
+    }
+    Ok(res)
 }

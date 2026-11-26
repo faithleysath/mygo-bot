@@ -1,11 +1,11 @@
 use axum::body::Bytes;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use futures_util::{StreamExt, pin_mut};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
 
 use super::{AttachmentBlob, ContentBlock, at_part, check_mime};
-use crate::{Error, Result, id::SessionId, store::Db};
+use crate::{Error, Result, id::{ContextNodeId, SessionId}, store::Db};
 
 // Offsets refer to the JSON before inserting any base64. They are recorded while
 // serializing real content fields, so arbitrary strings can never act as markers.
@@ -141,8 +141,18 @@ impl Page {
         sid: SessionId,
         after: i64,
         end: i64,
+        pinned_head: Option<ContextNodeId>,
         prefix: Vec<u8>,
     ) -> Result<Self> {
+        let cur_head: Option<ContextNodeId> = conn
+            .prepare_cached("SELECT node_id FROM active_context WHERE session_id=?1 AND position=?2")?
+            .query_row((sid, end), |r| r.get(0))
+            .optional()?;
+        if cur_head != pinned_head {
+            return Err(Error::conflict(
+                "session branch changed while streaming model input",
+            ));
+        }
         let mut page = Self {
             json: prefix,
             blobs: Vec::new(),
@@ -184,6 +194,7 @@ pub(crate) async fn model_input(
     db: Db,
     sid: SessionId,
     end: i64,
+    pinned_head: Option<ContextNodeId>,
     mut prefix: Vec<u8>,
 ) -> Result<reqwest::Body> {
     if end == 0 {
@@ -191,7 +202,7 @@ pub(crate) async fn model_input(
         return Ok(prefix.into());
     }
     let mut page = db
-        .call(move |s| Page::read(&s.conn, sid, 0, end, prefix))
+        .call(move |s| Page::read(&s.conn, sid, 0, end, pinned_head, prefix))
         .await?;
     if page.position == end && page.blobs.is_empty() {
         return Ok(page.json.into());
@@ -212,7 +223,7 @@ pub(crate) async fn model_input(
             yield json;
             let after = page.position;
             if after == end { break; }
-            page = db.call(move |s| Page::read(&s.conn, sid, after, end, Vec::new())).await?;
+            page = db.call(move |s| Page::read(&s.conn, sid, after, end, pinned_head, Vec::new())).await?;
         }
     };
     // Give try_stream's error a concrete type for reqwest's boxed body.

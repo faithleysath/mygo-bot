@@ -82,6 +82,10 @@ pub struct LocalNode {
     pub db_epoch: String,
     pub meta_seq: i64,
     pub membership_gen: i64,
+    pub voter_epoch: u64,
+    pub voter_set: Vec<String>,
+    pub pending_voter_epoch: u64,
+    pub pending_voter_set: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +172,32 @@ fn validate_peer_fields(peer: &PeerInfo) -> Result<()> {
     Ok(())
 }
 
+pub fn canonicalize_voter_set(set: &[String]) -> Result<Vec<String>> {
+    if set.len() > MAX_CLUSTER_PEERS + 1 {
+        return Err(Error::bad("voter_set exceeds maximum cluster size"));
+    }
+    let mut out = Vec::with_capacity(set.len());
+    for entry in set {
+        entry
+            .parse::<EndpointId>()
+            .map_err(|_| Error::bad("invalid node_id in voter_set"))?;
+        out.push(entry.clone());
+    }
+    out.sort();
+    out.dedup();
+    if out.len() > MAX_CLUSTER_PEERS + 1 {
+        return Err(Error::bad("voter_set exceeds maximum cluster size"));
+    }
+    Ok(out)
+}
+
+fn parse_voter_set_json(raw: &str) -> Vec<String> {
+    let mut v: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+    v.sort();
+    v.dedup();
+    v
+}
+
 pub fn ensure_local_node(conn: &Connection) -> Result<()> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM local_node WHERE id=1)",
@@ -191,9 +221,14 @@ pub fn ensure_local_node(conn: &Connection) -> Result<()> {
         let _ = write!(db_epoch, "{b:02x}");
     }
     let name = default_node_name();
+    let voter_set_json = serde_json::to_string(&[&node_id])
+        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
     conn.execute(
-        "INSERT INTO local_node(id,secret_key,node_id,cluster_secret,name,description,role,db_epoch,meta_seq,membership_gen)
-         VALUES(1,?,?,?,?,?,'voter',?,1,1)",
+        "INSERT INTO local_node(
+            id,secret_key,node_id,cluster_secret,name,description,role,db_epoch,
+            meta_seq,membership_gen,catalog_rev,voter_epoch,voter_set_json,
+            pending_voter_epoch,pending_voter_set_json
+         ) VALUES(1,?,?,?,?,?,'voter',?,1,1,0,1,?,0,'[]')",
         params![
             secret_key.as_slice(),
             node_id,
@@ -201,6 +236,7 @@ pub fn ensure_local_node(conn: &Connection) -> Result<()> {
             name,
             "",
             db_epoch,
+            voter_set_json,
         ],
     )?;
     Ok(())
@@ -229,7 +265,8 @@ pub fn local_node_id(conn: &Connection) -> Result<Rc<str>> {
 
 pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
     conn.query_row(
-        "SELECT secret_key,node_id,cluster_secret,name,description,role,db_epoch,meta_seq,membership_gen
+        "SELECT secret_key,node_id,cluster_secret,name,description,role,db_epoch,meta_seq,membership_gen,
+                voter_epoch,voter_set_json,pending_voter_epoch,pending_voter_set_json
          FROM local_node WHERE id=1",
         [],
         |r| {
@@ -245,6 +282,10 @@ pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
                     rusqlite::types::Type::Blob,
                 )
             })?;
+            let voter_epoch_i64: i64 = r.get(9)?;
+            let voter_set_raw: String = r.get(10)?;
+            let pending_epoch_i64: i64 = r.get(11)?;
+            let pending_set_raw: String = r.get(12)?;
             Ok(LocalNode {
                 secret_key,
                 node_id: r.get(1)?,
@@ -255,6 +296,10 @@ pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
                 db_epoch: r.get(6)?,
                 meta_seq: r.get(7)?,
                 membership_gen: r.get(8)?,
+                voter_epoch: u64::try_from(voter_epoch_i64).unwrap_or(0),
+                voter_set: parse_voter_set_json(&voter_set_raw),
+                pending_voter_epoch: u64::try_from(pending_epoch_i64).unwrap_or(0),
+                pending_voter_set: parse_voter_set_json(&pending_set_raw),
             })
         },
     )
@@ -265,7 +310,6 @@ pub fn update_self_meta(
     conn: &Connection,
     name: Option<String>,
     description: Option<String>,
-    role: Option<NodeRole>,
 ) -> Result<LocalNode> {
     let current = load_local_node(conn)?;
     let next_name = match name {
@@ -276,23 +320,162 @@ pub fn update_self_meta(
         Some(d) => validate_node_description(&d)?,
         None => current.description,
     };
-    let next_role = role.unwrap_or(current.role);
     conn.execute(
-        "UPDATE local_node SET name=?1, description=?2, role=?3, meta_seq=meta_seq+1 WHERE id=1",
-        params![next_name, next_desc, next_role],
+        "UPDATE local_node SET name=?1, description=?2, meta_seq=meta_seq+1 WHERE id=1",
+        params![next_name, next_desc],
     )?;
     load_local_node(conn)
 }
 
 pub fn set_local_role(conn: &Connection, role: NodeRole) -> Result<LocalNode> {
     let current = load_local_node(conn)?;
-    if current.role != role {
+    let has_peers: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM cluster_peers)", [], |r| r.get(0))?;
+    if has_peers {
+        if current.role != role {
+            return Err(Error::conflict(
+                "cannot change cluster role offline while cluster peers exist",
+            ));
+        }
+        return Ok(current);
+    }
+    let next_set = if role.is_voter() {
+        vec![current.node_id.clone()]
+    } else {
+        Vec::new()
+    };
+    let next_json = serde_json::to_string(&next_set)
+        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
+    let next_epoch = i64::try_from(current.voter_epoch.max(1)).unwrap_or(1);
+    if current.role != role
+        || current.voter_epoch == 0
+        || current.voter_set != next_set
+        || current.pending_voter_epoch != 0
+    {
         conn.execute(
-            "UPDATE local_node SET role=?1, meta_seq=meta_seq+1 WHERE id=1",
-            [role],
+            "UPDATE local_node
+             SET role=?1,
+                 meta_seq=CASE WHEN role != ?1 THEN meta_seq+1 ELSE meta_seq END,
+                 voter_epoch=?2,
+                 voter_set_json=?3,
+                 pending_voter_epoch=0,
+                 pending_voter_set_json='[]'
+             WHERE id=1",
+            params![role, next_epoch, next_json],
         )?;
     }
     load_local_node(conn)
+}
+
+pub fn prepare_voter_config(
+    conn: &Connection,
+    expected_epoch: u64,
+    next_epoch: u64,
+    new_set: &[String],
+) -> Result<LocalNode> {
+    let canonical = canonicalize_voter_set(new_set)?;
+    if next_epoch == 0 || next_epoch <= expected_epoch {
+        return Err(Error::bad("invalid voter epoch transition"));
+    }
+    let local = load_local_node(conn)?;
+    if local.voter_epoch >= next_epoch {
+        return Err(Error::conflict("voter epoch already advanced"));
+    }
+    if local.pending_voter_epoch != 0 {
+        if local.pending_voter_epoch == next_epoch && local.pending_voter_set == canonical {
+            return Ok(local);
+        }
+        return Err(Error::conflict("voter reconfiguration already pending"));
+    }
+    if local.voter_epoch != expected_epoch && local.voter_epoch != 0 {
+        return Err(Error::conflict(format!(
+            "voter_epoch mismatch: expected {expected_epoch}, local is {}",
+            local.voter_epoch
+        )));
+    }
+    let pending_json = serde_json::to_string(&canonical)
+        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
+    let next_i64 = i64::try_from(next_epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
+    conn.execute(
+        "UPDATE local_node SET pending_voter_epoch=?1, pending_voter_set_json=?2 WHERE id=1",
+        params![next_i64, pending_json],
+    )?;
+    load_local_node(conn)
+}
+
+pub fn commit_voter_config(
+    conn: &Connection,
+    epoch: u64,
+    new_set: &[String],
+) -> Result<(LocalNode, bool)> {
+    if epoch == 0 {
+        return Err(Error::bad("committed voter_epoch must be positive"));
+    }
+    let canonical = canonicalize_voter_set(new_set)?;
+    let local = load_local_node(conn)?;
+    if local.voter_epoch > epoch {
+        return Ok((local, false));
+    }
+    if local.voter_epoch == epoch {
+        if local.voter_set != canonical {
+            return Err(Error::conflict(
+                "conflicting voter_set for already-committed voter_epoch",
+            ));
+        }
+        if local.pending_voter_epoch == epoch {
+            conn.execute(
+                "UPDATE local_node SET pending_voter_epoch=0, pending_voter_set_json='[]' WHERE id=1",
+                [],
+            )?;
+            return Ok((load_local_node(conn)?, false));
+        }
+        return Ok((local, false));
+    }
+    let should_be_voter = canonical.iter().any(|id| id == &local.node_id);
+    let next_role = if should_be_voter {
+        NodeRole::Voter
+    } else {
+        NodeRole::Edge
+    };
+    let role_changed = local.role != next_role;
+    let json = serde_json::to_string(&canonical)
+        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
+    let epoch_i64 = i64::try_from(epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
+    conn.execute(
+        "UPDATE local_node
+         SET voter_epoch=?1,
+             voter_set_json=?2,
+             pending_voter_epoch=CASE WHEN pending_voter_epoch <= ?1 THEN 0 ELSE pending_voter_epoch END,
+             pending_voter_set_json=CASE WHEN pending_voter_epoch <= ?1 THEN '[]' ELSE pending_voter_set_json END,
+             role=?3,
+             meta_seq=CASE WHEN role != ?3 THEN meta_seq+1 ELSE meta_seq END
+         WHERE id=1",
+        params![epoch_i64, json, next_role],
+    )?;
+    Ok((load_local_node(conn)?, role_changed))
+}
+
+pub fn abort_voter_config(conn: &Connection, next_epoch: u64) -> Result<LocalNode> {
+    let next_i64 = i64::try_from(next_epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
+    conn.execute(
+        "UPDATE local_node
+         SET pending_voter_epoch=0, pending_voter_set_json='[]'
+         WHERE id=1 AND pending_voter_epoch=?1",
+        [next_i64],
+    )?;
+    load_local_node(conn)
+}
+
+pub fn adopt_voter_config(
+    conn: &Connection,
+    epoch: u64,
+    set: &[String],
+) -> Result<(LocalNode, bool)> {
+    let local = load_local_node(conn)?;
+    if epoch == 0 || epoch <= local.voter_epoch || epoch < local.pending_voter_epoch {
+        return Ok((local, false));
+    }
+    commit_voter_config(conn, epoch, set)
 }
 
 pub fn encode_endpoint_addrs(addr: &EndpointAddr) -> Vec<String> {
@@ -433,7 +616,11 @@ pub fn apply_join(
         }
         let next_gen = local.membership_gen + 1;
         conn.execute(
-            "UPDATE local_node SET cluster_secret=?1, membership_gen=?2 WHERE id=1",
+            "UPDATE local_node
+             SET cluster_secret=?1, membership_gen=?2,
+                 voter_epoch=0, voter_set_json='[]',
+                 pending_voter_epoch=0, pending_voter_set_json='[]'
+             WHERE id=1",
             params![new_secret.as_slice(), next_gen],
         )?;
         conn.execute("DELETE FROM cluster_peers", [])?;

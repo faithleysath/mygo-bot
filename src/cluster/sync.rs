@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::body::Bytes;
+use axum::{body::Bytes, http::StatusCode};
 use futures_util::{StreamExt, stream};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -21,8 +21,8 @@ use crate::{
     cluster::{
         ClusterSignal,
         identity::{
-            MAX_PEX_PEERS, PeerInfo, assert_membership_gen, list_peers, load_local_node,
-            self_peer_info, upsert_peer_if_gen,
+            MAX_PEX_PEERS, PeerInfo, adopt_voter_config, assert_membership_gen, list_peers,
+            load_local_node, self_peer_info, upsert_peer_if_gen,
         },
         ledger::{
             self, CALLS_SCOPE, CatalogDelta, McpServerWire, SessionDelta, apply_catalog_delta,
@@ -36,11 +36,12 @@ use crate::{
         },
     },
     events::Hub,
-    id::{AttachmentId, McpServerId, SessionId},
+    id::{AttachmentId, ItemId, McpServerId, SessionId},
     store::{Db, Store, session},
 };
 
 const ATT_CHUNK_SIZE: usize = 256 * 1024;
+const MAX_ITEM_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CHUNK_CONCURRENCY: usize = 4;
 const MAX_ATT_BYTE_PERMITS: usize = 512; // 128 MiB across temporary files (256 KiB units)
 const ATTACHMENT_HASH_BATCH: usize = 64;
@@ -60,6 +61,10 @@ enum RpcReq {
     ExchangePeers {
         self_info: PeerInfo,
         peers: Vec<PeerInfo>,
+        #[serde(default)]
+        voter_epoch: u64,
+        #[serde(default)]
+        voter_set: Vec<String>,
     },
     NotifyDirty {
         catalog: bool,
@@ -77,6 +82,12 @@ enum RpcReq {
         session_id: SessionId,
         #[serde(default)]
         vector: BTreeMap<String, i64>,
+    },
+    GetItemPayloadChunk {
+        session_id: SessionId,
+        item_id: ItemId,
+        offset: u64,
+        len: u32,
     },
     HasAttachments {
         hashes: Vec<[u8; 32]>,
@@ -113,10 +124,15 @@ enum RpcResp {
     Peers {
         self_info: PeerInfo,
         peers: Vec<PeerInfo>,
+        #[serde(default)]
+        voter_epoch: u64,
+        #[serde(default)]
+        voter_set: Vec<String>,
     },
     Ack,
     CatalogDelta(CatalogDelta),
     SessionDelta(SessionDelta),
+    ItemPayloadChunk,
     AttachmentsAvailable {
         hashes: Vec<[u8; 32]>,
     },
@@ -249,8 +265,8 @@ pub struct SyncEngine {
     streams: Hub,
     net: Arc<ClusterNet>,
     signal: Arc<ClusterSignal>,
-    catalog_lock: AsyncMutex<()>,
-    session_locks: LockTable<SessionId>,
+    catalog_locks: LockTable<String>,
+    session_locks: LockTable<(SessionId, String)>,
     mcp_locks: LockTable<McpServerId>,
     att_locks: LockTable<[u8; 32]>,
     att_byte_budget: Arc<Semaphore>,
@@ -276,7 +292,7 @@ impl SyncEngine {
             streams,
             net,
             signal,
-            catalog_lock: AsyncMutex::new(()),
+            catalog_locks: LockTable::default(),
             session_locks: LockTable::default(),
             mcp_locks: LockTable::default(),
             att_locks: LockTable::default(),
@@ -516,11 +532,15 @@ impl SyncEngine {
             return Some(InboundWork::Catalog { mgen, peer_id });
         }
         while let Some((mgen, sid)) = st.session_fifo.pop_front() {
-            if let Some(mut peers) = st.sessions.remove(&(mgen, sid)) {
-                st.total_session_entries = st.total_session_entries.saturating_sub(peers.len());
-                if let Some(peer_id) = peers.pop() {
-                    return Some(InboundWork::Session { mgen, sid, peer_id });
+            if let Some(mut peers) = st.sessions.remove(&(mgen, sid))
+                && let Some(peer_id) = peers.pop()
+            {
+                st.total_session_entries = st.total_session_entries.saturating_sub(1);
+                if !peers.is_empty() {
+                    st.sessions.insert((mgen, sid), peers);
+                    st.session_fifo.push_back((mgen, sid));
                 }
+                return Some(InboundWork::Session { mgen, sid, peer_id });
             }
         }
         None
@@ -533,7 +553,7 @@ impl SyncEngine {
                 if mgen != cur_mgen {
                     return;
                 }
-                if let Ok((changed, _)) = self.pull_catalog_from_peer(&peer_id, mgen).await
+                if let Ok((changed, _, _)) = self.pull_catalog_from_peer(&peer_id, mgen).await
                     && changed
                     && self.net.membership_gen() == cur_mgen
                 {
@@ -552,7 +572,7 @@ impl SyncEngine {
                 if !watched {
                     return;
                 }
-                if let Ok(true) = self.pull_session_from_peer(sid, &peer_id, mgen).await
+                if let Ok((true, _)) = self.pull_session_from_peer(sid, &peer_id, mgen).await
                     && self.net.membership_gen() == cur_mgen
                 {
                     self.broadcast_dirty(false, vec![sid], Some(&peer_id)).await;
@@ -690,12 +710,14 @@ impl SyncEngine {
             RpcReq::ExchangePeers {
                 self_info,
                 mut peers,
+                voter_epoch,
+                voter_set,
             } => {
                 if peers.len() > MAX_PEX_PEERS {
                     peers.truncate(MAX_PEX_PEERS);
                 }
                 let addr = self.net.endpoint_addr();
-                let (my_info, my_peers, discovered) = self
+                let (my_info, my_peers, discovered, my_voter_epoch, my_voter_set) = self
                     .db
                     .call(move |s| {
                         let now = chrono::Utc::now().timestamp_millis();
@@ -721,13 +743,20 @@ impl SyncEngine {
                                 conn_gen,
                             )?;
                         }
+                        let (local, _) = adopt_voter_config(&s.conn, voter_epoch, &voter_set)?;
                         let my_info = self_peer_info(&local, &addr);
                         let mut my_peers = list_peers(&s.conn)?;
                         s.presence.set_local_role(local.role);
+                        s.presence.set_voter_config(
+                            local.voter_epoch,
+                            &local.voter_set,
+                            local.pending_voter_epoch,
+                            &local.pending_voter_set,
+                        );
                         s.presence.set_peer_roles(&my_peers);
                         s.presence.set_known_peer_count(my_peers.len());
                         my_peers.truncate(MAX_PEX_PEERS);
-                        Ok((my_info, my_peers, changed))
+                        Ok((my_info, my_peers, changed, local.voter_epoch, local.voter_set))
                     })
                     .await?;
                 if discovered {
@@ -737,6 +766,8 @@ impl SyncEngine {
                     RpcResp::Peers {
                         self_info: my_info,
                         peers: my_peers,
+                        voter_epoch: my_voter_epoch,
+                        voter_set: my_voter_set,
                     },
                     None,
                 ))
@@ -781,6 +812,52 @@ impl SyncEngine {
                     })
                     .await?;
                 Ok((RpcResp::SessionDelta(delta), None))
+            }
+            RpcReq::GetItemPayloadChunk {
+                session_id,
+                item_id,
+                offset,
+                len,
+            } => {
+                let req_len = usize::try_from(len).unwrap_or(0);
+                if req_len == 0 || req_len > ATT_CHUNK_SIZE || offset > MAX_ITEM_PAYLOAD_BYTES {
+                    return Err(Error::bad("invalid item payload chunk request"));
+                }
+                let chunk = self
+                    .db
+                    .call(move |s| {
+                        assert_membership_gen(&s.conn, conn_gen)?;
+                        let deleted: bool = s
+                            .conn
+                            .prepare_cached(
+                                "SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)",
+                            )?
+                            .query_row([session_id], |r| r.get(0))?;
+                        if deleted {
+                            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                        }
+                        let off_i64 = i64::try_from(offset)
+                            .map_err(|_| Error::bad("invalid item payload chunk offset"))?;
+                        let len_i64 = i64::try_from(req_len)
+                            .map_err(|_| Error::bad("invalid item payload chunk length"))?;
+                        let (total_len, chunk): (i64, Vec<u8>) = s
+                            .conn
+                            .prepare_cached(
+                                "SELECT length(CAST(payload AS BLOB)),
+                                        substr(CAST(payload AS BLOB), ?3, ?4)
+                                 FROM items WHERE id=?1 AND session_id=?2",
+                            )?
+                            .query_row(
+                                params![item_id, session_id, off_i64 + 1, len_i64],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )?;
+                        if off_i64 >= total_len || chunk.is_empty() {
+                            return Err(Error::bad("item payload chunk out of range"));
+                        }
+                        Ok(chunk)
+                    })
+                    .await?;
+                Ok((RpcResp::ItemPayloadChunk, Some(chunk)))
             }
             RpcReq::HasAttachments { hashes } => {
                 let mut limited = hashes;
@@ -934,7 +1011,7 @@ impl SyncEngine {
     async fn exchange_peers_with(&self, peer_id: &str) -> Result<()> {
         let mgen = self.net.membership_gen();
         let addr = self.net.endpoint_addr();
-        let (self_info, peers) = self
+        let (self_info, peers, voter_epoch, voter_set) = self
             .db
             .call(move |s| {
                 let local = load_local_node(&s.conn)?;
@@ -943,13 +1020,23 @@ impl SyncEngine {
                 }
                 let mut my_peers = list_peers(&s.conn)?;
                 my_peers.truncate(MAX_PEX_PEERS);
-                Ok((self_peer_info(&local, &addr), my_peers))
+                Ok((
+                    self_peer_info(&local, &addr),
+                    my_peers,
+                    local.voter_epoch,
+                    local.voter_set,
+                ))
             })
             .await?;
         let (resp, _) = self
             .rpc(
                 peer_id,
-                &RpcReq::ExchangePeers { self_info, peers },
+                &RpcReq::ExchangePeers {
+                    self_info,
+                    peers,
+                    voter_epoch,
+                    voter_set,
+                },
                 RPC_TIMEOUT_SHORT,
             )
             .await?;
@@ -959,6 +1046,8 @@ impl SyncEngine {
         if let RpcResp::Peers {
             self_info,
             mut peers,
+            voter_epoch,
+            voter_set,
         } = resp
         {
             if peers.len() > MAX_PEX_PEERS {
@@ -978,8 +1067,15 @@ impl SyncEngine {
                         changed |=
                             upsert_peer_if_gen(&s.conn, &local.node_id, &p, now, false, mgen)?;
                     }
+                    let (local, _) = adopt_voter_config(&s.conn, voter_epoch, &voter_set)?;
                     let all = list_peers(&s.conn)?;
                     s.presence.set_local_role(local.role);
+                    s.presence.set_voter_config(
+                        local.voter_epoch,
+                        &local.voter_set,
+                        local.pending_voter_epoch,
+                        &local.pending_voter_set,
+                    );
                     s.presence.set_peer_roles(&all);
                     s.presence.set_known_peer_count(all.len());
                     Ok(changed)
@@ -1043,10 +1139,80 @@ impl SyncEngine {
         }
     }
 
-    async fn pull_catalog_from_peer(&self, peer_id: &str, expected_mgen: i64) -> Result<(bool, usize)> {
-        let _guard = self.catalog_lock.lock().await;
+    async fn fetch_item_payload(
+        &self,
+        peer_id: &str,
+        sid: SessionId,
+        item_id: ItemId,
+        expected_len: u64,
+        expected_hash: [u8; 32],
+        expected_mgen: i64,
+    ) -> Result<String> {
+        if expected_len == 0 || expected_len > MAX_ITEM_PAYLOAD_BYTES {
+            return Err(Error::bad("invalid oversized item payload length"));
+        }
+        let total_len = usize::try_from(expected_len)
+            .map_err(|_| Error::bad("oversized item payload length overflow"))?;
+        let units = u32::try_from(total_len.div_ceil(ATT_CHUNK_SIZE))
+            .map_err(|_| Error::bad("item payload budget overflow"))?
+            .max(1);
+        let _budget = tokio::time::timeout(
+            RPC_TIMEOUT_DATA,
+            self.att_byte_budget.clone().acquire_many_owned(units),
+        )
+        .await
+        .map_err(|_| Error::conflict("item payload staging budget saturated"))?
+        .map_err(|_| Error::internal("item payload budget closed"))?;
+
+        let mut buf = Vec::with_capacity(total_len);
+        let mut hasher = blake3::Hasher::new();
+        while buf.len() < total_len {
+            if self.net.membership_gen() != expected_mgen {
+                return Err(Error::conflict(
+                    "cluster membership changed during payload fetch",
+                ));
+            }
+            let offset = buf.len() as u64;
+            let want = (total_len - buf.len()).min(ATT_CHUNK_SIZE);
+            let (resp, chunk) = self
+                .rpc(
+                    peer_id,
+                    &RpcReq::GetItemPayloadChunk {
+                        session_id: sid,
+                        item_id,
+                        offset,
+                        len: want as u32,
+                    },
+                    RPC_TIMEOUT_DATA,
+                )
+                .await?;
+            let RpcResp::ItemPayloadChunk = resp else {
+                return Err(Error::bad("unexpected GetItemPayloadChunk response"));
+            };
+            if chunk.is_empty() || chunk.len() > want {
+                return Err(Error::bad("invalid item payload chunk size"));
+            }
+            hasher.update(&chunk);
+            buf.extend_from_slice(&chunk);
+        }
+        if buf.len() != total_len || hasher.finalize().as_bytes() != &expected_hash {
+            return Err(Error::bad(
+                "item payload failed BLAKE3 integrity verification",
+            ));
+        }
+        String::from_utf8(buf).map_err(|_| Error::bad("item payload is not valid UTF-8"))
+    }
+
+    async fn pull_catalog_from_peer(
+        &self,
+        peer_id: &str,
+        expected_mgen: i64,
+    ) -> Result<(bool, usize, bool)> {
+        let lock = self.catalog_locks.lock_for(peer_id.to_owned());
+        let _guard = lock.lock().await;
         let mut any_changed = false;
         let mut total_rows = 0usize;
+        let mut caught_up = false;
         let mut prev_cursor: Option<(String, i64)> = None;
 
         for _ in 0..1024 {
@@ -1124,6 +1290,7 @@ impl SyncEngine {
                 total_rows += row_count;
             }
             if !has_more {
+                caught_up = true;
                 break;
             }
             let cur_key = (cur_epoch, next_rev);
@@ -1133,7 +1300,7 @@ impl SyncEngine {
             prev_cursor = Some(cur_key);
         }
 
-        Ok((any_changed, total_rows))
+        Ok((any_changed, total_rows, caught_up))
     }
 
     async fn pull_session_from_peer(
@@ -1141,10 +1308,11 @@ impl SyncEngine {
         sid: SessionId,
         peer_id: &str,
         expected_mgen: i64,
-    ) -> Result<bool> {
-        let lock = self.session_locks.lock_for(sid);
+    ) -> Result<(bool, bool)> {
+        let lock = self.session_locks.lock_for((sid, peer_id.to_owned()));
         let _guard = lock.lock().await;
         let mut any_changed = false;
+        let mut caught_up = false;
         let mut prev_vec: Option<BTreeMap<String, i64>> = None;
 
         for _ in 0..1024 {
@@ -1166,6 +1334,7 @@ impl SyncEngine {
                 })
                 .await?;
             if deleted_local {
+                caught_up = true;
                 break;
             }
             let (resp, _) = self
@@ -1178,11 +1347,45 @@ impl SyncEngine {
                     RPC_TIMEOUT_DATA,
                 )
                 .await?;
-            let RpcResp::SessionDelta(delta) = resp else {
+            let RpcResp::SessionDelta(mut delta) = resp else {
                 return Err(Error::bad("unexpected SessionSync response"));
             };
+            if delta.session_id != sid {
+                return Err(Error::bad("SessionDelta session_id mismatch"));
+            }
             if self.net.membership_gen() != expected_mgen {
                 break;
+            }
+            for item in &mut delta.items {
+                match (item.payload_len, item.payload_hash) {
+                    (Some(expected_len), Some(expected_hash)) => {
+                        if item.payload.is_empty() {
+                            item.payload = self
+                                .fetch_item_payload(
+                                    peer_id,
+                                    sid,
+                                    item.id,
+                                    expected_len,
+                                    expected_hash,
+                                    expected_mgen,
+                                )
+                                .await?;
+                        } else {
+                            let bytes = item.payload.as_bytes();
+                            if bytes.len() as u64 != expected_len
+                                || blake3::hash(bytes).as_bytes() != &expected_hash
+                            {
+                                return Err(Error::bad("inline item payload checksum mismatch"));
+                            }
+                        }
+                        item.payload_len = None;
+                        item.payload_hash = None;
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(Error::bad("incomplete item payload metadata"));
+                    }
+                    (None, None) => {}
+                }
             }
             let has_more = delta.has_more;
             let deleted = delta.deleted;
@@ -1205,6 +1408,7 @@ impl SyncEngine {
                 any_changed = true;
             }
             if deleted || !has_more {
+                caught_up = true;
                 break;
             }
             if prev_vec.as_ref() == Some(&next_vec) && next_vec.is_empty() {
@@ -1213,7 +1417,7 @@ impl SyncEngine {
             prev_vec = Some(next_vec);
         }
 
-        Ok(any_changed)
+        Ok((any_changed, caught_up))
     }
 
     pub async fn sync_with_peers(
@@ -1236,11 +1440,16 @@ impl SyncEngine {
         }
 
         let mut catalog_rows_updated = 0usize;
-        for peer_id in &peers {
-            if self.net.membership_gen() != mgen {
-                break;
-            }
-            if let Ok((_, rows)) = self.pull_catalog_from_peer(peer_id, mgen).await {
+        let mut catalog_futs = stream::iter(peers.iter().cloned())
+            .map(|peer_id| async move {
+                if self.net.membership_gen() != mgen {
+                    return Ok((false, 0, false));
+                }
+                self.pull_catalog_from_peer(&peer_id, mgen).await
+            })
+            .buffer_unordered(4);
+        while let Some(res) = catalog_futs.next().await {
+            if let Ok((_, rows, _)) = res {
                 catalog_rows_updated += rows;
             }
         }
@@ -1260,8 +1469,16 @@ impl SyncEngine {
                 break;
             }
             let mut updated_this = false;
-            for peer_id in &peers {
-                if let Ok(true) = self.pull_session_from_peer(sid, peer_id, mgen).await {
+            let mut sess_futs = stream::iter(peers.iter().cloned())
+                .map(|peer_id| async move {
+                    if self.net.membership_gen() != mgen {
+                        return Ok((false, false));
+                    }
+                    self.pull_session_from_peer(sid, &peer_id, mgen).await
+                })
+                .buffer_unordered(4);
+            while let Some(res) = sess_futs.next().await {
+                if let Ok((true, _)) = res {
                     updated_this = true;
                 }
             }
@@ -1277,51 +1494,158 @@ impl SyncEngine {
         })
     }
 
-    pub async fn sync_now(&self, session_id: Option<SessionId>) -> Result<SyncSummary> {
-        let _gate = self.sync_now_gate.lock().await;
-        if let Some(sid) = session_id {
-            self.db
-                .call(move |s| {
-                    let deleted: bool = s
-                        .conn
-                        .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
-                        .query_row([sid], |r| r.get(0))?;
-                    if deleted {
-                        return Err(rusqlite::Error::QueryReturnedNoRows.into());
-                    }
-                    mark_session_watched(&s.conn, sid)?;
-                    Ok(())
-                })
-                .await?;
-        }
-        let summary = self.sync_with_peers(None, session_id).await?;
-        if let Some(sid) = session_id {
-            let _ = self.ensure_session_attachments(sid).await;
-        }
-        Ok(summary)
-    }
-
-    pub async fn sync_session_latest(&self, sid: SessionId) -> Result<()> {
+    pub async fn sync_session_strict(&self, sid: SessionId, peers: &[String]) -> Result<()> {
         let deleted_local = self
             .db
             .call(move |s| {
-                let deleted: bool = s
-                    .conn
+                s.conn
                     .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
-                    .query_row([sid], |r| r.get(0))?;
-                if !deleted {
-                    mark_session_watched(&s.conn, sid)?;
-                }
-                Ok(deleted)
+                    .query_row([sid], |r| r.get::<_, bool>(0))
+                    .map_err(Into::into)
             })
             .await?;
         if deleted_local {
             return Err(rusqlite::Error::QueryReturnedNoRows.into());
         }
-        if !self.net.online_peer_ids().is_empty() {
-            let _ = self.sync_with_peers(None, Some(sid)).await?;
+        let mgen = self.net.membership_gen();
+        if !peers.is_empty() {
+            let results: Vec<Result<()>> = stream::iter(peers.iter().cloned())
+                .map(|peer_id| async move {
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    let (_, _, cat_caught_up) = self
+                        .pull_catalog_from_peer(&peer_id, mgen)
+                        .await
+                        .map_err(|err| {
+                            if self.net.membership_gen() != mgen {
+                                Error::conflict("membership generation changed")
+                            } else {
+                                Error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    format!("catalog sync with peer {peer_id} failed: {}", err.1),
+                                )
+                            }
+                        })?;
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    if !cat_caught_up {
+                        return Err(Error(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            format!(
+                                "catalog sync with peer {peer_id} truncated before catching up"
+                            ),
+                        ));
+                    }
+                    let (_, sess_caught_up) = self
+                        .pull_session_from_peer(sid, &peer_id, mgen)
+                        .await
+                        .map_err(|err| {
+                            if self.net.membership_gen() != mgen {
+                                Error::conflict("membership generation changed")
+                            } else {
+                                Error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    format!("session sync with peer {peer_id} failed: {}", err.1),
+                                )
+                            }
+                        })?;
+                    if !sess_caught_up {
+                        return Err(Error(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            format!(
+                                "session sync with peer {peer_id} truncated before catching up"
+                            ),
+                        ));
+                    }
+                    Ok(())
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            for res in results {
+                res?;
+            }
         }
-        let (exists, deleted) = self
+        self.db
+            .call(move |s| {
+                let row: Option<bool> = s
+                    .conn
+                    .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                    .query_row([sid], |r| r.get(0))
+                    .optional()?;
+                if row != Some(false) {
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                }
+                mark_session_watched(&s.conn, sid)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn sync_now(&self, session_id: Option<SessionId>) -> Result<SyncSummary> {
+        let _gate = self.sync_now_gate.lock().await;
+        let Some(sid) = session_id else {
+            return self.sync_with_peers(None, None).await;
+        };
+        let deleted_local = self
+            .db
+            .call(move |s| {
+                s.conn
+                    .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
+                    .query_row([sid], |r| r.get::<_, bool>(0))
+                    .map_err(Into::into)
+            })
+            .await?;
+        if deleted_local {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+
+        let mgen = self.net.membership_gen();
+        let peers = self.net.online_peer_ids();
+        let mut catalog_rows_updated = 0usize;
+        let mut catalog_ok = 0usize;
+        let mut first_cat_err: Option<Error> = None;
+        if !peers.is_empty() {
+            let mut cat_futs = stream::iter(peers.iter().cloned())
+                .map(|peer_id| async move {
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    self.pull_catalog_from_peer(&peer_id, mgen).await.map_err(|err| {
+                        Error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("catalog sync with peer {peer_id} failed: {}", err.1),
+                        )
+                    })
+                })
+                .buffer_unordered(4);
+            while let Some(res) = cat_futs.next().await {
+                match res {
+                    Ok((_, rows, true)) => {
+                        catalog_ok += 1;
+                        catalog_rows_updated += rows;
+                    }
+                    Ok((_, rows, false)) => {
+                        catalog_rows_updated += rows;
+                        if first_cat_err.is_none() {
+                            first_cat_err = Some(Error(
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "catalog sync truncated before catching up".into(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if first_cat_err.is_none() {
+                            first_cat_err = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let state_after_cat: Option<bool> = self
             .db
             .call(move |s| {
                 let row: Option<bool> = s
@@ -1329,13 +1653,104 @@ impl SyncEngine {
                     .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
                     .query_row([sid], |r| r.get(0))
                     .optional()?;
-                Ok((row.is_some(), row.unwrap_or(false)))
+                if row == Some(false) {
+                    mark_session_watched(&s.conn, sid)?;
+                }
+                Ok(row)
             })
             .await?;
-        if !exists || deleted {
-            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        match state_after_cat {
+            Some(true) => return Err(rusqlite::Error::QueryReturnedNoRows.into()),
+            None => {
+                if !peers.is_empty() && catalog_ok == 0 {
+                    return Err(first_cat_err.unwrap_or_else(|| {
+                        Error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "unable to reach cluster peers to verify session".into(),
+                        )
+                    }));
+                }
+                return Err(rusqlite::Error::QueryReturnedNoRows.into());
+            }
+            Some(false) => {}
         }
-        Ok(())
+
+        let mut session_updated = false;
+        if !peers.is_empty() {
+            let mut session_ok = 0usize;
+            let mut first_sess_err: Option<Error> = None;
+            let mut sess_futs = stream::iter(peers.iter().cloned())
+                .map(|peer_id| async move {
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    self.pull_session_from_peer(sid, &peer_id, mgen)
+                        .await
+                        .map_err(|err| {
+                            Error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                format!("session sync with peer {peer_id} failed: {}", err.1),
+                            )
+                        })
+                })
+                .buffer_unordered(4);
+            while let Some(res) = sess_futs.next().await {
+                match res {
+                    Ok((changed, true)) => {
+                        session_ok += 1;
+                        session_updated |= changed;
+                    }
+                    Ok((changed, false)) => {
+                        session_updated |= changed;
+                        if first_sess_err.is_none() {
+                            first_sess_err = Some(Error(
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "session sync truncated before catching up".into(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if first_sess_err.is_none() {
+                            first_sess_err = Some(e);
+                        }
+                    }
+                }
+            }
+            if session_ok == 0 {
+                return Err(first_sess_err.unwrap_or_else(|| {
+                    Error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "failed to sync session from peers".into(),
+                    )
+                }));
+            }
+            let exists_active: bool = self
+                .db
+                .call(move |s| {
+                    let row: Option<bool> = s
+                        .conn
+                        .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                        .query_row([sid], |r| r.get(0))
+                        .optional()?;
+                    Ok(row == Some(false))
+                })
+                .await?;
+            if !exists_active {
+                return Err(rusqlite::Error::QueryReturnedNoRows.into());
+            }
+        }
+
+        let _ = self.ensure_session_attachments(sid).await;
+        Ok(SyncSummary {
+            peers_queried: peers.len(),
+            catalog_rows_updated,
+            sessions_updated: usize::from(session_updated),
+        })
+    }
+
+    pub async fn sync_session_latest(&self, sid: SessionId) -> Result<()> {
+        let peers = self.net.online_peer_ids();
+        self.sync_session_strict(sid, &peers).await
     }
 
     pub async fn ensure_session_watched(&self, sid: SessionId) -> Result<()> {
@@ -1350,12 +1765,13 @@ impl SyncEngine {
                 if deleted == Some(true) {
                     return Ok((true, false));
                 }
-                let already_watched = is_session_watched(&s.conn, sid)?;
-                mark_session_watched(&s.conn, sid)?;
-                let complete = already_watched
-                    && deleted == Some(false)
-                    && session_branch_complete(&s.conn, sid)?;
-                Ok((false, complete))
+                if deleted == Some(false) {
+                    let already_watched = is_session_watched(&s.conn, sid)?;
+                    mark_session_watched(&s.conn, sid)?;
+                    let complete = already_watched && session_branch_complete(&s.conn, sid)?;
+                    return Ok((false, complete));
+                }
+                Ok((false, false))
             })
             .await?;
         if deleted {
@@ -1370,9 +1786,18 @@ impl SyncEngine {
         let now_deleted = self
             .db
             .call(move |s| {
-                Ok(s.conn
-                    .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
-                    .query_row([sid], |r| r.get::<_, bool>(0))?)
+                let row: Option<bool> = s
+                    .conn
+                    .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                    .query_row([sid], |r| r.get(0))
+                    .optional()?;
+                if row == Some(true) {
+                    return Ok(true);
+                }
+                if row == Some(false) {
+                    mark_session_watched(&s.conn, sid)?;
+                }
+                Ok(false)
             })
             .await?;
         if now_deleted {
@@ -1899,9 +2324,20 @@ fn abort_active_session_worker(s: &mut Store, streams: &Hub, sid: SessionId) {
     if let Some(ctrl) = s.active.remove(&sid) {
         ctrl.soft.cancel();
         ctrl.hard.cancel();
+        if let Some(ref lease) = ctrl.lease {
+            lease.stopped.cancel();
+            s.presence.clear_active_local_lease(sid, &lease.claim_id);
+        }
+    } else if let Some(lease) = s.presence.active_local_lease(sid) {
+        lease.stopped.cancel();
+        s.presence.clear_active_local_lease(sid, &lease.claim_id);
     }
     s.pending_wakes.remove(&sid);
     crate::codemode::stop_session(s, sid);
+    let _ = s.conn.execute(
+        "UPDATE sessions SET local_status=NULL, local_error='' WHERE id=?1 AND local_status IS NOT NULL",
+        [sid],
+    );
     s.refresh_local_presence(sid);
     s.bump_run_gen(sid);
     s.bump_reset_gen(sid);
@@ -1930,12 +2366,15 @@ fn publish_catalog_merge(
     for &sid in &outcome.changed_sessions {
         s.wake_waiters(sid);
         if outcome.switched_sessions.contains(&sid) {
+            abort_active_session_worker(s, streams, sid);
+            let view = s.bump_view_rev(sid);
             if let Some(ch) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
-                crate::events::Notice::publish(&ch, "session.reset", json!({}));
+                crate::events::Notice::publish(&ch, "session.reset", json!({ "view": view }));
             }
         } else if outcome.resync_sessions.contains(&sid) {
+            let view = s.bump_view_rev(sid);
             if let Some(ch) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
-                crate::events::Notice::publish(&ch, "resync", json!({}));
+                crate::events::Notice::publish(&ch, "resync", json!({ "view": view }));
             }
         }
         if let Ok(info) = session(&s.conn, sid) {
@@ -1970,10 +2409,14 @@ fn publish_session_merge(
     }
     s.wake_waiters(sid);
     if outcome.reset_view {
+        let view = s.bump_view_rev(sid);
         if let Some(ch) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
-            crate::events::Notice::publish(&ch, "session.reset", json!({}));
+            crate::events::Notice::publish(&ch, "session.reset", json!({ "view": view }));
         }
     } else {
+        if outcome.out_of_order_view {
+            let _ = s.bump_view_rev(sid);
+        }
         for &id in &outcome.new_items {
             let _ = s.item_saved(sid, id);
         }

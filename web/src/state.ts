@@ -1,4 +1,4 @@
-import { errorMessage } from "./api.ts";
+import { ApiError, errorMessage } from "./api.ts";
 import type {
   ActiveDraft,
   ComposerAttachment,
@@ -617,10 +617,15 @@ export function createGlobalSessionSync({
   };
 }
 
+export interface HistoryPageResult {
+  items: HistoryItem[];
+  view: string;
+}
+
 export interface SessionSyncOptions {
-  fetchInitial: () => Promise<HistoryItem[]>;
-  fetchAfter: (afterId: string) => Promise<HistoryItem[]>;
-  fetchBefore?: (beforeId: string, signal: AbortSignal) => Promise<HistoryItem[]>;
+  fetchInitial: () => Promise<HistoryPageResult>;
+  fetchAfter: (afterId: string, expectedView: string) => Promise<HistoryPageResult>;
+  fetchBefore?: (beforeId: string, expectedView: string, signal: AbortSignal) => Promise<HistoryPageResult>;
   onLoadingOlder?: (loading: boolean) => void;
   onItems: (items: HistoryItem[]) => void;
   onReplaceItems?: (items: HistoryItem[]) => void;
@@ -634,12 +639,12 @@ export interface SessionSyncOptions {
 export interface SessionSync {
   loadOlder: (beforeId: string) => Promise<void>;
   start: () => void;
-  onReady: () => void;
-  onResync: () => void;
+  onReady: (view?: string) => void;
+  onResync: (view?: string) => void;
   onReset: () => void;
   onLiveItem: (item: HistoryItem) => void;
   dispose: () => void;
-  getState: () => { initialLoaded: boolean; syncedThroughId: string; gapOpen: boolean };
+  getState: () => { initialLoaded: boolean; syncedThroughId: string; gapOpen: boolean; knownView: string };
 }
 
 export function createSessionSync({
@@ -658,6 +663,7 @@ export function createSessionSync({
   let disposed = false;
   let initialLoaded = false;
   let syncedThroughId = "";
+  let knownView = "";
   let gapOpen = false;
   let inFlight = false;
   let runAgain = false;
@@ -688,6 +694,18 @@ export function createSessionSync({
       .catch(() => {});
   };
 
+  const prepareResetState = (): void => {
+    cancelOlder();
+    resetGen += 1;
+    initialLoaded = false;
+    syncedThroughId = "";
+    knownView = "";
+    gapOpen = true;
+    replaceNext = true;
+    retryDelay = 1000;
+    clearRetry();
+  };
+
   const runSync = async (): Promise<void> => {
     if (disposed) return;
     if (inFlight) {
@@ -700,8 +718,9 @@ export function createSessionSync({
     let shouldScheduleRetry = false;
     try {
       if (!initialLoaded) {
-        const hist = await fetchInitial();
+        const { items: hist, view } = await fetchInitial();
         if (disposed || myGen !== resetGen) return;
+        knownView = view;
         if (replaceNext && onReplaceItems) {
           onReplaceItems(hist);
         } else {
@@ -716,15 +735,26 @@ export function createSessionSync({
         onError?.("");
         if (!runAgain) triggerSidecars();
       } else {
+        const activeView = knownView;
+        if (!activeView) {
+          prepareResetState();
+          runAgain = true;
+          return;
+        }
         while (!disposed) {
-          const page = await fetchAfter(syncedThroughId);
+          const page = await fetchAfter(syncedThroughId, activeView);
           if (disposed || myGen !== resetGen) return;
-          if (page.length) {
-            onItems(page);
-            const last = page[page.length - 1].id;
+          if (!page.view || page.view !== activeView) {
+            prepareResetState();
+            runAgain = true;
+            return;
+          }
+          if (page.items.length) {
+            onItems(page.items);
+            const last = page.items[page.items.length - 1].id;
             if (last > syncedThroughId) syncedThroughId = last;
           }
-          if (page.length < 200) break;
+          if (page.items.length < 200) break;
         }
         if (!disposed && myGen === resetGen && !runAgain) {
           gapOpen = false;
@@ -735,6 +765,11 @@ export function createSessionSync({
       }
     } catch (e) {
       if (disposed || myGen !== resetGen) return;
+      if (e instanceof ApiError && e.status === 409) {
+        prepareResetState();
+        runAgain = true;
+        return;
+      }
       if (initialLoaded) gapOpen = true;
       onError?.(errorMessage(e));
       shouldScheduleRetry = !runAgain;
@@ -761,28 +796,25 @@ export function createSessionSync({
     void runSync();
   };
 
-  const syncAfterGap = (): void => {
+  const syncAfterGap = (view?: string): void => {
     if (disposed) return;
+    if (initialLoaded && typeof view === "string" && knownView !== "" && view !== knownView) {
+      onReset();
+      return;
+    }
     gapOpen = true;
     retryDelay = 1000;
     clearRetry();
     void runSync();
   };
 
-  const onReady = (): void => syncAfterGap();
+  const onReady = (view?: string): void => syncAfterGap(view);
 
-  const onResync = (): void => syncAfterGap();
+  const onResync = (view?: string): void => syncAfterGap(view);
 
   const onReset = (): void => {
     if (disposed) return;
-    cancelOlder();
-    resetGen += 1;
-    initialLoaded = false;
-    syncedThroughId = "";
-    gapOpen = true;
-    replaceNext = true;
-    retryDelay = 1000;
-    clearRetry();
+    prepareResetState();
     if (inFlight) {
       runAgain = true;
     } else {
@@ -792,18 +824,32 @@ export function createSessionSync({
 
   const loadOlder = async (beforeId: string): Promise<void> => {
     if (disposed || !initialLoaded || olderRequest || !fetchBefore) return;
+    const activeView = knownView;
+    if (!activeView) {
+      onReset();
+      return;
+    }
+    const myGen = resetGen;
     const request = new AbortController();
     olderRequest = request;
     onLoadingOlder?.(true);
     try {
-      const page = await fetchBefore(beforeId, request.signal);
-      if (request.signal.aborted) return;
-      onItems(page);
-      onHasMore(page.length === 50);
+      const page = await fetchBefore(beforeId, activeView, request.signal);
+      if (request.signal.aborted || myGen !== resetGen) return;
+      if (!page.view || page.view !== activeView) {
+        onReset();
+        return;
+      }
+      onItems(page.items);
+      onHasMore(page.items.length === 50);
     } catch (e) {
-      if (!request.signal.aborted) {
-        onError?.(errorMessage(e));
-        onResync();
+      if (!request.signal.aborted && myGen === resetGen) {
+        if (e instanceof ApiError && e.status === 409) {
+          onReset();
+        } else {
+          onError?.(errorMessage(e));
+          onResync();
+        }
       }
     } finally {
       if (olderRequest === request) {
@@ -827,7 +873,7 @@ export function createSessionSync({
     clearRetry();
   };
 
-  const getState = () => ({ initialLoaded, syncedThroughId, gapOpen });
+  const getState = () => ({ initialLoaded, syncedThroughId, gapOpen, knownView });
 
   return { start, onReady, onResync, onReset, onLiveItem, loadOlder, dispose, getState };
 }

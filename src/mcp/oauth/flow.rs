@@ -51,35 +51,53 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
     getrandom::fill(&mut nonce).map_err(|_| Error::internal("OAuth nonce unavailable"))?;
     let generation: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
     let key = generation.clone();
-    let (revision, server, timeout, local_node_id) = app
+    let (revision, server, timeout, local_node_id, auth_config_ts, auth_fingerprint) = app
         .db
         .write(
             move |conn| {
-                let (raw, revision, timeout, oauth): (String, i64, u32, bool) = conn.query_row(
-                    "SELECT config_json,revision,timeout_ms,json_type(config_json,'$.oauth') IS 'object'
+                let (transport, raw, revision, timeout, oauth, auth_config_ts): (
+                    String,
+                    String,
+                    i64,
+                    u32,
+                    bool,
+                    String,
+                ) = conn.query_row(
+                    "SELECT transport,config_json,revision,timeout_ms,json_type(config_json,'$.oauth') IS 'object',auth_config_ts
                      FROM mcp_servers WHERE id=? AND deleted=0",
                     [id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )?;
                 if !oauth {
                     return Err(Error::bad("MCP server has no OAuth configuration"));
                 }
                 let server: Server = decode(&raw)?;
                 server.oauth.validate()?;
+                let auth_fp = crate::cluster::ledger::auth_config_fingerprint(&transport, &raw);
                 let sql = format!(
-                    "INSERT INTO mcp_oauth(server_id,generation) VALUES(?,?) ON CONFLICT(server_id)
-                     DO UPDATE SET generation=excluded.generation,binding=NULL,pending=NULL,credentials=NULL,pending_refresh=NULL,rejected=0
+                    "INSERT INTO mcp_oauth(server_id,generation,auth_config_ts,auth_fingerprint) VALUES(?,?,?,?)
+                     ON CONFLICT(server_id)
+                     DO UPDATE SET generation=excluded.generation,auth_config_ts=excluded.auth_config_ts,
+                                   auth_fingerprint=excluded.auth_fingerprint,binding=NULL,pending=NULL,
+                                   credentials=NULL,pending_refresh=NULL,rejected=0
                      WHERE NOT {}",
                     super::storage::AUTHORIZED_SQL
                 );
-                let updated = conn.execute(&sql, params![id, key])?;
+                let updated = conn.execute(&sql, params![id, key, auth_config_ts, auth_fp])?;
                 if updated == 0 {
                     return Err(Error::conflict(
                         "MCP OAuth already authorized; sign out before replacing the account",
                     ));
                 }
                 let local_node_id = crate::cluster::identity::load_local_node(conn)?.node_id;
-                Ok((revision, server, Duration::from_millis(timeout.into()), local_node_id))
+                Ok((
+                    revision,
+                    server,
+                    Duration::from_millis(timeout.into()),
+                    local_node_id,
+                    auth_config_ts,
+                    auth_fp,
+                ))
             },
             move |s, values| {
                 s.mcp.oauth().cancel_login(id);
@@ -93,6 +111,9 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
         id,
         revision,
         generation,
+        auth_config_ts,
+        auth_fingerprint,
+        allow_disabled: true,
     };
     tokio::time::timeout(
         timeout,
@@ -271,34 +292,47 @@ pub(super) async fn complete(
     let mut redirect = url.clone();
     redirect.set_query(None);
     let lookup_state = state.clone();
-    let (binding, endpoint, revision, generation, timeout, pending) = db
+    let (binding, endpoint, revision, generation, timeout, pending, auth_config_ts, auth_fingerprint) = db
         .call(move |s| {
-            let sql = "SELECT binding,json_extract(config_json,'$.url'),revision,generation,timeout_ms,pending
-                FROM mcp_oauth JOIN mcp_servers ON id=server_id WHERE id=?1 AND deleted=0
-                AND json_extract(pending,'$.csrf_token')=?2 AND json_extract(pending,'$.created_at')+?3>unixepoch()";
+            let sql = "SELECT o.binding, m.transport, m.config_json, m.revision, o.generation,
+                              m.timeout_ms, o.pending, m.auth_config_ts, o.auth_config_ts, o.auth_fingerprint
+                FROM mcp_oauth o JOIN mcp_servers m ON m.id=o.server_id WHERE m.id=?1 AND m.deleted=0
+                AND json_extract(o.pending,'$.csrf_token')=?2 AND json_extract(o.pending,'$.created_at')+?3>unixepoch()";
             let row = s
                 .conn
                 .query_row(sql, params![id, lookup_state, LOGIN_TTL], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, u32>(4)?,
-                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, u32>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, String>(8)?,
+                        r.get::<_, String>(9)?,
                     ))
                 })
                 .map_err(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => Error::bad("unknown or expired OAuth login"),
                     other => other.into(),
                 })?;
-            let (raw, endpoint, revision, generation, ms, pending) = row;
+            let (raw, transport, cfg, revision, generation, ms, pending, m_auth_ts, o_auth_ts, o_fp) = row;
             if expected_generation
                 .as_ref()
                 .is_some_and(|expected| expected != &generation)
             {
                 return Err(Error::bad("OAuth login superseded"));
             }
+            let live_fp = crate::cluster::ledger::auth_config_fingerprint(&transport, &cfg);
+            if m_auth_ts != o_auth_ts || o_fp != live_fp {
+                return Err(Error::bad("OAuth login superseded"));
+            }
+            let endpoint = serde_json::from_str::<serde_json::Value>(&cfg)
+                .ok()
+                .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_owned))
+                .ok_or_else(|| Error::bad("invalid MCP OAuth endpoint"))?;
             Ok((
                 decode::<Binding>(&raw)?,
                 endpoint,
@@ -306,6 +340,8 @@ pub(super) async fn complete(
                 generation,
                 Duration::from_millis(ms.into()),
                 decode::<PendingState>(&pending)?,
+                m_auth_ts,
+                o_fp,
             ))
         })
         .await?;
@@ -345,6 +381,9 @@ pub(super) async fn complete(
         id,
         revision,
         generation,
+        auth_config_ts,
+        auth_fingerprint,
+        allow_disabled: true,
     };
     account.consume_pending(&state).await?;
     let base = discovery_base(&endpoint)?;

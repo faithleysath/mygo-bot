@@ -95,7 +95,7 @@ async fn set_archived<K: Prefix>(
             move |conn| {
                 let timestamp = archive.then(|| chrono::Utc::now().timestamp_millis());
                 let ts = crate::cluster::ledger::tick_hlc(conn)?;
-                let rev = crate::cluster::ledger::next_catalog_rev();
+                let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
                 if table == "llm_providers" {
                     if !archive {
                         let clash: bool = conn
@@ -318,22 +318,20 @@ fn save_provider(
         ));
     }
     let ts = crate::cluster::ledger::tick_hlc(conn)?;
-    let rev = crate::cluster::ledger::next_catalog_rev();
+    let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
     let api_key = provider.api_key.filter(|k| !k.is_empty());
     let name_ts = (old.is_none() || has_name).then(|| ts.as_str());
-    let base_url_ts = (old.is_none() || has_base_url).then(|| ts.as_str());
-    let api_key_ts = (old.is_none() || has_api_key).then(|| ts.as_str());
+    let endpoint_ts = (old.is_none() || has_base_url || has_api_key).then(|| ts.as_str());
     let id: ProviderId = conn
         .query_row(
-            "INSERT INTO llm_providers(id,name,name_ts,base_url,base_url_ts,api_key,api_key_ts,sync_rev)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+            "INSERT INTO llm_providers(id,name,name_ts,base_url,api_key,endpoint_ts,sync_rev)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(id) DO UPDATE SET
                name=excluded.name,
-               name_ts=coalesce(?9, llm_providers.name_ts),
+               name_ts=coalesce(?8, llm_providers.name_ts),
                base_url=excluded.base_url,
-               base_url_ts=coalesce(?10, llm_providers.base_url_ts),
                api_key=excluded.api_key,
-               api_key_ts=coalesce(?11, llm_providers.api_key_ts),
+               endpoint_ts=coalesce(?9, llm_providers.endpoint_ts),
                sync_rev=excluded.sync_rev
              RETURNING id",
             params![
@@ -341,13 +339,11 @@ fn save_provider(
                 provider.name,
                 ts,
                 provider.base_url,
-                ts,
                 api_key,
                 ts,
                 rev,
                 name_ts,
-                base_url_ts,
-                api_key_ts
+                endpoint_ts
             ],
             |r| r.get(0),
         )
@@ -581,7 +577,7 @@ fn save_model(conn: &Connection, id: Option<ModelId>, fields: Document) -> Resul
         ));
     }
     let ts = crate::cluster::ledger::tick_hlc(conn)?;
-    let rev = crate::cluster::ledger::next_catalog_rev();
+    let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
     let is_new = old.is_none();
     let id_ts = (is_new || has_identity).then(|| ts.as_str());
     let cw_ts = (is_new || has_cw).then(|| ts.as_str());

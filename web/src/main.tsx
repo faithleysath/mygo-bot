@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   ApiError,
   apiFetch,
+  apiFetchWithHeaders,
   connectSse,
   consumeHashToken,
   errorMessage,
@@ -721,18 +722,21 @@ function App() {
     const isCallClosed = (callId: string) =>
       closedCalls.has(callId) || (clearedThroughCallId !== "" && callId <= clearedThroughCallId);
 
-    const fetchHistoryPage = (url: string, signal?: AbortSignal) =>
-      apiFetch<HistoryItem[]>(url, { signal });
+    const fetchHistoryPage = async (url: string, signal?: AbortSignal) => {
+      const { data, headers } = await apiFetchWithHeaders<HistoryItem[]>(url, { signal });
+      return { items: data, view: headers.get("X-History-View") || "" };
+    };
     const sessionSync = createSessionSync({
       fetchInitial: () => fetchHistoryPage(`/sessions/${sid}/history?tail=true&limit=50`),
-      fetchAfter: (afterId) =>
-        fetchHistoryPage(
-          afterId
-            ? `/sessions/${sid}/history?after=${encodeURIComponent(afterId)}&limit=200`
-            : `/sessions/${sid}/history?limit=200`
-        ),
-      fetchBefore: (beforeId, signal) =>
-        fetchHistoryPage(`/sessions/${sid}/history?before=${encodeURIComponent(beforeId)}&limit=50`, signal),
+      fetchAfter: (afterId, expectedView) => {
+        const params = new URLSearchParams({ limit: "200", view: expectedView });
+        if (afterId) params.set("after", afterId);
+        return fetchHistoryPage(`/sessions/${sid}/history?${params.toString()}`);
+      },
+      fetchBefore: (beforeId, expectedView, signal) => {
+        const params = new URLSearchParams({ before: beforeId, limit: "50", view: expectedView });
+        return fetchHistoryPage(`/sessions/${sid}/history?${params.toString()}`, signal);
+      },
       onLoadingOlder: setLoadingMore,
       onItems: (page) => {
         if (activeIdRef.current === sid && sessionEpochRef.current === epoch) {
@@ -758,9 +762,13 @@ function App() {
     sessionSyncRef.current = sessionSync;
     sessionSync.start();
 
+    let sseView = "";
     const ctrl = new AbortController();
     connectSse(`/sessions/${sid}/events`, {
       signal: ctrl.signal,
+      onOpen: (view) => {
+        sseView = view;
+      },
       onStatus: setSseStatus,
       onEvent: (name, data) => {
         if (activeIdRef.current !== sid || sessionEpochRef.current !== epoch) return;
@@ -770,7 +778,7 @@ function App() {
           setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
           setDraft(null);
           setRetryNotice(null);
-          sessionSync.onReady();
+          sessionSync.onReady(sseView);
         } else if (name === "stream.snapshot") {
           const snap = data as ActiveDraft;
           if (!isCallClosed(snap.llm_call_id)) {
@@ -877,6 +885,10 @@ function App() {
           sessionSync.onReset();
         } else if (name === "resync") {
           setRetryNotice(null);
+          const evView =
+            data && typeof data === "object" && typeof (data as { view?: unknown }).view === "string"
+              ? (data as { view: string }).view
+              : undefined;
           globalSyncRef.current?.touchSession(sid);
           apiFetch<SessionInfo>(`/sessions/${sid}`)
             .then((sess) => {
@@ -886,7 +898,7 @@ function App() {
               }
             })
             .catch(() => {});
-          sessionSync.onResync();
+          sessionSync.onResync(evView);
         }
       },
     });

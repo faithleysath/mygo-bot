@@ -126,7 +126,9 @@ impl Connections {
         if change.cancel_login {
             self.oauth().cancel_login(change.id);
         }
-        self.forget(change.id);
+        if change.evict_pool {
+            self.forget(change.id);
+        }
     }
     pub fn forget_session(&mut self, sid: SessionId) {
         self.slots.retain(|(session, _), (slot, _)| {

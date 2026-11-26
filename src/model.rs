@@ -1,7 +1,7 @@
 use crate::{
     App, Error, Result,
     calls::Report,
-    id::{CallId, SessionId},
+    id::{CallId, ContextNodeId, SessionId},
     store::{self, Db},
     tools,
 };
@@ -27,6 +27,7 @@ pub struct Input {
     pub api_key: Option<String>,
     pub effort: Option<String>,
     pub end: i64,
+    pub head: Option<ContextNodeId>,
 }
 #[derive(Default)]
 pub struct Output {
@@ -36,6 +37,7 @@ pub struct Output {
     pub final_output_index: Option<u32>,
     pub tools: bool,
     pub tasks: JoinSet<Result<()>>,
+    pub current_head: Option<ContextNodeId>,
 }
 pub enum Failure {
     Cancelled,
@@ -90,7 +92,7 @@ async fn body(db: Db, sid: SessionId, input: &Input) -> Result<reqwest::Body> {
         prefix.push(b'}');
     }
     prefix.extend_from_slice(tools_and_dev);
-    crate::media::model_input(db, sid, input.end, prefix).await
+    crate::media::model_input(db, sid, input.end, input.head, prefix).await
 }
 #[derive(Deserialize)]
 struct Frame {
@@ -211,6 +213,7 @@ impl App {
         hard: &CancellationToken,
         run_gen: u64,
     ) -> std::result::Result<(), Failure> {
+        out.current_head = input.head;
         let body = body(self.db.clone(), sid, &input).await?;
         let mut request = self
             .client
@@ -389,6 +392,7 @@ impl App {
                 .to_owned();
             let name = item["name"].as_str().unwrap_or_default().to_owned();
             let args = item["arguments"].as_str().unwrap_or_default().to_owned();
+            let expected_head = out.current_head;
             let call_key = call.clone();
             let id = self
                 .db
@@ -396,6 +400,12 @@ impl App {
                     sid,
                     run_gen,
                     move |conn| {
+                        let cur_head: Option<ContextNodeId> = conn
+                            .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+                            .query_row([sid], |r| r.get(0))?;
+                        if cur_head != expected_head {
+                            return Err(Error::conflict("session branch changed during execution"));
+                        }
                         let sql =
                             "SELECT payload FROM items WHERE session_id=? AND kind='function_call'
                            AND json_extract(payload,'$.call_id')=? LIMIT 1";
@@ -462,16 +472,30 @@ impl App {
             kind
         }
         .to_owned();
-        self.db
+        let expected_head = out.current_head;
+        let (id, next_head) = self
+            .db
             .write_for_run(
                 sid,
                 run_gen,
-                move |conn| store::add_context_item(conn, sid, &kind, &item, llm_call_id),
-                move |s, id| {
+                move |conn| {
+                    store::add_context_item_at(
+                        conn,
+                        sid,
+                        &kind,
+                        &item,
+                        llm_call_id,
+                        Some(expected_head),
+                    )
+                },
+                move |s, (id, next_head)| {
                     s.item_saved(sid, id)?;
-                    Ok(())
+                    Ok((id, next_head))
                 },
             )
-            .await
+            .await?;
+        let _ = id;
+        out.current_head = next_head;
+        Ok(())
     }
 }

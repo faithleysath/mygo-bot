@@ -3,9 +3,8 @@ CREATE TABLE llm_providers (
     name TEXT NOT NULL,
     name_ts TEXT NOT NULL DEFAULT '',
     base_url TEXT NOT NULL,
-    base_url_ts TEXT NOT NULL DEFAULT '',
     api_key TEXT,
-    api_key_ts TEXT NOT NULL DEFAULT '',
+    endpoint_ts TEXT NOT NULL DEFAULT '',
     archived_at INTEGER,
     archived_ts TEXT NOT NULL DEFAULT '',
     sync_rev INTEGER NOT NULL DEFAULT 0 CHECK (sync_rev >= 0)
@@ -64,6 +63,8 @@ CREATE TABLE mcp_servers (
     timeout_ts TEXT NOT NULL DEFAULT '',
     revision INTEGER NOT NULL CHECK (revision > 0),
     config_ts TEXT NOT NULL DEFAULT '',
+    auth_config_ts TEXT NOT NULL DEFAULT '',
+    oauth_epoch_ts TEXT NOT NULL DEFAULT '',
     oauth_ts TEXT NOT NULL DEFAULT '',
     deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0,1)),
     sync_rev INTEGER NOT NULL DEFAULT 0 CHECK (sync_rev >= 0),
@@ -75,6 +76,8 @@ CREATE INDEX mcp_servers_by_rev ON mcp_servers(sync_rev, id) WHERE shared = 1;
 CREATE TABLE mcp_oauth (
     server_id TEXT PRIMARY KEY,
     generation TEXT NOT NULL,
+    auth_config_ts TEXT NOT NULL DEFAULT '',
+    auth_fingerprint TEXT NOT NULL DEFAULT '',
     binding TEXT,
     pending TEXT,
     credentials TEXT,
@@ -88,9 +91,11 @@ CREATE TABLE sessions (
     title_ts TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle','running','pausing','paused')),
+    status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle','paused')),
     last_error TEXT NOT NULL DEFAULT '',
     status_ts TEXT NOT NULL DEFAULT '',
+    local_status TEXT CHECK (local_status IS NULL OR local_status IN ('running','pausing','paused')),
+    local_error TEXT NOT NULL DEFAULT '',
     model_id TEXT NOT NULL,
     reasoning_effort TEXT,
     selection_ts TEXT NOT NULL DEFAULT '',
@@ -109,6 +114,7 @@ CREATE TABLE llm_calls (
     model_id TEXT NOT NULL,
     reasoning_effort TEXT,
     input_end_position INTEGER,
+    input_head TEXT,
     started_at INTEGER NOT NULL,
     finished_at INTEGER,
     status TEXT NOT NULL CHECK(status IN ('in_flight','succeeded','failed','cancelled','interrupted')),
@@ -167,7 +173,7 @@ CREATE INDEX items_by_target ON items(kind, target_id, id) WHERE target_id IS NO
 CREATE INDEX items_by_llm_call ON items(llm_call_id) WHERE llm_call_id IS NOT NULL;
 CREATE INDEX items_by_kind ON items(session_id, kind, id);
 CREATE INDEX tools_by_call ON items(session_id, json_extract(payload,'$.call_id')) WHERE kind='function_call';
-CREATE INDEX items_by_idempotency ON items(session_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX items_by_idempotency ON items(session_id, idempotency_key, id) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX codemode_receipts ON items(codemode_call_item_id)
     WHERE kind='function_call_output' AND codemode_call_item_id IS NOT NULL;
 CREATE INDEX codemode_event_sequence ON items(codemode_call_item_id, json_extract(payload,'$.sequence'))
@@ -248,7 +254,12 @@ CREATE TABLE local_node (
     role TEXT NOT NULL DEFAULT 'voter' CHECK (role IN ('voter','edge')),
     db_epoch TEXT NOT NULL CHECK (db_epoch != ''),
     meta_seq INTEGER NOT NULL DEFAULT 1 CHECK (meta_seq > 0),
-    membership_gen INTEGER NOT NULL DEFAULT 1 CHECK (membership_gen > 0)
+    membership_gen INTEGER NOT NULL DEFAULT 1 CHECK (membership_gen > 0),
+    catalog_rev INTEGER NOT NULL DEFAULT 0 CHECK (catalog_rev >= 0),
+    voter_epoch INTEGER NOT NULL DEFAULT 1 CHECK (voter_epoch >= 0),
+    voter_set_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(voter_set_json) = 'array'),
+    pending_voter_epoch INTEGER NOT NULL DEFAULT 0 CHECK (pending_voter_epoch >= 0),
+    pending_voter_set_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(pending_voter_set_json) = 'array')
 );
 
 CREATE TABLE cluster_peers (
@@ -289,4 +300,4 @@ CREATE TABLE session_leases (
     expires_at_ms INTEGER NOT NULL DEFAULT 0
 );
 
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;

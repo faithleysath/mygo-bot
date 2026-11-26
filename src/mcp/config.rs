@@ -394,6 +394,9 @@ fn save(
         McpTransport::StreamableHttp => "streamable-http",
         McpTransport::Stdio => "stdio",
     };
+    let connection_str = serde_json::to_string(&connection)
+        .map_err(|e| Error::internal(format!("failed to encode MCP config: {e}")))?;
+    let auth_fp = crate::cluster::ledger::auth_config_fingerprint(transport, &connection_str);
 
     if let Some((old_id, mcp)) = update
         && old.as_ref().is_some_and(|s| s.cfg.shared && !c.shared)
@@ -436,8 +439,8 @@ fn save(
             "INSERT INTO mcp_servers(
                 id,name,name_ts,description,description_ts,enabled,enabled_ts,shared,transport,
                 allowed_tools,allowed_tools_ts,config_json,timeout_ms,timeout_ts,revision,
-                config_ts,oauth_ts,deleted,sync_rev
-             ) VALUES(?1,?2,?9,?3,?9,?4,?9,0,?5,?6,?9,?7,?8,?9,1,?9,?9,0,0)",
+                config_ts,auth_config_ts,oauth_epoch_ts,oauth_ts,deleted,sync_rev
+             ) VALUES(?1,?2,?9,?3,?9,?4,?9,0,?5,?6,?9,?7,?8,?9,1,?9,?9,?9,?9,0,0)",
             params![
                 new_id,
                 c.name,
@@ -452,12 +455,12 @@ fn save(
         )?;
         if let Some((generation, binding, credentials, rejected)) = old_oauth {
             conn.execute(
-                "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,pending_refresh,rejected)
-                 VALUES(?,?,?,NULL,?,NULL,?)",
-                params![new_id, generation, binding, credentials, rejected],
+                "INSERT INTO mcp_oauth(server_id,generation,auth_config_ts,auth_fingerprint,binding,pending,credentials,pending_refresh,rejected)
+                 VALUES(?,?,?,?,?,NULL,?,NULL,?)",
+                params![new_id, generation, ts, auth_fp, binding, credentials, rejected],
             )?;
         }
-        return Ok((by_id(conn, new_id)?, config_changed, Some(old_id)));
+        return Ok((by_id(conn, new_id)?, oauth_invalidated, Some(old_id)));
     }
 
     let id = match id {
@@ -474,15 +477,16 @@ fn save(
     }
     let ts = crate::cluster::ledger::tick_hlc(conn)?;
     let sync_rev = if c.shared {
-        crate::cluster::ledger::next_catalog_rev()
+        crate::cluster::ledger::next_catalog_rev(conn)?
     } else {
         0
     };
+    let promoted_to_shared = old.as_ref().is_some_and(|s| !s.cfg.shared && c.shared);
     let sql = "INSERT INTO mcp_servers(
             id,name,name_ts,description,description_ts,enabled,enabled_ts,shared,transport,
             allowed_tools,allowed_tools_ts,config_json,timeout_ms,timeout_ts,revision,
-            config_ts,oauth_ts,deleted,sync_rev
-        ) VALUES(?1,?2,?10,?3,?10,?4,?10,?5,?6,?7,?10,?8,?9,?10,1,?10,?10,0,?11)
+            config_ts,auth_config_ts,oauth_epoch_ts,oauth_ts,deleted,sync_rev
+        ) VALUES(?1,?2,?10,?3,?10,?4,?10,?5,?6,?7,?10,?8,?9,?10,1,?10,?10,?10,?10,0,?11)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             name_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.name != excluded.name THEN ?10 ELSE mcp_servers.name_ts END,
@@ -499,7 +503,9 @@ fn save(
             timeout_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.timeout_ms != excluded.timeout_ms THEN ?10 ELSE mcp_servers.timeout_ts END,
             revision=mcp_servers.revision+1,
             config_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?12 THEN ?10 ELSE mcp_servers.config_ts END,
-            oauth_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?12 THEN ?10 ELSE mcp_servers.oauth_ts END,
+            auth_config_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 THEN ?10 ELSE mcp_servers.auth_config_ts END,
+            oauth_epoch_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 THEN ?10 ELSE mcp_servers.oauth_epoch_ts END,
+            oauth_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 THEN ?10 ELSE mcp_servers.oauth_ts END,
             sync_rev=excluded.sync_rev
         WHERE mcp_servers.deleted=0
         RETURNING id";
@@ -518,16 +524,22 @@ fn save(
             ts,
             sync_rev,
             config_changed,
+            oauth_invalidated,
         ],
         |r| r.get(0),
     )?;
     if oauth_invalidated {
         conn.execute("DELETE FROM mcp_oauth WHERE server_id=?", [id])?;
+    } else if promoted_to_shared {
+        conn.execute(
+            "UPDATE mcp_oauth SET auth_config_ts=?2, auth_fingerprint=?3 WHERE server_id=?1",
+            params![id, ts, auth_fp],
+        )?;
     }
     if c.shared {
         crate::cluster::ledger::stage_catalog();
     }
-    Ok((by_id(conn, id)?, config_changed, None))
+    Ok((by_id(conn, id)?, oauth_invalidated, None))
 }
 
 async fn list_servers(State(app): State<App>) -> Result<Json<Vec<McpServerInfo>>> {

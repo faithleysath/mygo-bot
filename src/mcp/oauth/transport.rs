@@ -29,18 +29,35 @@ impl HttpClient {
         allow_disabled: bool,
     ) -> std::result::Result<Self, String> {
         let authorization = if oauth_enabled {
-            let (generation, binding, endpoint, gate) = db
+            let (generation, binding, endpoint, gate, auth_config_ts, auth_fingerprint) = db
                 .call(move |s| {
                     let sql = format!(
-                        "SELECT generation,binding,json_extract(config_json,'$.url')
-                     FROM mcp_oauth JOIN mcp_servers ON id=server_id
-                     WHERE id=? AND deleted=0 AND revision=? AND (enabled OR ?) AND {}",
+                        "SELECT o.generation, o.binding, m.transport, m.config_json,
+                                m.auth_config_ts, o.auth_config_ts, o.auth_fingerprint
+                         FROM mcp_oauth o JOIN mcp_servers m ON m.id=o.server_id
+                         WHERE m.id=? AND m.deleted=0 AND m.revision=? AND (m.enabled OR ?) AND {}",
                         storage::AUTHORIZED_SQL
                     );
-                    let (generation, raw, endpoint): (String, String, String) = s
+                    let (generation, raw, transport, config_json, m_auth_ts, o_auth_ts, o_fp): (
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                        String,
+                    ) = s
                         .conn
                         .query_row(&sql, params![id, revision, allow_disabled], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                            ))
                         })
                         .map_err(|e| match e {
                             rusqlite::Error::QueryReturnedNoRows => {
@@ -48,8 +65,24 @@ impl HttpClient {
                             }
                             other => other.into(),
                         })?;
+                    let live_fp =
+                        crate::cluster::ledger::auth_config_fingerprint(&transport, &config_json);
+                    if m_auth_ts != o_auth_ts || o_fp != live_fp {
+                        return Err(Error::bad("MCP OAuth login required"));
+                    }
+                    let endpoint = serde_json::from_str::<serde_json::Value>(&config_json)
+                        .ok()
+                        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_owned))
+                        .ok_or_else(|| Error::bad("MCP OAuth login required"))?;
                     let gate = s.mcp.refresh_gate(&generation);
-                    Ok((generation, decode::<Binding>(&raw)?, endpoint, gate))
+                    Ok((
+                        generation,
+                        decode::<Binding>(&raw)?,
+                        endpoint,
+                        gate,
+                        m_auth_ts,
+                        o_fp,
+                    ))
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -58,6 +91,9 @@ impl HttpClient {
                 id,
                 revision,
                 generation,
+                auth_config_ts,
+                auth_fingerprint,
+                allow_disabled,
             };
             let base = flow::discovery_base(&endpoint).map_err(|e| e.to_string())?;
             let oauth_http = OAuthHttp::new(&base)?;

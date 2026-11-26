@@ -10,10 +10,9 @@ use serde_json::{Value, json};
 use crate::{
     App, Error, Result,
     cluster::{
-        SyncSignal,
         identity::{
-            NodeRole, current_arch, current_os, delete_peer, encode_endpoint_addrs, encode_invite,
-            list_peers, load_local_node, update_self_meta,
+            NodeRole, current_arch, current_os, encode_endpoint_addrs, encode_invite,
+            list_peers, load_local_node,
         },
         sync::SyncSummary,
     },
@@ -127,15 +126,8 @@ async fn patch_self(
     let addrs = encode_endpoint_addrs(&app.cluster.net.endpoint_addr());
     let local_only = app.cluster.net.is_local_only();
     let local = app
-        .db
-        .write(
-            move |conn| update_self_meta(conn, body.name, body.description, body.role),
-            |s, updated| {
-                s.presence.set_local_role(updated.role);
-                s.sync_signal(SyncSignal::SelfMetaChanged);
-                Ok(updated)
-            },
-        )
+        .exec
+        .change_self_role(body.name, body.description, body.role)
         .await?;
     Ok(Json(SelfNodeStatus {
         node_id: local.node_id,
@@ -194,29 +186,7 @@ async fn remove_peer(
     State(app): State<App>,
     Path(node_id): Path<String>,
 ) -> Result<StatusCode> {
-    let target = node_id.clone();
-    let presence = app.exec.presence().clone();
-    let removed = app
-        .db
-        .write(
-            move |conn| {
-                let removed = delete_peer(conn, &target)?;
-                let peers = if removed {
-                    crate::cluster::identity::list_peers(conn)?
-                } else {
-                    Vec::new()
-                };
-                Ok((removed, peers))
-            },
-            move |_, (removed, peers)| {
-                if removed {
-                    presence.set_peer_roles(&peers);
-                    presence.set_known_peer_count(peers.len());
-                }
-                Ok(removed)
-            },
-        )
-        .await?;
+    let removed = app.exec.remove_peer_safe(&node_id).await?;
     if !removed {
         return Err(rusqlite::Error::QueryReturnedNoRows.into());
     }

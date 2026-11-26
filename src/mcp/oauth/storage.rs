@@ -8,12 +8,15 @@ pub(super) struct Account {
     pub id: McpServerId,
     pub revision: i64,
     pub generation: String,
+    pub auth_config_ts: String,
+    pub auth_fingerprint: String,
+    pub allow_disabled: bool,
 }
 
-// Every credential/state mutation is an UPDATE tied to the login that issued it. Only
+// Every login/callback mutation is an UPDATE tied to the server revision & auth epoch. Only
 // the login endpoint may create a row. A late callback or refresh cannot recreate it.
-const CURRENT: &str = "server_id=?1 AND generation=?2 AND EXISTS(SELECT 1 FROM mcp_servers
-    WHERE id=?1 AND deleted=0 AND revision=?3)";
+const CURRENT: &str = "server_id=?1 AND generation=?2 AND auth_config_ts=?4 AND EXISTS(SELECT 1 FROM mcp_servers
+    WHERE id=?1 AND deleted=0 AND revision=?3 AND auth_config_ts=?4)";
 
 // A refreshable grant can survive an expired or peer-rejected access token. A public
 // client is allowed to receive just an access token, in which case login must reopen.
@@ -30,9 +33,11 @@ pub(super) fn touch_shared_mcp_oauth(conn: &rusqlite::Connection, id: McpServerI
         .query_row([id], |r| r.get(0))?;
     if active_shared {
         let ts = crate::cluster::ledger::tick_hlc(conn)?;
-        let rev = crate::cluster::ledger::next_catalog_rev();
-        conn.prepare_cached("UPDATE mcp_servers SET oauth_ts=?2, sync_rev=?3 WHERE id=?1")?
-            .execute(params![id, ts, rev])?;
+        let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
+        conn.prepare_cached(
+            "UPDATE mcp_servers SET oauth_epoch_ts=auth_config_ts, oauth_ts=?2, sync_rev=?3 WHERE id=?1",
+        )?
+        .execute(params![id, ts, rev])?;
         crate::cluster::ledger::stage_catalog();
     }
     Ok(())
@@ -42,18 +47,39 @@ impl Account {
     // Both issuer paths hold the generation gate through the network request and save.
     async fn can_refresh(&self, token: &str) -> Result<bool> {
         let id = self.id;
-        let revision = self.revision;
         let generation = self.generation.clone();
+        let auth_config_ts = self.auth_config_ts.clone();
+        let auth_fingerprint = self.auth_fingerprint.clone();
+        let allow_disabled = self.allow_disabled;
         let token = token.to_owned();
         self.db
             .call(move |s| {
-                let sql = format!(
-                    "SELECT EXISTS(SELECT 1 FROM mcp_oauth WHERE {CURRENT}
-                     AND pending_refresh IS NULL
-                     AND json_extract(credentials,'$.token_response.refresh_token')=?4)"
-                );
-                Ok(s.conn.prepare_cached(&sql)?
-                    .query_row(params![id, generation, revision, token], |r| r.get(0))?)
+                let row: Option<(String, String)> = s
+                    .conn
+                    .prepare_cached(
+                        "SELECT m.transport, m.config_json
+                         FROM mcp_oauth o JOIN mcp_servers m ON m.id=o.server_id
+                         WHERE o.server_id=?1 AND o.generation=?2
+                           AND o.auth_config_ts=?3 AND o.auth_fingerprint=?4
+                           AND o.pending_refresh IS NULL
+                           AND json_extract(o.credentials,'$.token_response.refresh_token')=?5
+                           AND m.deleted=0 AND (m.enabled OR ?6) AND m.auth_config_ts=?3",
+                    )?
+                    .query_row(
+                        params![
+                            id,
+                            generation,
+                            auth_config_ts,
+                            auth_fingerprint,
+                            token,
+                            allow_disabled
+                        ],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                Ok(row.is_some_and(|(t, cfg)| {
+                    crate::cluster::ledger::auth_config_fingerprint(&t, &cfg) == auth_fingerprint
+                }))
             })
             .await
     }
@@ -68,11 +94,12 @@ impl Account {
         let id = self.id;
         let revision = self.revision;
         let generation = self.generation.clone();
+        let auth_config_ts = self.auth_config_ts.clone();
         let sql = format!("UPDATE mcp_oauth SET {set} WHERE {CURRENT} {guard}");
         self.db
             .write(
                 move |conn| {
-                    if conn.execute(&sql, params![id, generation, revision, value])? != 1 {
+                    if conn.execute(&sql, params![id, generation, revision, auth_config_ts, value])? != 1 {
                         return Err(Error::conflict(
                             "OAuth login expired or configuration changed",
                         ));
@@ -91,7 +118,7 @@ impl Account {
         self.update(
             "pending=NULL",
             &format!(
-                "AND json_extract(pending,'$.csrf_token')=?4 AND json_extract(pending,'$.created_at')+{LOGIN_TTL}>unixepoch()"
+                "AND json_extract(pending,'$.csrf_token')=?5 AND json_extract(pending,'$.created_at')+{LOGIN_TTL}>unixepoch()"
             ),
             Some(state.to_owned()),
             false,
@@ -104,21 +131,31 @@ impl Account {
         let id = self.id;
         let generation = self.generation.clone();
         let revision = self.revision;
+        let auth_config_ts = self.auth_config_ts.clone();
+        let auth_fingerprint = self.auth_fingerprint.clone();
         // A callback creates the grant and needs its original revision. A refresh
         // rotates an existing grant: an unrelated description/access edit retires
         // this caller, but the new connection still needs the issuer's rotated token.
+        // Neither may ever write credentials across a different auth_config_ts/endpoint.
         self.db
             .write(
                 move |conn| {
                     let sql = "UPDATE mcp_oauth SET credentials=?4,pending_refresh=NULL,rejected=0
-                        WHERE server_id=?1 AND generation=?2 AND pending IS NULL AND
-                        (credentials IS NOT NULL
-                         OR EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND deleted=0 AND revision=?3))
-                        RETURNING (SELECT deleted=0 AND revision=?3 FROM mcp_servers WHERE id=?1)";
-                    let current = conn
-                        .query_row(sql, params![id, generation, revision, value], |row| {
-                            row.get::<_, bool>(0)
-                        })?;
+                        WHERE server_id=?1 AND generation=?2 AND auth_config_ts=?5 AND auth_fingerprint=?6
+                          AND pending IS NULL AND (
+                            (credentials IS NOT NULL AND EXISTS(
+                                SELECT 1 FROM mcp_servers WHERE id=?1 AND deleted=0 AND auth_config_ts=?5
+                            ))
+                            OR EXISTS(
+                                SELECT 1 FROM mcp_servers WHERE id=?1 AND deleted=0 AND revision=?3 AND auth_config_ts=?5
+                            )
+                          )
+                        RETURNING (SELECT deleted=0 AND revision=?3 AND auth_config_ts=?5 FROM mcp_servers WHERE id=?1)";
+                    let current = conn.query_row(
+                        sql,
+                        params![id, generation, revision, value, auth_config_ts, auth_fingerprint],
+                        |row| row.get::<_, bool>(0),
+                    )?;
                     touch_shared_mcp_oauth(conn, id)?;
                     Ok(current)
                 },
@@ -129,36 +166,67 @@ impl Account {
 
     pub async fn load_credentials(&self) -> Result<Option<(StoredCredentials, bool)>> {
         let id = self.id;
-        let revision = self.revision;
         let generation = self.generation.clone();
+        let auth_config_ts = self.auth_config_ts.clone();
+        let auth_fingerprint = self.auth_fingerprint.clone();
+        let allow_disabled = self.allow_disabled;
         self.db
             .call(move |s| {
                 let sql = format!(
-                    "SELECT credentials,rejected FROM mcp_oauth WHERE {CURRENT} AND {AUTHORIZED_SQL}"
+                    "SELECT o.credentials, o.rejected, m.transport, m.config_json
+                     FROM mcp_oauth o JOIN mcp_servers m ON m.id=o.server_id
+                     WHERE o.server_id=?1 AND o.generation=?2
+                       AND o.auth_config_ts=?3 AND o.auth_fingerprint=?4
+                       AND m.deleted=0 AND (m.enabled OR ?5) AND m.auth_config_ts=?3
+                       AND ({AUTHORIZED_SQL})"
                 );
-                let row: Option<(Option<String>, bool)> = s
+                let row: Option<(Option<String>, bool, String, String)> = s
                     .conn
-                    .query_row(&sql, params![id, generation, revision], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })
+                    .query_row(
+                        &sql,
+                        params![id, generation, auth_config_ts, auth_fingerprint, allow_disabled],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
                     .optional()?;
-                let Some((Some(raw), rejected)) = row else {
+                let Some((Some(raw), rejected, transport, config_json)) = row else {
                     return Ok(None);
                 };
+                if crate::cluster::ledger::auth_config_fingerprint(&transport, &config_json)
+                    != auth_fingerprint
+                {
+                    return Ok(None);
+                }
                 Ok(Some((decode(&raw)?, rejected)))
             })
             .await
     }
 
     pub async fn reject(&self, token: String) {
-        // Only mark the exact bearer the peer rejected. Other requests may already have refreshed it.
+        // Only mark the exact bearer the peer rejected under the same auth epoch.
+        let id = self.id;
+        let generation = self.generation.clone();
+        let auth_config_ts = self.auth_config_ts.clone();
+        let auth_fingerprint = self.auth_fingerprint.clone();
         let _ = self
-            .update(
-                "rejected=1,credentials=CASE WHEN json_extract(credentials,'$.token_response.refresh_token') IS NULL
-                 THEN NULL ELSE credentials END",
-                "AND json_extract(credentials,'$.token_response.access_token')=?4",
-                Some(token),
-                true,
+            .db
+            .write(
+                move |conn| {
+                    let sql = "UPDATE mcp_oauth
+                        SET rejected=1,credentials=CASE WHEN json_extract(credentials,'$.token_response.refresh_token') IS NULL
+                         THEN NULL ELSE credentials END
+                        WHERE server_id=?1 AND generation=?2 AND auth_config_ts=?3 AND auth_fingerprint=?4
+                          AND json_extract(credentials,'$.token_response.access_token')=?5
+                          AND EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND deleted=0 AND auth_config_ts=?3)";
+                    if conn.execute(
+                        sql,
+                        params![id, generation, auth_config_ts, auth_fingerprint, token],
+                    )? == 1
+                    {
+                        touch_shared_mcp_oauth(conn, id)?;
+                    }
+                    Ok(())
+                },
+                |_, ()| Ok(()),
             )
             .await;
     }
@@ -167,15 +235,21 @@ impl Account {
         let token = token.to_owned();
         let id = self.id;
         let generation = self.generation.clone();
+        let auth_config_ts = self.auth_config_ts.clone();
+        let auth_fingerprint = self.auth_fingerprint.clone();
         self.db
             .write(
                 move |conn| {
-                    conn.execute(
-                        "UPDATE mcp_oauth SET credentials=NULL,pending_refresh=NULL,rejected=0 WHERE server_id=? AND generation=?
-                        AND json_extract(credentials,'$.token_response.refresh_token')=?",
-                        params![id, generation, token],
-                    )?;
-                    touch_shared_mcp_oauth(conn, id)?;
+                    if conn.execute(
+                        "UPDATE mcp_oauth SET credentials=NULL,pending_refresh=NULL,rejected=0
+                         WHERE server_id=?1 AND generation=?2 AND auth_config_ts=?3 AND auth_fingerprint=?4
+                           AND json_extract(credentials,'$.token_response.refresh_token')=?5
+                           AND EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND deleted=0 AND auth_config_ts=?3)",
+                        params![id, generation, auth_config_ts, auth_fingerprint, token],
+                    )? == 1
+                    {
+                        touch_shared_mcp_oauth(conn, id)?;
+                    }
                     Ok(())
                 },
                 |_, ()| Ok(()),
@@ -196,13 +270,16 @@ pub(super) async fn save_pending_and_binding(
     let id = account.id;
     let revision = account.revision;
     let generation = account.generation.clone();
+    let auth_config_ts = account.auth_config_ts.clone();
+    let auth_fingerprint = account.auth_fingerprint.clone();
     let listener_generation = generation.clone();
     db.write(
         move |conn| {
             if conn.execute(
-                "UPDATE mcp_oauth SET binding=?1,pending=?2 WHERE server_id=?3 AND generation=?4
-                 AND EXISTS(SELECT 1 FROM mcp_servers WHERE id=?3 AND deleted=0 AND revision=?5)",
-                params![binding, pending, id, generation, revision],
+                "UPDATE mcp_oauth SET binding=?1,pending=?2
+                 WHERE server_id=?3 AND generation=?4 AND auth_config_ts=?6 AND auth_fingerprint=?7
+                   AND EXISTS(SELECT 1 FROM mcp_servers WHERE id=?3 AND deleted=0 AND revision=?5 AND auth_config_ts=?6)",
+                params![binding, pending, id, generation, revision, auth_config_ts, auth_fingerprint],
             )? != 1
             {
                 return Err(Error::conflict("OAuth login superseded or configuration changed"));

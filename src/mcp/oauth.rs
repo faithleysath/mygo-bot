@@ -365,6 +365,8 @@ pub(crate) async fn refresh_shared_as_coordinator(
         Early(CoordinatorRefreshOutcome),
         Proceed {
             revision: i64,
+            auth_config_ts: String,
+            auth_fingerprint: String,
             binding: Binding,
             endpoint: String,
             reject_token: Option<String>,
@@ -374,23 +376,63 @@ pub(crate) async fn refresh_shared_as_coordinator(
 
     let pre = db
         .call(move |s| {
-            let row: Option<(i64, String, String, Option<String>, bool, bool, bool)> = s
+            struct PreRow {
+                revision: i64,
+                transport: String,
+                config_json: String,
+                m_auth_ts: String,
+                o_auth_ts: String,
+                o_fp: String,
+                binding: String,
+                credentials: Option<String>,
+                rejected: bool,
+                authorized: bool,
+                pending_refresh: bool,
+            }
+            let row = s
                 .conn
                 .query_row(
                     &format!(
-                        "SELECT m.revision, o.binding, json_extract(m.config_json,'$.url'),
-                                o.credentials, o.rejected,
-                                ({}), o.pending_refresh IS NOT NULL
+                        "SELECT m.revision, m.transport, m.config_json, m.auth_config_ts,
+                                o.auth_config_ts, o.auth_fingerprint, o.binding,
+                                o.credentials, o.rejected, ({}), o.pending_refresh IS NOT NULL
                          FROM mcp_servers m JOIN mcp_oauth o ON o.server_id=m.id
                          WHERE m.id=?1 AND m.shared=1 AND m.deleted=0 AND o.generation=?2",
                         storage::AUTHORIZED_SQL
                     ),
                     params![id, gen_owned],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                    |r| {
+                        Ok(PreRow {
+                            revision: r.get(0)?,
+                            transport: r.get(1)?,
+                            config_json: r.get(2)?,
+                            m_auth_ts: r.get(3)?,
+                            o_auth_ts: r.get(4)?,
+                            o_fp: r.get(5)?,
+                            binding: r.get(6)?,
+                            credentials: r.get(7)?,
+                            rejected: r.get(8)?,
+                            authorized: r.get(9)?,
+                            pending_refresh: r.get(10)?,
+                        })
+                    },
                 )
-                .optional()?;
+                .optional()?
+                .and_then(|r| {
+                    let live_fp = crate::cluster::ledger::auth_config_fingerprint(
+                        &r.transport,
+                        &r.config_json,
+                    );
+                    if r.m_auth_ts != r.o_auth_ts || r.o_fp != live_fp {
+                        return None;
+                    }
+                    let endpoint = serde_json::from_str::<serde_json::Value>(&r.config_json)
+                        .ok()
+                        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_owned))?;
+                    Some((r, endpoint))
+                });
 
-            let Some((revision, raw_binding, endpoint, raw_creds, rejected, authorized, pending_refresh)) = row
+            let Some((row, endpoint)) = row
             else {
                 return Ok(Precheck::Early(CoordinatorRefreshOutcome {
                     status: OAuthRefreshStatus::ReauthRequired,
@@ -398,6 +440,17 @@ pub(crate) async fn refresh_shared_as_coordinator(
                     error: Some("MCP OAuth login changed or missing".into()),
                 }));
             };
+            let PreRow {
+                revision,
+                m_auth_ts: auth_config_ts,
+                o_fp: auth_fingerprint,
+                binding: raw_binding,
+                credentials: raw_creds,
+                rejected,
+                authorized,
+                pending_refresh,
+                ..
+            } = row;
             if pending_refresh {
                 return Err(Error::conflict("OAuth refresh is awaiting confirmation"));
             }
@@ -429,6 +482,8 @@ pub(crate) async fn refresh_shared_as_coordinator(
             let needs_refresh = storage::needs_refresh(&creds, rejected || matching_rejected);
             Ok(Precheck::Proceed {
                 revision,
+                auth_config_ts,
+                auth_fingerprint,
                 binding,
                 endpoint,
                 reject_token,
@@ -441,6 +496,8 @@ pub(crate) async fn refresh_shared_as_coordinator(
         Precheck::Early(out) => return Ok(out),
         Precheck::Proceed {
             revision,
+            auth_config_ts,
+            auth_fingerprint,
             binding,
             endpoint,
             reject_token,
@@ -454,6 +511,9 @@ pub(crate) async fn refresh_shared_as_coordinator(
                     id,
                     revision,
                     generation: generation.to_owned(),
+                    auth_config_ts,
+                    auth_fingerprint,
+                    allow_disabled: true,
                 };
                 if let Some(tok) = reject_token {
                     account.reject(tok).await;

@@ -192,13 +192,23 @@ impl Cluster {
                 let (secret_changed, new_gen, new_secret, peer, _) = db
                     .write(
                         move |conn| {
+                            let prev_local = identity::load_local_node(conn)?;
+                            let want_voter = prev_local.role.is_voter();
                             let (changed, next_gen, secret, peer) =
                                 identity::apply_join(conn, secret, peer, force)?;
                             let peers = identity::list_peers(conn)?;
-                            Ok((changed, next_gen, secret, peer, peers))
+                            let after_local = identity::load_local_node(conn)?;
+                            Ok((changed, next_gen, secret, peer, (peers, after_local.voter_epoch), want_voter))
                         },
-                        move |_, (changed, next_gen, secret, peer, peers)| {
+                        move |_, (changed, next_gen, secret, peer, (peers, voter_epoch), want_voter)| {
                             let count = peers.len();
+                            if changed {
+                                presence.set_want_voter_admission(want_voter);
+                                presence.set_voter_config(0, &[], 0, &[]);
+                                presence.clear_all_remote();
+                            } else if voter_epoch == 0 && want_voter {
+                                presence.set_want_voter_admission(true);
+                            }
                             presence.set_peer_roles(&peers);
                             presence.set_known_peer_count(count);
                             Ok((changed, next_gen, secret, peer, count))

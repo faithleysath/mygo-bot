@@ -11,16 +11,16 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // Called inside the transaction which pins the session's input prefix.
 pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
-    let (model_id, model, url, key, effort, prices) = conn
+    let (model_id, model, url, key, effort, prices, head) = conn
         .prepare_cached(
-            "SELECT m.id,m.model_key,p.base_url,p.api_key,s.reasoning_effort,m.pricing
-             FROM sessions s JOIN llm_models m ON m.id=s.model_id JOIN llm_providers p ON p.id=m.provider_id WHERE s.id=?",
+            "SELECT m.id,m.model_key,p.base_url,p.api_key,s.reasoning_effort,m.pricing,s.active_head
+             FROM sessions s JOIN llm_models m ON m.id=s.model_id JOIN llm_providers p ON p.id=m.provider_id WHERE s.id=? AND s.deleted=0",
         )?
         .query_row([sid], |r| {
             Ok((
@@ -30,8 +30,24 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
                 r.get(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<Value>>(5)?,
+                r.get::<_, Option<crate::id::ContextNodeId>>(6)?,
             ))
         })?;
+    if end > 0 {
+        let tip: Option<crate::id::ContextNodeId> = conn
+            .prepare_cached(
+                "SELECT node_id FROM active_context WHERE session_id=?1 AND position=?2",
+            )?
+            .query_row(params![sid, end], |r| r.get(0))
+            .optional()?;
+        if tip != head || head.is_none() {
+            return Err(Error::conflict(
+                "session active branch changed or is incomplete",
+            ));
+        }
+    } else if head.is_some() {
+        return Err(Error::conflict("session active context is incomplete"));
+    }
     let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
     media::check_call_input(conn, sid, model_id, &modalities, end)?;
     let started_at = Utc::now().timestamp_millis();
@@ -46,8 +62,8 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
         &origin_node_id,
     )?;
     conn.prepare_cached(
-        "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot,origin_node_id,origin_seq)
-         VALUES(?,?,?,?,?,?,'in_flight',?,?,?)",
+        "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,input_head,started_at,status,pricing_snapshot,origin_node_id,origin_seq)
+         VALUES(?,?,?,?,?,?,?,'in_flight',?,?,?)",
     )?
     .execute(params![
         call_id,
@@ -55,6 +71,7 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
         model_id,
         effort,
         end,
+        head,
         started_at,
         snapshot,
         &*origin_node_id,
@@ -68,6 +85,7 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
         api_key: key,
         effort,
         end,
+        head,
     })
 }
 

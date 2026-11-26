@@ -9,7 +9,7 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
@@ -152,7 +152,7 @@ async fn create_session(
                 let id = SessionId::new()?;
                 let now = chrono::Utc::now().timestamp_millis();
                 let ts = crate::cluster::ledger::tick_hlc(conn)?;
-                let rev = crate::cluster::ledger::next_catalog_rev();
+                let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
                 conn.execute(
                     "INSERT INTO sessions(id,title,title_ts,created_at,updated_at,status_ts,model_id,reasoning_effort,selection_ts,sync_rev)
                      VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -240,9 +240,14 @@ pub(crate) async fn patch_session_local(
                 }
                 let mut switched_branch = false;
                 if let Some(target_head) = active_head_req {
-                    if !crate::cluster::ledger::node_branch_complete(conn, sid, target_head)? {
+                    let is_leaf: bool = conn
+                        .prepare_cached(
+                            "SELECT EXISTS(SELECT 1 FROM session_leaves WHERE session_id=?1 AND head_id=?2)",
+                        )?
+                        .query_row(params![sid, target_head], |r| r.get(0))?;
+                    if !is_leaf || !crate::cluster::ledger::node_branch_complete(conn, sid, target_head)? {
                         return Err(Error::conflict(
-                            "target branch head does not exist in this session or is incomplete",
+                            "target active_head must be a complete branch leaf node",
                         ));
                     }
                     if cur_sess.active_head != Some(target_head) {
@@ -273,7 +278,7 @@ pub(crate) async fn patch_session_local(
                     .ok_or_else(|| Error::bad("model_id is required"))?;
                 let now = chrono::Utc::now().timestamp_millis();
                 let ts = crate::cluster::ledger::tick_hlc(conn)?;
-                let rev = crate::cluster::ledger::next_catalog_rev();
+                let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
                 let title_ts = title.as_ref().map(|_| ts.as_str());
                 let sel_ts = has_selection.then(|| ts.as_str());
                 conn.execute(
@@ -302,9 +307,10 @@ pub(crate) async fn patch_session_local(
             },
             move |s, (updated, switched_branch)| {
                 if switched_branch {
+                    let view = s.bump_view_rev(sid);
                     s.bump_reset_gen(sid);
                     if let Some(channel) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
-                        Notice::publish(&channel, "session.reset", json!({}));
+                        Notice::publish(&channel, "session.reset", json!({ "view": view }));
                     }
                 }
                 let view = s.session_view(updated);
@@ -406,7 +412,9 @@ async fn list_sessions(
     page.check()?;
     app.db
         .call(move |s| {
-            let sql = "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id,active_head
+            let sql = "SELECT id,title,created_at,updated_at,coalesce(local_status,status),reasoning_effort,
+                              CASE WHEN local_status IS NOT NULL THEN local_error ELSE last_error END,
+                              model_id,active_head
                        FROM sessions WHERE deleted=0 AND id>? ORDER BY id LIMIT ?";
             let mut stmt = s.conn.prepare_cached(sql)?;
             let after = page.after.as_ref().map_or("", SessionId::as_str);
@@ -494,9 +502,28 @@ macro_rules! messages_sql {
     ($filter:literal) => {
         concat!(
             "SELECT i.id, json_extract(i.payload,'$.content'),
-                    CASE WHEN EXISTS(SELECT 1 FROM context_nodes c WHERE c.session_id=i.session_id AND c.item_id=i.id) THEN 'included'
-                         WHEN EXISTS(SELECT 1 FROM items w WHERE w.session_id=i.session_id AND w.kind='withdrawal' AND w.target_id=i.id) THEN 'withdrawn'
-                         ELSE 'queued' END AS status
+                    CASE
+                      WHEN i.idempotency_key IS NOT NULL THEN
+                        CASE
+                          WHEN EXISTS(
+                            SELECT 1 FROM items k
+                            JOIN context_nodes c ON c.session_id=k.session_id AND c.item_id=k.id
+                            WHERE k.session_id=i.session_id AND k.idempotency_key=i.idempotency_key AND k.kind='user_message'
+                          ) THEN 'included'
+                          WHEN EXISTS(
+                            SELECT 1 FROM items k
+                            JOIN items w ON w.session_id=k.session_id AND w.kind='withdrawal' AND w.target_id=k.id
+                            WHERE k.session_id=i.session_id AND k.idempotency_key=i.idempotency_key AND k.kind='user_message'
+                          ) THEN 'withdrawn'
+                          ELSE 'queued'
+                        END
+                      ELSE
+                        CASE
+                          WHEN EXISTS(SELECT 1 FROM context_nodes c WHERE c.session_id=i.session_id AND c.item_id=i.id) THEN 'included'
+                          WHEN EXISTS(SELECT 1 FROM items w WHERE w.session_id=i.session_id AND w.kind='withdrawal' AND w.target_id=i.id) THEN 'withdrawn'
+                          ELSE 'queued'
+                        END
+                    END AS status
              FROM items i ",
             $filter
         )
@@ -554,6 +581,12 @@ async fn messages(
                 (
                     messages_sql!(
                         "WHERE i.session_id=?1 AND i.kind='user_message'
+                           AND (i.idempotency_key IS NULL OR i.id = (
+                             SELECT min(k.id) FROM items k
+                             WHERE k.session_id=i.session_id
+                               AND k.idempotency_key=i.idempotency_key
+                               AND k.kind='user_message'
+                           ))
                            AND i.id>?2 AND (?3 IS NULL OR status=?3)
                          ORDER BY i.id LIMIT ?4"
                     ),
@@ -580,12 +613,33 @@ pub(crate) async fn withdraw_local(app: &App, sid: SessionId, mid: ItemId) -> Re
     app.db
         .write(
             move |conn| {
-                let sql = "SELECT EXISTS(SELECT 1 FROM items WHERE session_id=?1 AND kind='withdrawal' AND target_id=?2),
-                              EXISTS(SELECT 1 FROM context_nodes WHERE session_id=?1 AND item_id=?2)
-                       FROM items WHERE session_id=?1 AND id=?2 AND kind='user_message'";
-                let (withdrawn, included) = conn.query_row(sql, (sid, mid), |r| {
-                    Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?))
-                })?;
+                let idemp_key: Option<String> = conn.query_row(
+                    "SELECT idempotency_key FROM items WHERE session_id=?1 AND id=?2 AND kind='user_message'",
+                    (sid, mid),
+                    |r| r.get(0),
+                )?;
+                let (withdrawn, included) = match idemp_key.as_deref() {
+                    Some(key) => conn.query_row(
+                        "SELECT EXISTS(
+                                SELECT 1 FROM items k
+                                JOIN items w ON w.session_id=k.session_id AND w.kind='withdrawal' AND w.target_id=k.id
+                                WHERE k.session_id=?1 AND k.idempotency_key=?2 AND k.kind='user_message'
+                            ),
+                            EXISTS(
+                                SELECT 1 FROM items k
+                                JOIN context_nodes c ON c.session_id=k.session_id AND c.item_id=k.id
+                                WHERE k.session_id=?1 AND k.idempotency_key=?2 AND k.kind='user_message'
+                            )",
+                        (sid, key),
+                        |r| Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?)),
+                    )?,
+                    None => conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM items WHERE session_id=?1 AND kind='withdrawal' AND target_id=?2),
+                                EXISTS(SELECT 1 FROM context_nodes WHERE session_id=?1 AND item_id=?2)",
+                        (sid, mid),
+                        |r| Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?)),
+                    )?,
+                };
                 if included {
                     return Err(Error::conflict("message already included"));
                 }
@@ -626,6 +680,7 @@ struct HistoryPage {
     tail: bool,
     #[serde(default = "default_limit")]
     limit: i64,
+    view: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -637,14 +692,19 @@ struct ContextPage {
     tail: bool,
     #[serde(default = "default_limit")]
     limit: i64,
+    view: Option<String>,
 }
 
-fn json_response(body: reqwest::Body) -> Response {
-    (
+fn json_response(body: reqwest::Body, view: &str) -> Response {
+    let mut res = (
         [(header::CONTENT_TYPE, "application/json")],
         axum::body::Body::new(body),
     )
-        .into_response()
+        .into_response();
+    if let Ok(hv) = HeaderValue::from_str(view) {
+        res.headers_mut().insert("x-history-view", hv);
+    }
+    res
 }
 
 async fn history(
@@ -661,24 +721,32 @@ async fn history(
     if app.exec.presence().known_peer_count() > 0 {
         app.cluster.ensure_session_watched(sid).await?;
     }
-    let range = app
+    let expected_view = page.view.clone();
+    let (items, view) = app
         .db
         .call(move |s| {
             session(&s.conn, sid)?;
-            store::JsonRows::history_range(
+            let view = s.view_token(sid);
+            if let Some(expected) = expected_view.as_deref()
+                && expected != view
+            {
+                return Err(Error::conflict("history view changed; reload from tail"));
+            }
+            let items = store::JsonRows::history_snapshot(
                 &s.conn,
                 sid,
                 page.after,
                 page.before,
                 page.tail,
                 page.limit,
-            )
+            )?;
+            Ok((items, view))
         })
         .await?;
     let body = store::JsonRows::History
-        .history_body(app.db, sid, range)
+        .history_body(app.db, items)
         .await?;
-    Ok(json_response(body))
+    Ok(json_response(body, &view))
 }
 
 async fn context(
@@ -700,24 +768,32 @@ async fn context(
     if app.exec.presence().known_peer_count() > 0 {
         app.cluster.ensure_session_watched(sid).await?;
     }
-    let range = app
+    let expected_view = page.view.clone();
+    let (items, view) = app
         .db
         .call(move |s| {
             session(&s.conn, sid)?;
-            store::JsonRows::context_range(
+            let view = s.view_token(sid);
+            if let Some(expected) = expected_view.as_deref()
+                && expected != view
+            {
+                return Err(Error::conflict("history view changed; reload from tail"));
+            }
+            let items = store::JsonRows::context_snapshot(
                 &s.conn,
                 sid,
                 page.after,
                 page.before,
                 page.tail,
                 page.limit,
-            )
+            )?;
+            Ok((items, view))
         })
         .await?;
     let body = store::JsonRows::Context
-        .context_body(app.db, sid, range, vec![b'['], b"]")
+        .context_body(app.db, items, vec![b'['], b"]")
         .await?;
-    Ok(json_response(body))
+    Ok(json_response(body, &view))
 }
 
 async fn list_tasks(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Value>> {

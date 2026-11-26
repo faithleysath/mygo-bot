@@ -123,12 +123,13 @@ export async function apiFetch<T = unknown>(path: string, opts: ApiFetchOptions 
 }
 
 export interface SseOptions {
+  onOpen?: (view: string) => void;
   onEvent?: (name: string, data: unknown) => void;
   onStatus?: (status: SseStatus) => void;
   signal?: AbortSignal;
 }
 
-export function connectSse(path: string, { onEvent, onStatus, signal }: SseOptions = {}): () => void {
+export function connectSse(path: string, { onOpen, onEvent, onStatus, signal }: SseOptions = {}): () => void {
   let active = true;
   let backoff = 500;
   let currentAbort: AbortController | null = null;
@@ -158,6 +159,7 @@ export function connectSse(path: string, { onEvent, onStatus, signal }: SseOptio
         if (!res.ok || !res.body) {
           throw new Error(`SSE HTTP ${res.status}`);
         }
+        onOpen?.(res.headers.get("X-History-View") || "");
         onStatus?.("open");
         backoff = 500;
 

@@ -1,6 +1,6 @@
 use crate::{
     App, Error, Result, calls,
-    cluster::exec::ActiveLease,
+    cluster::exec::{ActiveLease, RunAuth},
     events::Notice,
     id::{ItemId, SessionId},
     model::{self, Failure},
@@ -60,7 +60,12 @@ pub async fn start(
         serde_json::from_slice(&body).map_err(|e| Error::bad(e.to_string()))?
     };
     if req.node.is_none() && app.exec.presence().known_peer_count() == 0 {
-        return app.start_local_checked(sid, None).await.map(Json);
+        match app.start_local_checked(sid, RunAuth::Standalone).await {
+            Err(err)
+                if err.0 == axum::http::StatusCode::CONFLICT
+                    && err.1 == "cluster membership changed while starting session" => {}
+            other => return other.map(Json),
+        }
     }
     app.exec
         .start_run(&app, sid, req.node, req.force_offline)
@@ -75,7 +80,15 @@ impl App {
             let result = if app.exec.presence().known_peer_count() > 0 {
                 app.exec.start_wake_run(&app, sid).await
             } else {
-                app.start_worker_inner(sid, true, None).await
+                match app.start_worker_inner(sid, true, RunAuth::Standalone).await {
+                    Err(err)
+                        if err.0 == axum::http::StatusCode::CONFLICT
+                            && err.1 == "cluster membership changed while starting session" =>
+                    {
+                        app.exec.start_wake_run(&app, sid).await
+                    }
+                    other => other,
+                }
             };
             if let Err(e) = result
                 && !app.stopping.is_cancelled()
@@ -106,7 +119,7 @@ impl App {
                             } else if s.presence.remote_owner(sid).is_none() {
                                 let now = chrono::Utc::now().timestamp_millis();
                                 let _ = s.conn.execute(
-                                    "UPDATE sessions SET status='paused', last_error=?2, updated_at=?3 WHERE id=?1",
+                                    "UPDATE sessions SET local_status='paused', local_error=?2, updated_at=max(updated_at,?3) WHERE id=?1",
                                     (sid, &msg, now),
                                 );
                                 s.refresh_local_presence_with(
@@ -138,25 +151,32 @@ impl App {
     pub async fn start_local_checked(
         &self,
         sid: SessionId,
-        lease: Option<Arc<ActiveLease>>,
+        auth: crate::cluster::exec::RunAuth,
     ) -> Result<Session> {
-        self.start_worker_inner(sid, false, lease).await
+        self.start_worker_inner(sid, false, auth).await
     }
 
     pub(crate) async fn start_wake_checked(
         &self,
         sid: SessionId,
-        lease: Option<Arc<ActiveLease>>,
+        auth: crate::cluster::exec::RunAuth,
     ) -> Result<Session> {
-        self.start_worker_inner(sid, true, lease).await
+        self.start_worker_inner(sid, true, auth).await
     }
 
     async fn start_worker_inner(
         &self,
         sid: SessionId,
         automatic: bool,
-        lease: Option<Arc<ActiveLease>>,
+        auth: crate::cluster::exec::RunAuth,
     ) -> Result<Session> {
+        use crate::cluster::exec::RunAuth;
+
+        let lease = match &auth {
+            RunAuth::Quorum(l) => Some(l.clone()),
+            RunAuth::Standalone | RunAuth::ForcedOffline => None,
+        };
+        let verify_standalone = matches!(auth, RunAuth::Standalone);
         if automatic && self.exec.presence().remote_owner(sid).is_some() {
             let _ = self
                 .db
@@ -176,6 +196,15 @@ impl App {
             .start_write(
                 sid,
                 move |conn, active| {
+                    if verify_standalone {
+                        let has_peers: bool =
+                            conn.query_row("SELECT EXISTS(SELECT 1 FROM cluster_peers)", [], |r| r.get(0))?;
+                        if has_peers {
+                            return Err(Error::conflict(
+                                "cluster membership changed while starting session",
+                            ));
+                        }
+                    }
                     let current = session(conn, sid)?;
                     if automatic
                         && (active
@@ -202,9 +231,9 @@ impl App {
                     if !unfinished && !store::has_pending(conn, sid)? {
                         if current.status == SessionStatus::Paused {
                             let status_ts = crate::cluster::ledger::tick_hlc(conn)?;
-                            let rev = crate::cluster::ledger::next_catalog_rev();
+                            let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
                             conn.prepare_cached(
-                                "UPDATE sessions SET status='idle',last_error='',updated_at=max(updated_at,?2),status_ts=?3,sync_rev=?4 WHERE id=?1",
+                                "UPDATE sessions SET status='idle',last_error='',local_status=NULL,local_error='',updated_at=max(updated_at,?2),status_ts=?3,sync_rev=?4 WHERE id=?1",
                             )?
                             .execute((sid, now, status_ts, rev))?;
                             crate::cluster::ledger::stage_catalog();
@@ -213,13 +242,13 @@ impl App {
                         return Ok((current, StartEffect::None));
                     }
                     let recovered = if unfinished {
-                        store::publish_tools(conn, sid, true)?
+                        store::publish_tools(conn, sid, true, None, Some(current.active_head))?.0
                     } else {
                         Vec::new()
                     };
                     store::take_pending(conn, sid)?;
                     conn.prepare_cached(
-                        "UPDATE sessions SET status='running',last_error='',updated_at=max(updated_at,?2) WHERE id=?1",
+                        "UPDATE sessions SET local_status='running',local_error='',updated_at=max(updated_at,?2) WHERE id=?1",
                     )?
                     .execute((sid, now))?;
                     Ok((session(conn, sid)?, StartEffect::Worker(recovered, now)))
@@ -294,7 +323,10 @@ impl App {
                         (s.active.contains_key(&sid)
                             || s.pending_wakes.contains(&sid)
                             || crate::codemode::has_session_tasks(s, sid))
-                            && s.presence.active_local_lease_kind(sid).is_none()
+                            && !matches!(
+                                s.presence.active_local_lease_kind(sid),
+                                Some(crate::cluster::exec::LocalLease::Quorum(_))
+                            )
                     }
                 };
                 if !lease_matches {
@@ -320,7 +352,7 @@ fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
     // A fenced runner can only record its pause locally.
     let update = s.conn.execute(
-        "UPDATE sessions SET status='paused',last_error=?2,updated_at=?3 WHERE id=?1",
+        "UPDATE sessions SET local_status='paused',local_error=?2,updated_at=max(updated_at,?3) WHERE id=?1",
         (sid, reason, now),
     );
     s.refresh_local_presence(sid);
@@ -518,9 +550,9 @@ impl App {
                         if !needed {
                             let now = chrono::Utc::now().timestamp_millis();
                             let status_ts = crate::cluster::ledger::tick_hlc(conn)?;
-                            let rev = crate::cluster::ledger::next_catalog_rev();
+                            let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
                             conn.prepare_cached(
-                                "UPDATE sessions SET status='idle',last_error='',updated_at=max(updated_at,?2),status_ts=?3,sync_rev=?4 WHERE id=?1",
+                                "UPDATE sessions SET status='idle',last_error='',local_status=NULL,local_error='',updated_at=max(updated_at,?2),status_ts=?3,sync_rev=?4 WHERE id=?1",
                             )?
                             .execute((sid, now, status_ts, rev))?;
                             crate::cluster::ledger::stage_catalog();
@@ -550,6 +582,7 @@ impl App {
             let call_id = input.call_id;
             self.streams.start_call(sid, call_id);
             let mut output = model::Output::default();
+            output.current_head = input.head;
             let has_null_att = self.exec.presence().has_null_attachments();
             let multi_node = self.exec.presence().known_peer_count() > 0;
             let streamed = if control.lease.is_none() && !has_null_att && !multi_node {
@@ -617,6 +650,7 @@ impl App {
             if streamed.is_err() || interrupted {
                 self.streams.clear_call(sid, call_id, true);
             }
+            let mut step_head = output.current_head;
             // A call may have reached the store just as the stream was cancelled, before spawn.
             if (interrupted || (output.tools && streamed.is_err()))
                 && control.lease_valid()
@@ -636,7 +670,13 @@ impl App {
                         {
                             return Ok(());
                         }
-                        let missing = store::publish_tools(&tx, sid, interrupted)?;
+                        let (missing, _) = store::publish_tools(
+                            &tx,
+                            sid,
+                            interrupted,
+                            Some(call_id),
+                            Some(step_head),
+                        )?;
                         tx.commit()?;
                         for id in missing {
                             s.item_saved(sid, id)?;
@@ -692,24 +732,36 @@ impl App {
                             return Err(Error::conflict("session deleted"));
                         }
                         if tools {
-                            store::publish_tools(conn, sid, false)?;
+                            let (_, next_head) = store::publish_tools(
+                                conn,
+                                sid,
+                                false,
+                                Some(call_id),
+                                Some(step_head),
+                            )?;
+                            step_head = next_head;
                         }
                         if let Some(report) = final_report {
                             report.finish(conn, call_id, "succeeded", None, finished_at)?;
                         }
                         let saved = if let Some(item) = output.final_item {
-                            Some(store::add_context_item(
+                            let (id, next_head) = store::add_context_item_at(
                                 conn,
                                 sid,
                                 "assistant_message",
                                 &item,
                                 call_id,
-                            )?)
+                                Some(step_head),
+                            )?;
+                            step_head = next_head;
+                            Some(id)
                         } else {
                             None
                         };
-                        if !tools {
-                            crate::cluster::ledger::mark_turn_settled(conn, sid)?;
+                        if !tools
+                            && let Some(h) = step_head
+                        {
+                            crate::cluster::ledger::mark_turn_settled_node(conn, sid, h)?;
                         }
                         let state = if soft.is_cancelled() {
                             "paused"
@@ -721,17 +773,25 @@ impl App {
                         let now = chrono::Utc::now().timestamp_millis();
                         if matches!(state, "idle" | "paused") {
                             let status_ts = crate::cluster::ledger::tick_hlc(conn)?;
-                            let rev = crate::cluster::ledger::next_catalog_rev();
+                            let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
                             conn.prepare_cached(
-                                "UPDATE sessions SET status=?2,updated_at=max(updated_at,?3),status_ts=?4,sync_rev=?5 WHERE id=?1",
+                                "UPDATE sessions
+                                 SET status=?2,
+                                     last_error=CASE WHEN ?2='paused' THEN coalesce(nullif(local_error,''), last_error) ELSE '' END,
+                                     local_status=NULL,
+                                     local_error='',
+                                     updated_at=max(updated_at,?3),
+                                     status_ts=?4,
+                                     sync_rev=?5
+                                 WHERE id=?1",
                             )?
                             .execute((sid, state, now, status_ts, rev))?;
                             crate::cluster::ledger::stage_catalog();
                         } else {
                             conn.prepare_cached(
-                                "UPDATE sessions SET status=?2,updated_at=max(updated_at,?3) WHERE id=?1",
+                                "UPDATE sessions SET local_status='running',local_error='',updated_at=max(updated_at,?2) WHERE id=?1",
                             )?
-                            .execute((sid, state, now))?;
+                            .execute((sid, now))?;
                         }
                         Ok((saved, state, now))
                     },

@@ -9,10 +9,7 @@ use std::{
 
 use axum::body::Bytes;
 use reqwest::Body;
-use rusqlite::{
-    Connection, OptionalExtension, ToSql, params,
-    types::{FromSql, ValueRef},
-};
+use rusqlite::{Connection, OptionalExtension, params, types::ValueRef};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -23,10 +20,10 @@ use crate::{
         ClusterSignal, SyncSignal,
         exec::{PresenceState, SessionOccupancy},
         ledger::{
-            AttachmentRef, CALLS_SCOPE, append_context_items, clear_staged, list_session_leaves,
-            mark_session_watched, merge_attachment_refs, next_catalog_rev, next_origin_seq,
-            on_item_inserted, seed_catalog_rev, seed_hlc_from_db, session_scope, stage_catalog,
-            stage_session, take_staged, tick_hlc_for, with_savepoint,
+            AttachmentRef, CALLS_SCOPE, append_context_items, append_context_items_at,
+            clear_staged, list_session_leaves, mark_session_watched, merge_attachment_refs,
+            next_catalog_rev, next_origin_seq, on_item_inserted, seed_hlc_from_db, session_scope,
+            stage_catalog, stage_session, take_staged, tick_hlc_for, with_savepoint,
         },
     },
     events::Notice,
@@ -78,6 +75,7 @@ pub struct Db(mpsc::Sender<Command>);
 pub struct Store {
     pub conn: Connection,
     pub local_node_id: String,
+    pub instance_id: String,
     pub presence: Arc<PresenceState>,
     pub pending_wakes: HashSet<SessionId>,
     pub active: HashMap<SessionId, Control>,
@@ -88,6 +86,7 @@ pub struct Store {
     pub wake_sequences: HashMap<SessionId, watch::Sender<u64>>,
     pub session_run_gen: HashMap<SessionId, u64>,
     pub session_reset_gen: HashMap<SessionId, u64>,
+    pub session_view_rev: HashMap<SessionId, u64>,
     pub global_events: broadcast::Sender<Notice>,
     pub sync_tx: Arc<ClusterSignal>,
     pub closing: bool,
@@ -121,7 +120,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 9 {
+            if version != 10 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
@@ -130,14 +129,26 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         }
         seed_hlc_from_db(&tx)?;
-        seed_catalog_rev(&tx)?;
         crate::media::init_validation_cache(&tx)?;
+        let mut instance_raw = [0u8; 8];
+        getrandom::fill(&mut instance_raw)
+            .map_err(|_| Error::internal("entropy unavailable"))?;
+        let instance_id: String = instance_raw.iter().map(|b| format!("{b:02x}")).collect();
         let local = crate::cluster::identity::load_local_node(&tx)?;
         let local_node_id = local.node_id.clone();
         presence.set_local_node_id(local_node_id.clone());
         presence.set_local_role(local.role);
+        presence.set_voter_config(
+            local.voter_epoch,
+            &local.voter_set,
+            local.pending_voter_epoch,
+            &local.pending_voter_set,
+        );
         let peers = crate::cluster::identity::list_peers(&tx)?;
         let peer_count = peers.len();
+        if local.voter_epoch == 0 && peer_count > 0 && local.role.is_voter() {
+            presence.set_want_voter_admission(true);
+        }
         presence.set_peer_roles(&peers);
         presence.set_known_peer_count(peer_count);
         let has_null_att: bool = tx.query_row(
@@ -179,17 +190,21 @@ impl Db {
         }
         let running_sids = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM sessions WHERE deleted=0 AND status IN ('running','pausing')",
+                "SELECT id FROM sessions WHERE deleted=0 AND local_status IN ('running','pausing')",
             )?;
             stmt.query_map([], |r| r.get::<_, SessionId>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let now = chrono::Utc::now().timestamp_millis();
         for sid in running_sids {
-            let status_ts = tick_hlc_for(&local_node_id);
-            let rev = next_catalog_rev();
+            let status_ts = tick_hlc_for(&local_node_id)?;
+            let rev = next_catalog_rev(&tx)?;
             tx.execute(
-                "UPDATE sessions SET status='paused', last_error='daemon restarted', updated_at=max(updated_at,?2), status_ts=?3, sync_rev=?4 WHERE id=?1",
+                "UPDATE sessions
+                 SET status='paused', last_error='daemon restarted',
+                     local_status=NULL, local_error='',
+                     updated_at=max(updated_at,?2), status_ts=?3, sync_rev=?4
+                 WHERE id=?1",
                 params![sid, now, status_ts, rev],
             )?;
             stage_catalog();
@@ -206,6 +221,7 @@ impl Db {
                 let mut store = Store {
                     conn,
                     local_node_id,
+                    instance_id,
                     presence,
                     pending_wakes: HashSet::new(),
                     active: HashMap::new(),
@@ -216,6 +232,7 @@ impl Db {
                     wake_sequences: HashMap::new(),
                     session_run_gen: HashMap::new(),
                     session_reset_gen: HashMap::new(),
+                    session_view_rev: HashMap::new(),
                     global_events,
                     sync_tx,
                     closing: false,
@@ -401,7 +418,10 @@ impl Db {
 impl Enqueue {
     fn insert(&self, conn: &Connection) -> Result<Enqueued> {
         if let Some(key) = &self.key {
-            let mut lookup = conn.prepare_cached("SELECT id,json_extract(payload,'$.content') FROM items WHERE session_id=? AND idempotency_key=?")?;
+            let mut lookup = conn.prepare_cached(
+                "SELECT id,json_extract(payload,'$.content') FROM items
+                 WHERE session_id=?1 AND idempotency_key=?2 ORDER BY id ASC LIMIT 1",
+            )?;
             if let Some((id, content)) = lookup
                 .query_row((self.sid, key), |row| {
                     Ok((row.get(0)?, row.get::<_, Value>(1)?))
@@ -432,7 +452,7 @@ impl Enqueue {
         .execute(params![id, self.sid, payload, self.key, &*origin, seq])?;
         on_item_inserted(conn, self.sid, id, "user_message", &payload, None)?;
         let now = chrono::Utc::now().timestamp_millis();
-        let rev = next_catalog_rev();
+        let rev = next_catalog_rev(conn)?;
         conn.prepare_cached(
             "UPDATE sessions SET updated_at=max(updated_at,?2), sync_rev=?3 WHERE id=?1",
         )?
@@ -475,6 +495,17 @@ impl Store {
 
     pub fn reset_gen(&self, sid: SessionId) -> u64 {
         self.session_reset_gen.get(&sid).copied().unwrap_or(0)
+    }
+
+    pub fn view_token(&self, sid: SessionId) -> String {
+        let rev = self.session_view_rev.get(&sid).copied().unwrap_or(1);
+        format!("{}:{rev}", self.instance_id)
+    }
+
+    pub fn bump_view_rev(&mut self, sid: SessionId) -> String {
+        let next = self.session_view_rev.get(&sid).copied().unwrap_or(1) + 1;
+        self.session_view_rev.insert(sid, next);
+        format!("{}:{next}", self.instance_id)
     }
 
     fn commit_batch(&mut self, batch: &mut Vec<Write>) {
@@ -617,17 +648,19 @@ impl Store {
         with_savepoint(&self.conn, "store_status", || {
             let durable = matches!(state, "idle" | "paused");
             if durable {
-                let status_ts = tick_hlc_for(&self.local_node_id);
-                let rev = next_catalog_rev();
+                let status_ts = tick_hlc_for(&self.local_node_id)?;
+                let rev = next_catalog_rev(&self.conn)?;
                 self.conn.execute(
-                    "UPDATE sessions SET status=?2,last_error=?3,updated_at=max(updated_at,?4),status_ts=?5,sync_rev=?6
+                    "UPDATE sessions
+                     SET status=?2,last_error=?3,local_status=NULL,local_error='',
+                         updated_at=max(updated_at,?4),status_ts=?5,sync_rev=?6
                      WHERE id=?1 AND deleted=0",
                     params![sid, state, reason, now, status_ts, rev],
                 )?;
                 stage_catalog();
             } else {
                 self.conn.execute(
-                    "UPDATE sessions SET status=?2,last_error=?3,updated_at=max(updated_at,?4)
+                    "UPDATE sessions SET local_status=?2,local_error=?3,updated_at=max(updated_at,?4)
                      WHERE id=?1 AND deleted=0",
                     params![sid, state, reason, now],
                 )?;
@@ -827,7 +860,10 @@ fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
 
 pub fn session(conn: &Connection, sid: SessionId) -> Result<Session> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id,active_head FROM sessions WHERE id=? AND deleted=0",
+        "SELECT id,title,created_at,updated_at,coalesce(local_status,status),reasoning_effort,
+                CASE WHEN local_status IS NOT NULL THEN local_error ELSE last_error END,
+                model_id,active_head
+         FROM sessions WHERE id=? AND deleted=0",
     )?;
     Ok(stmt.query_row([sid], session_row)?)
 }
@@ -973,42 +1009,106 @@ pub fn add_item(
     Ok(id)
 }
 
-pub fn add_context_item(
+pub fn add_context_item_at(
     tx: &Connection,
     sid: SessionId,
     kind: &str,
     item: &Value,
     call_id: CallId,
-) -> Result<ItemId> {
+    expected_head: Option<Option<ContextNodeId>>,
+) -> Result<(ItemId, Option<ContextNodeId>)> {
+    if let Some(expected) = expected_head {
+        let cur: Option<ContextNodeId> = tx
+            .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+            .query_row([sid], |r| r.get(0))?;
+        if cur != expected {
+            return Err(Error::conflict("session branch changed during execution"));
+        }
+    }
     let id = add_item(tx, sid, kind, item, None, Some(call_id))?;
-    append_context_items(tx, sid, &[id], None)?;
-    Ok(id)
+    let created = append_context_items_at(tx, sid, &[id], expected_head, None)?;
+    Ok((id, created.last().copied()))
 }
 
-// Publish all completed tools in call order. A missing result after interruption
-// is recorded explicitly: replaying an already executed tool could repeat its effect.
-pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Result<Vec<ItemId>> {
+// Publish completed tools for one call (active execution) or for the active branch
+// (crash recovery). Never pulls unpublished tool calls from another DAG branch.
+pub fn publish_tools(
+    tx: &Connection,
+    sid: SessionId,
+    recovering: bool,
+    filter_call_id: Option<CallId>,
+    expected_head: Option<Option<ContextNodeId>>,
+) -> Result<(Vec<ItemId>, Option<ContextNodeId>)> {
     let mut recovered = Vec::new();
     let mut to_append = Vec::new();
     let mut after: Option<ItemId> = None;
-    let mut pending = tx.prepare_cached(
-        "SELECT c.id, json_extract(c.payload,'$.call_id'),
-                (SELECT r.id FROM items r WHERE r.session_id=c.session_id AND r.kind='function_call_output' AND r.target_id=c.id ORDER BY r.id LIMIT 1)
-         FROM items c
-         WHERE c.session_id=?1 AND c.kind='function_call' AND c.id>?2
-           AND NOT EXISTS(SELECT 1 FROM context_nodes n WHERE n.session_id=?1 AND n.item_id=c.id)
-         ORDER BY c.id LIMIT 1",
-    )?;
-    while let Some((id, call, output)) = pending
-        .query_row((sid, after.as_ref().map_or("", ItemId::as_str)), |r| {
-            Ok((
-                r.get::<_, ItemId>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<ItemId>>(2)?,
-            ))
-        })
-        .optional()?
-    {
+    let cur_head: Option<ContextNodeId> = match expected_head {
+        Some(h) => {
+            let actual: Option<ContextNodeId> = tx
+                .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+                .query_row([sid], |r| r.get(0))?;
+            if actual != h {
+                return Err(Error::conflict("session branch changed during execution"));
+            }
+            h
+        }
+        None => tx
+            .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+            .query_row([sid], |r| r.get(0))?,
+    };
+    let next_row = |after: Option<ItemId>| -> Result<Option<(ItemId, String, Option<ItemId>)>> {
+        let after_str = after.as_ref().map_or("", ItemId::as_str);
+        if let Some(cid) = filter_call_id {
+            let mut stmt = tx.prepare_cached(
+                "SELECT c.id, json_extract(c.payload,'$.call_id'),
+                        (SELECT r.id FROM items r WHERE r.session_id=c.session_id AND r.kind='function_call_output' AND r.target_id=c.id ORDER BY r.id LIMIT 1)
+                 FROM items c
+                 WHERE c.session_id=?1 AND c.kind='function_call' AND c.id>?2 AND c.llm_call_id=?3
+                   AND NOT EXISTS(SELECT 1 FROM context_nodes n WHERE n.session_id=?1 AND n.item_id=c.id)
+                 ORDER BY c.id LIMIT 1",
+            )?;
+            Ok(stmt
+                .query_row(params![sid, after_str, cid], |r| {
+                    Ok((
+                        r.get::<_, ItemId>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<ItemId>>(2)?,
+                    ))
+                })
+                .optional()?)
+        } else {
+            let mut stmt = tx.prepare_cached(
+                "SELECT c.id, json_extract(c.payload,'$.call_id'),
+                        (SELECT r.id FROM items r WHERE r.session_id=c.session_id AND r.kind='function_call_output' AND r.target_id=c.id ORDER BY r.id LIMIT 1)
+                 FROM items c
+                 WHERE c.session_id=?1 AND c.kind='function_call' AND c.id>?2
+                   AND NOT EXISTS(SELECT 1 FROM context_nodes n WHERE n.session_id=?1 AND n.item_id=c.id)
+                   AND EXISTS(
+                     SELECT 1 FROM llm_calls lc
+                     WHERE lc.id = c.llm_call_id
+                       AND (
+                         lc.input_head IS ?3
+                         OR (?3 IS NOT NULL AND EXISTS(
+                             SELECT 1 FROM active_context ac
+                             JOIN items ai ON ai.id = ac.item_id
+                             WHERE ac.session_id = ?1 AND ac.node_id = ?3 AND ai.llm_call_id = lc.id
+                         ))
+                       )
+                   )
+                 ORDER BY c.id LIMIT 1",
+            )?;
+            Ok(stmt
+                .query_row(params![sid, after_str, cur_head], |r| {
+                    Ok((
+                        r.get::<_, ItemId>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<ItemId>>(2)?,
+                    ))
+                })
+                .optional()?)
+        }
+    };
+    while let Some((id, call, output)) = next_row(after)? {
         after = Some(id);
         let result = match output {
             Some(id) => id,
@@ -1023,13 +1123,13 @@ pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Resul
         to_append.push(id);
         to_append.push(result);
     }
-    if !to_append.is_empty() {
-        append_context_items(tx, sid, &to_append, None)?;
+    if to_append.is_empty() {
+        return Ok((recovered, cur_head));
     }
-    Ok(recovered)
+    let created = append_context_items_at(tx, sid, &to_append, expected_head, None)?;
+    Ok((recovered, created.last().copied().or(cur_head)))
 }
 
-const BATCH_ITEMS: i64 = 256;
 const BATCH_BYTES: usize = 64 * 1024;
 const HISTORY_BRANCH_FILTER: &str = " AND (EXISTS(SELECT 1 FROM active_context ac WHERE ac.session_id=items.session_id AND ac.item_id=items.id) \
       OR NOT EXISTS(SELECT 1 FROM context_nodes cn WHERE cn.session_id=items.session_id AND cn.item_id=items.id))";
@@ -1043,139 +1143,115 @@ fn has_inactive_branch(conn: &Connection, sid: SessionId) -> Result<bool> {
         .query_row([sid], |r| r.get(0))?)
 }
 
-trait Cursor: Copy + Eq + Ord + Send + ToSql + FromSql + 'static {}
-impl Cursor for i64 {}
-impl Cursor for ItemId {}
-
 #[derive(Clone, Copy)]
 pub enum JsonRows {
     History,
     Context,
 }
 
-fn page_bounds<C: Cursor>(
-    conn: &Connection,
-    table: &str,
-    col: &str,
-    sid: SessionId,
-    after: impl ToSql,
-    before: Option<C>,
-    tail: bool,
-    limit: i64,
-    extra_where: &str,
-) -> Result<Option<(C, C)>> {
-    let pair = if tail {
-        let sql = format!(
-            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1{extra_where} ORDER BY {col} DESC LIMIT ?2)"
-        );
-        conn.prepare_cached(&sql)?.query_row((sid, limit), |r| {
-            Ok((r.get::<_, Option<C>>(0)?, r.get::<_, Option<C>>(1)?))
-        })?
-    } else if let Some(before) = before {
-        let sql = format!(
-            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}<?2{extra_where} ORDER BY {col} DESC LIMIT ?3)"
-        );
-        conn.prepare_cached(&sql)?
-            .query_row((sid, before, limit), |r| {
-                Ok((r.get::<_, Option<C>>(0)?, r.get::<_, Option<C>>(1)?))
-            })?
-    } else {
-        let sql = format!(
-            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}>?2{extra_where} ORDER BY {col} LIMIT ?3)"
-        );
-        conn.prepare_cached(&sql)?
-            .query_row(params![sid, after, limit], |r| {
-                Ok((r.get::<_, Option<C>>(0)?, r.get::<_, Option<C>>(1)?))
-            })?
-    };
-    Ok(pair.0.zip(pair.1))
-}
-
 impl JsonRows {
-    // Both tables are append-only. Pin the cursor span of this page before sending
-    // bytes so a concurrent append can't appear halfway through the response.
-    pub fn history_range(
+    // Capture an immutable snapshot list of <= 200 keys in one DB read so branch switches
+    // cannot mix two branches or lose rows while streaming response chunks.
+    pub fn history_snapshot(
         conn: &Connection,
         sid: SessionId,
         after: Option<ItemId>,
         before: Option<ItemId>,
         tail: bool,
         limit: i64,
-    ) -> Result<Option<(ItemId, ItemId)>> {
+    ) -> Result<Vec<ItemId>> {
         let extra = if has_inactive_branch(conn, sid)? {
             HISTORY_BRANCH_FILTER
         } else {
             ""
         };
-        page_bounds(
-            conn,
-            "items",
-            "id",
-            sid,
-            after.as_ref().map_or("", ItemId::as_str),
-            before,
-            tail,
-            limit,
-            extra,
-        )
+        let mut ids: Vec<ItemId> = if tail {
+            let sql = format!(
+                "SELECT id FROM items WHERE session_id=?1{extra} ORDER BY id DESC LIMIT ?2"
+            );
+            conn.prepare_cached(&sql)?
+                .query_map((sid, limit), |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        } else if let Some(before) = before {
+            let sql = format!(
+                "SELECT id FROM items WHERE session_id=?1 AND id<?2{extra} ORDER BY id DESC LIMIT ?3"
+            );
+            conn.prepare_cached(&sql)?
+                .query_map((sid, before, limit), |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            let sql = format!(
+                "SELECT id FROM items WHERE session_id=?1 AND id>?2{extra} ORDER BY id ASC LIMIT ?3"
+            );
+            conn.prepare_cached(&sql)?
+                .query_map(
+                    params![sid, after.as_ref().map_or("", ItemId::as_str), limit],
+                    |r| r.get(0),
+                )?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if tail || before.is_some() {
+            ids.reverse();
+        }
+        Ok(ids)
     }
 
-    pub fn context_range(
+    pub fn context_snapshot(
         conn: &Connection,
         sid: SessionId,
         after: Option<i64>,
         before: Option<i64>,
         tail: bool,
         limit: i64,
-    ) -> Result<Option<(i64, i64)>> {
-        page_bounds(
-            conn,
-            "active_context",
-            "position",
-            sid,
-            after.unwrap_or(0),
-            before,
-            tail,
-            limit,
-            "",
-        )
+    ) -> Result<Vec<(i64, ItemId)>> {
+        let mut rows: Vec<(i64, ItemId)> = if tail {
+            conn.prepare_cached(
+                "SELECT position, item_id FROM active_context WHERE session_id=?1 ORDER BY position DESC LIMIT ?2",
+            )?
+            .query_map((sid, limit), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+        } else if let Some(before) = before {
+            conn.prepare_cached(
+                "SELECT position, item_id FROM active_context WHERE session_id=?1 AND position<?2 ORDER BY position DESC LIMIT ?3",
+            )?
+            .query_map((sid, before, limit), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+        } else {
+            conn.prepare_cached(
+                "SELECT position, item_id FROM active_context WHERE session_id=?1 AND position>?2 ORDER BY position ASC LIMIT ?3",
+            )?
+            .query_map((sid, after.unwrap_or(0), limit), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        if tail || before.is_some() {
+            rows.reverse();
+        }
+        Ok(rows)
     }
 
-    fn batch<C: Cursor>(
-        self,
+    fn history_chunk(
         conn: &Connection,
-        sid: SessionId,
-        cursor: C,
-        end: C,
-        inclusive: bool,
+        items: &[ItemId],
+        offset: usize,
         mut bytes: Vec<u8>,
         mut comma: bool,
-    ) -> Result<(Vec<u8>, C)> {
-        let cmp = if inclusive { ">=" } else { ">" };
-        let sql = match self {
-            Self::Context => format!(
-                "SELECT c.position,json_object('position',c.position,'item_id',i.id,'llm_call_id',i.llm_call_id,'payload',json(i.payload))
-                 FROM active_context c JOIN items i ON i.id=c.item_id
-                 WHERE c.session_id=? AND c.position{cmp}? AND c.position<=? ORDER BY c.position LIMIT ?"
-            ),
-            Self::History => {
-                let extra = if has_inactive_branch(conn, sid)? {
-                    HISTORY_BRANCH_FILTER
-                } else {
-                    ""
-                };
-                format!(
-                    "SELECT id,json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'llm_call_id',llm_call_id)
-                     FROM items WHERE session_id=? AND id{cmp}? AND id<=?{extra} ORDER BY id LIMIT ?"
-                )
-            }
-        };
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query((sid, cursor, end, BATCH_ITEMS))?;
-        let mut position = None;
-        while let Some(row) = rows.next()? {
-            let raw = row.get_ref(1)?.as_bytes().map_err(|e| Error::internal(e.to_string()))?;
-            if position.is_some() && bytes.len() + raw.len() + 1 > BATCH_BYTES {
+    ) -> Result<(Vec<u8>, usize)> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'llm_call_id',llm_call_id)
+             FROM items WHERE id=?1",
+        )?;
+        let mut next = offset;
+        for &id in &items[offset..] {
+            let raw_str: String = stmt
+                .query_row([id], |r| r.get(0))
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        Error::internal("missing row in saved history")
+                    }
+                    other => other.into(),
+                })?;
+            let raw = raw_str.as_bytes();
+            if next > offset && bytes.len() + raw.len() + 1 > BATCH_BYTES {
                 break;
             }
             if comma {
@@ -1183,72 +1259,128 @@ impl JsonRows {
             }
             bytes.extend_from_slice(raw);
             comma = true;
-            position = Some(row.get::<_, C>(0)?);
+            next += 1;
             if bytes.len() >= BATCH_BYTES {
                 break;
             }
         }
-        let Some(position) = position else {
-            return Err(Error::internal("missing row in saved history"));
-        };
-        Ok((bytes, position))
+        Ok((bytes, next))
     }
 
-    pub async fn history_body(
-        self,
-        db: Db,
-        sid: SessionId,
-        range: Option<(ItemId, ItemId)>,
-    ) -> Result<Body> {
-        self.body_with_range(db, sid, range, vec![b'['], b"]").await
+    fn context_chunk(
+        conn: &Connection,
+        items: &[(i64, ItemId)],
+        offset: usize,
+        mut bytes: Vec<u8>,
+        mut comma: bool,
+    ) -> Result<(Vec<u8>, usize)> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT json_object('position',?1,'item_id',id,'llm_call_id',llm_call_id,'payload',json(payload))
+             FROM items WHERE id=?2",
+        )?;
+        let mut next = offset;
+        for &(pos, id) in &items[offset..] {
+            let raw_str: String = stmt
+                .query_row(params![pos, id], |r| r.get(0))
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        Error::internal("missing row in saved history")
+                    }
+                    other => other.into(),
+                })?;
+            let raw = raw_str.as_bytes();
+            if next > offset && bytes.len() + raw.len() + 1 > BATCH_BYTES {
+                break;
+            }
+            if comma {
+                bytes.push(b',');
+            }
+            bytes.extend_from_slice(raw);
+            comma = true;
+            next += 1;
+            if bytes.len() >= BATCH_BYTES {
+                break;
+            }
+        }
+        Ok((bytes, next))
+    }
+
+    pub async fn history_body(self, db: Db, items: Vec<ItemId>) -> Result<Body> {
+        let mut prefix = vec![b'['];
+        let total = items.len();
+        if total == 0 {
+            prefix.push(b']');
+            return Ok(Body::from(prefix));
+        }
+        let items = Arc::new(items);
+        let first_items = items.clone();
+        let (mut bytes, mut next) = db
+            .call(move |s| Self::history_chunk(&s.conn, &first_items, 0, prefix, false))
+            .await?;
+        if next >= total {
+            bytes.push(b']');
+            return Ok(Body::from(bytes));
+        }
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, Error>(Bytes::from(bytes));
+            while next < total {
+                let batch_items = items.clone();
+                let res = db
+                    .call(move |s| Self::history_chunk(&s.conn, &batch_items, next, Vec::new(), true))
+                    .await;
+                match res {
+                    Ok((mut chunk, next_idx)) => {
+                        next = next_idx;
+                        if next >= total {
+                            chunk.push(b']');
+                        }
+                        yield Ok(Bytes::from(chunk));
+                    }
+                    Err(err) => {
+                        yield Err(err);
+                        break;
+                    }
+                }
+            }
+        };
+        Ok(Body::wrap_stream(stream))
     }
 
     pub async fn context_body(
         self,
         db: Db,
-        sid: SessionId,
-        range: Option<(i64, i64)>,
-        prefix: Vec<u8>,
-        suffix: &'static [u8],
-    ) -> Result<Body> {
-        self.body_with_range(db, sid, range, prefix, suffix).await
-    }
-
-    async fn body_with_range<C: Cursor>(
-        self,
-        db: Db,
-        sid: SessionId,
-        range: Option<(C, C)>,
+        items: Vec<(i64, ItemId)>,
         mut prefix: Vec<u8>,
         suffix: &'static [u8],
     ) -> Result<Body> {
-        let Some((start, end)) = range else {
+        let total = items.len();
+        if total == 0 {
             prefix.extend_from_slice(suffix);
             return Ok(Body::from(prefix));
-        };
-        let read_batch = move |conn: &Connection, cursor, inclusive, bytes, comma| {
-            self.batch(conn, sid, cursor, end, inclusive, bytes, comma)
-        };
-        let (mut bytes, mut position) = db
-            .call(move |s| read_batch(&s.conn, start, true, prefix, false))
+        }
+        let items = Arc::new(items);
+        let first_items = items.clone();
+        let (mut bytes, mut next) = db
+            .call(move |s| Self::context_chunk(&s.conn, &first_items, 0, prefix, false))
             .await?;
-        if position == end {
+        if next >= total {
             bytes.extend_from_slice(suffix);
             return Ok(Body::from(bytes));
         }
         let stream = async_stream::stream! {
             yield Ok::<Bytes, Error>(Bytes::from(bytes));
-            while position < end {
-                let result = db
-                    .call(move |s| read_batch(&s.conn, position, false, Vec::new(), true))
+            while next < total {
+                let batch_items = items.clone();
+                let res = db
+                    .call(move |s| Self::context_chunk(&s.conn, &batch_items, next, Vec::new(), true))
                     .await;
-                match result {
-                    Ok((mut bytes, next)) => {
-                        position = next;
-                        if position == end {
-                            bytes.extend_from_slice(suffix);
+                match res {
+                    Ok((mut chunk, next_idx)) => {
+                        next = next_idx;
+                        if next >= total {
+                            chunk.extend_from_slice(suffix);
                         }
-                        yield Ok(Bytes::from(bytes));
+                        yield Ok(Bytes::from(chunk));
                     }
                     Err(err) => {
                         yield Err(err);
