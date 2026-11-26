@@ -84,8 +84,10 @@ pub struct LocalNode {
     pub membership_gen: i64,
     pub voter_epoch: u64,
     pub voter_set: Vec<String>,
+    pub voter_ballot: String,
     pub pending_voter_epoch: u64,
     pub pending_voter_set: Vec<String>,
+    pub pending_proposal_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,9 +228,9 @@ pub fn ensure_local_node(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT INTO local_node(
             id,secret_key,node_id,cluster_secret,name,description,role,db_epoch,
-            meta_seq,membership_gen,catalog_rev,voter_epoch,voter_set_json,
-            pending_voter_epoch,pending_voter_set_json
-         ) VALUES(1,?,?,?,?,?,'voter',?,1,1,0,1,?,0,'[]')",
+            meta_seq,membership_gen,catalog_rev,voter_epoch,voter_set_json,voter_ballot,
+            pending_voter_epoch,pending_voter_set_json,pending_proposal_id
+         ) VALUES(1,?,?,?,?,?,'voter',?,1,1,0,1,?,'',0,'[]','')",
         params![
             secret_key.as_slice(),
             node_id,
@@ -266,7 +268,7 @@ pub fn local_node_id(conn: &Connection) -> Result<Rc<str>> {
 pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
     conn.query_row(
         "SELECT secret_key,node_id,cluster_secret,name,description,role,db_epoch,meta_seq,membership_gen,
-                voter_epoch,voter_set_json,pending_voter_epoch,pending_voter_set_json
+                voter_epoch,voter_set_json,voter_ballot,pending_voter_epoch,pending_voter_set_json,pending_proposal_id
          FROM local_node WHERE id=1",
         [],
         |r| {
@@ -284,8 +286,10 @@ pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
             })?;
             let voter_epoch_i64: i64 = r.get(9)?;
             let voter_set_raw: String = r.get(10)?;
-            let pending_epoch_i64: i64 = r.get(11)?;
-            let pending_set_raw: String = r.get(12)?;
+            let voter_ballot: String = r.get(11)?;
+            let pending_epoch_i64: i64 = r.get(12)?;
+            let pending_set_raw: String = r.get(13)?;
+            let pending_proposal_id: String = r.get(14)?;
             Ok(LocalNode {
                 secret_key,
                 node_id: r.get(1)?,
@@ -298,8 +302,10 @@ pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
                 membership_gen: r.get(8)?,
                 voter_epoch: u64::try_from(voter_epoch_i64).unwrap_or(0),
                 voter_set: parse_voter_set_json(&voter_set_raw),
+                voter_ballot,
                 pending_voter_epoch: u64::try_from(pending_epoch_i64).unwrap_or(0),
                 pending_voter_set: parse_voter_set_json(&pending_set_raw),
+                pending_proposal_id,
             })
         },
     )
@@ -359,7 +365,8 @@ pub fn set_local_role(conn: &Connection, role: NodeRole) -> Result<LocalNode> {
                  voter_epoch=?2,
                  voter_set_json=?3,
                  pending_voter_epoch=0,
-                 pending_voter_set_json='[]'
+                 pending_voter_set_json='[]',
+                 pending_proposal_id=''
              WHERE id=1",
             params![role, next_epoch, next_json],
         )?;
@@ -367,25 +374,53 @@ pub fn set_local_role(conn: &Connection, role: NodeRole) -> Result<LocalNode> {
     load_local_node(conn)
 }
 
+pub fn probe_voter_config(
+    conn: &Connection,
+    expected_epoch: u64,
+    next_epoch: u64,
+    ballot: &str,
+) -> Result<(bool, LocalNode)> {
+    if ballot.is_empty() || next_epoch == 0 || next_epoch <= expected_epoch {
+        return Err(Error::bad("invalid voter recovery ballot"));
+    }
+    crate::cluster::ledger::validate_hlc(ballot)?;
+    crate::cluster::ledger::observe_hlc(ballot);
+    let local = load_local_node(conn)?;
+    if local.voter_epoch >= next_epoch {
+        return Ok((false, local));
+    }
+    if local.voter_epoch != expected_epoch && local.voter_epoch != 0 {
+        return Ok((false, local));
+    }
+    if ballot <= local.voter_ballot.as_str() {
+        return Ok((false, local));
+    }
+    conn.execute(
+        "UPDATE local_node SET voter_ballot=?1 WHERE id=1",
+        [ballot],
+    )?;
+    Ok((true, load_local_node(conn)?))
+}
+
 pub fn prepare_voter_config(
     conn: &Connection,
     expected_epoch: u64,
     next_epoch: u64,
+    proposal_id: &str,
     new_set: &[String],
 ) -> Result<LocalNode> {
     let canonical = canonicalize_voter_set(new_set)?;
-    if next_epoch == 0 || next_epoch <= expected_epoch {
+    if canonical.is_empty() {
+        return Err(Error::conflict("cluster must retain at least one voter"));
+    }
+    if proposal_id.is_empty() || next_epoch == 0 || next_epoch <= expected_epoch {
         return Err(Error::bad("invalid voter epoch transition"));
     }
+    crate::cluster::ledger::validate_hlc(proposal_id)?;
+    crate::cluster::ledger::observe_hlc(proposal_id);
     let local = load_local_node(conn)?;
     if local.voter_epoch >= next_epoch {
         return Err(Error::conflict("voter epoch already advanced"));
-    }
-    if local.pending_voter_epoch != 0 {
-        if local.pending_voter_epoch == next_epoch && local.pending_voter_set == canonical {
-            return Ok(local);
-        }
-        return Err(Error::conflict("voter reconfiguration already pending"));
     }
     if local.voter_epoch != expected_epoch && local.voter_epoch != 0 {
         return Err(Error::conflict(format!(
@@ -393,12 +428,34 @@ pub fn prepare_voter_config(
             local.voter_epoch
         )));
     }
+    if proposal_id < local.voter_ballot.as_str() {
+        return Err(Error::conflict("stale voter configuration ballot"));
+    }
+    if local.pending_voter_epoch != 0 {
+        if local.pending_voter_epoch != next_epoch {
+            return Err(Error::conflict("voter reconfiguration already pending"));
+        }
+        if local.pending_proposal_id == proposal_id {
+            if local.pending_voter_set == canonical {
+                return Ok(local);
+            }
+            return Err(Error::conflict("conflicting voter proposal_id"));
+        }
+        if proposal_id < local.pending_proposal_id.as_str() {
+            return Err(Error::conflict("stale voter configuration ballot"));
+        }
+    }
     let pending_json = serde_json::to_string(&canonical)
         .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
     let next_i64 = i64::try_from(next_epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
     conn.execute(
-        "UPDATE local_node SET pending_voter_epoch=?1, pending_voter_set_json=?2 WHERE id=1",
-        params![next_i64, pending_json],
+        "UPDATE local_node
+         SET voter_ballot=CASE WHEN ?3 > voter_ballot THEN ?3 ELSE voter_ballot END,
+             pending_voter_epoch=?1,
+             pending_voter_set_json=?2,
+             pending_proposal_id=?3
+         WHERE id=1",
+        params![next_i64, pending_json, proposal_id],
     )?;
     load_local_node(conn)
 }
@@ -412,6 +469,9 @@ pub fn commit_voter_config(
         return Err(Error::bad("committed voter_epoch must be positive"));
     }
     let canonical = canonicalize_voter_set(new_set)?;
+    if canonical.is_empty() {
+        return Err(Error::conflict("cluster must retain at least one voter"));
+    }
     let local = load_local_node(conn)?;
     if local.voter_epoch > epoch {
         return Ok((local, false));
@@ -424,7 +484,9 @@ pub fn commit_voter_config(
         }
         if local.pending_voter_epoch == epoch {
             conn.execute(
-                "UPDATE local_node SET pending_voter_epoch=0, pending_voter_set_json='[]' WHERE id=1",
+                "UPDATE local_node
+                 SET pending_voter_epoch=0, pending_voter_set_json='[]', pending_proposal_id=''
+                 WHERE id=1",
                 [],
             )?;
             return Ok((load_local_node(conn)?, false));
@@ -447,6 +509,7 @@ pub fn commit_voter_config(
              voter_set_json=?2,
              pending_voter_epoch=CASE WHEN pending_voter_epoch <= ?1 THEN 0 ELSE pending_voter_epoch END,
              pending_voter_set_json=CASE WHEN pending_voter_epoch <= ?1 THEN '[]' ELSE pending_voter_set_json END,
+             pending_proposal_id=CASE WHEN pending_voter_epoch <= ?1 THEN '' ELSE pending_proposal_id END,
              role=?3,
              meta_seq=CASE WHEN role != ?3 THEN meta_seq+1 ELSE meta_seq END
          WHERE id=1",
@@ -455,14 +518,38 @@ pub fn commit_voter_config(
     Ok((load_local_node(conn)?, role_changed))
 }
 
-pub fn abort_voter_config(conn: &Connection, next_epoch: u64) -> Result<LocalNode> {
+pub fn abort_voter_config(
+    conn: &Connection,
+    next_epoch: u64,
+    proposal_id: &str,
+    fence_ballot: Option<&str>,
+) -> Result<LocalNode> {
+    if proposal_id.is_empty() {
+        return Err(Error::bad("invalid voter proposal_id"));
+    }
+    if let Some(ballot) = fence_ballot {
+        crate::cluster::ledger::validate_hlc(ballot)?;
+        crate::cluster::ledger::observe_hlc(ballot);
+    }
     let next_i64 = i64::try_from(next_epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
-    conn.execute(
-        "UPDATE local_node
-         SET pending_voter_epoch=0, pending_voter_set_json='[]'
-         WHERE id=1 AND pending_voter_epoch=?1",
-        [next_i64],
-    )?;
+    if let Some(ballot) = fence_ballot {
+        conn.execute(
+            "UPDATE local_node
+             SET voter_ballot=CASE WHEN ?3 > voter_ballot THEN ?3 ELSE voter_ballot END,
+                 pending_voter_epoch=CASE WHEN pending_voter_epoch=?1 AND pending_proposal_id=?2 THEN 0 ELSE pending_voter_epoch END,
+                 pending_voter_set_json=CASE WHEN pending_voter_epoch=?1 AND pending_proposal_id=?2 THEN '[]' ELSE pending_voter_set_json END,
+                 pending_proposal_id=CASE WHEN pending_voter_epoch=?1 AND pending_proposal_id=?2 THEN '' ELSE pending_proposal_id END
+             WHERE id=1",
+            params![next_i64, proposal_id, ballot],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE local_node
+             SET pending_voter_epoch=0, pending_voter_set_json='[]', pending_proposal_id=''
+             WHERE id=1 AND pending_voter_epoch=?1 AND pending_proposal_id=?2",
+            params![next_i64, proposal_id],
+        )?;
+    }
     load_local_node(conn)
 }
 
@@ -472,7 +559,7 @@ pub fn adopt_voter_config(
     set: &[String],
 ) -> Result<(LocalNode, bool)> {
     let local = load_local_node(conn)?;
-    if epoch == 0 || epoch <= local.voter_epoch || epoch < local.pending_voter_epoch {
+    if epoch == 0 || set.is_empty() || epoch <= local.voter_epoch || epoch < local.pending_voter_epoch {
         return Ok((local, false));
     }
     commit_voter_config(conn, epoch, set)
@@ -618,8 +705,8 @@ pub fn apply_join(
         conn.execute(
             "UPDATE local_node
              SET cluster_secret=?1, membership_gen=?2,
-                 voter_epoch=0, voter_set_json='[]',
-                 pending_voter_epoch=0, pending_voter_set_json='[]'
+                 voter_epoch=0, voter_set_json='[]', voter_ballot='',
+                 pending_voter_epoch=0, pending_voter_set_json='[]', pending_proposal_id=''
              WHERE id=1",
             params![new_secret.as_slice(), next_gen],
         )?;

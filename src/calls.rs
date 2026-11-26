@@ -89,6 +89,32 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
     })
 }
 
+pub const MAX_STORED_RAW_USAGE_BYTES: usize = 64 * 1024;
+pub const MAX_STORED_ERROR_SUMMARY_BYTES: usize = 8 * 1024;
+
+pub(crate) fn truncate_utf8(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
+pub(crate) fn clamp_raw_usage(usage: Option<Value>) -> Option<Value> {
+    usage.filter(|v| {
+        serde_json::to_vec(v)
+            .map(|b| b.len() <= MAX_STORED_RAW_USAGE_BYTES)
+            .unwrap_or(false)
+    })
+}
+
+pub(crate) fn clamp_raw_usage_str(raw: Option<String>) -> Option<String> {
+    raw.filter(|s| s.len() <= MAX_STORED_RAW_USAGE_BYTES)
+}
+
 #[derive(Default)]
 pub struct Report {
     pub response_id: Option<String>,
@@ -116,8 +142,10 @@ impl Report {
                 crate::cluster::ledger::CALLS_SCOPE,
                 &origin_node_id,
             )?;
-            let usage = self.usage.filter(Value::is_object);
-            let bill = pricing::settle(snapshot, usage.as_ref());
+            let full_usage = self.usage.filter(Value::is_object);
+            let bill = pricing::settle(snapshot, full_usage.as_ref());
+            let stored_usage = clamp_raw_usage(full_usage);
+            let stored_reason = reason.map(|r| truncate_utf8(r, MAX_STORED_ERROR_SUMMARY_BYTES));
             conn.prepare_cached(
                 "UPDATE llm_calls SET finished_at=?, status=?, error_summary=?, upstream_response_id=?,
                  http_status=?, raw_usage=?, input_uncached_tokens=?, cache_read_tokens=?, cache_write_tokens=?,
@@ -126,10 +154,10 @@ impl Report {
             .execute(params![
                 at,
                 status,
-                reason,
+                stored_reason,
                 self.response_id,
                 self.http_status,
-                usage,
+                stored_usage,
                 bill.input_uncached_tokens,
                 bill.cache_read_tokens,
                 bill.cache_write_tokens,

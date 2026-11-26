@@ -204,7 +204,7 @@ impl Cluster {
                             let count = peers.len();
                             if changed {
                                 presence.set_want_voter_admission(want_voter);
-                                presence.set_voter_config(0, &[], 0, &[]);
+                                presence.set_voter_config(0, &[], 0, &[], "");
                                 presence.clear_all_remote();
                             } else if voter_epoch == 0 && want_voter {
                                 presence.set_want_voter_admission(true);

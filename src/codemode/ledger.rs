@@ -103,18 +103,25 @@ fn invalidate_only(conn: &Connection, sid: SessionId, origin: ItemId) -> Result<
     let origin_node_id = crate::cluster::identity::local_node_id(conn)?;
     let scope = session_scope(sid);
     let mut inserted = 0usize;
+    let mut exists_stmt = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM invalidated_warnings WHERE item_id=?1)",
+    )?;
     let mut ins_stmt = conn.prepare_cached(
-        "INSERT OR IGNORE INTO invalidated_warnings(item_id, session_id, origin_node_id, origin_seq)
-         VALUES(?1, ?2, ?3, ?4)",
+        "INSERT INTO invalidated_warnings(item_id, session_id, origin_node_id, origin_seq)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(item_id, origin_node_id) DO NOTHING",
     )?;
     let mut del_stmt =
         conn.prepare_cached("DELETE FROM pending_inputs WHERE session_id=?1 AND item_id=?2")?;
     for item_id in ids {
-        let origin_seq = next_origin_seq(conn, &scope, &origin_node_id)?;
-        let n = ins_stmt.execute(params![item_id, sid, &*origin_node_id, origin_seq])?;
+        let already: bool = exists_stmt.query_row([item_id], |r| r.get(0))?;
         del_stmt.execute(params![sid, item_id])?;
-        if n > 0 {
-            inserted += 1;
+        if !already {
+            let origin_seq = next_origin_seq(conn, &scope, &origin_node_id)?;
+            let n = ins_stmt.execute(params![item_id, sid, &*origin_node_id, origin_seq])?;
+            if n > 0 {
+                inserted += 1;
+            }
         }
     }
     if inserted > 0 {
@@ -362,18 +369,25 @@ pub fn recover(conn: &Connection) -> Result<()> {
     };
     if !warning_candidates.is_empty() {
         with_savepoint(conn, "recover_warnings", || {
+            let mut exists_stmt = conn.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM invalidated_warnings WHERE item_id=?1)",
+            )?;
             let mut ins_stmt = conn.prepare_cached(
-                "INSERT OR IGNORE INTO invalidated_warnings(item_id, session_id, origin_node_id, origin_seq)
-                 VALUES(?1, ?2, ?3, ?4)",
+                "INSERT INTO invalidated_warnings(item_id, session_id, origin_node_id, origin_seq)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(item_id, origin_node_id) DO NOTHING",
             )?;
             let mut del_stmt = conn
                 .prepare_cached("DELETE FROM pending_inputs WHERE session_id=?1 AND item_id=?2")?;
             for (sid, item_id) in warning_candidates {
-                let origin_seq = next_origin_seq(conn, &session_scope(sid), &local_node_id)?;
-                let n = ins_stmt.execute(params![item_id, sid, &local_node_id, origin_seq])?;
+                let already: bool = exists_stmt.query_row([item_id], |r| r.get(0))?;
                 del_stmt.execute(params![sid, item_id])?;
-                if n > 0 {
-                    stage_session(sid);
+                if !already {
+                    let origin_seq = next_origin_seq(conn, &session_scope(sid), &local_node_id)?;
+                    let n = ins_stmt.execute(params![item_id, sid, &local_node_id, origin_seq])?;
+                    if n > 0 {
+                        stage_session(sid);
+                    }
                 }
             }
             Ok(())

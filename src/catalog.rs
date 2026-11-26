@@ -303,6 +303,18 @@ fn save_provider(
             "expected HTTP(S) base_url without credentials, query or fragment",
         ));
     }
+    if let Some(prev) = &old
+        && prev.api_key.as_deref().is_some_and(|k| !k.is_empty())
+        && has_base_url
+        && !has_api_key
+    {
+        let prev_origin = reqwest::Url::parse(&prev.base_url).ok().map(|u| u.origin());
+        if prev_origin != Some(url.origin()) {
+            return Err(Error::bad(
+                "set api_key explicitly when changing the provider origin",
+            ));
+        }
+    }
     let id = match id {
         Some(id) => id,
         None => ProviderId::new()?,

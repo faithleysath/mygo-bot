@@ -62,7 +62,8 @@ CREATE TABLE mcp_servers (
     timeout_ms INTEGER NOT NULL CHECK (timeout_ms BETWEEN 1 AND 86400000),
     timeout_ts TEXT NOT NULL DEFAULT '',
     revision INTEGER NOT NULL CHECK (revision > 0),
-    config_ts TEXT NOT NULL DEFAULT '',
+    headers_epoch_ts TEXT NOT NULL DEFAULT '',
+    headers_ts TEXT NOT NULL DEFAULT '',
     auth_config_ts TEXT NOT NULL DEFAULT '',
     oauth_epoch_ts TEXT NOT NULL DEFAULT '',
     oauth_ts TEXT NOT NULL DEFAULT '',
@@ -198,18 +199,20 @@ CREATE INDEX context_nodes_by_item ON context_nodes(session_id, item_id);
 CREATE INDEX context_nodes_by_origin ON context_nodes(session_id, origin_node_id, origin_seq, id);
 
 CREATE TABLE turn_settled (
-    context_node_id TEXT PRIMARY KEY,
+    context_node_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     origin_node_id TEXT NOT NULL,
-    origin_seq INTEGER NOT NULL CHECK (origin_seq > 0)
+    origin_seq INTEGER NOT NULL CHECK (origin_seq > 0),
+    PRIMARY KEY (context_node_id, origin_node_id)
 ) WITHOUT ROWID;
 CREATE INDEX turn_settled_by_origin ON turn_settled(session_id, origin_node_id, origin_seq);
 
 CREATE TABLE invalidated_warnings (
-    item_id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL,
     session_id TEXT NOT NULL,
     origin_node_id TEXT NOT NULL,
-    origin_seq INTEGER NOT NULL CHECK (origin_seq > 0)
+    origin_seq INTEGER NOT NULL CHECK (origin_seq > 0),
+    PRIMARY KEY (item_id, origin_node_id)
 ) WITHOUT ROWID;
 CREATE INDEX invalidated_warnings_by_origin ON invalidated_warnings(session_id, origin_node_id, origin_seq);
 
@@ -258,8 +261,10 @@ CREATE TABLE local_node (
     catalog_rev INTEGER NOT NULL DEFAULT 0 CHECK (catalog_rev >= 0),
     voter_epoch INTEGER NOT NULL DEFAULT 1 CHECK (voter_epoch >= 0),
     voter_set_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(voter_set_json) = 'array'),
+    voter_ballot TEXT NOT NULL DEFAULT '',
     pending_voter_epoch INTEGER NOT NULL DEFAULT 0 CHECK (pending_voter_epoch >= 0),
-    pending_voter_set_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(pending_voter_set_json) = 'array')
+    pending_voter_set_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(pending_voter_set_json) = 'array'),
+    pending_proposal_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE cluster_peers (

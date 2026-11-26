@@ -752,6 +752,7 @@ impl SyncEngine {
                             &local.voter_set,
                             local.pending_voter_epoch,
                             &local.pending_voter_set,
+                            &local.pending_proposal_id,
                         );
                         s.presence.set_peer_roles(&my_peers);
                         s.presence.set_known_peer_count(my_peers.len());
@@ -1075,6 +1076,7 @@ impl SyncEngine {
                         &local.voter_set,
                         local.pending_voter_epoch,
                         &local.pending_voter_set,
+                        &local.pending_proposal_id,
                     );
                     s.presence.set_peer_roles(&all);
                     s.presence.set_known_peer_count(all.len());
@@ -1139,6 +1141,47 @@ impl SyncEngine {
         }
     }
 
+    pub(crate) fn validate_session_delta_budget(delta: &SessionDelta) -> Result<u32> {
+        let mut total_unpacked_bytes: u64 = 0;
+        let mut total_oversized_units: u32 = 0;
+        let mut oversized_items: usize = 0;
+        for item in &delta.items {
+            match (item.payload_len, item.payload_hash) {
+                (Some(expected_len), Some(_)) => {
+                    if expected_len == 0 || expected_len > MAX_ITEM_PAYLOAD_BYTES {
+                        return Err(Error::bad("invalid oversized item payload length"));
+                    }
+                    if item.payload.is_empty() {
+                        oversized_items += 1;
+                    }
+                    total_unpacked_bytes = total_unpacked_bytes.saturating_add(expected_len);
+                    let units = u32::try_from(expected_len.div_ceil(ATT_CHUNK_SIZE as u64))
+                        .map_err(|_| Error::bad("item payload budget overflow"))?
+                        .max(1);
+                    total_oversized_units = total_oversized_units.saturating_add(units);
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(Error::bad("incomplete item payload metadata"));
+                }
+                (None, None) => {
+                    total_unpacked_bytes =
+                        total_unpacked_bytes.saturating_add(item.payload.len() as u64);
+                }
+            }
+        }
+        let within_delta = total_unpacked_bytes <= ledger::MAX_DELTA_BYTES as u64;
+        let single_oversized = oversized_items == 1
+            && delta.items.len() == 1
+            && delta.context_nodes.is_empty()
+            && delta.turn_settled.is_empty()
+            && delta.invalidated_warnings.is_empty()
+            && total_unpacked_bytes <= MAX_ITEM_PAYLOAD_BYTES;
+        if !within_delta && !single_oversized {
+            return Err(Error::bad("SessionDelta unpacked payload exceeds page budget"));
+        }
+        Ok(total_oversized_units)
+    }
+
     async fn fetch_item_payload(
         &self,
         peer_id: &str,
@@ -1153,16 +1196,6 @@ impl SyncEngine {
         }
         let total_len = usize::try_from(expected_len)
             .map_err(|_| Error::bad("oversized item payload length overflow"))?;
-        let units = u32::try_from(total_len.div_ceil(ATT_CHUNK_SIZE))
-            .map_err(|_| Error::bad("item payload budget overflow"))?
-            .max(1);
-        let _budget = tokio::time::timeout(
-            RPC_TIMEOUT_DATA,
-            self.att_byte_budget.clone().acquire_many_owned(units),
-        )
-        .await
-        .map_err(|_| Error::conflict("item payload staging budget saturated"))?
-        .map_err(|_| Error::internal("item payload budget closed"))?;
 
         let mut buf = Vec::with_capacity(total_len);
         let mut hasher = blake3::Hasher::new();
@@ -1356,6 +1389,22 @@ impl SyncEngine {
             if self.net.membership_gen() != expected_mgen {
                 break;
             }
+            let total_oversized_units = Self::validate_session_delta_budget(&delta)?;
+            let page_budget = if total_oversized_units > 0 {
+                Some(
+                    tokio::time::timeout(
+                        RPC_TIMEOUT_DATA,
+                        self.att_byte_budget
+                            .clone()
+                            .acquire_many_owned(total_oversized_units),
+                    )
+                    .await
+                    .map_err(|_| Error::conflict("item payload staging budget saturated"))?
+                    .map_err(|_| Error::internal("item payload budget closed"))?,
+                )
+            } else {
+                None
+            };
             for item in &mut delta.items {
                 match (item.payload_len, item.payload_hash) {
                     (Some(expected_len), Some(expected_hash)) => {
@@ -1403,6 +1452,7 @@ impl SyncEngine {
                     Ok(outcome)
                 })
                 .await?;
+            drop(page_budget);
 
             if outcome.changed {
                 any_changed = true;
@@ -1662,13 +1712,14 @@ impl SyncEngine {
         match state_after_cat {
             Some(true) => return Err(rusqlite::Error::QueryReturnedNoRows.into()),
             None => {
-                if !peers.is_empty() && catalog_ok == 0 {
-                    return Err(first_cat_err.unwrap_or_else(|| {
-                        Error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "unable to reach cluster peers to verify session".into(),
-                        )
-                    }));
+                if let Some(err) = first_cat_err {
+                    return Err(err);
+                }
+                if !peers.is_empty() && catalog_ok < peers.len() {
+                    return Err(Error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "unable to reach all cluster peers to verify session".into(),
+                    ));
                 }
                 return Err(rusqlite::Error::QueryReturnedNoRows.into());
             }
@@ -2332,6 +2383,7 @@ fn abort_active_session_worker(s: &mut Store, streams: &Hub, sid: SessionId) {
         lease.stopped.cancel();
         s.presence.clear_active_local_lease(sid, &lease.claim_id);
     }
+    s.presence.clear_non_quorum_local_lease(sid);
     s.pending_wakes.remove(&sid);
     crate::codemode::stop_session(s, sid);
     let _ = s.conn.execute(

@@ -18,7 +18,7 @@ use crate::{
 
 pub const CALLS_SCOPE: &str = "calls";
 pub const MAX_INLINE_ITEM_PAYLOAD_BYTES: usize = 1_000_000;
-const MAX_DELTA_BYTES: usize = 1_500_000;
+pub const MAX_DELTA_BYTES: usize = 1_500_000;
 const DELTA_PAGE_LIMIT: usize = 256;
 // Strict upper bound for HLC physical wall milliseconds (~36M years), preventing u64 saturation.
 pub const MAX_HLC_WALL_MS: u64 = 1u64 << 60;
@@ -100,6 +100,11 @@ fn valid_hlc_node_part(node: &str) -> bool {
     !node.is_empty() && node.len() <= 128 && node.bytes().all(|b| b.is_ascii_graphic())
 }
 
+#[inline]
+fn hlc_in_bounds(wall_ms: u64, logical: u32) -> bool {
+    wall_ms < MAX_HLC_WALL_MS && !(wall_ms == MAX_HLC_WALL_MS - 1 && logical == u32::MAX)
+}
+
 fn parse_hlc(ts: &str) -> Option<(u64, u32)> {
     let b = ts.as_bytes();
     if b.len() < 27 || b.len() > 154 || b[16] != b':' || b[25] != b':' {
@@ -116,7 +121,7 @@ fn parse_hlc(ts: &str) -> Option<(u64, u32)> {
     let logical = u32::from_str_radix(&ts[17..25], 16).ok()?;
     // Reject wall_ms at/above MAX_HLC_WALL_MS and the final slot before MAX_HLC_WALL_MS so a
     // strictly monotonic successor is always representable.
-    if wall_ms >= MAX_HLC_WALL_MS || (wall_ms == MAX_HLC_WALL_MS - 1 && logical == u32::MAX) {
+    if !hlc_in_bounds(wall_ms, logical) {
         return None;
     }
     Some((wall_ms, logical))
@@ -150,21 +155,23 @@ pub fn tick_hlc_for(node_id: &str) -> Result<String> {
     }
     let (wall_ms, logical) = {
         let mut st = HLC.lock().unwrap();
-        if raw_now > st.wall_ms {
-            st.wall_ms = raw_now;
-            st.logical = 0;
+        let (next_wall, next_logical) = if raw_now > st.wall_ms {
+            (raw_now, 0)
         } else if st.logical < u32::MAX {
-            st.logical += 1;
+            (st.wall_ms, st.logical + 1)
         } else {
             let next_wall = st
                 .wall_ms
                 .checked_add(1)
-                .filter(|&w| w < MAX_HLC_WALL_MS)
                 .ok_or_else(|| Error::internal("HLC timestamp space exhausted"))?;
-            st.wall_ms = next_wall;
-            st.logical = 0;
+            (next_wall, 0)
+        };
+        if !hlc_in_bounds(next_wall, next_logical) {
+            return Err(Error::internal("HLC timestamp space exhausted"));
         }
-        (st.wall_ms, st.logical)
+        st.wall_ms = next_wall;
+        st.logical = next_logical;
+        (next_wall, next_logical)
     };
     Ok(format!("{wall_ms:016x}:{logical:08x}:{node_id}"))
 }
@@ -215,9 +222,11 @@ pub fn seed_hlc_from_db(conn: &Connection) -> Result<()> {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         ) = conn.query_row(
             "SELECT max(name_ts), max(description_ts), max(enabled_ts), max(allowed_tools_ts),
-                    max(timeout_ts), max(config_ts), max(auth_config_ts), max(oauth_epoch_ts), max(oauth_ts)
+                    max(timeout_ts), max(headers_epoch_ts), max(headers_ts),
+                    max(auth_config_ts), max(oauth_epoch_ts), max(oauth_ts)
              FROM mcp_servers",
             [],
             |r| {
@@ -231,11 +240,12 @@ pub fn seed_hlc_from_db(conn: &Connection) -> Result<()> {
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             },
         )?;
         for ts in [
-            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8,
+            row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
         ]
         .into_iter()
         .flatten()
@@ -256,6 +266,19 @@ pub fn seed_hlc_from_db(conn: &Connection) -> Result<()> {
         )?;
         for ts in [a, b, c, d].into_iter().flatten() {
             observe_hlc(&ts);
+        }
+    }
+    {
+        let ballots: Option<(String, String)> = conn
+            .query_row(
+                "SELECT voter_ballot, pending_proposal_id FROM local_node WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((ballot, prop)) = ballots {
+            observe_hlc(&ballot);
+            observe_hlc(&prop);
         }
     }
     Ok(())
@@ -343,6 +366,35 @@ pub(crate) fn auth_config_fingerprint(transport: &str, config_json: &str) -> Str
     blake3::hash(&bytes).to_hex().to_string()
 }
 
+pub(crate) fn split_mcp_config(
+    transport: &str,
+    config_json: &str,
+) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
+    let mut core = serde_json::from_str::<Value>(config_json)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if transport == "stdio" {
+        return (core, serde_json::Map::new());
+    }
+    let headers = core
+        .remove("headers")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    (core, headers)
+}
+
+pub(crate) fn compose_mcp_config(
+    transport: &str,
+    mut core: serde_json::Map<String, Value>,
+    headers: serde_json::Map<String, Value>,
+) -> String {
+    if transport != "stdio" {
+        core.insert("headers".into(), Value::Object(headers));
+    }
+    serde_json::to_string(&Value::Object(core)).unwrap_or_else(|_| "{}".into())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttachmentRef {
     pub id: AttachmentId,
@@ -408,7 +460,8 @@ pub struct McpServerWire {
     pub config_json: String,
     pub timeout_ms: i64,
     pub timeout_ts: String,
-    pub config_ts: String,
+    pub headers_epoch_ts: String,
+    pub headers_ts: String,
     pub auth_config_ts: String,
     pub oauth_epoch_ts: String,
     pub oauth: Option<McpOAuthGrantWire>,
@@ -1139,7 +1192,7 @@ pub fn mark_turn_settled_node(
         .prepare_cached(
             "INSERT INTO turn_settled(context_node_id, session_id, origin_node_id, origin_seq)
              VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(context_node_id) DO NOTHING",
+             ON CONFLICT(context_node_id, origin_node_id) DO NOTHING",
         )?
         .execute(params![expected_head, sid, &*node_id, origin_seq])?;
     if changed > 0 {
@@ -1228,8 +1281,8 @@ pub fn tombstone_shared_mcp(conn: &Connection, id: McpServerId) -> Result<bool> 
          SET deleted=1, name='', name_ts='',
              description='', description_ts='',
              enabled=0, enabled_ts='',
-             transport='streamable-http', config_json='{}', revision=revision+1, config_ts='',
-             auth_config_ts='', oauth_epoch_ts='',
+             transport='streamable-http', config_json='{}', revision=revision+1,
+             headers_epoch_ts='', headers_ts='', auth_config_ts='', oauth_epoch_ts='',
              allowed_tools=NULL, allowed_tools_ts='',
              timeout_ms=1, timeout_ts='',
              oauth_ts='', sync_rev=?2
@@ -1247,27 +1300,27 @@ pub fn load_mcp_wire(conn: &Connection, id: McpServerId) -> Result<Option<McpSer
         .prepare_cached(
             "SELECT m.id, m.name, m.name_ts, m.description, m.description_ts,
                     m.enabled, m.enabled_ts, m.transport, m.allowed_tools, m.allowed_tools_ts,
-                    m.config_json, m.timeout_ms, m.timeout_ts, m.config_ts, m.auth_config_ts,
-                    m.oauth_epoch_ts, m.oauth_ts, m.deleted, m.sync_rev,
+                    m.config_json, m.timeout_ms, m.timeout_ts, m.headers_epoch_ts, m.headers_ts,
+                    m.auth_config_ts, m.oauth_epoch_ts, m.oauth_ts, m.deleted, m.sync_rev,
                     o.generation, o.auth_config_ts, o.auth_fingerprint, o.binding, o.credentials, o.rejected
              FROM mcp_servers m
              LEFT JOIN mcp_oauth o ON o.server_id = m.id
              WHERE m.id=?1 AND m.shared=1",
         )?
         .query_row([id], |r| {
-            let deleted: bool = r.get(17)?;
-            let oauth_gen: Option<String> = r.get(19)?;
-            let credentials: Option<String> = r.get(23)?;
-            let rejected: Option<bool> = r.get(24)?;
+            let deleted: bool = r.get(18)?;
+            let oauth_gen: Option<String> = r.get(20)?;
+            let credentials: Option<String> = r.get(24)?;
+            let rejected: Option<bool> = r.get(25)?;
             let oauth = if !deleted
                 && let Some(generation) = oauth_gen
                 && (credentials.is_some() || rejected == Some(true))
             {
                 Some(McpOAuthGrantWire {
                     generation,
-                    auth_config_ts: r.get::<_, Option<String>>(20)?.unwrap_or_default(),
-                    auth_fingerprint: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
-                    binding: r.get(22)?,
+                    auth_config_ts: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
+                    auth_fingerprint: r.get::<_, Option<String>>(22)?.unwrap_or_default(),
+                    binding: r.get(23)?,
                     credentials,
                     rejected: rejected.unwrap_or(false),
                 })
@@ -1288,13 +1341,14 @@ pub fn load_mcp_wire(conn: &Connection, id: McpServerId) -> Result<Option<McpSer
                 config_json: r.get(10)?,
                 timeout_ms: r.get(11)?,
                 timeout_ts: r.get(12)?,
-                config_ts: r.get(13)?,
-                auth_config_ts: r.get(14)?,
-                oauth_epoch_ts: r.get(15)?,
+                headers_epoch_ts: r.get(13)?,
+                headers_ts: r.get(14)?,
+                auth_config_ts: r.get(15)?,
+                oauth_epoch_ts: r.get(16)?,
                 oauth,
-                oauth_ts: r.get(16)?,
+                oauth_ts: r.get(17)?,
                 deleted,
-                sync_rev: r.get(18)?,
+                sync_rev: r.get(19)?,
             })
         })
         .optional()?;
@@ -1563,7 +1617,8 @@ pub fn merge_mcp_server_wire(
         &w.enabled_ts,
         &w.allowed_tools_ts,
         &w.timeout_ts,
-        &w.config_ts,
+        &w.headers_epoch_ts,
+        &w.headers_ts,
         &w.auth_config_ts,
         &w.oauth_epoch_ts,
         &w.oauth_ts,
@@ -1582,22 +1637,22 @@ pub fn merge_mcp_server_wire(
                 "SELECT m.name, m.name_ts, m.description, m.description_ts,
                         m.enabled, m.enabled_ts, m.shared, m.transport,
                         m.allowed_tools, m.allowed_tools_ts, m.config_json,
-                        m.timeout_ms, m.timeout_ts, m.config_ts, m.auth_config_ts,
-                        m.oauth_epoch_ts, m.oauth_ts, m.deleted,
+                        m.timeout_ms, m.timeout_ts, m.headers_epoch_ts, m.headers_ts,
+                        m.auth_config_ts, m.oauth_epoch_ts, m.oauth_ts, m.deleted,
                         o.generation, o.auth_config_ts, o.auth_fingerprint, o.binding, o.credentials, o.rejected
                  FROM mcp_servers m
                  LEFT JOIN mcp_oauth o ON o.server_id = m.id
                  WHERE m.id=?1",
             )?
             .query_row([w.id], |r| {
-                let oauth_gen: Option<String> = r.get(18)?;
+                let oauth_gen: Option<String> = r.get(19)?;
                 let oauth = oauth_gen.map(|generation| McpOAuthGrantWire {
                     generation,
-                    auth_config_ts: r.get::<_, Option<String>>(19).ok().flatten().unwrap_or_default(),
-                    auth_fingerprint: r.get::<_, Option<String>>(20).ok().flatten().unwrap_or_default(),
-                    binding: r.get(21).unwrap_or(None),
-                    credentials: r.get(22).unwrap_or(None),
-                    rejected: r.get::<_, Option<bool>>(23).unwrap_or(None).unwrap_or(false),
+                    auth_config_ts: r.get::<_, Option<String>>(20).ok().flatten().unwrap_or_default(),
+                    auth_fingerprint: r.get::<_, Option<String>>(21).ok().flatten().unwrap_or_default(),
+                    binding: r.get(22).unwrap_or(None),
+                    credentials: r.get(23).unwrap_or(None),
+                    rejected: r.get::<_, Option<bool>>(24).unwrap_or(None).unwrap_or(false),
                 });
                 Ok((
                     r.get::<_, String>(0)?,
@@ -1617,7 +1672,8 @@ pub fn merge_mcp_server_wire(
                     r.get::<_, String>(14)?,
                     r.get::<_, String>(15)?,
                     r.get::<_, String>(16)?,
-                    r.get::<_, bool>(17)?,
+                    r.get::<_, String>(17)?,
+                    r.get::<_, bool>(18)?,
                     oauth,
                 ))
             })
@@ -1637,7 +1693,8 @@ pub fn merge_mcp_server_wire(
             mut config_json,
             mut timeout_ms,
             mut timeout_ts,
-            mut config_ts,
+            mut headers_epoch_ts,
+            mut headers_ts,
             mut auth_config_ts,
             mut oauth_epoch_ts,
             mut oauth_ts,
@@ -1651,8 +1708,9 @@ pub fn merge_mcp_server_wire(
                     "INSERT INTO mcp_servers(
                         id, name, name_ts, description, description_ts, enabled, enabled_ts,
                         shared, transport, allowed_tools, allowed_tools_ts, config_json,
-                        timeout_ms, timeout_ts, revision, config_ts, auth_config_ts, oauth_epoch_ts, oauth_ts, deleted, sync_rev
-                     ) VALUES(?1,'','','','',0,'',1,'streamable-http',NULL,'','{}',1,'',1,'','','','',1,?2)",
+                        timeout_ms, timeout_ts, revision, headers_epoch_ts, headers_ts,
+                        auth_config_ts, oauth_epoch_ts, oauth_ts, deleted, sync_rev
+                     ) VALUES(?1,'','','','',0,'',1,'streamable-http',NULL,'','{}',1,'',1,'','','','','',1,?2)",
                 )?
                 .execute(params![w.id, rev])?;
                 return Ok((
@@ -1664,7 +1722,23 @@ pub fn merge_mcp_server_wire(
                     }),
                 ));
             }
-            let fp = auth_config_fingerprint(&w.transport, &w.config_json);
+            let (w_core, w_headers) = split_mcp_config(&w.transport, &w.config_json);
+            let hdr_eligible = w.transport != "stdio" && w.headers_epoch_ts == w.auth_config_ts;
+            let (init_hdr_epoch, init_hdr_ts, init_headers) = if hdr_eligible {
+                (
+                    w.headers_epoch_ts.as_str(),
+                    w.headers_ts.as_str(),
+                    w_headers,
+                )
+            } else {
+                (
+                    w.auth_config_ts.as_str(),
+                    w.auth_config_ts.as_str(),
+                    serde_json::Map::new(),
+                )
+            };
+            let init_cfg = compose_mcp_config(&w.transport, w_core, init_headers);
+            let fp = auth_config_fingerprint(&w.transport, &init_cfg);
             let incoming_eligible = w.oauth_epoch_ts == w.auth_config_ts
                 && w.oauth.as_ref().is_none_or(|g| {
                     g.auth_config_ts == w.auth_config_ts && g.auth_fingerprint == fp
@@ -1682,8 +1756,9 @@ pub fn merge_mcp_server_wire(
                 "INSERT INTO mcp_servers(
                     id, name, name_ts, description, description_ts, enabled, enabled_ts,
                     shared, transport, allowed_tools, allowed_tools_ts, config_json,
-                    timeout_ms, timeout_ts, revision, config_ts, auth_config_ts, oauth_epoch_ts, oauth_ts, deleted, sync_rev
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,?17,0,?18)",
+                    timeout_ms, timeout_ts, revision, headers_epoch_ts, headers_ts,
+                    auth_config_ts, oauth_epoch_ts, oauth_ts, deleted, sync_rev
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,?17,?18,0,?19)",
             )?
             .execute(params![
                 w.id,
@@ -1696,10 +1771,11 @@ pub fn merge_mcp_server_wire(
                 &w.transport,
                 &w.allowed_tools,
                 &w.allowed_tools_ts,
-                &w.config_json,
+                &init_cfg,
                 w.timeout_ms,
                 &w.timeout_ts,
-                &w.config_ts,
+                init_hdr_epoch,
+                init_hdr_ts,
                 &w.auth_config_ts,
                 init_epoch,
                 init_oauth_ts,
@@ -1744,7 +1820,7 @@ pub fn merge_mcp_server_wire(
                      description='', description_ts='',
                      enabled=0, enabled_ts='',
                      transport='streamable-http', config_json='{}', revision=revision+1,
-                     config_ts='', auth_config_ts='', oauth_epoch_ts='',
+                     headers_epoch_ts='', headers_ts='', auth_config_ts='', oauth_epoch_ts='',
                      allowed_tools=NULL, allowed_tools_ts='',
                      timeout_ms=1, timeout_ts='',
                      oauth_ts='', sync_rev=?2
@@ -1781,15 +1857,63 @@ pub fn merge_mcp_server_wire(
             &w.allowed_tools_ts,
         );
         let timeout_changed = lww_take(&mut timeout_ms, &mut timeout_ts, w.timeout_ms, &w.timeout_ts);
-        let config_changed = if w.config_ts > config_ts {
+
+        let (mut core_map, mut headers_map) = split_mcp_config(&transport, &config_json);
+        let (w_core, w_headers) = split_mcp_config(&w.transport, &w.config_json);
+        let mut auth_changed = false;
+        let mut auth_meta_changed = false;
+        if w.auth_config_ts > auth_config_ts {
+            if transport != w.transport || core_map != w_core {
+                auth_changed = true;
+            }
             transport = w.transport.clone();
-            config_json = w.config_json.clone();
+            core_map = w_core;
             auth_config_ts = w.auth_config_ts.clone();
-            config_ts = w.config_ts.clone();
-            true
-        } else {
-            false
-        };
+            auth_meta_changed = true;
+        }
+
+        let local_hdr_eligible = transport != "stdio" && headers_epoch_ts == auth_config_ts;
+        let incoming_hdr_eligible =
+            transport != "stdio" && w.transport == transport && w.headers_epoch_ts == auth_config_ts;
+        let mut headers_changed = false;
+        let mut headers_meta_changed = false;
+        match (local_hdr_eligible, incoming_hdr_eligible) {
+            (true, true) => {
+                if w.headers_ts > headers_ts {
+                    if headers_map != w_headers {
+                        headers_changed = true;
+                    }
+                    headers_map = w_headers;
+                    headers_ts = w.headers_ts.clone();
+                    headers_meta_changed = true;
+                }
+            }
+            (true, false) => {}
+            (false, true) => {
+                if headers_map != w_headers {
+                    headers_changed = true;
+                }
+                headers_map = w_headers;
+                headers_epoch_ts = auth_config_ts.clone();
+                headers_ts = w.headers_ts.clone();
+                headers_meta_changed = true;
+            }
+            (false, false) => {
+                if !headers_map.is_empty()
+                    || headers_epoch_ts != auth_config_ts
+                    || headers_ts != auth_config_ts
+                {
+                    if !headers_map.is_empty() {
+                        headers_changed = true;
+                    }
+                    headers_map = serde_json::Map::new();
+                    headers_epoch_ts = auth_config_ts.clone();
+                    headers_ts = auth_config_ts.clone();
+                    headers_meta_changed = true;
+                }
+            }
+        }
+        config_json = compose_mcp_config(&transport, core_map, headers_map);
 
         let winning_fp = auth_config_fingerprint(&transport, &config_json);
         let local_eligible = oauth_epoch_ts == auth_config_ts
@@ -1870,15 +1994,21 @@ pub fn merge_mcp_server_wire(
             || enabled_changed
             || allowed_tools_changed
             || timeout_changed
-            || config_changed;
+            || auth_changed
+            || auth_meta_changed
+            || headers_meta_changed;
         if !non_oauth_changed && !oauth_changed {
             return Ok((false, None));
         }
 
-        let evict_pool =
-            enabled_changed || allowed_tools_changed || timeout_changed || config_changed || oauth_binding_changed;
+        let evict_pool = enabled_changed
+            || allowed_tools_changed
+            || timeout_changed
+            || auth_changed
+            || headers_changed
+            || oauth_binding_changed;
         let cancel_login =
-            (enabled_changed && !enabled) || config_changed || oauth_binding_changed;
+            (enabled_changed && !enabled) || auth_changed || oauth_binding_changed;
 
         let rev = next_catalog_rev(conn)?;
         let rev_bump = i64::from(evict_pool);
@@ -1888,8 +2018,8 @@ pub fn merge_mcp_server_wire(
                  enabled=?6, enabled_ts=?7, transport=?8,
                  allowed_tools=?9, allowed_tools_ts=?10,
                  config_json=?11, timeout_ms=?12, timeout_ts=?13,
-                 revision=revision+?14, config_ts=?15, auth_config_ts=?16,
-                 oauth_epoch_ts=?17, oauth_ts=?18, sync_rev=?19
+                 revision=revision+?14, headers_epoch_ts=?15, headers_ts=?16,
+                 auth_config_ts=?17, oauth_epoch_ts=?18, oauth_ts=?19, sync_rev=?20
              WHERE id=?1",
         )?
         .execute(params![
@@ -1907,7 +2037,8 @@ pub fn merge_mcp_server_wire(
             timeout_ms,
             timeout_ts,
             rev_bump,
-            config_ts,
+            headers_epoch_ts,
+            headers_ts,
             auth_config_ts,
             oauth_epoch_ts,
             oauth_ts,
@@ -2228,6 +2359,11 @@ pub fn merge_llm_call_wire(conn: &Connection, w: &LlmCallWire) -> Result<bool> {
         .query_row([w.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
 
+    let bounded_err = w.error_summary.as_deref().map(|s| {
+        crate::calls::truncate_utf8(s, crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES)
+    });
+    let bounded_usage = crate::calls::clamp_raw_usage_str(w.raw_usage.clone());
+
     let mut changed = false;
     match existing {
         None => {
@@ -2252,8 +2388,8 @@ pub fn merge_llm_call_wire(conn: &Connection, w: &LlmCallWire) -> Result<bool> {
                 &w.status,
                 &w.upstream_response_id,
                 w.http_status,
-                &w.error_summary,
-                &w.raw_usage,
+                &bounded_err,
+                &bounded_usage,
                 w.input_uncached_tokens,
                 w.cache_read_tokens,
                 w.cache_write_tokens,
@@ -2294,8 +2430,8 @@ pub fn merge_llm_call_wire(conn: &Connection, w: &LlmCallWire) -> Result<bool> {
                         &w.status,
                         &w.upstream_response_id,
                         w.http_status,
-                        &w.error_summary,
-                        &w.raw_usage,
+                        &bounded_err,
+                        &bounded_usage,
                         w.input_uncached_tokens,
                         w.cache_read_tokens,
                         w.cache_write_tokens,
@@ -2452,17 +2588,25 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
 
         let scope = session_scope(sid);
         let mut content_touched = false;
-        let prev_max_visible: Option<ItemId> = if !delta.items.is_empty() || !delta.context_nodes.is_empty() {
-            conn.prepare_cached(
-                "SELECT max(id) FROM items
-                 WHERE session_id=?1
-                   AND (EXISTS(SELECT 1 FROM active_context ac WHERE ac.session_id=?1 AND ac.item_id=items.id)
-                        OR NOT EXISTS(SELECT 1 FROM context_nodes cn WHERE cn.session_id=?1 AND cn.item_id=items.id))",
-            )?
-            .query_row([sid], |r| r.get(0))?
-        } else {
-            None
-        };
+        let (prev_max_visible, prev_active_pos): (Option<ItemId>, i64) =
+            if !delta.items.is_empty() || !delta.context_nodes.is_empty() {
+                let max_vis: Option<ItemId> = conn
+                    .prepare_cached(
+                        "SELECT max(id) FROM items
+                         WHERE session_id=?1
+                           AND (EXISTS(SELECT 1 FROM active_context ac WHERE ac.session_id=?1 AND ac.item_id=items.id)
+                                OR NOT EXISTS(SELECT 1 FROM context_nodes cn WHERE cn.session_id=?1 AND cn.item_id=items.id))",
+                    )?
+                    .query_row([sid], |r| r.get(0))?;
+                let active_pos: i64 = conn
+                    .prepare_cached(
+                        "SELECT coalesce(max(position), -1) FROM active_context WHERE session_id=?1",
+                    )?
+                    .query_row([sid], |r| r.get(0))?;
+                (max_vis, active_pos)
+            } else {
+                (None, -1)
+            };
 
         for iw in &delta.invalidated_warnings {
             id::observe_id(iw.item_id);
@@ -2474,7 +2618,7 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
                 .prepare_cached(
                     "INSERT INTO invalidated_warnings(item_id, session_id, origin_node_id, origin_seq)
                      VALUES(?1, ?2, ?3, ?4)
-                     ON CONFLICT(item_id) DO NOTHING",
+                     ON CONFLICT(item_id, origin_node_id) DO NOTHING",
                 )?
                 .execute(params![iw.item_id, sid, &iw.origin_node_id, iw.origin_seq])?;
             if ins > 0 {
@@ -2535,7 +2679,7 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
             }
         }
 
-        let mut newly_branched_preexisting = Vec::new();
+        let mut newly_branched_preexisting = HashSet::new();
         for node in &delta.context_nodes {
             id::observe_id(node.id);
             id::observe_id(node.session_id);
@@ -2554,7 +2698,7 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
                     )?
                     .query_row(params![node.item_id, sid], |r| r.get(0))?;
                 if was_unbranched {
-                    newly_branched_preexisting.push(node.item_id);
+                    newly_branched_preexisting.insert(node.item_id);
                 }
             }
             let ins = conn
@@ -2599,7 +2743,7 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
                     "INSERT INTO turn_settled(
                         context_node_id, session_id, origin_node_id, origin_seq
                      ) VALUES(?1, ?2, ?3, ?4)
-                     ON CONFLICT(context_node_id) DO NOTHING",
+                     ON CONFLICT(context_node_id, origin_node_id) DO NOTHING",
                 )?
                 .execute(params![
                     ts.context_node_id,
@@ -2612,17 +2756,65 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
             }
         }
 
-        for (origin_node_id, &seq) in &delta.advanced_vector {
-            advance_vector(conn, &scope, origin_node_id, seq)?;
+        for (origin_node_id, &claimed_seq) in &delta.advanced_vector {
+            let cur_seq: i64 = conn
+                .prepare_cached(
+                    "SELECT coalesce((SELECT seq FROM sync_vectors WHERE scope=?1 AND node_id=?2), 0)",
+                )?
+                .query_row(params![&scope, origin_node_id], |r| r.get(0))?;
+            if claimed_seq > cur_seq {
+                let mut seq_stmt = conn.prepare_cached(
+                    "SELECT origin_seq FROM items
+                     WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3 AND origin_seq<=?4
+                     UNION ALL
+                     SELECT origin_seq FROM context_nodes
+                     WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3 AND origin_seq<=?4
+                     UNION ALL
+                     SELECT origin_seq FROM turn_settled
+                     WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3 AND origin_seq<=?4
+                     UNION ALL
+                     SELECT origin_seq FROM invalidated_warnings
+                     WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3 AND origin_seq<=?4",
+                )?;
+                let present: HashSet<i64> = seq_stmt
+                    .query_map(params![sid, origin_node_id, cur_seq, claimed_seq], |r| r.get(0))?
+                    .collect::<rusqlite::Result<HashSet<_>>>()?;
+                for seq in (cur_seq + 1)..=claimed_seq {
+                    if !present.contains(&seq) {
+                        return Err(Error::bad(format!(
+                            "incomplete session delta vector for origin {origin_node_id}: missing origin_seq {seq}"
+                        )));
+                    }
+                }
+                advance_vector(conn, &scope, origin_node_id, claimed_seq)?;
+            }
         }
 
         if content_touched {
             let change = reconcile_active_context(conn, sid)?;
-            if matches!(
-                change,
-                ActiveContextChange::Switched | ActiveContextChange::Cleared
-            ) {
-                out.reset_view = true;
+            match change {
+                ActiveContextChange::Switched | ActiveContextChange::Cleared => {
+                    out.reset_view = true;
+                }
+                ActiveContextChange::Appended(_) => {
+                    let mut appended_stmt = conn.prepare_cached(
+                        "SELECT item_id FROM active_context
+                         WHERE session_id=?1 AND position>?2
+                         ORDER BY position ASC",
+                    )?;
+                    let appended_ids = appended_stmt
+                        .query_map(params![sid, prev_active_pos], |r| r.get::<_, ItemId>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for item_id in appended_ids {
+                        if !newly_inserted_items.contains(&item_id)
+                            && !newly_branched_preexisting.contains(&item_id)
+                        {
+                            out.reset_view = true;
+                            break;
+                        }
+                    }
+                }
+                ActiveContextChange::Unchanged | ActiveContextChange::Incomplete => {}
             }
         }
 
@@ -2630,7 +2822,7 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
             let mut in_active = conn.prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM active_context WHERE session_id=?1 AND item_id=?2)",
             )?;
-            for item_id in newly_branched_preexisting {
+            for &item_id in &newly_branched_preexisting {
                 if !in_active.query_row(params![sid, item_id], |r| r.get::<_, bool>(0))? {
                     out.reset_view = true;
                     break;
@@ -2832,8 +3024,8 @@ pub fn read_catalog_delta(
     let mut mcp_stmt = conn.prepare_cached(
         "SELECT m.id, m.name, m.name_ts, m.description, m.description_ts,
                 m.enabled, m.enabled_ts, m.transport, m.allowed_tools, m.allowed_tools_ts,
-                m.config_json, m.timeout_ms, m.timeout_ts, m.config_ts, m.auth_config_ts,
-                m.oauth_epoch_ts, m.oauth_ts, m.deleted, m.sync_rev,
+                m.config_json, m.timeout_ms, m.timeout_ts, m.headers_epoch_ts, m.headers_ts,
+                m.auth_config_ts, m.oauth_epoch_ts, m.oauth_ts, m.deleted, m.sync_rev,
                 o.generation, o.auth_config_ts, o.auth_fingerprint, o.binding, o.credentials, o.rejected
          FROM mcp_servers m
          LEFT JOIN mcp_oauth o ON o.server_id = m.id
@@ -2897,19 +3089,19 @@ pub fn read_catalog_delta(
             CatalogKey::Mcp(id) => {
                 if let Some(s) = mcp_stmt
                     .query_row([id], |r| {
-                        let deleted: bool = r.get(17)?;
-                        let oauth_gen: Option<String> = r.get(19)?;
-                        let credentials: Option<String> = r.get(23)?;
-                        let rejected: Option<bool> = r.get(24)?;
+                        let deleted: bool = r.get(18)?;
+                        let oauth_gen: Option<String> = r.get(20)?;
+                        let credentials: Option<String> = r.get(24)?;
+                        let rejected: Option<bool> = r.get(25)?;
                         let oauth = if !deleted
                             && let Some(generation) = oauth_gen
                             && (credentials.is_some() || rejected == Some(true))
                         {
                             Some(McpOAuthGrantWire {
                                 generation,
-                                auth_config_ts: r.get::<_, Option<String>>(20)?.unwrap_or_default(),
-                                auth_fingerprint: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
-                                binding: r.get(22)?,
+                                auth_config_ts: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
+                                auth_fingerprint: r.get::<_, Option<String>>(22)?.unwrap_or_default(),
+                                binding: r.get(23)?,
                                 credentials,
                                 rejected: rejected.unwrap_or(false),
                             })
@@ -2930,13 +3122,14 @@ pub fn read_catalog_delta(
                             config_json: r.get(10)?,
                             timeout_ms: r.get(11)?,
                             timeout_ts: r.get(12)?,
-                            config_ts: r.get(13)?,
-                            auth_config_ts: r.get(14)?,
-                            oauth_epoch_ts: r.get(15)?,
+                            headers_epoch_ts: r.get(13)?,
+                            headers_ts: r.get(14)?,
+                            auth_config_ts: r.get(15)?,
+                            oauth_epoch_ts: r.get(16)?,
                             oauth,
-                            oauth_ts: r.get(16)?,
+                            oauth_ts: r.get(17)?,
                             deleted,
-                            sync_rev: r.get(18)?,
+                            sync_rev: r.get(19)?,
                         })
                     })
                     .optional()?
@@ -2987,12 +3180,12 @@ pub fn read_catalog_delta(
     let local_calls_vec = read_vector(conn, CALLS_SCOPE)?;
     let mut call_meta_stmt = conn.prepare_cached(
         "SELECT id, origin_seq,
-                coalesce(length(CAST(raw_usage AS BLOB)), 0)
-                + coalesce(length(CAST(error_summary AS BLOB)), 0)
+                min(coalesce(length(CAST(raw_usage AS BLOB)), 0), ?1)
+                + min(coalesce(length(CAST(error_summary AS BLOB)), 0), ?2)
                 + coalesce(length(CAST(pricing_snapshot AS BLOB)), 0) + 256
          FROM llm_calls
-         WHERE origin_node_id = ?1 AND origin_seq > ?2
-         ORDER BY origin_seq ASC, id ASC LIMIT ?3",
+         WHERE origin_node_id = ?3 AND origin_seq > ?4
+         ORDER BY origin_seq ASC, id ASC LIMIT ?5",
     )?;
     let mut call_full_stmt = conn.prepare_cached(
         "SELECT id, session_id, model_id, reasoning_effort, input_end_position, input_head,
@@ -3013,7 +3206,13 @@ pub fn read_catalog_delta(
         }
         let batch = call_meta_stmt
             .query_map(
-                params![&origin_node_id, remote_seq, DELTA_PAGE_LIMIT as i64],
+                params![
+                    crate::calls::MAX_STORED_RAW_USAGE_BYTES as i64,
+                    crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES as i64,
+                    &origin_node_id,
+                    remote_seq,
+                    DELTA_PAGE_LIMIT as i64
+                ],
                 |r| {
                     let raw_bytes: i64 = r.get(2)?;
                     Ok((
@@ -3053,8 +3252,13 @@ pub fn read_catalog_delta(
                         status: r.get(8)?,
                         upstream_response_id: r.get(9)?,
                         http_status: r.get(10)?,
-                        error_summary: r.get(11)?,
-                        raw_usage: r.get(12)?,
+                        error_summary: r.get::<_, Option<String>>(11)?.map(|s| {
+                            crate::calls::truncate_utf8(
+                                &s,
+                                crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES,
+                            )
+                        }),
+                        raw_usage: crate::calls::clamp_raw_usage_str(r.get(12)?),
                         input_uncached_tokens: r.get(13)?,
                         cache_read_tokens: r.get(14)?,
                         cache_write_tokens: r.get(15)?,
@@ -3093,6 +3297,7 @@ enum SessionEventKey {
 struct SessionEventMeta {
     origin_seq: i64,
     est_bytes: usize,
+    unpacked_bytes: usize,
     key: SessionEventKey,
 }
 
@@ -3149,6 +3354,7 @@ pub fn read_session_delta(
         advanced_vector: BTreeMap::new(),
     };
     let mut total_bytes = 0usize;
+    let mut unpacked_total = 0usize;
     let mut referenced_attachments = HashSet::new();
 
     let mut item_meta_stmt = conn.prepare_cached(
@@ -3187,11 +3393,11 @@ pub fn read_session_delta(
     )?;
     let mut settled_full_stmt = conn.prepare_cached(
         "SELECT context_node_id, session_id, origin_node_id, origin_seq
-         FROM turn_settled WHERE context_node_id=?1 AND session_id=?2",
+         FROM turn_settled WHERE context_node_id=?1 AND session_id=?2 AND origin_node_id=?3",
     )?;
     let mut warn_full_stmt = conn.prepare_cached(
         "SELECT item_id, session_id, origin_node_id, origin_seq
-         FROM invalidated_warnings WHERE item_id=?1 AND session_id=?2",
+         FROM invalidated_warnings WHERE item_id=?1 AND session_id=?2 AND origin_node_id=?3",
     )?;
 
     for (origin_node_id, local_max) in local_vec {
@@ -3199,7 +3405,7 @@ pub fn read_session_delta(
         if local_max <= remote_seq {
             continue;
         }
-        if total_bytes >= MAX_DELTA_BYTES {
+        if total_bytes >= MAX_DELTA_BYTES || unpacked_total >= MAX_DELTA_BYTES {
             delta.has_more = true;
             break;
         }
@@ -3222,6 +3428,7 @@ pub fn read_session_delta(
                         Ok(SessionEventMeta {
                             origin_seq: r.get(1)?,
                             est_bytes,
+                            unpacked_bytes: raw_len.saturating_add(512),
                             key: SessionEventKey::Item {
                                 id: r.get(0)?,
                                 oversized,
@@ -3246,6 +3453,7 @@ pub fn read_session_delta(
                         Ok(SessionEventMeta {
                             origin_seq: r.get(1)?,
                             est_bytes: 256,
+                            unpacked_bytes: 256,
                             key: SessionEventKey::ContextNode(r.get(0)?),
                         })
                     },
@@ -3267,6 +3475,7 @@ pub fn read_session_delta(
                         Ok(SessionEventMeta {
                             origin_seq: r.get(1)?,
                             est_bytes: 192,
+                            unpacked_bytes: 192,
                             key: SessionEventKey::TurnSettled(r.get(0)?),
                         })
                     },
@@ -3288,6 +3497,7 @@ pub fn read_session_delta(
                         Ok(SessionEventMeta {
                             origin_seq: r.get(1)?,
                             est_bytes: 192,
+                            unpacked_bytes: 192,
                             key: SessionEventKey::InvalidatedWarning(r.get(0)?),
                         })
                     },
@@ -3308,12 +3518,16 @@ pub fn read_session_delta(
         let mut broke_early = false;
         let mut selected = Vec::new();
         for ev in events {
-            if total_bytes > 0 && total_bytes.saturating_add(ev.est_bytes) > MAX_DELTA_BYTES {
+            if total_bytes > 0
+                && (total_bytes.saturating_add(ev.est_bytes) > MAX_DELTA_BYTES
+                    || unpacked_total.saturating_add(ev.unpacked_bytes) > MAX_DELTA_BYTES)
+            {
                 delta.has_more = true;
                 broke_early = true;
                 break;
             }
             total_bytes += ev.est_bytes;
+            unpacked_total += ev.unpacked_bytes;
             last_seq = last_seq.max(ev.origin_seq);
             selected.push(ev.key);
         }
@@ -3375,7 +3589,7 @@ pub fn read_session_delta(
                 }
                 SessionEventKey::TurnSettled(id) => {
                     if let Some(ts) = settled_full_stmt
-                        .query_row(params![id, sid], |r| {
+                        .query_row(params![id, sid, &origin_node_id], |r| {
                             Ok(TurnSettledWire {
                                 context_node_id: r.get(0)?,
                                 session_id: r.get(1)?,
@@ -3390,7 +3604,7 @@ pub fn read_session_delta(
                 }
                 SessionEventKey::InvalidatedWarning(id) => {
                     if let Some(iw) = warn_full_stmt
-                        .query_row(params![id, sid], |r| {
+                        .query_row(params![id, sid, &origin_node_id], |r| {
                             Ok(InvalidatedWarningWire {
                                 item_id: r.get(0)?,
                                 session_id: r.get(1)?,

@@ -382,9 +382,23 @@ fn save(
         .map_err(|_| Error::bad("invalid MCP configuration fields or types"))?;
     validate(&mut c)?;
     let connection = connection_document(&c);
-    let config_changed = old.as_ref().is_some_and(|s| {
-        s.cfg.transport != c.transport || connection_document(&s.cfg) != connection
+    let auth_config_changed = old.as_ref().is_some_and(|s| {
+        s.cfg.transport != c.transport
+            || match c.transport {
+                McpTransport::StreamableHttp => {
+                    s.cfg.url != c.url
+                        || serde_json::to_value(&s.cfg.oauth).ok()
+                            != serde_json::to_value(&c.oauth).ok()
+                }
+                McpTransport::Stdio => {
+                    s.cfg.command != c.command
+                        || s.cfg.args != c.args
+                        || s.cfg.env != c.env
+                        || s.cfg.cwd != c.cwd
+                }
+            }
     });
+    let headers_changed = old.as_ref().is_some_and(|s| s.cfg.headers != c.headers);
     let oauth_invalidated = old.as_ref().is_some_and(|s| {
         s.cfg.transport != c.transport
             || s.cfg.url != c.url
@@ -439,8 +453,8 @@ fn save(
             "INSERT INTO mcp_servers(
                 id,name,name_ts,description,description_ts,enabled,enabled_ts,shared,transport,
                 allowed_tools,allowed_tools_ts,config_json,timeout_ms,timeout_ts,revision,
-                config_ts,auth_config_ts,oauth_epoch_ts,oauth_ts,deleted,sync_rev
-             ) VALUES(?1,?2,?9,?3,?9,?4,?9,0,?5,?6,?9,?7,?8,?9,1,?9,?9,?9,?9,0,0)",
+                headers_epoch_ts,headers_ts,auth_config_ts,oauth_epoch_ts,oauth_ts,deleted,sync_rev
+             ) VALUES(?1,?2,?9,?3,?9,?4,?9,0,?5,?6,?9,?7,?8,?9,1,?9,?9,?9,?9,?9,0,0)",
             params![
                 new_id,
                 c.name,
@@ -485,8 +499,8 @@ fn save(
     let sql = "INSERT INTO mcp_servers(
             id,name,name_ts,description,description_ts,enabled,enabled_ts,shared,transport,
             allowed_tools,allowed_tools_ts,config_json,timeout_ms,timeout_ts,revision,
-            config_ts,auth_config_ts,oauth_epoch_ts,oauth_ts,deleted,sync_rev
-        ) VALUES(?1,?2,?10,?3,?10,?4,?10,?5,?6,?7,?10,?8,?9,?10,1,?10,?10,?10,?10,0,?11)
+            headers_epoch_ts,headers_ts,auth_config_ts,oauth_epoch_ts,oauth_ts,deleted,sync_rev
+        ) VALUES(?1,?2,?10,?3,?10,?4,?10,?5,?6,?7,?10,?8,?9,?10,1,?10,?10,?10,?10,?10,0,?11)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
             name_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.name != excluded.name THEN ?10 ELSE mcp_servers.name_ts END,
@@ -502,7 +516,8 @@ fn save(
             timeout_ms=excluded.timeout_ms,
             timeout_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.timeout_ms != excluded.timeout_ms THEN ?10 ELSE mcp_servers.timeout_ts END,
             revision=mcp_servers.revision+1,
-            config_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?12 THEN ?10 ELSE mcp_servers.config_ts END,
+            headers_epoch_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 THEN ?10 WHEN ?12 THEN mcp_servers.auth_config_ts ELSE mcp_servers.headers_epoch_ts END,
+            headers_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 OR ?12 THEN ?10 ELSE mcp_servers.headers_ts END,
             auth_config_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 THEN ?10 ELSE mcp_servers.auth_config_ts END,
             oauth_epoch_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 THEN ?10 ELSE mcp_servers.oauth_epoch_ts END,
             oauth_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?13 THEN ?10 ELSE mcp_servers.oauth_ts END,
@@ -523,8 +538,8 @@ fn save(
             c.timeout_ms,
             ts,
             sync_rev,
-            config_changed,
-            oauth_invalidated,
+            headers_changed,
+            auth_config_changed,
         ],
         |r| r.get(0),
     )?;

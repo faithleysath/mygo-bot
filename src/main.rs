@@ -559,6 +559,7 @@ async fn serve(
                     &updated.voter_set,
                     updated.pending_voter_epoch,
                     &updated.pending_voter_set,
+                    &updated.pending_proposal_id,
                 );
                 Ok(())
             })

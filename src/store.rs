@@ -143,6 +143,7 @@ impl Db {
             &local.voter_set,
             local.pending_voter_epoch,
             &local.pending_voter_set,
+            &local.pending_proposal_id,
         );
         let peers = crate::cluster::identity::list_peers(&tx)?;
         let peer_count = peers.len();

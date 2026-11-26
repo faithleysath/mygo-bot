@@ -199,7 +199,13 @@ impl App {
                     if verify_standalone {
                         let has_peers: bool =
                             conn.query_row("SELECT EXISTS(SELECT 1 FROM cluster_peers)", [], |r| r.get(0))?;
-                        if has_peers {
+                        let local = crate::cluster::identity::load_local_node(conn)?;
+                        let single_node_cfg = local.voter_epoch >= 1
+                            && local.pending_voter_epoch == 0
+                            && (local.voter_set == vec![local.node_id.clone()]
+                                || (local.voter_set.is_empty()
+                                    && local.role == crate::cluster::identity::NodeRole::Edge));
+                        if has_peers || !single_node_cfg {
                             return Err(Error::conflict(
                                 "cluster membership changed while starting session",
                             ));
@@ -346,6 +352,7 @@ fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
     if let Some(lease) = s.presence.active_local_lease(sid) {
         lease.revoked.cancel();
     }
+    s.presence.clear_non_quorum_local_lease(sid);
     s.pending_wakes.remove(&sid);
     crate::codemode::stop_session(s, sid);
     s.bump_reset_gen(sid);

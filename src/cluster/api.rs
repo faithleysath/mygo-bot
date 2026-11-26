@@ -148,14 +148,14 @@ struct InviteResponse {
 }
 
 async fn invite(State(app): State<App>) -> Result<Json<InviteResponse>> {
+    let local = app.db.call(|s| load_local_node(&s.conn)).await?;
+    if local.voter_epoch == 0 || local.voter_set.is_empty() {
+        return Err(Error::conflict(
+            "cannot invite peers from a node without a committed voter; set cluster role to voter first",
+        ));
+    }
     let addr = app.cluster.net.ensure_endpoint().await?.addr();
-    let invite = app
-        .db
-        .call(move |s| {
-            let local = load_local_node(&s.conn)?;
-            encode_invite(&local, &addr)
-        })
-        .await?;
+    let invite = encode_invite(&local, &addr)?;
     Ok(Json(InviteResponse { invite }))
 }
 
