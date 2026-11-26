@@ -122,13 +122,14 @@ impl Cluster {
             .db
             .call(|s| identity::load_local_node(&s.conn))
             .await?;
-        let net = net::ClusterNet::bind(
+        let bind_on_start =
+            start.presence.known_peer_count() > 0 || start.config.bind_addr.is_some();
+        let net = net::ClusterNet::new(
             start.db.clone(),
             local,
             start.config,
             start.stopping.clone(),
-        )
-        .await?;
+        );
         let sync = sync::SyncEngine::new(
             start.db.clone(),
             start.client,
@@ -138,8 +139,10 @@ impl Cluster {
             start.presence.clone(),
         );
         net.attach_handler(Arc::downgrade(&sync));
+        if bind_on_start {
+            net.ensure_endpoint().await?;
+        }
         sync.spawn_loops(start.stopping.clone(), workers);
-        net.spawn_loops(workers);
         Ok(Arc::new(Self {
             db: start.db,
             workers: workers.clone(),
@@ -155,6 +158,15 @@ impl Cluster {
     }
 
     pub async fn join_cluster(&self, invite: String, force: bool) -> Result<identity::PeerInfo> {
+        let (secret, peer) = identity::decode_invite(&invite)?;
+        if self.net.is_local_only() && !identity::has_direct_ip(&peer.addrs) {
+            return Err(Error::bad(
+                "local-only cluster invite must include at least one direct IP address",
+            ));
+        }
+        if peer.node_id == self.net.local_node_id() {
+            return Err(Error::bad("cannot join own node invite"));
+        }
         let db = self.db.clone();
         let net = self.net.clone();
         let sync = self.sync.clone();
@@ -163,12 +175,12 @@ impl Cluster {
         self.workers
             .spawn(async move {
                 let _guard = join_gate.lock().await;
-                let local_only = net.is_local_only();
+                net.ensure_endpoint().await?;
                 let (secret_changed, new_gen, new_secret, peer, _) = db
                     .write(
                         move |conn| {
                             let (changed, next_gen, secret, peer) =
-                                identity::apply_join(conn, &invite, local_only, force)?;
+                                identity::apply_join(conn, secret, peer, force)?;
                             let count = identity::list_peers(conn)?.len();
                             Ok((changed, next_gen, secret, peer, count))
                         },

@@ -165,7 +165,7 @@ struct InviteResponse {
 }
 
 async fn invite(State(app): State<App>) -> Result<Json<InviteResponse>> {
-    let addr = app.cluster.net.endpoint_addr();
+    let addr = app.cluster.net.ensure_endpoint().await?.addr();
     let invite = app
         .db
         .call(move |s| {

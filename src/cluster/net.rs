@@ -14,7 +14,7 @@ use iroh::{
 };
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
@@ -137,7 +137,10 @@ impl AuxKind {
 
 pub struct ClusterNet {
     db: Db,
-    endpoint: Endpoint,
+    // Shutdown stores None if it wins the race with the first bind.
+    endpoint: OnceCell<Option<Endpoint>>,
+    secret_key: SecretKey,
+    config: crate::cluster::ClusterConfig,
     auth: Mutex<NetAuthState>,
     membership_gen_fast: AtomicI64,
     local_node_id: String,
@@ -155,7 +158,6 @@ pub struct ClusterNet {
     connected_peers: Mutex<PeerConnectState>,
     connect_notify: Notify,
     dial_wake: Notify,
-    local_only: bool,
     stopping: CancellationToken,
     tasks: TaskTracker,
     global_rpc_sem: Arc<Semaphore>,
@@ -321,46 +323,18 @@ impl Drop for DialGuard {
 }
 
 impl ClusterNet {
-    pub async fn bind(
+    pub fn new(
         db: Db,
         local: LocalNode,
         config: crate::cluster::ClusterConfig,
         stopping: CancellationToken,
-    ) -> Result<Arc<Self>> {
-        let sk = SecretKey::from_bytes(&local.secret_key);
-        let transport = QuicTransportConfig::builder()
-            .keep_alive_interval(Duration::from_secs(2))
-            .max_idle_timeout(Some(
-                IdleTimeout::try_from(Duration::from_secs(6))
-                    .map_err(|e| Error::internal(format!("invalid QUIC idle timeout: {e}")))?,
-            ))
-            .build();
-        let mut builder = if config.local_only {
-            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
-        } else {
-            Endpoint::builder(presets::N0)
-        }
-        .secret_key(sk)
-        .transport_config(transport)
-        .alpns(vec![
-            CLUSTER_ALPN.to_vec(),
-            CAP_ALPN.to_vec(),
-            EXEC_ALPN.to_vec(),
-        ]);
-        if let Some(addr) = config.bind_addr {
-            builder = builder
-                .clear_ip_transports()
-                .bind_addr(addr)
-                .map_err(|e| Error::internal(format!("invalid cluster bind addr {addr}: {e}")))?;
-        }
-        let endpoint = builder
-            .bind()
-            .await
-            .map_err(|e| Error::internal(format!("failed to bind iroh endpoint: {e}")))?;
+    ) -> Arc<Self> {
         let gen_cancel = stopping.child_token();
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             db,
-            endpoint,
+            endpoint: OnceCell::new(),
+            secret_key: SecretKey::from_bytes(&local.secret_key),
+            config,
             membership_gen_fast: AtomicI64::new(local.membership_gen),
             auth: Mutex::new(NetAuthState {
                 secret: local.cluster_secret,
@@ -382,13 +356,72 @@ impl ClusterNet {
             connected_peers: Mutex::default(),
             connect_notify: Notify::new(),
             dial_wake: Notify::new(),
-            local_only: config.local_only,
             stopping,
             tasks: TaskTracker::new(),
             global_rpc_sem: Arc::new(Semaphore::new(MAX_GLOBAL_INFLIGHT_RPC)),
             peer_rpc_sems: Mutex::default(),
             rpc_byte_budget: Arc::new(Semaphore::new(MAX_RPC_BYTE_PERMITS)),
-        }))
+        })
+    }
+
+    async fn bind_endpoint(&self) -> Result<Endpoint> {
+        let transport = QuicTransportConfig::builder()
+            .keep_alive_interval(Duration::from_secs(2))
+            .max_idle_timeout(Some(
+                IdleTimeout::try_from(Duration::from_secs(6))
+                    .map_err(|e| Error::internal(format!("invalid QUIC idle timeout: {e}")))?,
+            ))
+            .build();
+        let mut builder = if self.config.local_only {
+            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
+        } else {
+            Endpoint::builder(presets::N0)
+        }
+        .secret_key(self.secret_key.clone())
+        .transport_config(transport)
+        .alpns(vec![
+            CLUSTER_ALPN.to_vec(),
+            CAP_ALPN.to_vec(),
+            EXEC_ALPN.to_vec(),
+        ]);
+        if let Some(addr) = self.config.bind_addr {
+            builder = builder
+                .clear_ip_transports()
+                .bind_addr(addr)
+                .map_err(|e| Error::internal(format!("invalid cluster bind addr {addr}: {e}")))?;
+        }
+        builder
+            .bind()
+            .await
+            .map_err(|e| Error::internal(format!("failed to bind iroh endpoint: {e}")))
+    }
+
+    pub(super) async fn ensure_endpoint(self: &Arc<Self>) -> Result<&Endpoint> {
+        let mut starting_loops = None;
+        let init = self.endpoint.get_or_try_init(|| async {
+            let endpoint = self.bind_endpoint().await?;
+            starting_loops = Some(self.tasks.token());
+            Ok::<_, Error>(Some(endpoint))
+        });
+        let stopped = || Error::internal("cluster is shutting down");
+        let endpoint = tokio::select! {
+            biased;
+            _ = self.stopping.cancelled() => return Err(stopped()),
+            result = init => result?,
+        }
+        .as_ref()
+        .ok_or_else(stopped)?;
+        // Only the initializer starts the loops, after publication. Hold its tracker
+        // token until both loops are registered so shutdown can await them.
+        if starting_loops.is_some() {
+            self.tasks.spawn(self.clone().accept_loop(endpoint.clone()));
+            self.tasks.spawn(self.clone().dial_loop(endpoint.clone()));
+        }
+        Ok(endpoint)
+    }
+
+    fn endpoint(&self) -> Option<&Endpoint> {
+        self.endpoint.get().and_then(Option::as_ref)
     }
 
     pub fn attach_handler(&self, handler: Weak<SyncEngine>) {
@@ -408,7 +441,8 @@ impl ClusterNet {
     }
 
     pub fn endpoint_addr(&self) -> EndpointAddr {
-        self.endpoint.addr()
+        self.endpoint()
+            .map_or_else(|| EndpointAddr::new(self.secret_key.public()), Endpoint::addr)
     }
 
     pub fn local_node_id(&self) -> &str {
@@ -416,7 +450,7 @@ impl ClusterNet {
     }
 
     pub fn is_local_only(&self) -> bool {
-        self.local_only
+        self.config.local_only
     }
 
     pub fn membership_gen(&self) -> i64 {
@@ -527,7 +561,9 @@ impl ClusterNet {
     }
 
     pub fn wake_dialer(&self) {
-        self.dial_wake.notify_one();
+        if self.endpoint().is_some() {
+            self.dial_wake.notify_one();
+        }
     }
 
     pub fn switch_membership(&self, new_gen: i64, new_secret: [u8; 32]) {
@@ -562,17 +598,6 @@ impl ClusterNet {
         self.notify_peer_offline(node_id);
     }
 
-    pub fn spawn_loops(self: &Arc<Self>, workers: &TaskTracker) {
-        let net_accept = self.clone();
-        workers.spawn(async move {
-            net_accept.accept_loop().await;
-        });
-        let net_dial = self.clone();
-        workers.spawn(async move {
-            net_dial.dial_loop().await;
-        });
-    }
-
     pub async fn shutdown(&self) {
         self.stopping.cancel();
         self.auth.lock().unwrap().gen_cancel.cancel();
@@ -586,16 +611,18 @@ impl ClusterNet {
         }
         self.drain_aux_all(AuxKind::Cap, 0, b"shutdown");
         self.drain_aux_all(AuxKind::Exec, 0, b"shutdown");
-        self.endpoint.close().await;
+        if let Some(endpoint) = self.endpoint.get_or_init(|| async { None }).await {
+            endpoint.close().await;
+        }
         self.tasks.close();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.tasks.wait()).await;
     }
 
-    async fn accept_loop(self: Arc<Self>) {
+    async fn accept_loop(self: Arc<Self>, endpoint: Endpoint) {
         loop {
             let incoming = tokio::select! {
                 _ = self.stopping.cancelled() => break,
-                inc = self.endpoint.accept() => match inc {
+                inc = endpoint.accept() => match inc {
                     Some(inc) => inc,
                     None => break,
                 },
@@ -617,9 +644,9 @@ impl ClusterNet {
         }
     }
 
-    async fn dial_loop(self: Arc<Self>) {
+    async fn dial_loop(self: Arc<Self>, endpoint: Endpoint) {
         loop {
-            if self.stopping.is_cancelled() || self.endpoint.is_closed() {
+            if self.stopping.is_cancelled() || endpoint.is_closed() {
                 return;
             }
             let (mgen, _, gen_cancel) = self.auth_context();
@@ -631,7 +658,7 @@ impl ClusterNet {
                 continue;
             }
             for peer in peers {
-                if self.stopping.is_cancelled() || self.endpoint.is_closed() {
+                if self.stopping.is_cancelled() || endpoint.is_closed() {
                     return;
                 }
                 if gen_cancel.is_cancelled() || self.membership_gen() != mgen {
@@ -651,21 +678,22 @@ impl ClusterNet {
                     peer_id: peer.node_id.clone(),
                 };
                 let net = self.clone();
+                let endpoint = endpoint.clone();
                 self.tasks.spawn(async move {
                     let _guard = guard;
-                    let _ = net.dial_peer(&peer).await;
+                    let _ = net.dial_peer(&endpoint, &peer).await;
                 });
             }
             tokio::select! {
                 _ = self.stopping.cancelled() => return,
-                _ = self.endpoint.closed() => return,
+                _ = endpoint.closed() => return,
                 _ = self.dial_wake.notified() => (),
                 _ = tokio::time::sleep(RECONNECT_INTERVAL) => (),
             }
         }
     }
 
-    pub async fn dial_peer(self: &Arc<Self>, peer: &PeerInfo) -> Result<()> {
+    async fn dial_peer(self: &Arc<Self>, endpoint: &Endpoint, peer: &PeerInfo) -> Result<()> {
         if peer.node_id == self.local_node_id || self.is_peer_online(&peer.node_id) {
             return Ok(());
         }
@@ -673,7 +701,7 @@ impl ClusterNet {
         let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs)?;
         let conn = tokio::select! {
             _ = gen_cancel.cancelled() => return Err(Error::conflict("membership changed during dial")),
-            res = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr, CLUSTER_ALPN)) => {
+            res = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, CLUSTER_ALPN)) => {
                 res.map_err(|_| Error::internal("dial timed out"))?
                     .map_err(|e| Error::internal(format!("dial failed: {e}")))?
             }
@@ -758,7 +786,7 @@ impl ClusterNet {
         cli_label: &[u8],
     ) -> Result<PeerInfo> {
         let local = self.db.call(|s| load_local_node(&s.conn)).await?;
-        let self_info = self_peer_info(&local, &self.endpoint.addr());
+        let self_info = self_peer_info(&local, &self.endpoint_addr());
         let mut client_nonce = [0u8; 32];
         getrandom::fill(&mut client_nonce).map_err(|_| Error::internal("entropy unavailable"))?;
 
@@ -840,7 +868,7 @@ impl ClusterNet {
             &client_nonce,
             &server_nonce,
         );
-        let self_info = self_peer_info(&local, &self.endpoint.addr());
+        let self_info = self_peer_info(&local, &self.endpoint_addr());
         write_auth(
             &mut send,
             &AuthMsg::Challenge {
@@ -1013,12 +1041,13 @@ impl ClusterNet {
         if let Some(found) = self.pick_aux_conn(kind, &peer.node_id, mgen) {
             return Ok(found);
         }
+        let endpoint = self.endpoint().ok_or("cluster endpoint is offline")?;
         let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs).map_err(|e| e.to_string())?;
         let conn = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err("cancelled".into()),
             _ = gen_cancel.cancelled() => return Err(format!("membership changed during {tag} dial")),
-            res = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr, kind.alpn())) => {
+            res = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(addr, kind.alpn())) => {
                 res.map_err(|_| format!("{tag} dial to {} timed out", peer.node_id))?
                     .map_err(|e| format!("{tag} dial to {} failed: {e}", peer.node_id))?
             }

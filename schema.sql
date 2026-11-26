@@ -114,9 +114,9 @@ CREATE TABLE items (
     FOREIGN KEY (session_id, codemode_call_item_id) REFERENCES items(session_id, id),
     FOREIGN KEY (session_id, llm_call_id) REFERENCES llm_calls(session_id, id),
     UNIQUE (session_id, id),
-    UNIQUE (kind, target_id),
     FOREIGN KEY (session_id, target_id) REFERENCES items(session_id, id)
 );
+CREATE UNIQUE INDEX items_by_target ON items(kind, target_id) WHERE target_id IS NOT NULL;
 CREATE INDEX items_by_llm_call ON items(llm_call_id) WHERE llm_call_id IS NOT NULL;
 CREATE INDEX items_by_kind ON items(session_id, kind, id);
 CREATE UNIQUE INDEX tools_by_call ON items(session_id,json_extract(payload,'$.call_id')) WHERE kind='function_call';
@@ -260,4 +260,4 @@ CREATE TABLE deferred_crash_sessions (
     head_hash BLOB NOT NULL CHECK (length(head_hash) = 32),
     reason TEXT NOT NULL DEFAULT 'daemon restarted'
 );
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;

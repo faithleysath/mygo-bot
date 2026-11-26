@@ -330,20 +330,11 @@ pub fn decode_invite(invite: &str) -> Result<([u8; 32], PeerInfo)> {
 
 pub fn apply_join(
     conn: &Connection,
-    invite: &str,
-    local_only: bool,
+    new_secret: [u8; 32],
+    peer: PeerInfo,
     force: bool,
 ) -> Result<(bool, i64, [u8; 32], PeerInfo)> {
-    let (new_secret, peer) = decode_invite(invite)?;
-    if local_only && !has_direct_ip(&peer.addrs) {
-        return Err(Error::bad(
-            "local-only cluster invite must include at least one direct IP address",
-        ));
-    }
     let local = load_local_node(conn)?;
-    if peer.node_id == local.node_id {
-        return Err(Error::bad("cannot join own node invite"));
-    }
     let secret_changed = local.cluster_secret != new_secret;
     let next_gen = if secret_changed {
         let has_peers: bool =
