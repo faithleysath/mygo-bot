@@ -12,7 +12,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 - **供应商与模型目录（`llm_providers` 与 `llm_models`）**：模型的上游地址 `base_url`、密钥 `api_key`、模型代号 `model_key`、上下文窗口大小、支持的输入模态（`text`、`image`、`audio`、`video`）、推理强度档位以及价格表，都登记在独立的目录表里。
 - **不再维护全局默认表 `config`**：为了免去多节点同步全局配置的耦合与状态同步包袱，系统直接移除全局 `config` 表，改为在建会话时显式选模：数据库里 `sessions.model_id` 是 `NOT NULL`，调 `POST /sessions` **必须传入**一个当前可用（自己和所属供应商都没有被归档）的 `model_id`（缺省或传 `null` 直接返 `400`），可选再带上该模型支持的 `reasoning_effort`；WebUI 会在浏览器 `localStorage` 里记住上次使用的模型并自动回落到首个可用模型（若尚无可用模型则弹窗引导先添加），已有会话随时可以通过 `PATCH /sessions/{sid}` 改换别的有效模型，但不允许把 `model_id` 改回 `null`。
-- **发给上游的静态前缀**：会话跑起来发请求时，除了在 `input` 最前面实时拼入一条**云原生跨平台静态英文 `role: "developer"` 指南消息**（位于 [src/model.rs](../src/model.rs#L55-L72)；刻意不包含任何宿主 OS/架构假定或动态环境信息、也不写进流水账，引导模型通过 `cluster.nodes()` 与 `cluster.node(target)` 发现并驱动任意集群节点，同时可跨异构节点稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
+- **发给上游的静态前缀**：会话跑起来发请求时，除了在 `input` 最前面实时拼入一条**云原生跨平台静态英文 `role: "developer"` 指南消息**（位于 [src/model.rs](../src/model.rs#L55-L72)，连同 `tools::definitions()` 通过 `OnceLock` 缓存预序列化静态前缀；刻意不包含任何宿主 OS/架构假定或动态环境信息、也不写进流水账，引导模型通过 `cluster.nodes()` 与 `cluster.node(target)` 发现并驱动任意集群节点，同时可跨异构节点稳定命中上游前缀缓存）外，会话上下文完全原封不动按 OpenAI Responses API 发出去。
 
 ---
 
@@ -54,19 +54,19 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 **在这个程序里，“投信”和“点火”是分开的。** 会话停着时（`idle` 或 `paused`），客户端调 `POST /sessions/{sid}/messages` 发消息，只是往 `items` 流水账里塞进一条 `user_message`，就像把信投进门外信箱，不会自己去叫模型；真要让模型干活，得调一次 `PUT /sessions/{sid}/run` 点火开工。
 
-在多节点集群里，任何节点都能接 HTTP 请求（控制面），但不一定由它亲自干活（执行面）：`PUT /sessions/{sid}/run` 支持可选请求体 `{ "node": "<node_id或节点名>" }`（省略时默认由收到请求的节点自己来跑），如果指定了远端节点，控制面会自动把开工请求经 `mygo/exec/1` 单跳转发过去。真正点着火之前，执行节点如果发现集群里还有其他在线同伴，会先过一遍**四步执行门禁**（[src/cluster/exec.rs](../src/cluster/exec.rs)）：
-1. **看占有、抢工牌**：先核对内存里的全网在线占有表（发现疑似被他机占着就立即去对方实时复核一次，防止过期缓存误报），再在本机登记一枚三态临时工牌 `LocalClaim`（`Probing` -> `Committing` / `Yielded`——如果两个节点恰巧同一毫秒抢跑，按节点 ID 字典序确定性让步，确保最多只有一个节点胜出）；
-2. **拉齐最新账**：调 `sync_session_latest` 确保本机已 Watch 并追平会话最新提交、无分叉冲突且处于可写完整状态；
+在多节点集群里，任何节点都能接 HTTP 请求（控制面），但不一定由它亲自干活（执行面）：`PUT /sessions/{sid}/run` 支持可选请求体 `{ "node": "<node_id或节点名>", "force_offline": false }`（省略 `node` 时由收到请求的节点自己来跑），如果指定了远端节点，控制面会自动把开工请求经 `mygo/exec/1` 单跳转发过去。如果当前只有自己一个单节点（`known_peer_count == 0`），直接走零锁、无额外 RPC 的快路径开跑；一旦集群存在已知同伴，执行节点在真正点着火前（除非本机已经因活跃后台任务或活跃 Runner 持有有效 `LocalLease` 租约而直接复用/幂等返回），会先过一遍**多数派四步执行门禁**（[src/cluster/exec.rs](../src/cluster/exec.rs)）：
+1. **看占有、抢单调号工牌**：先核对内存里的全网在线占有表（发现疑似被他机占着就立即去对方实时复核一次，防止过期缓存误报），再在本机登记一枚附带递增任期 **`term`** 的三态临时工牌 `LocalClaim`（`Probing` -> `Committing` / `Yielded`——同毫秒抢跑按节点 ID 字典序让步，且任何更高 `term` 自动压倒旧任期，确保同一任期最多只有一个胜出者）；
+2. **拉齐最新账与预写任期**：调 `sync_session_latest` 确保本机已 Watch 并追平会话最新提交、无分叉冲突且处于可写完整状态，并把 `highest_term` 持久化进 `session_leases`；
 3. **预检并发附件**：通过 `missing_session_context_attachments`（[src/media.rs](../src/media.rs)）一次性扫描上下文 `context_items` 和门外排队 `pending` 涉及的全部多模态附件，缺字节就当场从持有同行分块拉齐，源头离线拉不到就直接退回 `409` 且保持会话 `idle`；
-4. **全网打招呼再正式落牌**：向所有在线同行群发带工牌的 `CheckOccupancy`，二次核对无人跑着会话或后台任务、也没有比自己更新或分叉的头哈希，随后把工牌切进 `Committing` 并原子切为 `running`，再立刻同步推送一条带 `clear_claim` 的 `PresenceSync` 公布正式 Runner 身份并顺手摘掉临时工牌。
+4. **凑齐多数派租约再正式落牌**：向在线同伴群发带 `RunClaim(claim_id, term, ttl_ms=10s)` 的 `CheckOccupancy`，校验没人占用、头哈希未落后且已收齐 **多数派（`total / 2 + 1`）** 节点授出的隔离租约（远端同步记入 `session_leases`）。凑不够多数派时默认返回 `503 Service Unavailable`，只有客户端显式传 **`force_offline: true`** 才记为受控降级的 `LocalLease::ForcedOffline` 离线续跑。拿下 `LocalLease::Quorum` 后，后台 **`spawn_lease_renew_loop`** 每隔 **3 秒**（`LEASE_RENEW_INTERVAL`）向全网在线同伴发送 `RenewLease` 续租（新加入同伴也可顺手接纳更高 `term` 的在途租约），并每轮按当前最新集群人数重算多数派门槛——一旦失掉多数派或遭遇更高 `term` 抢占，在本地 **9 秒有效窗口（`10s TTL - 1s 安全余量`）**到期瞬间立刻熔断取消 `lease.revoked` 并通过 `fence_session_local` 做仅本机可见的 `paused` 停机，绝不带着失效租约往共享账本里写提交。更关键的是，哪怕某场会话是**先在单机模式下开跑**、中途才被拉进新集群或有新同伴连入，`on_peer_connected` 与 `membership_reconcile_loop` 也会立刻通过 `reconcile_standalone_leases` 为这类无租约活跃会话/后台任务补抢多数派租约（抢不到多数派当场仅本机停机），彻底堵死“单机起跑进集群后失多数派仍继续提交”的旁路。
 
-对应的控制操作也统一按这套占有权自动寻址（[src/api.rs](../src/api.rs)）：只要会话眼下正被远端 Runner 占着（包括停在 `idle` 但还挂着未收尾后台 `codemode` 任务），`POST /messages`（连带发送方登记过的附件元数据 `AttachmentRef` 一起带上，免去附件还未全库同步时 `400` 拒收）、`DELETE /messages/{mid}`、`PATCH /sessions/{sid}`、`DELETE /run` 会全部单跳转发给那个 Runner 处理；如果全网没人占着，本地写操作会先追平最新提交再写库；而删会话 `DELETE /sessions/{sid}` 会过一道集群占有屏障，只要任意在线同行上还跑着会话或挂着后台任务，直接返回 `409`。
+对应的控制操作也统一按这套占有权自动寻址（[src/api.rs](../src/api.rs)）：只要会话眼下正被远端 Runner 占着（包括停在 `idle` 但还挂着未收尾后台 `codemode` 任务），`POST /messages`（连带发送方登记过的附件元数据 `AttachmentRef` 一起带上，免去附件还未全库同步时 `400` 拒收）、`DELETE /messages/{mid}`、`PATCH /sessions/{sid}`、`DELETE /run` 会全部单跳转发给那个 Runner 处理；如果当前全网无人占用且本机持有完整正文（即便分区离线，非删类投信/改标题/撤回仍允许先写入本地链，重连后再按哈希链收敛或走分叉裁决），本地写操作直接落盘；而删会话 `DELETE /sessions/{sid}` 在存在集群成员时必须拿到多数派占有门控 `DeleteGateGuard`（`1 + granted >= quorum`，分区失多数派直接返 `503`），不仅拦截任何在线 Runner 与未收尾任务（`409`），还要把删除租约（`ActiveLease`）带进最后的 SQLite 提交事务内再次验活，防止预约超期后误删。
 
 不过一旦点火跑起来（进入 `running`），后面就不用再反复点火了——手头这一趟活收完尾，它自己会去翻门外信箱还有没有新信，有就接着跑。
 
 具体一趟活是怎么走的？
 
-1. **收信并开单**：Worker 开跑后，先让记账员在一个事务里把门外排队且没被撤回的新输入收进 `context_items`，在 `llm_calls` 表里开一笔 `in_flight` 调用单并钉死本轮读取的上下文终点 `input_end_position`（见 [第 3 篇](03-catalog-media-and-billing.md)）。
+1. **收信并开单**：Worker 开跑后，先让记账员走 **`write_for_run` 组提交事务**把门外排队且没被撤回的新输入收进 `context_items`，在 `llm_calls` 表里开一笔 `in_flight` 调用单并钉死本轮读取的上下文终点 `input_end_position`（见 [第 3 篇](03-catalog-media-and-billing.md)），高并发下多条开单还能与其它写单拼成同一次物理刷盘。
 2. **流式问模型**：拿着截至 `input_end_position` 的上下文，连上内置的 6 个工具定义（[src/tools.rs](../src/tools.rs)），向 `{base_url}/responses` 发出 `POST` 请求（`stream: true, store: false`，带可选的 `reasoning.effort`）。
 3. **边读流边派工具**：响应以 SSE 流回来，程序一边把片段吐给实时订阅者（见 [第 7 篇](07-realtime-api-and-webui.md)），一边盯着完整的输出项（`response.output_item.done`）。只要凑齐一条 `function_call`，程序立刻先把它记进 `items` 流水账（不马上进 `context_items`），当场异步 `spawn` 出去跑，**不等模型把整段话说完，也不等工具跑完**。如果是文本回答或思考块（`reasoning`），当场就记进 `items` 并顺手收进 `context_items`。
 4. **顺手合写小优化**：如果模型这一步没调任何工具，在收到最后一条完整回答（`output_text` 或 `refusal`）的那一瞬间，程序会偷瞄一眼网络缓冲区——要是 `response.completed` 结束信号已经紧跟在后面躺着了，它就不先写一次库再结算一次，而是把“写入 `assistant_message`、结算 `llm_calls` 账单、清零 `needs_model`、把会话切回 `idle`（或暂停）”合进同一次 SQLite 事务提交，白省一趟刷盘。
@@ -109,7 +109,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 ## 会话状态机与软暂停 / 硬暂停
 
-`sessions.status` 只有四个合法持久化值：`idle`、`running`、`pausing`、`paused`。在多节点环境下，**临时运行态（`running` / `pausing`）故意不写进集群同步提交，也不会写进共享状态机账本**；非执行节点会在内存里维持一份随 `mygo/exec/1` 实时跳变的节点在线占有表 `PresenceState`，每次对外组装 `Session`（`Store::session_view`）时，动态把当前实际执行节点的 `runner_node_id` 和实时 `running`/`pausing` 状态叠加上去。这样即使某个 Runner 节点被 `SIGKILL` 强杀或突发断网，其他节点收到连接断开通知后当场清空该节点的在线占有记录，`runner_node_id` 自动清零，绝不会出现集群死锁占坑——幸存节点随时可以按照账本里留下的 `needs_model` 和 `pending` 队列把会话接过来重跑（前提是通过上面的预检且拿齐了需要用到的附件）。配合前面的积木，“暂停”这件事就只剩一个问题：**手头正在跑的这个 `step`，还让不让它做完？**
+`sessions.status` 只有四个合法持久化值：`idle`、`running`、`pausing`、`paused`。在多节点环境下，**临时运行态（`running` / `pausing`）故意不写进集群同步提交，也不会写进共享状态机账本**；非执行节点会在内存里维持一份随 `mygo/exec/1` 实时跳变的节点在线占有表 `PresenceState`，每次对外组装 `Session`（`Store::session_view`）时，动态把当前实际执行节点的 `runner_node_id` 和实时 `running`/`pausing` 状态叠加上去。这样即使某个 Runner 节点被 `SIGKILL` 强杀或突发断网，其他节点收到连接断开通知后当场清空该节点的在线占有记录，`runner_node_id` 立刻清零；不过为了给失联旧节点留出本地自锁时间窗口、防止它断网重启前最后一口气提交造成分叉，同伴手里持有的原 **`session_leases` 隔离租约（约 10 秒 TTL，对应旧节点本地 9 秒自锁到期窗口）**到期之前新接管会短暂返回 `409`/`503`，只要旧租约过期或原节点死前显式广播了摘牌，幸存多数派随时可以按照账本里留下的 `needs_model` 和 `pending` 队列接手重跑（前提是通过预检且拿齐了附件）。配合前面的积木，“暂停”这件事就只剩一个问题：**手头正在跑的这个 `step`，还让不让它做完？**
 
 ```mermaid
 stateDiagram-v2
@@ -171,8 +171,8 @@ stateDiagram-v2
 **崩溃恢复专门拿来跟硬暂停做对照：硬暂停是程序还醒着，能自己把残局结清；`SIGKILL` 强杀或直接断电，是连最后一次结账的机会都没给。**
 
 所以进程重新拉起、打开数据库 `Db::open` 时，只认 SQLite WAL 最后一次提交的事务，在一个启动事务里做三件事：
-1. **验库、对齐时钟水位与认领本机身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 `6`，紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L113)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`（详见 [第 2 篇](02-storage-and-concurrency.md)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
-2. **只按源节点 `origin_node_id` 截停状态**：建表时每行 `llm_calls` 和 `items` 都记录着写下这行原始数据的 `origin_node_id`。启动恢复只把 `origin_node_id == local_node_id` 且仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`），把本机原先是 `'running'` 或 `'pausing'` 的会话统一标成 `'paused'`，同时交给 `codemode::ledger::recover` 也按 `origin_node_id` 过滤后处理未结清的后台任务与过期租期提醒（详见 [第 5 篇](05-codemode-lifecycle.md)）——既不会从旧提交 JSON 里误扫出别的节点的任务，也绝不会越权修改冲突未决或只有半份目录头的远端会话；恢复动作仅在对本机无冲突且可写完整的流上才补记同步提交，让集群同伴看到一致状态。
+1. **验库、对齐时钟水位、加载租约并认领身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 **`7`**，紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L117-L161)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`、预统计同伴人数 `known_peer_count` 与空附件标记，并把 `session_leases` 里尚存的最高 `term` 与已授出租约载回内存（详见 [第 2 篇](02-storage-and-concurrency.md)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
+2. **只按源节点 `origin_node_id` 截停与延迟同步恢复**：建表时每行 `llm_calls` 和 `items` 都记录着写下这行原始数据的 `origin_node_id`。启动恢复只把 `origin_node_id == local_node_id` 且仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`），把本机原先是 `'running'` 或 `'pausing'` 的会话统一标成 `'paused'`，同时交给 `codemode::ledger::recover` 也按 `origin_node_id` 过滤后处理未结清的后台任务与过期租期提醒（详见 [第 5 篇](05-codemode-lifecycle.md)）——既不会从旧提交 JSON 里误扫出别的节点的任务，也绝不会越权修改冲突未决或只有半份目录头的远端会话。**在多节点环境下，本地恢复不再一启动就盲写集群同步提交**（避免节点刚刚接管完成、旧节点重启又往旧分支写停机记录制造分叉），而是先把“待宣布恢复”的会话头快照记进 **`deferred_crash_sessions`**，等后台 **`deferred_recovery_loop`** 凑齐当前多数派租约并核对最新头未变后再安全落盘同步；单机下（`known_peer_count == 0`）且无冲突、可写完整的流则当场补记同步提交。
 3. **等人工重开才补未果工具**：注意启动恢复时**绝不会擅自重跑上次没回来的普通工具调用**——因为账上没记 `function_call_output`，只说明**结果没落盘**，推不出**工具当时没执行过**（比如发邮件、扣款）。重启后这些工具的空缺先留着，等你下次手动调 `PUT /sessions/{sid}/run` 恢复会话时，程序再翻流水账收残局，调用 `publish_tools(..., recovering=true)` 补上 `"Execution interrupted; result unknown."`。补齐残局后要不要接着问模型，又稳稳地回到前面那两个书签：先看 `needs_model`，再看 `pending` 队列，有活接着跑，没活切回 `idle`。
 
 ---

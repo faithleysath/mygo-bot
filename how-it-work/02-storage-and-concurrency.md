@@ -67,12 +67,12 @@
 
 ### 细节二：谁绝不能拼进同一趟车？——`Write::can_join`
 
-看代码 [src/store.rs](../src/store.rs#L37-L44) 里的规则，写单分成“普通写”和“启动运行写（`start_session`）”两类，**它们绝不混批**：
-- 普通写（比如投信、建目录、保存模型）只能和普通写拼车；
+看代码 [src/store.rs](../src/store.rs#L39-L55) 里的规则，写单分成“普通写（包括 `Db::write`、`calls::begin` 与收尾均使用的 `Db::write_for_run`）”和“启动运行写（`start_session`）”两类，**它们绝不混批**：
+- 普通写（比如建会话、投信、开单 `calls::begin`、记录回复、保存模型）之间可以自由拼车；
 - **最关键的是同一个会话被两个客户端同时点 `PUT /run` 点火**：如果两笔针对同一个会话 `sid` 的点火被塞进同一个外层事务里，第一笔虽然在 SQLite 里改了 `status='running'`，但外层事务还没 `COMMIT`，它的 `publish` 阶段还没来得及把 worker 登记进内存 `s.active` 字典，紧接着第二笔在同一批里一看 `s.active` 还是空的，就会误以为“还没人跑”，再派一个重复 worker 出来！
 - 所以规则写得死死的：**不同会话的点火可以拼车，同一个会话的两次点火绝不能进同一车**——第一车提交并把 worker 登记进 `s.active` 之后，第二车进门一眼看见活动 worker 已经在了，直接跳过开新循环、原样返回当前会话状态。顺便一提，在优雅退出阶段（`self.closing == true`），点火批次还会直接拒绝开新单，统一返回 `503 Service Unavailable`（`"shutting down"`）。
-- **还要防着过期老 worker 死灰复燃（运行世代与重置世代分离）**：假如会话正跑在半路，突然碰上集群全量覆盖或删除会话，旧 worker 虽然收到了取消信号，但手里已经攥着一笔算完的工具账单正准备排进写通道。为了既不让“上一任过期打工人”写坏新历史、错删新点火 worker 的 `s.active` 登记，又不至于让正常新开的下一回合把上一回合留下的后台任务完成事件吞掉，记账员把**两件事彻底拆成两本世代账**：
-  - `Store.session_run_gen`（Worker 身份世代）：每次会话点火都先递增并钉在 `Control` 上，模型 worker 的每一笔写库——包括 [src/model.rs](../src/model.rs) 里的流式中间推理/回复输出，以及 [src/tools.rs](../src/tools.rs) 配合 `hard.is_cancelled()` 守门的参数校验报错回包——全都要经 `Db::write_for_run` 附带 `expected_run_gen`，记账员在 `commit_batch`（[src/store.rs](../src/store.rs#L385-L411)）核对一致才放行，否则当场拒写；
+- **还要防着过期老 worker 与失租节点死灰复燃（运行世代、重置世代与租约同查）**：假如会话正跑在半路，突然碰上集群全量覆盖、删除会话，或者网络分区导致执行租约过期，旧 worker 虽然收到了取消信号，但手里已经攥着一笔算完的工具账单正准备排进写通道。为了既不让“上一任过期打工人”或“失去多数派的旧 Runner”写坏新历史，又不至于让正常新开的下一回合把上一回合留下的后台任务完成事件吞掉，记账员把世代与租约绑定在了同一道批提交校验里：
+  - `Store.session_run_gen`（Worker 身份世代）与实时租约检查 `is_local_lease_valid`：每次会话点火都先递增并钉在 `Control` 上，模型 worker 的每一笔写库——包括开单 `calls::begin`、[src/model.rs](../src/model.rs) 里的流式中间推理/回复输出，以及 [src/tools.rs](../src/tools.rs) 配合 `hard.is_cancelled()` 守门的参数校验报错回包——全都要经 `Db::write_for_run` 附带 `expected_run_gen`，记账员在 `commit_batch`（[src/store.rs](../src/store.rs#L480-L505)）同时核对 `run_gen` 一致且本地执行租约有效才放行，否则当场拒写；
   - `Store.session_reset_gen` 与持久化的 `sync_streams.reset_gen`（`history_rev` 正文替换世代）：**只在真正覆盖整本正文或删除会话时才递增**，供后台 `codemode` 任务在 `task_superseded` 里核对。因此正常开新回合不会递增 `reset_gen`，上一回合遗留的后台任务完成事件照常送达；只有真正被集群替代或删会话时，`abort_active_session_worker` 才会同时硬取消 worker、停掉名下任务、摘除 `s.active` 并递增这两套世代号，同时 `clear_session_body_rows` 把滞留的 `'running'`/`'pausing'` 状态先归位为 `'paused'` 再重放胜方快照。
 
 ---
@@ -113,7 +113,7 @@
 - **查排队信件 `GET /sessions/{sid}/messages`**：通过左连接撤回单 `withdrawal` 和上下文 `context_items`，实时把每条 `user_message` 算出 `queued`、`included`、`withdrawn` 三种状态，支持按 `id` 和 `status` 过滤及游标分页。
 - **撤回消息 `DELETE /sessions/{sid}/messages/{mid}`**：先确保会话已进入 Watch，然后在独立 `Db::write` 事务里检查与写入——只能撤回还没被 `take_pending` 收进上下文的 `user_message`。如果已经进上下文，直接返回 `409 Conflict`（`"message already included"`）；如果流处于分叉冲突中，savepoint 回滚并返回 `409`，不留半截记录；如果已经撤回过再点撤回，直接幂等返回 `204 No Content`，不会写第二张撤回单（`UNIQUE(kind, target_id)` 也兜底锁死了这一点）。
 - **彻底删除会话 `DELETE /sessions/{sid}`**：
-  - **先入 Watch 再查禁区**：入口处先调用 `ensure_session_watched(sid)` 把会话正文拉齐（免得在只有半份目录头的状态下误删），进事务后再检查不能处于冲突未裁决态（`409`）；只要会话正在 `running`/`pausing`，或者 `s.active` 还在跑，或者名下还有活着的 `codemode` 任务，一律返回 `409 Conflict` 拒删——必须先停下来。
+  - **先入 Watch 再抢多数派删除门控**：入口处先在有集群同伴时调 `ensure_session_watched(sid)` 把会话正文拉齐（免得在只有半份目录头的状态下误删），随后走 `acquire_delete_gate(sid)`（有同伴时必须向在线同伴拿齐 **多数派确认并取得有效期约 9 秒的本地 `DeleteGateGuard` 隔离租约**，分区失多数派直接返 `503`，任何人占着会话或挂着后台任务返 `409`）；进 SQLite 事务后还会**再次核验 `delete_lease.is_valid()`、无远端占有/已提交租约、头哈希与 `expected_head` 一致且无未决冲突**，彻底封死预约超期后的并发提交窗口；
   - **外键有序清表**：在事务里严格按外键依赖依次清理 `context_items` -> `invalidated_warnings` -> 带 `target_id` 或 `codemode_call_item_id` 的衍生 `items` -> 其余 `items`。
   - **留住花费账单并记录脱钩**：删会话**不会删历史花费账单**！程序先把这批 `llm_calls.session_id` 设为 `NULL`（同时把这几笔脱离关联的 `llm_calls` 各自记进同步提交，并把 `detached_call_ids` 一起写入 `session_delete` 提交载荷，确保远端按终态墓碑删除时也不会卡在外键上），保留所有模型调用和费用记录供全局核算，然后才删 `sessions` 行，并在该会话流上写入一笔永久 `session_delete` 墓碑（`deleted = 1`），保证离线节点重新上线后也会跟着彻底删掉它、绝不会把旧副本“复活”回来。
   - **清光内存残留**：事务提交后，记账员当场从内存摘掉该会话的 MCP 连接（`s.mcp.forget_session(sid)`）、广播槽、唤醒弦、草稿流缓存，并向全局事件流广播 `session.deleted`。
@@ -127,7 +127,7 @@
 ### 1. 单机即 1 节点集群：`local_node`、成员代数与确定性破冰
 
 在 MyGo-Bot 里，**没有“单机模式”和“集群模式”两套代码**：
-- 首次开库建表（当前 schema 版本 `PRAGMA user_version = 6`）时，程序在 `local_node` 表生成本机专属密钥（`iroh` Ed25519 节点身份 `node_id`）、初始成员代数 `membership_gen = 1` 和一条 32 字节随机集群密钥 `cluster_secret`——此时你就是一台 **1 节点私有集群**；
+- 首次开库建表（当前 schema 版本 **`PRAGMA user_version = 7`**，共 19 张表，相比 v6 新增持久化隔离租约表 **`session_leases`** 与延迟崩溃恢复表 **`deferred_crash_sessions`**）时，程序在 `local_node` 表生成本机专属密钥（`iroh` Ed25519 节点身份 `node_id`）、初始成员代数 `membership_gen = 1` 和一条 32 字节随机集群密钥 `cluster_secret`——此时你就是一台 **1 节点私有集群**；单机日常请求会先经 `known_peer_count() == 0` 原子快路径直接跳过集群锁与 RPC 开销，保持与单机极速相当的吞吐；
 - 通过 `POST /cluster/invite` 生成一次性邀请码（打包了集群密钥与接入地址）；在另一台节点上调 `POST /cluster/join` 填入后：如果本机还没有任何集群同伴，会直接热切换密钥并合并保留本地数据接入；如果本机**已经存在 `cluster_peers`** 且邀请码更换了 `cluster_secret`，默认返回 **`409 Conflict`** 防止误踢原有集群，必须明确传入 **`force: true`** 才执行切换（保留本地数据、清空旧 `cluster_peers` 与 `sync_staging_commits` 暂存表、写入新同伴、原子递增 `membership_gen` 并先调 `net.switch_membership` 立刻切断旧世代连接，再通知 `sync.on_membership_switched`），同时拉回来的清单和 `InboundState` 入站队列条目从获取那一刻就绑死当时的 **`membership_gen`**，并在对账前与每一笔落库 SQLite 事务内经 `identity::assert_membership_gen` 核对，跨世代旧包当场丢弃重取，杜绝换群瞬间还在半路的同步包跨世污染新集群；另，`--cluster-local --cluster-bind` 在绑定端点前会先 `clear_ip_transports()` 确保不会混用其他默认传输地址；
 - **双向 BLAKE3 keyed-MAC 握手 + 区分来源的 PEX + 确定性破冰**：连上后双方互相拿 `cluster_secret` + 各自随机数算两轮 BLAKE3 keyed-MAC 验身份（`mygo-auth-srv` / `mygo-auth-cli`），验过身份后做 **PEX（Peer Exchange）** 自动发现全网状同伴，并单独区分直连实测地址与间接 PEX 转发时间戳（`addrs_ts`），避免陈旧转播覆盖新地址；同一对节点若同毫秒互相拨通，就按 `node_id` 字典序破冰（只保留较小 `node_id` 主动拨出的那条连接），同时每节点同一时刻只允许一个 `DialGuard` 在途拨号。
 
