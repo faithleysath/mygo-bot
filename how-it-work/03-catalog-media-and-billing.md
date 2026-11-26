@@ -12,7 +12,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 
 ## 供应商与模型目录：软归档与四道护账铁门
 
-所有模型信息都分成两级存在 SQLite 里（[schema.sql](../schema.sql#L1-L23)、[src/catalog.rs](../src/catalog.rs)）：
+所有模型信息都分成两级存在 SQLite 里（[schema.sql](../schema.sql#L1-L48)、[src/catalog.rs](../src/catalog.rs)）：
 
 - **`llm_providers`（供应商）**：登记 `name`、`base_url`（校验必须是 `http` 或 `https`，且不允许夹带用户名、密码、query 或 `#fragment`）以及可选 `api_key`（传空串视为清空；查询接口 `ProviderInfo` **永远不回显密钥明文**，只返回 `has_api_key: bool`）。
 - **`llm_models`（模型）**：挂在某个 `provider_id` 下，记录 `model_key`、可选正整数 `context_window_tokens`、`input_modalities`（非空去重数组，只能取 `text`、`image`、`audio`、`video`）、`reasoning_efforts`（去重非空、无首尾空白的字符串数组）和可选的 `pricing` 价目表。
@@ -21,13 +21,13 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 
 用过的供应商和模型从来不能物理硬删——因为 `llm_calls` 账单和老会话里还指着它们。程序采用 `archived_at` 时间戳来做软归档（`DELETE /providers/{id}`、`DELETE /models/{id}`，支持用 `POST .../restore` 恢复）。
 
-妙在两个部分唯一索引：
-- `active_provider_name ON llm_providers(name) WHERE archived_at IS NULL`
-- `active_model_key ON llm_models(provider_id, model_key) WHERE archived_at IS NULL`
+妙在两个部分索引配合应用层事务检查：
+- `llm_providers_active_name ON llm_providers(name) WHERE archived_at IS NULL`
+- `llm_models_active_key ON llm_models(provider_id, model_key) WHERE archived_at IS NULL`
 
-意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会撞上唯一索引返回 `409 Conflict`。
+注意：`v9` 刻意把这两条索引建成**非唯一部分索引**（这样就算两台设备离线并发创建重名目录，跨节点 CRDT 合流时也不会被 SQL `UNIQUE` 报错卡死）；而在正常本地新建、修改或恢复的写事务入口里，应用层会顺着这两条索引严格拦截同活跃名称碰撞并返回 `409 Conflict`。意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会被应用层冲突检查拦住。
 
-判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会记入同步提交，在私有集群内即时自动同步。
+判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会打上逐字段 HLC 时间戳并递增本地 `sync_rev`，在私有集群内经 `CatalogSync` 即时自动同步。
 
 ### 护账与护会话的四道铁门
 
@@ -36,7 +36,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 | 铁门 | 在哪拦截 | 它只管哪件事、省掉会漏掉什么 |
 | :--- | :--- | :--- |
 | **1. 跑过一次就锁死身份** | `PATCH /models/{id}`<br>（`Model::check_update`） | 只要 `llm_calls` 里已经记过哪怕一笔调用，该模型的 `provider_id` 和 `model_key` 就永久锁死不可改（返 `409`）。省掉它，改一下 `model_key` 就会把昨天跑旧模型的花费算到新模型头上。 |
-| **2. 缩减能力先扫所有相关会话** | `PATCH /models/{id}`<br>（`Model::check_update`） | 想从模型里删掉某个 `reasoning_effort` 或某项 `input_modality`？先扫描所有正在使用该模型的现有会话：对本地已完整同步正文（或无集群记录）的会话跑 `media::check_session` 逐项验光；对只留有目录头的未 Watch 会话，直接核对目录头里 `SessionSnapshot.required_modalities`（若缺失该快照或仍包含被删模态，同样返 `409` 拦下，无需先拉全本对话正文）。 |
+| **2. 缩减能力先扫所有相关会话** | `PATCH /models/{id}`<br>（`Model::check_update`） | 想从模型里删掉某个 `reasoning_effort` 或某项 `input_modality`？先扫描所有正在使用该模型的未删除会话：检查 `reasoning_effort` 是否正在使用；若缩减了 `input_modalities`（[src/catalog.rs](../src/catalog.rs#L477-L484)），则先确认该会话活跃分支历史已在本地完整收敛（`session_branch_complete`，不完整直接返 `409` 提示先同步再改模态），再跑 `media::check_session` 逐项验光全部已入账与门外媒体。 |
 | **3. 换会话模型先查历史媒体** | `PATCH /sessions/{sid}` | 由于数据库里 `sessions.model_id` 是 `NOT NULL`，给会话切换模型时（入口先 `ensure_session_watched(sid)` 拉齐正文）必跑 `media::check_session` 验光全部现有媒体是否被新模型支持（仅凭 `attachments` 元数据里的 `mime_type` 就能判断，不用把远端附件大文件先拉下来）；而且**任何情况下都不再允许传 `model_id: null`**（传 `null` 直接返 `400`）。 |
 | **4. 归档供应商拒绝挂新模型** | `POST /models` / `PATCH /models/{id}` | 不能往已归档的供应商下面添新模型或把模型挪过去（返 `409`）。同时针对单个会话的 `Selection` 配置，没选模型时一律不准单填 `reasoning_effort`。 |
 
@@ -58,15 +58,15 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
      - **`audio` / `video`**：转成 `{"type":"input_file","filename":"attachment-{id}.{ext}","file_data":"data:..."}`，内部贴心把 `audio/mpeg`、`audio/x-wav`、`audio/mp4`、`video/quicktime` 等分别映射成 `.mp3`、`.wav`、`.m4a`、`.mov`；
      - **`codemode_event`**：在内容数组最前面自动插一块文本身份牌（`"Codemode <event> event from cm_<26位后缀> (sequence 1)."`），再把整条包成 `role: "user"` 消息喂给模型。
 3. **精准检查与增量前缀缓存（`media::check_session` / `media::check_call_input`）**：
-   - 无论是点火开跑前（`calls::begin`）还是给会话换模型时，检查函数只翻**真正会送进模型输入槽位**的三处东西：① 已进 `context_items` 的消息/推理/图像生成结果；② 刚跑完还没归进上下文的 `function_call_output`；③ 门外还没收进来的有效 `pending` 输入。
+   - 无论是点火开跑前（`calls::begin`）还是给会话换模型时，检查函数只翻**真正会送进模型输入槽位**的三处东西：① 已进活跃分支 `active_context` 的消息/推理/图像生成结果；② 刚跑完还没归进上下文的 `function_call_output`；③ 门外还没收进来的有效 `pending`（`pending_inputs`）输入。
    - 它**绝不乱翻工具名称、参数或普通 JSON 字符串**——脚本里打印了一句 `"image_url"` 纯文本，不会误判成会话带了图片模态。
-   - 并且为了避免几千条消息的长对话每次开轮都要从头扫一遍库，`calls::begin` 调用的是带缓存的 **`media::check_call_input`**：启动时在独占连接上建好连接级临时表 **`temp.checked_input`**（最多缓存 256 个会话，挂了 7 个 `context_items` / `items` / `attachments` 变更触发器，随事务/`savepoint` 同步回滚失效）记住某 `(sid, model, modalities, revision)` 已验过的 `context_items.position` 前缀，后续回合只增量检查新增上下文行、未归档工具输出与门外 `pending` 队列。
+   - 并且为了避免几千条消息的长对话每次开轮都要从头扫一遍库，`calls::begin` 调用的是带缓存的 **`media::check_call_input`**：启动时在独占连接上建好连接级临时表 **`temp.checked_input`**（最多缓存 256 个会话，挂了 7 个 `active_context` / `items` / `attachments` 变更触发器，随事务/`savepoint` 同步回滚失效）记住某 `(sid, model, modalities, revision)` 已验过的 `active_context.position` 前缀，后续回合只增量检查新增上下文行、未归档工具输出与门外 `pending` 队列。
 
 ---
 
 ## 每次请求立一张单：`llm_calls` 与 `PriceBook` 精确计费
 
-每当 Agent 循环准备向模型发起**一次**上游 HTTP 请求（注意：**自动重试时的每一次重发也算单独一笔**！），记账员就会在钉死 `input_end_position` 的同一个事务里，往 `llm_calls` 表插一行 `status = 'in_flight'` 的账单（[src/calls.rs](../src/calls.rs)），并同步写进集群账本。`llm_calls` 与目录表一样走**即时全量自动同步**（收尾结果及删会话时 `session_id = NULL` 脱钩均会补记提交），确保各节点随时能看到全集群的完整调用流水与花费。
+每当 Agent 循环准备向模型发起**一次**上游 HTTP 请求（注意：**自动重试时的每一次重发也算单独一笔**！），记账员就会在钉死 `input_end_position` 的同一个事务里，往 `llm_calls` 表插一行 `status = 'in_flight'` 的账单（[src/calls.rs](../src/calls.rs)），并写入 `(origin_node_id, origin_seq)` 因果序。`llm_calls` 与目录表一样走**即时全量自动同步**（在收尾结算以及删会话将 `session_id` 设为 `NULL` 脱钩时都会重新递增源节点 `origin_seq`，随 `CatalogSync` 的 `calls_vector` 因果向量推进全网对齐），确保各节点随时能看到全集群的完整调用流水与花费。
 
 ### 为什么开跑时就先把价格快照冻进账单？
 

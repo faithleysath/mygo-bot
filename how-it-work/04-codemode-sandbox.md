@@ -12,7 +12,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
 
 因为主运行时只有一条单线程事件循环，JavaScript **绝不能**直接跑在它上面。
 
-所以程序启动时（[src/main.rs](../src/main.rs#L499-L502)），会专门单拉一排固定数量的后台操作系统线程，取名叫 `codemode-js-0`、`codemode-js-1`……数量由 `--js-threads` 控制，默认按宿主机逻辑 CPU 核数最多开 **4 条**（每条线程配 **4 MiB** OS 栈，内部跑一个**不带 I/O 和定时器驱动的裸单线程 Tokio `LocalSet`**）。
+所以程序启动时（[src/main.rs](../src/main.rs#L521-L524)），会专门单拉一排固定数量的后台操作系统线程，取名叫 `codemode-js-0`、`codemode-js-1`……数量由 `--js-threads` 控制，默认按宿主机逻辑 CPU 核数最多开 **4 条**（每条线程配 **4 MiB** OS 栈，内部跑一个**不带 I/O 和定时器驱动的裸单线程 Tokio `LocalSet`**）。
 
 每次模型调 `codemode`（代码最多 **256 KiB**，可选 `label` 最多 **256 字节**；每次 `codemode_wait` 带的探针脚本同理）：
 
@@ -31,7 +31,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
 
 ## 全套云化节点原语、跨节点流句柄与进程笼子
 
-在全局层，车间只提供 `cluster.nodes()`（返回按 `(name, id)` 排序的 `[{ id, name, description, os, arch, online }]`，**刻意不暴露哪个节点是当前脚本执行者**）和 `const node = cluster.node(target)`（按精确 `id` 或唯一 `name` 取出目标节点句柄，报错带 `ENODENOTFOUND` / `ENODEAMBIGUOUS` / `ENODEUNREACH`）。
+在全局层，车间只提供 `cluster.nodes()`（返回按 `(name, id)` 排序的 `[{ id, name, description, os, arch, role, online }]`，其中 `role` 为 `'voter'` 或 `'edge'`，**刻意不暴露哪个节点是当前脚本执行者**）和 `const node = cluster.node(target)`（按精确 `id` 或唯一 `name` 取出目标节点句柄，报错带 `ENODENOTFOUND` / `ENODEAMBIGUOUS` / `ENODEUNREACH`）。
 
 每次调用 `node.fs.*`、`node.proc.exec`、`node.http.request`、`node.mcp.*` 或 `node.mygo.request` 时，请求统一步入 `src/codemode/io.rs`：
 - **本地零开销直调**：目标解析到本机 `node_id` 时直接走本机执行路径；
@@ -101,7 +101,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
 
 ## 两路合流交账与 `savepoint` 多模态落盘
 
-脚本跑到最后，怎么把战果安全地交回给大模型？这里顺着人写 JS 的直觉做了**两路合流**（[src/codemode/vm.rs](../src/codemode/vm.rs#L514-L669)、[src/codemode/output.rs](../src/codemode/output.rs)）：
+脚本跑到最后，怎么把战果安全地交回给大模型？这里顺着人写 JS 的直觉做了**两路合流**（[src/codemode/vm.rs](../src/codemode/vm.rs#L517-L670)、[src/codemode/output.rs](../src/codemode/output.rs)）：
 
 1. **`return` 返回值**：
    - `undefined` 或纯空白文本记空；
@@ -112,7 +112,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
 
 为了防止多模态大附件把内存撑爆，每块数据必须同时过**两道预算闸门**：每块额外加计 **128 字节**元开销，单次输出/事件总预算封顶 **52 MiB**（`TASK_BYTES`），全进程所有在途未落盘的输出共享 **192 MiB** 全局预算（`OUTPUT_BUDGET` 信号量，结果一消费或 `Drop` 立刻归还）。
 
-最后记账员把这包 `Blocks` 真正写进 SQLite 时，在事务里先立一个 **`SAVEPOINT codemode_blocks`**（[src/codemode/ledger.rs](../src/codemode/ledger.rs#L331-L368)）：
+最后记账员把这包 `Blocks` 真正写进 SQLite 时，在事务里先立一个 **`SAVEPOINT codemode_blocks`**（[src/codemode/ledger.rs](../src/codemode/ledger.rs#L311-L341)）：
 1. 把每个内联 `Part::Bytes` 存进 `attachments` 表拿到新 `attachment_id`；
 2. 查出该会话所选模型声明的 `input_modalities`（哪怕模型之后被归档了，仍按它记录的模态核对），校验这批块是不是模型吃得下的（比如纯文本模型不收图片）；
 3. **要是任何一步失败**：当场 `ROLLBACK TO codemode_blocks`，把刚才临时插进去的 `attachments` 行抹得干干净净，**绝不在库里留半个孤儿附件**；若是客户端错误（如模态不支持或空结果），外层事务再顺势转成纯文本的 `"failed"` 工具回复收尾。
