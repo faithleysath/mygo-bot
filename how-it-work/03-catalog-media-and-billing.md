@@ -14,7 +14,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 
 所有模型信息都分成两级存在 SQLite 里（[schema.sql](../schema.sql#L1-L48)、[src/catalog.rs](../src/catalog.rs)）：
 
-- **`llm_providers`（供应商）**：登记 `name`、`base_url`（校验必须是 `http` 或 `https`，且不允许夹带用户名、密码、query 或 `#fragment`）以及可选 `api_key`（传空串视为清空；查询接口 `ProviderInfo` **永远不回显密钥明文**，只返回 `has_api_key: bool`）。
+- **`llm_providers`（供应商）**：登记 `name`、`base_url`（校验必须是 `http` 或 `https`，且不允许夹带用户名、密码、query 或 `#fragment`）以及可选 `api_key`（传空串视为清空；两者合并共用同一个原子 HLC 时间戳 `endpoint_ts` 防跨机同步拼错地址与密钥；查询接口 `ProviderInfo` **永远不回显密钥明文**，只返回 `has_api_key: bool`）。
 - **`llm_models`（模型）**：挂在某个 `provider_id` 下，记录 `model_key`、可选正整数 `context_window_tokens`、`input_modalities`（非空去重数组，只能取 `text`、`image`、`audio`、`video`）、`reasoning_efforts`（去重非空、无首尾空白的字符串数组）和可选的 `pricing` 价目表。
 
 ### 软归档与名字复用
@@ -25,9 +25,9 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 - `llm_providers_active_name ON llm_providers(name) WHERE archived_at IS NULL`
 - `llm_models_active_key ON llm_models(provider_id, model_key) WHERE archived_at IS NULL`
 
-注意：`v9` 刻意把这两条索引建成**非唯一部分索引**（这样就算两台设备离线并发创建重名目录，跨节点 CRDT 合流时也不会被 SQL `UNIQUE` 报错卡死）；而在正常本地新建、修改或恢复的写事务入口里，应用层会顺着这两条索引严格拦截同活跃名称碰撞并返回 `409 Conflict`。意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会被应用层冲突检查拦住。
+注意：`v10` 刻意把这两条索引建成**非唯一部分索引**（这样就算两台设备离线并发创建重名目录，跨节点 CRDT 合流时也不会被 SQL `UNIQUE` 报错卡死）；而在正常本地新建、修改或恢复的写事务入口里，应用层会顺着这两条索引严格拦截同活跃名称碰撞并返回 `409 Conflict`。意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会被应用层冲突检查拦住。
 
-判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会打上逐字段 HLC 时间戳并递增本地 `sync_rev`，在私有集群内经 `CatalogSync` 即时自动同步。
+判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会打上逐字段 HLC 时间戳并递增持久化在高水位 `local_node.catalog_rev` 上的行级 `sync_rev`，在私有集群内经 `CatalogSync` 即时自动同步。其中 [`merge_provider_wire`](../src/cluster/ledger.rs#L1304) 特意把供应商的 `base_url` 与 `api_key` 绑在同一枚原子 HLC 时间戳 **`endpoint_ts`**（`lww_take_pair`）上一并取新——省掉这枚绑定、拆成两个时间戳，A 改地址而 B 换密钥后合流就会把新密钥错发去老地址。
 
 ### 护账与护会话的四道铁门
 
@@ -53,7 +53,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
    - 下载接口 `GET /attachments/{id}` 同样通过 `AttachmentBlob::chunks` 增量读取 BLOB（每次开 `blob_open` 连续读取最多 **4 帧 × 192 KiB** 即 768 KiB，立刻松开数据库锁再往网络吐出，避免大附件久占记账员窗口），原样吐出存储的 `mime_type` 和字节流，并强制加上 `Content-Disposition: attachment` 和 `X-Content-Type-Options: nosniff`，防止浏览器把恶意文件当成同源网页或脚本执行。
 2. **轻量账本引用 vs 上游实时展开**：
    - 写进 `user_message`、`function_call_output` 或 `codemode_event` 的媒体块，只留一个干净的小指针：`{"type":"image","attachment_id":"att_<26位后缀>"}`。
-   - 只有当准备发往上游模型时，`media::wire::model_input`（[src/media/wire.rs](../src/media/wire.rs)）才逐页把上下文序列化成 JSON 骨架、精准记下各 `data:{essence};base64,` 字段的插入字节偏移量，随后释放 SQLite 锁并借助 `AttachmentBlob::chunks` 按 **192 KiB** 帧（3 的倍数，适合无填充增量 Base64 编码）现读现编：
+   - 只有当准备发往上游模型时，`media::wire::model_input`（[src/media/wire.rs](../src/media/wire.rs#L193)）才按本轮调用钉死的 **`pinned_head`** 逐页把上下文序列化成 JSON 骨架、精准记下各 `data:{essence};base64,` 字段的插入字节偏移量，**每次回库翻下一瓢页前都要重新核对 `active_head == pinned_head`**（防异步分块读期间被并发切换分支导致前后半截上下文拼岔），随后释放 SQLite 锁并借助 `AttachmentBlob::chunks` 按 **192 KiB** 帧（3 的倍数，适合无填充增量 Base64 编码）现读现编：
      - **`image`**：转成 OpenAI Responses API 的 `{"type":"input_image","image_url":"data:...","detail":"auto"}`；
      - **`audio` / `video`**：转成 `{"type":"input_file","filename":"attachment-{id}.{ext}","file_data":"data:..."}`，内部贴心把 `audio/mpeg`、`audio/x-wav`、`audio/mp4`、`video/quicktime` 等分别映射成 `.mp3`、`.wav`、`.m4a`、`.mov`；
      - **`codemode_event`**：在内容数组最前面自动插一块文本身份牌（`"Codemode <event> event from cm_<26位后缀> (sequence 1)."`），再把整条包成 `role: "user"` 消息喂给模型。
@@ -66,7 +66,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 
 ## 每次请求立一张单：`llm_calls` 与 `PriceBook` 精确计费
 
-每当 Agent 循环准备向模型发起**一次**上游 HTTP 请求（注意：**自动重试时的每一次重发也算单独一笔**！），记账员就会在钉死 `input_end_position` 的同一个事务里，往 `llm_calls` 表插一行 `status = 'in_flight'` 的账单（[src/calls.rs](../src/calls.rs)），并写入 `(origin_node_id, origin_seq)` 因果序。`llm_calls` 与目录表一样走**即时全量自动同步**（在收尾结算以及删会话将 `session_id` 设为 `NULL` 脱钩时都会重新递增源节点 `origin_seq`，随 `CatalogSync` 的 `calls_vector` 因果向量推进全网对齐），确保各节点随时能看到全集群的完整调用流水与花费。
+每当 Agent 循环准备向模型发起**一次**上游 HTTP 请求（注意：**自动重试时的每一次重发也算单独一笔**！），记账员 [`calls::begin`](../src/calls.rs#L19) 就会在同一个事务里验证并钉死本轮读取的上下文终点 `input_end_position` 与当前分支头 **`input_head`**（核对 `active_context` 末端与 `sessions.active_head` 一致，避免分叉或半同步上下文开跑），往 `llm_calls` 表插一行 `status = 'in_flight'` 的账单（[src/calls.rs](../src/calls.rs)），并写入 `(origin_node_id, origin_seq)` 因果序；后续崩溃恢复也正靠这枚 `input_head` 精确认出“只属于当前分支”的在途工具调用。`llm_calls` 与目录表一样走**即时全量自动同步**（在收尾结算以及删会话将 `session_id` 设为 `NULL` 脱钩时都会重新递增源节点 `origin_seq`，随 `CatalogSync` 的 `calls_vector` 因果向量推进全网对齐），确保各节点随时能看到全集群的完整调用流水与花费。
 
 ### 为什么开跑时就先把价格快照冻进账单？
 
