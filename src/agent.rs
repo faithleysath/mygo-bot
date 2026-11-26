@@ -113,7 +113,10 @@ impl App {
                             && session(&s.conn, sid)?.status == SessionStatus::Idle
                             && store::has_pending(&s.conn, sid)?
                         {
-                            let msg = e.to_string();
+                            let msg = crate::calls::truncate_utf8(
+                                &e.to_string(),
+                                crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES,
+                            );
                             if can_sync_pause {
                                 s.status(sid, "paused", &msg)?;
                             } else if s.presence.remote_owner(sid).is_none() {
@@ -344,6 +347,8 @@ impl App {
     }
 }
 
+const LEASE_UPGRADE_WAIT: Duration = Duration::from_secs(10);
+
 fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
     if let Some(ctrl) = s.active.remove(&sid) {
         ctrl.soft.cancel();
@@ -356,6 +361,9 @@ fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
     s.pending_wakes.remove(&sid);
     crate::codemode::stop_session(s, sid);
     s.bump_reset_gen(sid);
+    let reason_bounded =
+        crate::calls::truncate_utf8(reason, crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES);
+    let reason = reason_bounded.as_str();
     let now = chrono::Utc::now().timestamp_millis();
     // A fenced runner can only record its pause locally.
     let update = s.conn.execute(
@@ -496,6 +504,11 @@ impl App {
     async fn run(self, sid: SessionId, control: Control, channel: broadcast::Sender<Notice>) {
         let outcome = self.run_loop(sid, &control, &channel).await;
         if let Err(problem) = outcome {
+            let _ = self
+                .exec
+                .presence()
+                .wait_local_lease_ready(sid, None, LEASE_UPGRADE_WAIT)
+                .await;
             let settled = self
                 .db
                 .call(move |s| {
@@ -528,6 +541,11 @@ impl App {
         let mut attempt = 0u64;
         let run_gen = control.run_gen;
         loop {
+            let _ = self
+                .exec
+                .presence()
+                .wait_local_lease_ready(sid, Some(&control.hard), LEASE_UPGRADE_WAIT)
+                .await;
             if !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid) {
                 return Err(Error::conflict("execution lease lost"));
             }
@@ -659,6 +677,13 @@ impl App {
             }
             let mut step_head = output.current_head;
             // A call may have reached the store just as the stream was cancelled, before spawn.
+            if (interrupted || (output.tools && streamed.is_err())) && control.lease_valid() {
+                let _ = self
+                    .exec
+                    .presence()
+                    .wait_local_lease_ready(sid, None, LEASE_UPGRADE_WAIT)
+                    .await;
+            }
             if (interrupted || (output.tools && streamed.is_err()))
                 && control.lease_valid()
                 && self.exec.presence().is_local_lease_valid(sid)
@@ -695,6 +720,11 @@ impl App {
             if interrupted {
                 return Err(Error::conflict("paused"));
             }
+            let _ = self
+                .exec
+                .presence()
+                .wait_local_lease_ready(sid, Some(&control.hard), LEASE_UPGRADE_WAIT)
+                .await;
             if !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid) {
                 return Err(Error::conflict("execution lease lost"));
             }

@@ -34,6 +34,7 @@ use crate::{
 pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/1";
 pub const CAP_ALPN: &[u8] = b"mygo/cap/1";
 pub const EXEC_ALPN: &[u8] = b"mygo/exec/1";
+pub const JOIN_PROBE_ALPN: &[u8] = b"mygo/join-probe/1";
 const MAX_CAP_CONNS_PER_PEER: usize = 4;
 const MAX_EXEC_CONNS_PER_PEER: usize = 2;
 const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
@@ -67,6 +68,14 @@ enum AuthMsg {
         mac: [u8; 32],
     },
     Ok,
+    JoinProbe {
+        ok: bool,
+        voter_epoch: u64,
+        #[serde(default)]
+        voter_set: Vec<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -383,6 +392,7 @@ impl ClusterNet {
             CLUSTER_ALPN.to_vec(),
             CAP_ALPN.to_vec(),
             EXEC_ALPN.to_vec(),
+            JOIN_PROBE_ALPN.to_vec(),
         ]);
         if let Some(addr) = self.config.bind_addr {
             builder = builder
@@ -737,8 +747,100 @@ impl ClusterNet {
         Ok(())
     }
 
+    pub(super) async fn probe_join(
+        self: &Arc<Self>,
+        secret: &[u8; 32],
+        peer: &PeerInfo,
+    ) -> Result<(u64, Vec<String>)> {
+        let endpoint = self.ensure_endpoint().await?;
+        let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs)?;
+        let conn = match tokio::time::timeout(
+            DIAL_TIMEOUT,
+            endpoint.connect(addr, JOIN_PROBE_ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("invite peer unreachable: {e}"),
+                ));
+            }
+            Err(_) => {
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "timed out reaching invite peer".into(),
+                ));
+            }
+        };
+        let remote_id = conn.remote_id().to_string();
+        if remote_id != peer.node_id {
+            conn.close(1u32.into(), b"node id mismatch");
+            return Err(Error::bad("peer node id mismatch"));
+        }
+        let auth = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            self.authenticate_outbound_stream(
+                &conn,
+                secret,
+                b"mygo-join-srv",
+                b"mygo-join-cli",
+            ),
+        )
+        .await;
+        let (_remote_peer, _send, mut recv) = match auth {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(e)) => {
+                conn.close(1u32.into(), b"auth failed");
+                return Err(if e.0 == axum::http::StatusCode::BAD_REQUEST {
+                    Error::conflict(e.1)
+                } else {
+                    Error(axum::http::StatusCode::SERVICE_UNAVAILABLE, e.1)
+                });
+            }
+            Err(_) => {
+                conn.close(1u32.into(), b"auth timeout");
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "cluster invite probe timed out".into(),
+                ));
+            }
+        };
+        let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_auth(&mut recv)).await;
+        conn.close(0u32.into(), b"probe done");
+        match reply {
+            Ok(Ok(AuthMsg::JoinProbe {
+                ok: true,
+                voter_epoch,
+                voter_set,
+                ..
+            })) if voter_epoch > 0 && !voter_set.is_empty() => Ok((voter_epoch, voter_set)),
+            Ok(Ok(AuthMsg::JoinProbe { reason, .. })) => Err(Error::conflict(
+                reason.unwrap_or_else(|| "invite peer cannot accept cluster joins".into()),
+            )),
+            Ok(Ok(_)) => Err(Error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "unexpected cluster join probe response".into(),
+            )),
+            Ok(Err(e)) => Err(if e.0 == axum::http::StatusCode::BAD_REQUEST {
+                Error::conflict(e.1)
+            } else {
+                Error(axum::http::StatusCode::SERVICE_UNAVAILABLE, e.1)
+            }),
+            Err(_) => Err(Error(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "cluster join probe timed out".into(),
+            )),
+        }
+    }
+
     async fn handle_incoming_conn(self: Arc<Self>, conn: Connection) {
         let alpn = conn.alpn();
+        if alpn == JOIN_PROBE_ALPN {
+            self.handle_join_probe_inbound(conn).await;
+            return;
+        }
         let (srv_label, cli_label, aux) = if alpn == CLUSTER_ALPN {
             (b"mygo-auth-srv".as_slice(), b"mygo-auth-cli".as_slice(), None)
         } else if alpn == CAP_ALPN {
@@ -785,6 +887,19 @@ impl ClusterNet {
         srv_label: &[u8],
         cli_label: &[u8],
     ) -> Result<PeerInfo> {
+        let (peer, _, _) = self
+            .authenticate_outbound_stream(conn, cluster_secret, srv_label, cli_label)
+            .await?;
+        Ok(peer)
+    }
+
+    async fn authenticate_outbound_stream(
+        &self,
+        conn: &Connection,
+        cluster_secret: &[u8; 32],
+        srv_label: &[u8],
+        cli_label: &[u8],
+    ) -> Result<(PeerInfo, SendStream, RecvStream)> {
         let local = self.db.call(|s| load_local_node(&s.conn)).await?;
         let self_info = self_peer_info(&local, &self.endpoint_addr());
         let mut client_nonce = [0u8; 32];
@@ -833,7 +948,7 @@ impl ClusterNet {
         write_auth(&mut send, &AuthMsg::Finish { mac: client_mac }).await?;
         let _ = send.finish();
         match read_auth(&mut recv).await? {
-            AuthMsg::Ok => Ok(remote_peer),
+            AuthMsg::Ok => Ok((remote_peer, send, recv)),
             _ => Err(Error::bad("cluster authentication rejected")),
         }
     }
@@ -845,6 +960,20 @@ impl ClusterNet {
         srv_label: &[u8],
         cli_label: &[u8],
     ) -> Result<PeerInfo> {
+        let (remote_peer, mut send, _) = self
+            .authenticate_inbound_stream(conn, cluster_secret, srv_label, cli_label)
+            .await?;
+        let _ = send.finish();
+        Ok(remote_peer)
+    }
+
+    async fn authenticate_inbound_stream(
+        &self,
+        conn: &Connection,
+        cluster_secret: &[u8; 32],
+        srv_label: &[u8],
+        cli_label: &[u8],
+    ) -> Result<(PeerInfo, SendStream, RecvStream)> {
         let local = self.db.call(|s| load_local_node(&s.conn)).await?;
         let remote_id = conn.remote_id().to_string();
         let (mut send, mut recv) = conn
@@ -894,8 +1023,73 @@ impl ClusterNet {
             return Err(Error::bad("cluster client authentication failed"));
         }
         write_auth(&mut send, &AuthMsg::Ok).await?;
-        let _ = send.finish();
-        Ok(remote_peer)
+        Ok((remote_peer, send, recv))
+    }
+
+    async fn handle_join_probe_inbound(self: Arc<Self>, conn: Connection) {
+        let (mgen, cluster_secret, gen_cancel) = self.auth_context();
+        let res = tokio::select! {
+            _ = gen_cancel.cancelled() => {
+                conn.close(2u32.into(), b"cluster changed");
+                return;
+            }
+            r = tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                self.authenticate_inbound_stream(
+                    &conn,
+                    &cluster_secret,
+                    b"mygo-join-srv",
+                    b"mygo-join-cli",
+                ),
+            ) => r,
+        };
+        let (remote_peer, mut send, _recv) = match res {
+            Ok(Ok(ok)) => ok,
+            _ => {
+                conn.close(1u32.into(), b"unauthorized");
+                return;
+            }
+        };
+        if remote_peer.node_id == self.local_node_id {
+            conn.close(1u32.into(), b"self connection");
+            return;
+        }
+        let local = match self.db.call(|s| load_local_node(&s.conn)).await {
+            Ok(local) => local,
+            Err(_) => {
+                conn.close(1u32.into(), b"probe failed");
+                return;
+            }
+        };
+        if self.membership_gen() != mgen
+            || gen_cancel.is_cancelled()
+            || local.membership_gen != mgen
+        {
+            conn.close(2u32.into(), b"cluster changed");
+            return;
+        }
+        let msg = if local.voter_epoch > 0 && !local.voter_set.is_empty() {
+            AuthMsg::JoinProbe {
+                ok: true,
+                voter_epoch: local.voter_epoch,
+                voter_set: local.voter_set,
+                reason: None,
+            }
+        } else {
+            AuthMsg::JoinProbe {
+                ok: false,
+                voter_epoch: local.voter_epoch,
+                voter_set: Vec::new(),
+                reason: Some(
+                    "invite source has no committed cluster voter and cannot accept joins".into(),
+                ),
+            }
+        };
+        if write_auth(&mut send, &msg).await.is_ok() {
+            let _ = send.finish();
+            let _ = tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
+        }
+        conn.close(0u32.into(), b"probe done");
     }
 
     fn aux_maps(&self, kind: AuxKind) -> (&AuxConnMap, &AuxLockMap) {
@@ -1200,6 +1394,21 @@ impl ClusterNet {
         let registered = self
             .db
             .call(move |s| {
+                let local = load_local_node(&s.conn)?;
+                if local.membership_gen != mgen {
+                    return Err(Error::conflict("membership changed during register"));
+                }
+                let peers = list_peers(&s.conn)?;
+                let known = peers.iter().any(|p| p.node_id == remote_peer.node_id);
+                if !is_outbound
+                    && !known
+                    && peers.is_empty()
+                    && (local.voter_epoch == 0 || local.voter_set.is_empty())
+                {
+                    return Err(Error::conflict(
+                        "standalone node without a committed voter cannot admit peers",
+                    ));
+                }
                 let now = chrono::Utc::now().timestamp_millis();
                 upsert_peer_if_gen(&s.conn, &self_id, &remote_peer, now, true, mgen)?;
                 // Enable write notifications before the first manifest can be read.

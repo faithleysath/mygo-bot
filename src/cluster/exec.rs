@@ -209,6 +209,13 @@ impl Default for VoterConfigState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalLeaseStatus {
+    Valid,
+    Upgrading,
+    Invalid,
+}
+
 pub struct PresenceState {
     local_node_id: Mutex<String>,
     local_role: AtomicU8,
@@ -220,6 +227,7 @@ pub struct PresenceState {
     local_nonempty: AtomicBool,
     has_null_attachments: AtomicBool,
     membership_grew_notify: Notify,
+    lease_upgrade_notify: Notify,
     cluster_active_tx: watch::Sender<bool>,
     inner: Mutex<PresenceInner>,
     local_changed: Notify,
@@ -277,6 +285,7 @@ impl PresenceState {
             local_nonempty: AtomicBool::new(false),
             has_null_attachments: AtomicBool::new(false),
             membership_grew_notify: Notify::new(),
+            lease_upgrade_notify: Notify::new(),
             cluster_active_tx,
             inner: Mutex::new(PresenceInner {
                 instance_id,
@@ -362,6 +371,7 @@ impl PresenceState {
         if epoch >= 1 || pending_epoch > 0 {
             self.voter_config_notify.notify_waiters();
         }
+        self.lease_upgrade_notify.notify_waiters();
     }
 
     pub fn current_voter_config(&self) -> (u64, Vec<String>, u64, Vec<String>) {
@@ -476,6 +486,7 @@ impl PresenceState {
         if count > prev {
             self.membership_grew_notify.notify_one();
         }
+        self.lease_upgrade_notify.notify_waiters();
     }
 
     pub fn known_peer_count(&self) -> usize {
@@ -545,6 +556,7 @@ impl PresenceState {
             self.update_local_nonempty_locked(&inner);
             old
         };
+        self.lease_upgrade_notify.notify_waiters();
         if let Some(LocalLease::Quorum(old_l)) = prev {
             old_l.stopped.cancel();
         }
@@ -559,6 +571,7 @@ impl PresenceState {
             self.update_local_nonempty_locked(&inner);
             old
         };
+        self.lease_upgrade_notify.notify_waiters();
         if let Some(LocalLease::Quorum(old_l)) = prev {
             old_l.stopped.cancel();
         }
@@ -582,6 +595,8 @@ impl PresenceState {
         ) {
             inner.active_local_leases.remove(&sid);
             self.update_local_nonempty_locked(&inner);
+            drop(inner);
+            self.lease_upgrade_notify.notify_waiters();
         }
     }
 
@@ -593,6 +608,7 @@ impl PresenceState {
         {
             self.update_local_nonempty_locked(&inner);
             drop(inner);
+            self.lease_upgrade_notify.notify_waiters();
             lease.stopped.cancel();
         }
     }
@@ -609,16 +625,67 @@ impl PresenceState {
         self.inner.lock().unwrap().active_local_leases.get(&sid).cloned()
     }
 
-    pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
+    pub fn local_lease_status(&self, sid: SessionId) -> LocalLeaseStatus {
         if self.is_single_node_config_valid() {
-            return true;
+            return LocalLeaseStatus::Valid;
         }
         let cur_epoch = self.voter_config.lock().unwrap().epoch;
         let inner = self.inner.lock().unwrap();
         match inner.active_local_leases.get(&sid) {
-            Some(LocalLease::Quorum(l)) => cur_epoch > 0 && l.is_valid() && l.voter_epoch == cur_epoch,
-            Some(LocalLease::ForcedOffline) => true,
-            Some(LocalLease::UpgradingOffline) | None => false,
+            Some(LocalLease::Quorum(l))
+                if cur_epoch > 0 && l.is_valid() && l.voter_epoch == cur_epoch =>
+            {
+                LocalLeaseStatus::Valid
+            }
+            Some(LocalLease::ForcedOffline) => LocalLeaseStatus::Valid,
+            Some(LocalLease::UpgradingOffline) => LocalLeaseStatus::Upgrading,
+            Some(LocalLease::Quorum(_)) | None => LocalLeaseStatus::Invalid,
+        }
+    }
+
+    pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
+        self.local_lease_status(sid) == LocalLeaseStatus::Valid
+    }
+
+    pub fn is_local_lease_upgrading(&self, sid: SessionId) -> bool {
+        self.local_lease_status(sid) == LocalLeaseStatus::Upgrading
+    }
+
+    pub async fn wait_local_lease_ready(
+        &self,
+        sid: SessionId,
+        cancel: Option<&CancellationToken>,
+        timeout: Duration,
+    ) -> LocalLeaseStatus {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.lease_upgrade_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let status = self.local_lease_status(sid);
+            if status != LocalLeaseStatus::Upgrading {
+                return status;
+            }
+            if let Some(tok) = cancel
+                && tok.is_cancelled()
+            {
+                return self.local_lease_status(sid);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return self.local_lease_status(sid);
+            }
+            tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(tok) = cancel {
+                        tok.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => return self.local_lease_status(sid),
+                _ = tokio::time::sleep_until(deadline) => return self.local_lease_status(sid),
+                _ = &mut notified => {}
+            }
         }
     }
 
@@ -1612,6 +1679,33 @@ impl DeleteGateGuard {
     }
 }
 
+enum VoterDelta {
+    Add(String),
+    Remove(String),
+}
+
+impl VoterDelta {
+    fn apply(&self, current: &[String]) -> Result<Vec<String>> {
+        let mut next = current.to_vec();
+        match self {
+            Self::Add(id) => {
+                if !next.contains(id) {
+                    next.push(id.clone());
+                }
+            }
+            Self::Remove(id) => next.retain(|existing| existing != id),
+        }
+        canonicalize_voter_set(&next)
+    }
+
+    fn is_satisfied_by(&self, current: &[String]) -> bool {
+        match self {
+            Self::Add(id) => current.iter().any(|existing| existing == id),
+            Self::Remove(id) => !current.iter().any(|existing| existing == id),
+        }
+    }
+}
+
 pub struct ExecPlane {
     db: Db,
     net: Arc<ClusterNet>,
@@ -1866,6 +1960,7 @@ impl ExecPlane {
         next_epoch: u64,
         old_voters: &[String],
         online: &[String],
+        probed_ballot: &str,
         promised_ids: &HashSet<String>,
         node_pending: &HashMap<String, (u64, String)>,
         chosen_pid: String,
@@ -1975,7 +2070,7 @@ impl ExecPlane {
         if PresenceState::explicit_majority(old_voters, promised_ids)
             && PresenceState::explicit_majority(new_voters, promised_ids)
         {
-            let reprepare_id = self.db.call(|s| tick_hlc(&s.conn)).await?;
+            let reprepare_id = probed_ballot.to_owned();
             let prep_set = chosen_set.clone();
             let prep_id = reprepare_id.clone();
             self.db
@@ -2151,6 +2246,7 @@ impl ExecPlane {
             next_epoch,
             &local.voter_set,
             &online,
+            &ballot,
             &promised_ids,
             &node_pending,
             chosen_pid,
@@ -2190,7 +2286,7 @@ impl ExecPlane {
             if self.stopping.is_cancelled() || !self.presence.want_voter_admission() {
                 return;
             }
-            let (epoch, mut voters, pending_epoch, _) = self.presence.current_voter_config();
+            let (epoch, voters, pending_epoch, _) = self.presence.current_voter_config();
             if epoch == 0 {
                 return;
             }
@@ -2200,9 +2296,11 @@ impl ExecPlane {
                 return;
             }
             if pending_epoch == 0 {
-                voters.push(local_id);
                 let _reconfig = self.reconfig_lock.lock().await;
-                match self.reconfigure_voters_locked(Some(app), voters).await {
+                match self
+                    .reconfigure_voters_locked(Some(app), VoterDelta::Add(local_id))
+                    .await
+                {
                     Ok(()) => {
                         self.presence.set_want_voter_admission(false);
                         return;
@@ -2226,9 +2324,8 @@ impl ExecPlane {
     async fn reconfigure_voters_locked(
         &self,
         maybe_app: Option<&App>,
-        new_voters: Vec<String>,
+        delta: VoterDelta,
     ) -> Result<()> {
-        let canonical = canonicalize_voter_set(&new_voters)?;
         let (mut local, mut peers) = self
             .db
             .call(move |s| {
@@ -2248,9 +2345,6 @@ impl ExecPlane {
             })
             .await?;
 
-        if canonical.is_empty() && !peers.is_empty() {
-            return Err(Error::conflict("cluster must retain at least one voter"));
-        }
         if local.voter_epoch == 0 {
             return Err(Error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -2285,6 +2379,10 @@ impl ExecPlane {
                     "cluster voter reconfiguration already in progress",
                 ));
             }
+        }
+        let canonical = delta.apply(&local.voter_set)?;
+        if canonical.is_empty() && !peers.is_empty() {
+            return Err(Error::conflict("cluster must retain at least one voter"));
         }
         if canonical == local.voter_set {
             return Ok(());
@@ -2326,6 +2424,7 @@ impl ExecPlane {
                 next_epoch,
                 &old_voters,
                 &online,
+                &proposal_id,
                 &promised_ids,
                 &node_pending,
                 chosen_pid,
@@ -2350,7 +2449,7 @@ impl ExecPlane {
                     Ok(local)
                 })
                 .await?;
-            if refreshed.voter_set == canonical && refreshed.pending_voter_epoch == 0 {
+            if refreshed.pending_voter_epoch == 0 && delta.is_satisfied_by(&refreshed.voter_set) {
                 return Ok(());
             }
             return Err(Error::conflict(
@@ -2548,18 +2647,20 @@ impl ExecPlane {
             if !has_peers {
                 let n = name;
                 let d = description;
-                return self
+                let (updated, prev_gen) = self
                     .db
                     .write(
                         move |conn| {
+                            let prev_gen = load_local_node(conn)?.membership_gen;
                             let updated = crate::cluster::identity::set_local_role(conn, target_role)?;
-                            if n.is_some() || d.is_some() {
-                                update_self_meta(conn, n, d)
+                            let updated = if n.is_some() || d.is_some() {
+                                update_self_meta(conn, n, d)?
                             } else {
-                                Ok(updated)
-                            }
+                                updated
+                            };
+                            Ok((updated, prev_gen))
                         },
-                        |s, updated| {
+                        |s, (updated, prev_gen)| {
                             s.presence.set_local_role(updated.role);
                             s.presence.set_voter_config(
                                 updated.voter_epoch,
@@ -2569,25 +2670,24 @@ impl ExecPlane {
                                 &updated.pending_proposal_id,
                             );
                             s.sync_signal(crate::cluster::SyncSignal::SelfMetaChanged);
-                            Ok(updated)
+                            Ok((updated, prev_gen))
                         },
                     )
-                    .await;
-            }
-            if target_role != local.role {
-                let mut next_set = local.voter_set.clone();
-                if target_role.is_voter() {
-                    if !next_set.contains(&local.node_id) {
-                        next_set.push(local.node_id.clone());
-                    }
-                } else {
-                    next_set.retain(|id| id != &local.node_id);
-                    if next_set.is_empty() {
-                        return Err(Error::conflict("cluster must retain at least one voter"));
-                    }
-                    self.presence.set_want_voter_admission(false);
+                    .await?;
+                if updated.membership_gen != prev_gen {
+                    self.net
+                        .switch_membership(updated.membership_gen, updated.cluster_secret);
+                    self.sync.on_membership_switched();
                 }
-                self.reconfigure_voters_locked(None, next_set).await?;
+                return Ok(updated);
+            }
+            if target_role != local.role || local.pending_voter_epoch != 0 {
+                let delta = if target_role.is_voter() {
+                    VoterDelta::Add(local.node_id.clone())
+                } else {
+                    VoterDelta::Remove(local.node_id.clone())
+                };
+                self.reconfigure_voters_locked(None, delta).await?;
                 self.presence.set_want_voter_admission(false);
             }
         }
@@ -2611,32 +2711,42 @@ impl ExecPlane {
     pub async fn remove_peer_safe(&self, node_id: &str) -> Result<bool> {
         let _reconfig = self.reconfig_lock.lock().await;
         let target = node_id.to_owned();
-        let (exists, is_voter, voter_epoch, voter_set) = self
+        let (mut local, mut peers) = self
             .db
-            .call(move |s| {
-                let local = load_local_node(&s.conn)?;
-                let peers = list_peers(&s.conn)?;
-                let exists = peers.iter().any(|p| p.node_id == target);
-                let is_voter = local.voter_set.iter().any(|id| id == &target);
-                Ok((exists, is_voter, local.voter_epoch, local.voter_set))
-            })
+            .call(|s| Ok((load_local_node(&s.conn)?, list_peers(&s.conn)?)))
             .await?;
-        if !exists {
+        if !peers.iter().any(|p| p.node_id == target) {
             return Ok(false);
         }
-        if is_voter {
-            if voter_epoch == 0 {
+        if local.pending_voter_epoch != 0 {
+            self.recover_pending_voter_config_locked(None, true).await?;
+            let refreshed = self
+                .db
+                .call(|s| Ok((load_local_node(&s.conn)?, list_peers(&s.conn)?)))
+                .await?;
+            local = refreshed.0;
+            peers = refreshed.1;
+            if !peers.iter().any(|p| p.node_id == target) {
+                return Ok(false);
+            }
+            if local.pending_voter_epoch != 0 {
+                return Err(Error::conflict(
+                    "cluster voter reconfiguration already in progress",
+                ));
+            }
+        }
+        if local.voter_set.iter().any(|id| id == &target) {
+            if local.voter_epoch == 0 {
                 return Err(Error(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "cluster voter configuration not yet synchronized; cannot remove voter".into(),
                 ));
             }
-            let mut next_set = voter_set;
-            next_set.retain(|id| id != node_id);
-            if next_set.is_empty() {
+            if local.voter_set.iter().filter(|id| *id != &target).count() == 0 {
                 return Err(Error::conflict("cluster must retain at least one voter"));
             }
-            self.reconfigure_voters_locked(None, next_set).await?;
+            self.reconfigure_voters_locked(None, VoterDelta::Remove(target.clone()))
+                .await?;
         }
         let target = node_id.to_owned();
         let presence = self.presence.clone();
@@ -2644,6 +2754,14 @@ impl ExecPlane {
             .db
             .write(
                 move |conn| {
+                    let after = load_local_node(conn)?;
+                    if after.voter_set.iter().any(|id| id == &target)
+                        || after.pending_voter_epoch != 0
+                    {
+                        return Err(Error::conflict(
+                            "cluster voter configuration changed before removing peer; retry",
+                        ));
+                    }
                     let removed = delete_peer(conn, &target)?;
                     let peers = if removed { list_peers(conn)? } else { Vec::new() };
                     Ok((removed, peers, target))

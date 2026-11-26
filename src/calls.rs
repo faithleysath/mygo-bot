@@ -91,6 +91,7 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
 
 pub const MAX_STORED_RAW_USAGE_BYTES: usize = 64 * 1024;
 pub const MAX_STORED_ERROR_SUMMARY_BYTES: usize = 8 * 1024;
+pub const MAX_STORED_RESPONSE_ID_BYTES: usize = 1024;
 
 pub(crate) fn truncate_utf8(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -113,6 +114,10 @@ pub(crate) fn clamp_raw_usage(usage: Option<Value>) -> Option<Value> {
 
 pub(crate) fn clamp_raw_usage_str(raw: Option<String>) -> Option<String> {
     raw.filter(|s| s.len() <= MAX_STORED_RAW_USAGE_BYTES)
+}
+
+pub(crate) fn clamp_response_id(id: Option<String>) -> Option<String> {
+    id.filter(|s| s.len() <= MAX_STORED_RESPONSE_ID_BYTES)
 }
 
 #[derive(Default)]
@@ -146,6 +151,7 @@ impl Report {
             let bill = pricing::settle(snapshot, full_usage.as_ref());
             let stored_usage = clamp_raw_usage(full_usage);
             let stored_reason = reason.map(|r| truncate_utf8(r, MAX_STORED_ERROR_SUMMARY_BYTES));
+            let stored_response_id = clamp_response_id(self.response_id);
             conn.prepare_cached(
                 "UPDATE llm_calls SET finished_at=?, status=?, error_summary=?, upstream_response_id=?,
                  http_status=?, raw_usage=?, input_uncached_tokens=?, cache_read_tokens=?, cache_write_tokens=?,
@@ -155,7 +161,7 @@ impl Report {
                 at,
                 status,
                 stored_reason,
-                self.response_id,
+                stored_response_id,
                 self.http_status,
                 stored_usage,
                 bill.input_uncached_tokens,

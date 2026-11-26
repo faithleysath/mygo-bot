@@ -358,18 +358,38 @@ pub fn set_local_role(conn: &Connection, role: NodeRole) -> Result<LocalNode> {
         || current.voter_set != next_set
         || current.pending_voter_epoch != 0
     {
-        conn.execute(
-            "UPDATE local_node
-             SET role=?1,
-                 meta_seq=CASE WHEN role != ?1 THEN meta_seq+1 ELSE meta_seq END,
-                 voter_epoch=?2,
-                 voter_set_json=?3,
-                 pending_voter_epoch=0,
-                 pending_voter_set_json='[]',
-                 pending_proposal_id=''
-             WHERE id=1",
-            params![role, next_epoch, next_json],
-        )?;
+        if !role.is_voter() && !current.voter_set.is_empty() {
+            let mut next_secret = [0u8; 32];
+            getrandom::fill(&mut next_secret)
+                .map_err(|_| Error::internal("entropy unavailable"))?;
+            conn.execute(
+                "UPDATE local_node
+                 SET role=?1,
+                     meta_seq=CASE WHEN role != ?1 THEN meta_seq+1 ELSE meta_seq END,
+                     voter_epoch=?2,
+                     voter_set_json=?3,
+                     pending_voter_epoch=0,
+                     pending_voter_set_json='[]',
+                     pending_proposal_id='',
+                     cluster_secret=?4,
+                     membership_gen=membership_gen+1
+                 WHERE id=1",
+                params![role, next_epoch, next_json, next_secret.as_slice()],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE local_node
+                 SET role=?1,
+                     meta_seq=CASE WHEN role != ?1 THEN meta_seq+1 ELSE meta_seq END,
+                     voter_epoch=?2,
+                     voter_set_json=?3,
+                     pending_voter_epoch=0,
+                     pending_voter_set_json='[]',
+                     pending_proposal_id=''
+                 WHERE id=1",
+                params![role, next_epoch, next_json],
+            )?;
+        }
     }
     load_local_node(conn)
 }

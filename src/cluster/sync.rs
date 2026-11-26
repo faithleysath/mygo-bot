@@ -725,6 +725,14 @@ impl SyncEngine {
                         if local.membership_gen != conn_gen {
                             return Err(Error::conflict("membership changed during PEX"));
                         }
+                        let existing_peers = list_peers(&s.conn)?;
+                        if existing_peers.is_empty()
+                            && (local.voter_epoch == 0 || local.voter_set.is_empty())
+                        {
+                            return Err(Error::conflict(
+                                "standalone node without a committed voter cannot admit peers",
+                            ));
+                        }
                         let mut changed = upsert_peer_if_gen(
                             &s.conn,
                             &local.node_id,

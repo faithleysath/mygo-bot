@@ -305,4 +305,4 @@ CREATE TABLE session_leases (
     expires_at_ms INTEGER NOT NULL DEFAULT 0
 );
 
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;

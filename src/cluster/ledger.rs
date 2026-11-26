@@ -2140,8 +2140,12 @@ pub fn merge_session_wire(conn: &Connection, w: &SessionWire) -> Result<SessionM
         "paused" => "paused",
         _ => "idle",
     };
+    let bounded_wire_err = crate::calls::truncate_utf8(
+        w.last_error.as_str(),
+        crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES,
+    );
     let wire_err = if wire_status == "paused" {
-        w.last_error.as_str()
+        bounded_wire_err.as_str()
     } else {
         ""
     };
@@ -2363,6 +2367,7 @@ pub fn merge_llm_call_wire(conn: &Connection, w: &LlmCallWire) -> Result<bool> {
         crate::calls::truncate_utf8(s, crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES)
     });
     let bounded_usage = crate::calls::clamp_raw_usage_str(w.raw_usage.clone());
+    let bounded_resp_id = crate::calls::clamp_response_id(w.upstream_response_id.clone());
 
     let mut changed = false;
     match existing {
@@ -2386,7 +2391,7 @@ pub fn merge_llm_call_wire(conn: &Connection, w: &LlmCallWire) -> Result<bool> {
                 w.started_at,
                 w.finished_at,
                 &w.status,
-                &w.upstream_response_id,
+                &bounded_resp_id,
                 w.http_status,
                 &bounded_err,
                 &bounded_usage,
@@ -2428,7 +2433,7 @@ pub fn merge_llm_call_wire(conn: &Connection, w: &LlmCallWire) -> Result<bool> {
                         next_sid,
                         w.finished_at,
                         &w.status,
-                        &w.upstream_response_id,
+                        &bounded_resp_id,
                         w.http_status,
                         &bounded_err,
                         &bounded_usage,
@@ -2963,19 +2968,28 @@ pub fn read_catalog_delta(
     {
         let mut stmt = conn.prepare_cached(
             "SELECT id, sync_rev,
-                    length(CAST(title AS BLOB)) + length(CAST(last_error AS BLOB)) + 384
-             FROM sessions WHERE sync_rev > ?1
-             ORDER BY sync_rev ASC, id ASC LIMIT ?2",
+                    length(CAST(title AS BLOB))
+                    + min(length(CAST(last_error AS BLOB)), ?1)
+                    + coalesce(length(CAST(reasoning_effort AS BLOB)), 0) + 512
+             FROM sessions WHERE sync_rev > ?2
+             ORDER BY sync_rev ASC, id ASC LIMIT ?3",
         )?;
         let list = stmt
-            .query_map(params![since_rev, DELTA_PAGE_LIMIT as i64], |r| {
-                let raw_bytes: i64 = r.get(2)?;
-                Ok(CatalogMeta {
-                    sync_rev: r.get(1)?,
-                    est_bytes: usize::try_from(raw_bytes).unwrap_or(384).saturating_mul(2).saturating_add(384),
-                    key: CatalogKey::Session(r.get(0)?),
-                })
-            })?
+            .query_map(
+                params![
+                    crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES as i64,
+                    since_rev,
+                    DELTA_PAGE_LIMIT as i64
+                ],
+                |r| {
+                    let raw_bytes: i64 = r.get(2)?;
+                    Ok(CatalogMeta {
+                        sync_rev: r.get(1)?,
+                        est_bytes: usize::try_from(raw_bytes).unwrap_or(512).saturating_mul(2).saturating_add(512),
+                        key: CatalogKey::Session(r.get(0)?),
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if list.len() == DELTA_PAGE_LIMIT
             && let Some(last) = list.last()
@@ -3147,7 +3161,10 @@ pub fn read_catalog_delta(
                             created_at: r.get(3)?,
                             updated_at: r.get(4)?,
                             status: r.get(5)?,
-                            last_error: r.get(6)?,
+                            last_error: crate::calls::truncate_utf8(
+                                &r.get::<_, String>(6)?,
+                                crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES,
+                            ),
                             status_ts: r.get(7)?,
                             model_id: r.get(8)?,
                             reasoning_effort: r.get(9)?,
@@ -3182,10 +3199,13 @@ pub fn read_catalog_delta(
         "SELECT id, origin_seq,
                 min(coalesce(length(CAST(raw_usage AS BLOB)), 0), ?1)
                 + min(coalesce(length(CAST(error_summary AS BLOB)), 0), ?2)
+                + min(coalesce(length(CAST(upstream_response_id AS BLOB)), 0), ?3)
+                + coalesce(length(CAST(reasoning_effort AS BLOB)), 0)
+                + length(CAST(origin_node_id AS BLOB))
                 + coalesce(length(CAST(pricing_snapshot AS BLOB)), 0) + 256
          FROM llm_calls
-         WHERE origin_node_id = ?3 AND origin_seq > ?4
-         ORDER BY origin_seq ASC, id ASC LIMIT ?5",
+         WHERE origin_node_id = ?4 AND origin_seq > ?5
+         ORDER BY origin_seq ASC, id ASC LIMIT ?6",
     )?;
     let mut call_full_stmt = conn.prepare_cached(
         "SELECT id, session_id, model_id, reasoning_effort, input_end_position, input_head,
@@ -3209,6 +3229,7 @@ pub fn read_catalog_delta(
                 params![
                     crate::calls::MAX_STORED_RAW_USAGE_BYTES as i64,
                     crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES as i64,
+                    crate::calls::MAX_STORED_RESPONSE_ID_BYTES as i64,
                     &origin_node_id,
                     remote_seq,
                     DELTA_PAGE_LIMIT as i64
@@ -3250,7 +3271,7 @@ pub fn read_catalog_delta(
                         started_at: r.get(6)?,
                         finished_at: r.get(7)?,
                         status: r.get(8)?,
-                        upstream_response_id: r.get(9)?,
+                        upstream_response_id: crate::calls::clamp_response_id(r.get(9)?),
                         http_status: r.get(10)?,
                         error_summary: r.get::<_, Option<String>>(11)?.map(|s| {
                             crate::calls::truncate_utf8(

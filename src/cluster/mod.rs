@@ -188,7 +188,25 @@ impl Cluster {
         self.workers
             .spawn(async move {
                 let _guard = join_gate.lock().await;
+                let precheck_secret = secret;
+                let precheck_conflict = db
+                    .call(move |s| {
+                        let local = identity::load_local_node(&s.conn)?;
+                        let has_peers: bool = s.conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM cluster_peers)",
+                            [],
+                            |r| r.get(0),
+                        )?;
+                        Ok(has_peers && local.cluster_secret != precheck_secret && !force)
+                    })
+                    .await?;
+                if precheck_conflict {
+                    return Err(Error::conflict(
+                        "node already belongs to another cluster; pass force=true to switch clusters",
+                    ));
+                }
                 net.ensure_endpoint().await?;
+                let _ = net.probe_join(&secret, &peer).await?;
                 let (secret_changed, new_gen, new_secret, peer, _) = db
                     .write(
                         move |conn| {

@@ -39,6 +39,7 @@ type ApplyWrite = Box<dyn FnOnce(Result<&Connection>, bool) -> (bool, Acknowledg
 struct Write {
     start_session: Option<SessionId>,
     expected_run_gen: Option<(SessionId, u64)>,
+    retry_tx: Option<oneshot::Sender<Write>>,
     apply: ApplyWrite,
 }
 
@@ -70,7 +71,10 @@ pub enum Enqueued {
 }
 
 #[derive(Clone)]
-pub struct Db(mpsc::Sender<Command>);
+pub struct Db {
+    tx: mpsc::Sender<Command>,
+    presence: Arc<PresenceState>,
+}
 
 pub struct Store {
     pub conn: Connection,
@@ -120,7 +124,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 10 {
+            if version != 11 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
@@ -215,6 +219,7 @@ impl Db {
         clear_staged();
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
         let runtime = tokio::runtime::Handle::current();
+        let db_presence = presence.clone();
         thread::Builder::new()
             .name("sqlite".into())
             .spawn(move || {
@@ -271,7 +276,10 @@ impl Db {
                     }
                 }
             })?;
-        Ok(Self(sender))
+        Ok(Self {
+            tx: sender,
+            presence: db_presence,
+        })
     }
 
     pub async fn call<T: Send + 'static>(
@@ -355,13 +363,68 @@ impl Db {
         apply: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
-        self.grouped_write(
-            None,
-            Some((sid, expected_run_gen)),
-            move |conn, _| apply(conn),
-            publish,
-        )
-        .await
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let mut write = Write {
+            start_session: None,
+            expected_run_gen: Some((sid, expected_run_gen)),
+            retry_tx: None,
+            apply: Box::new(move |conn, _| {
+                let result = conn.and_then(apply);
+                (
+                    result.is_ok(),
+                    Box::new(move |store, committed| {
+                        let result = match committed {
+                            Ok(()) => result.and_then(|value| publish(store, value)),
+                            Err(error) => Err(error.clone()),
+                        };
+                        let _ = reply_tx.send(result);
+                    }),
+                )
+            }),
+        };
+        let mut retries = 0usize;
+        loop {
+            let (ret_tx, ret_rx) = oneshot::channel();
+            write.retry_tx = Some(ret_tx);
+            self.tx
+                .send(Command::Write(write))
+                .await
+                .map_err(|_| Error::internal("database worker stopped"))?;
+            let returned = tokio::select! {
+                res = &mut reply_rx => {
+                    return res.map_err(|_| Error::internal("database worker stopped"))?;
+                }
+                ret = ret_rx => match ret {
+                    Ok(returned) => returned,
+                    Err(_) => {
+                        return reply_rx
+                            .await
+                            .map_err(|_| Error::internal("database worker stopped"))?;
+                    }
+                },
+            };
+            retries += 1;
+            if retries >= 8 {
+                return Err(Error::conflict("session execution lease lost"));
+            }
+            match self
+                .presence
+                .wait_local_lease_ready(sid, None, std::time::Duration::from_secs(10))
+                .await
+            {
+                crate::cluster::exec::LocalLeaseStatus::Valid => {
+                    write = returned;
+                }
+                crate::cluster::exec::LocalLeaseStatus::Upgrading => {
+                    return Err(Error::conflict(
+                        "session execution lease temporarily upgrading",
+                    ));
+                }
+                crate::cluster::exec::LocalLeaseStatus::Invalid => {
+                    return Err(Error::conflict("session execution lease lost"));
+                }
+            }
+        }
     }
 
     pub async fn start_write<T: 'static, R: Send + 'static>(
@@ -384,6 +447,7 @@ impl Db {
             Command::Write(Write {
                 start_session,
                 expected_run_gen,
+                retry_tx: None,
                 apply: Box::new(move |conn, active| {
                     let result = conn.and_then(|conn| apply(conn, active));
                     (
@@ -407,7 +471,7 @@ impl Db {
         command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
     ) -> Result<T> {
         let (send, recv) = oneshot::channel();
-        self.0
+        self.tx
             .send(command(send))
             .await
             .map_err(|_| Error::internal("database worker stopped"))?;
@@ -525,19 +589,43 @@ impl Store {
             }
             let active_map = &self.active;
             let mut tx = self.conn.transaction()?;
-            for write in pending.by_ref() {
-                if let Some((sid, expected_gen)) = write.expected_run_gen
-                    && (active_map.get(&sid).is_none_or(|run| run.run_gen != expected_gen)
-                        || !self.presence.is_local_lease_valid(sid))
-                {
-                    let (_, reply) = (write.apply)(
-                        Err(Error::conflict(
-                            "session superseded by cluster replacement or expired execution lease",
-                        )),
-                        false,
-                    );
-                    replies.push(reply);
-                    continue;
+            for mut write in pending.by_ref() {
+                if let Some((sid, expected_gen)) = write.expected_run_gen {
+                    let lease_status = if active_map
+                        .get(&sid)
+                        .is_none_or(|run| run.run_gen != expected_gen)
+                    {
+                        crate::cluster::exec::LocalLeaseStatus::Invalid
+                    } else {
+                        self.presence.local_lease_status(sid)
+                    };
+                    match lease_status {
+                        crate::cluster::exec::LocalLeaseStatus::Valid => {}
+                        crate::cluster::exec::LocalLeaseStatus::Upgrading => {
+                            if let Some(retry_tx) = write.retry_tx.take() {
+                                let _ = retry_tx.send(write);
+                                continue;
+                            }
+                            let (_, reply) = (write.apply)(
+                                Err(Error::conflict(
+                                    "session execution lease temporarily upgrading",
+                                )),
+                                false,
+                            );
+                            replies.push(reply);
+                            continue;
+                        }
+                        crate::cluster::exec::LocalLeaseStatus::Invalid => {
+                            let (_, reply) = (write.apply)(
+                                Err(Error::conflict(
+                                    "session superseded by cluster replacement or expired execution lease",
+                                )),
+                                false,
+                            );
+                            replies.push(reply);
+                            continue;
+                        }
+                    }
                 }
                 // A failed multi-statement operation must not leave part of its reply in the DB.
                 clear_staged();
@@ -645,6 +733,9 @@ impl Store {
         reason: &str,
         before_commit: impl FnOnce(&Self) -> Result<()>,
     ) -> Result<()> {
+        let reason_bounded =
+            crate::calls::truncate_utf8(reason, crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES);
+        let reason = reason_bounded.as_str();
         let now = chrono::Utc::now().timestamp_millis();
         with_savepoint(&self.conn, "store_status", || {
             let durable = matches!(state, "idle" | "paused");
@@ -681,6 +772,10 @@ impl Store {
 
     pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
         self.presence.is_local_lease_valid(sid)
+    }
+
+    pub fn is_local_lease_upgrading(&self, sid: SessionId) -> bool {
+        self.presence.is_local_lease_upgrading(sid)
     }
 
     pub fn effective_runner_node_id(&self, sid: SessionId) -> Option<Cow<'_, str>> {
