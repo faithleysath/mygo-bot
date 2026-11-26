@@ -242,7 +242,7 @@ impl PresenceState {
     pub fn set_known_peer_count(&self, count: usize) {
         let prev = self.known_peer_count.swap(count, Ordering::AcqRel);
         if (prev == 0) != (count == 0) {
-            let _ = self.cluster_active_tx.send(count > 0);
+            self.cluster_active_tx.send_replace(count > 0);
         }
         if count > prev {
             self.membership_grew_notify.notify_one();
@@ -393,6 +393,27 @@ impl PresenceState {
         *entry = (*entry).max(term);
     }
 
+    pub fn check_delete_lease(&self, sid: SessionId, lease: Option<&ActiveLease>) -> Result<()> {
+        let Some(lease) = lease else {
+            return if self.known_peer_count() == 0 {
+                Ok(())
+            } else {
+                Err(Error::conflict("cluster membership changed before delete commit; retry"))
+            };
+        };
+        let inner = self.inner.lock().unwrap();
+        if lease.is_valid()
+            && inner.highest_terms.get(&sid) == Some(&lease.term)
+            && inner.local_claims.get(&sid).is_some_and(|claim| {
+                claim.claim_id == lease.claim_id && claim.phase == LocalClaimPhase::Committing
+            })
+        {
+            Ok(())
+        } else {
+            Err(Error::conflict("delete lease expired or superseded before commit; retry"))
+        }
+    }
+
     pub fn has_committed_remote_lease(&self, sid: SessionId) -> bool {
         let now = Instant::now();
         let local_id = self.local_node_id();
@@ -450,13 +471,7 @@ impl PresenceState {
             let mut inner = self.inner.lock().unwrap();
             let unchanged = inner.local.get(&sid) == next.as_ref();
             let cleared = if next.is_none() {
-                match inner.active_local_leases.get(&sid) {
-                    Some(LocalLease::Quorum(l)) if !l.revoked.is_cancelled() => {
-                        inner.active_local_leases.remove(&sid)
-                    }
-                    Some(LocalLease::ForcedOffline) => inner.active_local_leases.remove(&sid),
-                    _ => None,
-                }
+                inner.active_local_leases.remove(&sid)
             } else {
                 None
             };

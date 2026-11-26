@@ -334,28 +334,72 @@ impl App {
                 if !lease_matches {
                     return Ok(());
                 }
-                if let Some(ctrl) = s.active.remove(&sid) {
-                    ctrl.soft.cancel();
-                    ctrl.hard.cancel();
-                    if let Some(l) = &ctrl.lease {
-                        l.revoked.cancel();
-                    }
-                }
-                s.pending_wakes.remove(&sid);
-                crate::codemode::stop_session(s, sid);
-                let now = chrono::Utc::now().timestamp_millis();
-                // Self-fencing must not append a synced commit so surviving majority quorum never forks.
-                let _ = s.conn.execute(
-                    "UPDATE sessions SET status='paused',last_error=?2,updated_at=?3 WHERE id=?1",
-                    (sid, reason, now),
-                );
-                s.presence.set_local(sid, None);
-                s.notify_status(sid, "paused", reason, now);
-                Ok(())
+                fence_local_run(s, sid, reason)
             })
             .await;
     }
 }
+
+fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
+    if let Some(ctrl) = s.active.remove(&sid) {
+        ctrl.soft.cancel();
+        ctrl.hard.cancel();
+    }
+    if let Some(lease) = s.presence.active_local_lease(sid) {
+        lease.revoked.cancel();
+    }
+    s.pending_wakes.remove(&sid);
+    crate::codemode::stop_session(s, sid);
+    s.bump_reset_gen(sid);
+    let now = chrono::Utc::now().timestamp_millis();
+    // A fenced runner can only record its pause locally.
+    let update = s.conn.execute(
+        "UPDATE sessions SET status='paused',last_error=?2,updated_at=?3 WHERE id=?1",
+        (sid, reason, now),
+    );
+    s.refresh_local_presence(sid);
+    update?;
+    s.notify_status(sid, "paused", reason, now);
+    Ok(())
+}
+
+fn pause_failed_run(s: &mut Store, sid: SessionId, control: &Control, problem: Error) -> Result<()> {
+    let stream = crate::cluster::ledger::stream_head(&s.conn, sid.as_str())?;
+    let conflicted = crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?;
+    let epoch_ok = stream.as_ref().is_none_or(|st| {
+        st.epoch == control.epoch && !st.deleted && !st.retired
+    });
+    let writable = crate::cluster::ledger::is_session_writable_local(&s.conn, sid)?;
+    if conflicted || !epoch_ok || !writable {
+        return Ok(());
+    }
+    let Ok(current) = session(&s.conn, sid) else {
+        return Ok(());
+    };
+    if current.status == SessionStatus::Paused {
+        s.notify_status(sid, "paused", &current.last_error, current.updated_at);
+        return Ok(());
+    }
+    let reason = if control.soft.is_cancelled() {
+        current.last_error
+    } else {
+        problem.1
+    };
+    let mut fenced = false;
+    let result = s.status_checked(sid, "paused", &reason, |s| {
+        if control.lease_valid() && s.is_local_lease_valid(sid) {
+            return Ok(());
+        }
+        fenced = true;
+        Err(Error::conflict("execution lease lost"))
+    });
+    if fenced {
+        crate::cluster::ledger::clear_staged();
+        return fence_local_run(s, sid, "execution lease lost");
+    }
+    result
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 enum PauseMode {
@@ -456,64 +500,20 @@ impl App {
     async fn run(self, sid: SessionId, control: Control, channel: broadcast::Sender<Notice>) {
         let outcome = self.run_loop(sid, &control, &channel).await;
         if let Err(problem) = outcome {
-            let lease_fenced =
-                !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid);
             let settled = self
                 .db
                 .call(move |s| {
-                    if s.run_gen(sid) != control.run_gen {
+                    if s.active.get(&sid).is_none_or(|run| run.run_gen != control.run_gen) {
                         return Ok(());
                     }
-                    if s.active
-                        .get(&sid)
-                        .is_some_and(|c| c.run_gen == control.run_gen)
-                    {
-                        s.active.remove(&sid);
+                    if !control.lease_valid() || !s.is_local_lease_valid(sid) {
+                        return fence_local_run(s, sid, "execution lease lost");
                     }
+                    s.active.remove(&sid);
+                    // Keep the lease until the terminal write has committed or failed.
+                    let result = pause_failed_run(s, sid, &control, problem);
                     s.refresh_local_presence(sid);
-                    if lease_fenced || !s.is_local_lease_valid(sid) {
-                        crate::codemode::stop_session(s, sid);
-                        if let Ok(current) = session(&s.conn, sid)
-                            && matches!(
-                                current.status,
-                                SessionStatus::Running | SessionStatus::Pausing
-                            )
-                        {
-                            let now = chrono::Utc::now().timestamp_millis();
-                            let reason = problem.1.as_str();
-                            // Local-only fallback pause if lease lapsed before fence_session_local ran.
-                            let _ = s.conn.execute(
-                                "UPDATE sessions SET status='paused',last_error=?2,updated_at=?3 WHERE id=?1",
-                                (sid, reason, now),
-                            );
-                            s.presence.set_local(sid, None);
-                            s.notify_status(sid, "paused", reason, now);
-                        }
-                        return Ok(());
-                    }
-                    let stream = crate::cluster::ledger::stream_head(&s.conn, sid.as_str())?;
-                    let conflicted = crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?;
-                    let epoch_ok = stream.as_ref().is_none_or(|st| {
-                        st.epoch == control.epoch && !st.deleted && !st.retired
-                    });
-                    let writable = crate::cluster::ledger::is_session_writable_local(&s.conn, sid)?;
-                    if conflicted || !epoch_ok || !writable {
-                        return Ok(());
-                    }
-                    let Ok(current) = session(&s.conn, sid) else {
-                        return Ok(());
-                    };
-                    if current.status == SessionStatus::Paused {
-                        s.notify_status(sid, "paused", &current.last_error, current.updated_at);
-                        return Ok(());
-                    }
-                    let reason = if control.soft.is_cancelled() {
-                        current.last_error
-                    } else {
-                        problem.1
-                    };
-                    s.status(sid, "paused", &reason)?;
-                    Ok(())
+                    result
                 })
                 .await;
             if let Err(err) = settled {
@@ -681,7 +681,9 @@ impl App {
             {
                 self.db
                     .call(move |s| {
-                        if s.run_gen(sid) != run_gen || !s.is_local_lease_valid(sid) {
+                        if s.active.get(&sid).is_none_or(|run| run.run_gen != run_gen)
+                            || !s.is_local_lease_valid(sid)
+                        {
                             return Ok(());
                         }
                         let tx = s.conn.transaction()?;

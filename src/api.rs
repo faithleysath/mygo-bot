@@ -1,6 +1,6 @@
 use crate::{
     App, Error, ErrorBody, Result, agent,
-    cluster::exec::WriterTarget,
+    cluster::exec::{DeleteGateGuard, WriterTarget},
     codemode, events,
     events::Notice,
     id::{ItemId, ModelId, SessionId},
@@ -273,6 +273,15 @@ async fn delete_session(
         app.cluster.ensure_session_watched(sid).await?;
     }
     let delete_gate = app.exec.acquire_delete_gate(sid).await?;
+    // The SQLite job can outlive its HTTP caller. Keep its grant through commit or rollback.
+    app.workers
+        .clone()
+        .spawn(finish_delete(app, sid, delete_gate))
+        .await
+        .map_err(|_| Error::internal("session delete interrupted; check session state"))?
+}
+
+async fn finish_delete(app: App, sid: SessionId, delete_gate: DeleteGateGuard) -> Result<StatusCode> {
     let expected_head = delete_gate.expected_head();
     let delete_lease = delete_gate.lease();
     let res = app
@@ -291,15 +300,7 @@ async fn delete_session(
                 ));
             }
             let tx = s.conn.transaction()?;
-            if let Some(ref lease) = delete_lease {
-                if !lease.is_valid() {
-                    return Err(Error::conflict("delete lease expired before commit; retry"));
-                }
-            } else if s.presence.known_peer_count() > 0 {
-                return Err(Error::conflict(
-                    "cluster membership changed before delete commit; retry",
-                ));
-            }
+            s.presence.check_delete_lease(sid, delete_lease.as_deref())?;
             if s.presence.remote_owner(sid).is_some() || s.presence.has_committed_remote_lease(sid)
             {
                 return Err(Error::conflict(
@@ -341,6 +342,7 @@ async fn delete_session(
             }
             tx.execute("DELETE FROM sessions WHERE id=?", [sid])?;
             crate::cluster::ledger::record_session_deleted(&tx, sid, &detached_calls)?;
+            s.presence.check_delete_lease(sid, delete_lease.as_deref())?;
             tx.commit()?;
             s.mcp.forget_session(sid);
             s.channels.remove(&sid);

@@ -490,12 +490,11 @@ impl Store {
                     "shutting down".into(),
                 ));
             }
-            let cur_gen_map = &self.session_run_gen;
             let active_map = &self.active;
             let mut tx = self.conn.transaction()?;
             for write in pending.by_ref() {
                 if let Some((sid, expected_gen)) = write.expected_run_gen
-                    && (cur_gen_map.get(&sid).copied().unwrap_or(0) != expected_gen
+                    && (active_map.get(&sid).is_none_or(|run| run.run_gen != expected_gen)
                         || !self.presence.is_local_lease_valid(sid))
                 {
                     let (_, reply) = (write.apply)(
@@ -597,6 +596,16 @@ impl Store {
     }
 
     pub fn status(&mut self, sid: SessionId, state: &str, reason: &str) -> Result<()> {
+        self.status_checked(sid, state, reason, |_| Ok(()))
+    }
+
+    pub fn status_checked(
+        &mut self,
+        sid: SessionId,
+        state: &str,
+        reason: &str,
+        before_commit: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         with_savepoint(&self.conn, "store_status", || {
             has_conflict(&self.conn, sid.as_str()).and_then(|c| {
@@ -620,7 +629,7 @@ impl Store {
             if matches!(state, "idle" | "paused") {
                 record_session_delta(&self.conn, sid, "session_delta", &[], Vec::new(), Vec::new())?;
             }
-            Ok(())
+            before_commit(self)
         })?;
         let status_enum = match state {
             "running" => SessionStatus::Running,
