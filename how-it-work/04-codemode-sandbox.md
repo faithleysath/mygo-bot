@@ -12,7 +12,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
 
 因为主运行时只有一条单线程事件循环，JavaScript **绝不能**直接跑在它上面。
 
-所以程序启动时（[src/main.rs](../src/main.rs#L468-L471)），会专门单拉一排固定数量的后台操作系统线程，取名叫 `codemode-js-0`、`codemode-js-1`……数量由 `--js-threads` 控制，默认按宿主机逻辑 CPU 核数最多开 **4 条**（每条线程配 **4 MiB** OS 栈，内部跑一个**不带 I/O 和定时器驱动的裸单线程 Tokio `LocalSet`**）。
+所以程序启动时（[src/main.rs](../src/main.rs#L499-L502)），会专门单拉一排固定数量的后台操作系统线程，取名叫 `codemode-js-0`、`codemode-js-1`……数量由 `--js-threads` 控制，默认按宿主机逻辑 CPU 核数最多开 **4 条**（每条线程配 **4 MiB** OS 栈，内部跑一个**不带 I/O 和定时器驱动的裸单线程 Tokio `LocalSet`**）。
 
 每次模型调 `codemode`（代码最多 **256 KiB**，可选 `label` 最多 **256 字节**；每次 `codemode_wait` 带的探针脚本同理）：
 
@@ -25,7 +25,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
    - 挂给 JS 对象的原生回调只抓 `Weak<Resolvers>` 弱引用，彻底打断 Rust `Rc` 和 QuickJS 垃圾回收器之间的循环引用内存泄漏；
    - 一旦最外层根 `Promise` 结算，程序立刻把 `scope.accepting` 设成 `false` **然后再**去读返回值——专门防返回值对象里藏着恶作剧 `getter` 在交卷瞬间偷偷再调宿主 API 或写 `console.log`。
 4. **重活外包给主运行时**：JS 工人线程自己没有网络和定时器轮子，脚本每调一次异步宿主能力（比如读写文件、发 HTTP、跑命令），VM 就通过 `JoinSet::spawn_on(..., &host.executor)` 把这个异步任务扔回主进程的 Tokio 运行时执行，等结果回来后再在 JS 线程唤醒对应的 `Promise`。
-5. **内建文本编解码（[src/codemode/decoder.js](../src/codemode/decoder.js)）**：QuickJS 本身不带 Web 标准的 `TextEncoder` / `TextDecoder`，程序启动车间时先装好一套带品牌校验和原型缓存（提前锁住 `TypedArray`、`DataView`、`ArrayBuffer` 原型 getter，防脚本造假对象欺骗长度/偏移）的 UTF-8 编解码器。每次按 **64 KiB** 分块处理（单次总上限 **8 MiB**），支持流式 `{ stream: true }` 暂存跨块劈开的合法多字节 UTF-8 残缺前缀、自动剥离首部 BOM、并把孤立 UTF-16 代理对安全转成替换符 `U+FFFD`。
+5. **内建文本编解码（[src/codemode/decoder.js](../src/codemode/decoder.js)）**：QuickJS 本身不带 Web 标准的 `TextEncoder` / `TextDecoder`，程序启动车间时先装好一套带品牌校验和原型缓存（提前锁住 `TypedArray`、`DataView`、`ArrayBuffer` 原型 getter，防脚本造假对象欺骗长度/偏移）的 UTF-8 编解码器（release 构建由 [build.rs](../build.rs) 调 `bun` 运行 [tools/minify-codemode.mjs](../tools/minify-codemode.mjs) 压缩 `bootstrap.js` 和 `decoder.js` 后再从 `OUT_DIR` 嵌入二进制）。每次按 **64 KiB** 分块处理（单次总上限 **8 MiB**），支持流式 `{ stream: true }` 暂存跨块劈开的合法多字节 UTF-8 残缺前缀、自动剥离首部 BOM、并把孤立 UTF-16 代理对安全转成替换符 `U+FFFD`。
 
 ---
 
@@ -112,7 +112,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
 
 为了防止多模态大附件把内存撑爆，每块数据必须同时过**两道预算闸门**：每块额外加计 **128 字节**元开销，单次输出/事件总预算封顶 **52 MiB**（`TASK_BYTES`），全进程所有在途未落盘的输出共享 **192 MiB** 全局预算（`OUTPUT_BUDGET` 信号量，结果一消费或 `Drop` 立刻归还）。
 
-最后记账员把这包 `Blocks` 真正写进 SQLite 时，在事务里先立一个 **`SAVEPOINT codemode_blocks`**（[src/codemode/ledger.rs](../src/codemode/ledger.rs#L227-L264)）：
+最后记账员把这包 `Blocks` 真正写进 SQLite 时，在事务里先立一个 **`SAVEPOINT codemode_blocks`**（[src/codemode/ledger.rs](../src/codemode/ledger.rs#L331-L368)）：
 1. 把每个内联 `Part::Bytes` 存进 `attachments` 表拿到新 `attachment_id`；
 2. 查出该会话所选模型声明的 `input_modalities`（哪怕模型之后被归档了，仍按它记录的模态核对），校验这批块是不是模型吃得下的（比如纯文本模型不收图片）；
 3. **要是任何一步失败**：当场 `ROLLBACK TO codemode_blocks`，把刚才临时插进去的 `attachments` 行抹得干干净净，**绝不在库里留半个孤儿附件**；若是客户端错误（如模态不支持或空结果），外层事务再顺势转成纯文本的 `"failed"` 工具回复收尾。

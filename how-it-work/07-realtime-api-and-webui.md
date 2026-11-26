@@ -10,19 +10,19 @@
 
 ## 两级实时 SSE 流：围观再多也不堵门
 
-早期架构只把写进 SQLite 的成品 `item` 往外推，人坐在屏幕前要干等模型整段话吐完才能看见内容。为了让界面跟聊天软件一样实时跳字，同时又绝不污染只增不删的账本，[src/events.rs](../src/events.rs) 和 [src/model.rs](../src/model.rs#L79-L127) 搭了一套**“两级广播 + 全局统一编号”**的实时流中心（`events::Hub`）：
+早期架构只把写进 SQLite 的成品 `item` 往外推，人坐在屏幕前要干等模型整段话吐完才能看见内容。为了让界面跟聊天软件一样实时跳字，同时又绝不污染只增不删的账本，[src/events.rs](../src/events.rs) 和 [src/model.rs](../src/model.rs#L106-L154) 搭了一套**“两级广播 + 全局统一编号”**的实时流中心（`events::Hub`）：
 
 1. **先分两股流接口**：
    - **全局流 `GET /events`**：容量 **256** 的广播通道。一连上先推 `ready`（`{}`），之后整个进程任何会话新建（`session.created`）、改配置/改标题（`session.updated`）、切状态（`session.status`）或删除（`session.deleted`），外加集群同步拉来新目录/MCP/分叉告警时触发的 **`catalog.updated`**、**`mcp.updated`** 和 **`sync.conflict`**，侧边栏与设置页全靠它实时刷新；谁掉队了收到 `resync`。
    - **单会话流 `GET /sessions/{sid}/events`**：每个新连上的订阅者，都会同时接上**两条独立广播通道**：
      - **持久通道（记账员拥有，容量 64）**：只在事务 `COMMIT` 之后发成品事件——`item.saved`（完整账目）、`session.status`、`session.updated`、`session.reset`（当集群重写整本会话历史并递增 `sync_streams.reset_gen` 时，携带着最新 **`history_rev`** 通知前端清游标重拉），外加不进数据库的 `attempt.retry`。连接首包的 `ready` 和后续所有 `resync` 也都会一并带上当前 `history_rev`。**压根没人订阅时，记账员连回查数据库组装 JSON 的活都直接省掉**；有人听时，一笔新账只组装一份 `Arc<str>` 丢进槽里大家共享引用；要是某个慢窗口积压超过 64 条，广播槽直接冲它扔一条 **`resync`** 让它自己去翻 `/history` 补课，绝不回头等它。
      - **临时草稿通道（`Hub` 拥有，容量 256）**：模型在上游刚吐字时，经过一个 **`DeltaBatcher`**（每攒满 **30 毫秒**或者满 **256 字节**就打包推一次，不按单字符轰炸广播槽）发来 `item.started`、`item.delta`（区分 `text`/`reasoning`/`arguments`）和收尾清空用的 `stream.clear`。同时内存里维持着一个每字段封顶 **256 KiB** 的 `ActiveDraft` 影子草稿——所以你半路刷新页面或刚点进一个正在生成的会话，一连上紧跟着 `ready` 就会收到一份 **`stream.snapshot`**，立刻把屏幕上已经吐到一半的话续上，不用等这轮说完！
-   - **跨节点实时流中继与组群前订阅升级（`ALPN b"mygo/exec/1"`）**：单会话流核心逻辑被抽成了可复用的 `SessionEventStream`（同时服务本地 HTTP SSE 与远端 `ExecServer::handle_subscribe_events`；当无订阅者监听时，`Store::item_saved`、`notify_status` 与 `session.created` 通过 `Notice::publish_serializable` 直接短路，省去全部 SQLite 回查与 `Value` 构造）。当浏览器连到**非执行节点**的 `GET /sessions/{sid}/events` 时，接入协程会直接把 `PresenceState::watch_remote_runner(sid)` 接进协调循环；甚至**早在单机尚未组群前就打开的 SSE 连接**，也会在内部同一层 `tokio::select!` 里静默监听 `PresenceState::subscribe_cluster_active()`——只要后续有同伴加入集群（`known_peer_count > 0`），就当场触发 `ensure_session_watched(sid)` 并无缝升级进集群中继循环（且不再重复补发初始 `stream.snapshot`），确保组群后由远端 Runner 跑起来的 `item.started`、`item.delta`、`stream.snapshot`、`stream.clear`、`attempt.retry` 和 `item.saved` 一条不漏地经 `SubscribeSessionEvents` 中继给浏览器。为了防止同一条已完成项既走中继提前露面、又随集群同步提交在本地再次落库触发第二次 `item.saved`，中继出口维护了一圈容量 **256 条**的 **`SeenSavedItems`** 去重窗口；远端中继断开时会自动补推带当前 `history_rev` 的 **`resync`**；浏览器一旦关闭标签页，借助 `ActiveRelay::drop` -> `recv.stop` -> `send.stopped()` 三端联动立即退出协程并归还远端 SSE 并发许可（上限 `64` 路）。
+   - **跨节点实时流中继与组群前订阅升级（`ALPN b"mygo/exec/1"`）**：单会话流核心逻辑被抽成了可复用的 `SessionEventStream`（同时服务本地 HTTP SSE 与远端 `ExecServer::handle_subscribe_events`；当无订阅者监听时，`Store::item_saved`、`notify_status` 与 `session.created` 通过 `Notice::publish_serializable` 直接短路，省去全部 SQLite 回查与 `Value` 构造；并在连接对象 `Drop` 时顺手调用 `remove_idle_stream` 回收 `Hub` 中的空闲会话槽位）。当浏览器连到**非执行节点**的 `GET /sessions/{sid}/events` 时，接入协程会直接把 `PresenceState::watch_remote_runner(sid)` 接进协调循环；甚至**早在单机尚未组群前就打开的 SSE 连接**，也会在内部同一层 `tokio::select!` 里静默监听 `PresenceState::subscribe_cluster_active()`——只要后续有同伴加入集群（`known_peer_count > 0`），就当场触发 `ensure_session_watched(sid)` 并无缝升级进集群中继循环（且不再重复补发初始 `stream.snapshot`），确保组群后由远端 Runner 跑起来的 `item.started`、`item.delta`、`stream.snapshot`、`stream.clear`、`attempt.retry` 和 `item.saved` 一条不漏地经 `SubscribeSessionEvents` 中继给浏览器。为了防止同一条已完成项既走中继提前露面、又随集群同步提交在本地再次落库触发第二次 `item.saved`，中继出口维护了一圈容量 **256 条**的 **`SeenSavedItems`** 去重窗口；远端中继断开时会自动补推带当前 `history_rev` 的 **`resync`**；浏览器一旦关闭标签页，借助 `ActiveRelay::drop` -> `recv.stop` -> `send.stopped()` 三端联动立即退出协程并归还远端 SSE 并发许可（上限 `64` 路）。
 
 2. **两股通道怎么保证“碎片不跑到成品后面”？**
    既然打字机碎片走 `Hub` 的 256 通道、成品 `item.saved` 走记账员的 64 通道，万一两路消息在 `tokio::select!` 里抢跑，用户刚看到完整的 `item.saved` 落盘卡片，下一毫秒一条迟到的 `item.delta` 才冒出来怎么办？
 
-   解决招数非常漂亮——**全进程共抢一个原子递增序号 [`NEXT_SEQ`](../src/events.rs#L29-L47)**（[推送协调循环](../src/events.rs#L345-L555)）：
+   解决招数非常漂亮——**全进程共抢一个原子递增序号 [`NEXT_SEQ`](../src/events.rs#L33-L52)**（[推送协调循环](../src/events.rs#L413-L729)）：
    - 每一条发往持久通道和临时通道的通知，在放进槽里的那一瞬间都领一个唯一的 `seq`；
    - 连入 SSE 时顺手记下此刻快照已经覆盖到的线 **`min_seq`**，所有比 `min_seq` 老的碎片直接丢弃，免得快照和碎片重复叠字；
    - 推送协程每收到一条持久事件 `d` 时，先把 `take_older_deltas` 排干——把临时通道里所有序号 `seq < d.seq` 的碎片先吐干净，**然后再吐 `d`**！如果慢窗口在**持久通道**掉队了，清掉缓存在手里的草稿、在全部 4 处掉队分支统一吐出带着当前 **`history_rev`** 的 `resync` 让前端核对历史版本并补拉对齐，同时顺带触发一次草稿恢复（继续补发最新的 `stream.snapshot` 或 `stream.clear`），保证已落盘或已清盘状态不与界面草稿脱节；如果在**临时通道**掉队，同样先把已经排进持久通道的事件送完保证因果顺序，再拿着 `Hub` 锁重拍一次最新快照、把 `min_seq` 往前推，并补发 `stream.snapshot`（若该轮调用刚结束清盘，则补发 `stream.clear`）把实时草稿接回来，既不缺字、也不用把整条长对话重拉一遍。
@@ -31,7 +31,7 @@
 
 ## HTTP API 全景、三条路由面与内置 OpenAPI 文档
 
-整套系统一共对外暴露 **36 条路径、51 个操作**（完整契约及 **57 个 Schema** 以单行压缩 JSON 格式编译期嵌在 [src/openapi.json](../src/openapi.json) 里，约 **85.0 KiB / 87,005 字节**，OpenAPI `3.1.0`；契约内新增 **`Session.runner_node_id`** 与可选请求体 **`SessionRunRequest`**（`PUT /sessions/{sid}/run` 可传 `{ "node": "<id-or-name>", "force_offline": false }` 路由执行节点或显式跳过多数派在线门控，目标离线或集群失多数派默认返回 `503`），并完整声明了按需 Watch 拉取、同步冲突及集群占有权拦截相关的 `409 Conflict`——覆盖 `/sessions/{sid}` 删改及 `/history`、`/context`、`/messages`、`/events`、`/run`、`/tasks`、`GET /attachments/{id}` 及目录/MCP 写操作——以及 `GET /sessions/{sid}/history` 返回的 **`X-History-Rev`** 响应头与 `POST /cluster/sync` 指定不存在 `session_id` 时的 `404 Not Found`）：
+整套系统一共对外暴露 **36 条路径、51 个操作**（完整契约及 **57 个 Schema** 以单行压缩 JSON 格式编译期嵌在 [src/openapi.json](../src/openapi.json) 里，约 **85.3 KiB / 87,388 字节**，OpenAPI `3.1.0`；契约内新增 **`Session.runner_node_id`** 与可选请求体 **`SessionRunRequest`**（`PUT /sessions/{sid}/run` 可传 `{ "node": "<id-or-name>", "force_offline": false }` 路由执行节点或显式跳过多数派在线门控，目标离线或集群失多数派默认返回 `503`），并完整声明了按需 Watch 拉取、同步冲突及集群占有权拦截相关的 `409 Conflict`——覆盖 `/sessions/{sid}` 删改及 `/history`、`/context`、`/messages`、`/events`、`/run`、`/tasks`、`GET /attachments/{id}` 及目录/MCP 写操作——以及 `GET /sessions/{sid}/history` 返回的 **`X-History-Rev`** 响应头与 `POST /cluster/sync` 指定不存在 `session_id` 时的 `404 Not Found`）：
 
 | 模块 | 路由一览 | 核心职责 |
 | :--- | :--- | :--- |
@@ -39,12 +39,12 @@
 | **会话与账本**（7） | `GET/POST /sessions`，`GET/PATCH/DELETE /sessions/{sid}`<br>`GET /sessions/{sid}/history`，`GET /sessions/{sid}/context` | 管理会话生命周期与 `items`/`context_items` 分块流式分页 |
 | **排队消息**（3） | `GET/POST /sessions/{sid}/messages`，`DELETE /sessions/{sid}/messages/{mid}` | 投信（`Idempotency-Key` 幂等）、查排队状态、撤回未进上下文输入 |
 | **运行、流与任务**（6） | `GET /events`，`GET /sessions/{sid}/events`<br>`PUT/DELETE /sessions/{sid}/run`，`GET .../tasks`，`DELETE .../tasks/{tid}` | 点火/软硬暂停（`?mode=soft\|hard`）、订阅两级 SSE、查停后台 JS 任务 |
-| **媒体附件**（2） | `POST /attachments`，`GET /attachments/{id}` | 上传不超过 50 MiB 多模态原文件及按需跨节点分块拉取、防嗅探下载 |
+| **媒体附件**（2） | `POST /attachments`，`GET /attachments/{id}` | 上传不超过 50 MiB 多模态原文件（并发与字节预算限流，满额返 `429`）及按需跨节点分块拉取、增量流式防嗅探下载 |
 | **调用与计费**（3） | `GET /calls`，`GET /calls/summary`，`GET /calls/{id}` | 查询每轮上游调用明细、token、最新上下文长度与 `cost_nano_usd` 费用 |
 | **MCP 与 OAuth**（10） | `GET/POST /mcp/servers`，`GET/PATCH/DELETE /mcp/servers/{id}`，`POST .../test`<br>`GET/DELETE .../oauth`，`POST .../oauth/login`，`POST .../oauth/callback` | 注册传输与 `shared` 同步开关、并发 4 体检探测、启动/手动完成/撤销 OAuth 2.1 |
 | **集群与同步**（8） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync`<br>`GET /cluster/conflicts`，`POST /cluster/conflicts/{stream_id}/resolve` | 查询集群状态与成员、改本机名称/描述、邀请/加入/踢出节点、触发全量同步、查看并双向裁决分叉冲突 |
 
-### 三条不同的路由出口（[src/main.rs](../src/main.rs#L503-L541)、[src/api.rs](../src/api.rs#L51-L78)）
+### 三条不同的路由出口（[src/main.rs](../src/main.rs#L580-L620)、[src/api.rs](../src/api.rs#L54-L81)）
 
 虽然核心业务逻辑都在同一套 `api::routes` 里，但程序故意把**外网/本机 TCP**、**本机 Unix Socket** 和 **Codemode 内部自省**三条入口的权限与页面切得清清楚楚：
 

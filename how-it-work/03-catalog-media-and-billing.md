@@ -47,19 +47,20 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 图片、音频、视频动辄几兆甚至几十兆，MyGo-Bot 坚决不把原始二进制直接塞进 `items` 表的 JSON 里，也不在集群同步会话时盲目把整包大文件到处预先拷贝，而是用 `attachments` 表单独托管（[src/media.rs](../src/media.rs)、[src/cluster/sync.rs](../src/cluster/sync.rs)）：
 
 1. **上传、内容寻址与下载防线**：
-   - 客户端先调 `POST /attachments`，Body 直接传原始二进制（上限 **50 MiB**），请求头必须带单个具体、无 `*` 通配符的 `image/*`、`audio/*` 或 `video/*` `Content-Type`。落库时同步算好 32 字节 BLAKE3 **`content_hash`** 与 **`byte_len`**，拿到 `att_<26位后缀>` 格式的 TypeID；
+   - 客户端先调 `POST /attachments`，Body 直接传原始二进制（上限 **50 MiB**），请求头必须带单个具体、无 `*` 通配符的 `image/*`、`audio/*` 或 `video/*` `Content-Type`。入口通过 `UPLOAD_SLOTS`（最多 **8 路**并发上传）与 `UPLOAD_BYTES`（全局 **100 MiB** = `2 × 50 MiB` 字节预算，满额直接返 `429 Too Many Requests`）挡住慢客户端和内存轰炸——且字节许可一路绑定到 64 KiB 分块缓冲区，直到数据库线程写完才释放（客户端中途断连也同步回收）。接收时流式计算 32 字节 BLAKE3 **`content_hash`** 与 **`byte_len`**，落库先插 `ZeroBlob` 再经 SQLite `blob_open` 分块写入，拿到 `att_<26位后缀>` 格式的 TypeID（[src/media.rs](../src/media.rs)）；
    - 表里的 **`data` 列是可空的**：从其他集群节点 Watch 同步会话正文时，只先同步 `attachments` 的轻量元数据行（`id`、`mime_type`、`content_hash`、`byte_len`，此时 `data = NULL`），没点开、没重跑的媒体一字节都不浪费带宽；
-   - 一旦需要真正用到数据——无论用户在客户端或 WebUI 调 **`GET /attachments/{id}`**（触发 `ensure_attachment_data`），还是某节点准备发上游大模型前跑 `model::stream`（触发 `ensure_session_attachments`）——如果发现本地 `data IS NULL`：先顺着局部索引 `attachments_by_hash` 在本机找找有没有同 `content_hash` 的现成副本直接复用；本机没有，再像 BT 下载一样向所有在线且持有该 `content_hash` 的节点并发发起 **256 KiB 分块（`GetAttachmentChunk`）** 接力拉取（服务端通过 SQLite **`blob_open` 增量读取**只抠出请求的字节区间，无需整包读进堆内存；接收端在全局块预算内并行拉取后把拼装与 BLAKE3 整包哈希核验卸载到阻塞线程池），验证通过才落盘；
-   - 下载接口 `GET /attachments/{id}` 会原样吐出存储的 `mime_type` 和字节流，但强制加上 `Content-Disposition: attachment` 和 `X-Content-Type-Options: nosniff`，防止浏览器把恶意文件当成同源网页或脚本执行。
+   - 一旦需要真正用到数据——无论用户在客户端或 WebUI 调 **`GET /attachments/{id}`**（触发 `ensure_attachment_data`），还是某节点准备发上游大模型前跑 `model::stream`（触发 `ensure_session_attachments`）——如果发现本地 `data IS NULL`：先顺着局部索引 `attachments_by_hash` 在本机找找有没有同 `content_hash` 的现成副本直接复用；本机没有，再像 BT 下载一样先从全网预占全局 **128 MiB** 临时文件预算（`MAX_ATT_BYTE_PERMITS = 512 × 256 KiB`），向所有在线且持有该 `content_hash` 的节点发起最多 **4 路**并发的 **256 KiB 分块（`GetAttachmentChunk`）** 接力拉取（发送方通过 SQLite **`blob_open` 增量读取**只抠出请求的字节区间，无需整包读进堆内存），按序落进 `tempfile` 并在阻塞线程池核对整包 BLAKE3，验证通过后再流式写入 SQLite BLOB；
+   - 下载接口 `GET /attachments/{id}` 同样通过 `AttachmentBlob::chunks` 增量读取 BLOB（每次开 `blob_open` 连续读取最多 **4 帧 × 192 KiB** 即 768 KiB，立刻松开数据库锁再往网络吐出，避免大附件久占记账员窗口），原样吐出存储的 `mime_type` 和字节流，并强制加上 `Content-Disposition: attachment` 和 `X-Content-Type-Options: nosniff`，防止浏览器把恶意文件当成同源网页或脚本执行。
 2. **轻量账本引用 vs 上游实时展开**：
    - 写进 `user_message`、`function_call_output` 或 `codemode_event` 的媒体块，只留一个干净的小指针：`{"type":"image","attachment_id":"att_<26位后缀>"}`。
-   - 只有当第 2 篇讲的 `JsonRows::ModelInput` 接力拼装上游 HTTP 请求体时，`media::wire_message` 才现从 `attachments` 里捞出二进制并编成 `data:{essence};base64,...`：
+   - 只有当准备发往上游模型时，`media::wire::model_input`（[src/media/wire.rs](../src/media/wire.rs)）才逐页把上下文序列化成 JSON 骨架、精准记下各 `data:{essence};base64,` 字段的插入字节偏移量，随后释放 SQLite 锁并借助 `AttachmentBlob::chunks` 按 **192 KiB** 帧（3 的倍数，适合无填充增量 Base64 编码）现读现编：
      - **`image`**：转成 OpenAI Responses API 的 `{"type":"input_image","image_url":"data:...","detail":"auto"}`；
      - **`audio` / `video`**：转成 `{"type":"input_file","filename":"attachment-{id}.{ext}","file_data":"data:..."}`，内部贴心把 `audio/mpeg`、`audio/x-wav`、`audio/mp4`、`video/quicktime` 等分别映射成 `.mp3`、`.wav`、`.m4a`、`.mov`；
      - **`codemode_event`**：在内容数组最前面自动插一块文本身份牌（`"Codemode <event> event from cm_<26位后缀> (sequence 1)."`），再把整条包成 `role: "user"` 消息喂给模型。
-3. **精准检查不误伤（`media::check_session`）**：
-   - 无论是点火开跑前（`calls::begin`）还是给会话换模型时，`check_session` 只翻**真正会送进模型输入槽位**的三处东西：① 已进 `context_items` 的消息/推理/图像生成结果；② 刚跑完还没归进上下文的 `function_call_output`；③ 门外还没收进来的有效 `pending` 输入。
+3. **精准检查与增量前缀缓存（`media::check_session` / `media::check_call_input`）**：
+   - 无论是点火开跑前（`calls::begin`）还是给会话换模型时，检查函数只翻**真正会送进模型输入槽位**的三处东西：① 已进 `context_items` 的消息/推理/图像生成结果；② 刚跑完还没归进上下文的 `function_call_output`；③ 门外还没收进来的有效 `pending` 输入。
    - 它**绝不乱翻工具名称、参数或普通 JSON 字符串**——脚本里打印了一句 `"image_url"` 纯文本，不会误判成会话带了图片模态。
+   - 并且为了避免几千条消息的长对话每次开轮都要从头扫一遍库，`calls::begin` 调用的是带缓存的 **`media::check_call_input`**：启动时在独占连接上建好连接级临时表 **`temp.checked_input`**（最多缓存 256 个会话，挂了 7 个 `context_items` / `items` / `attachments` 变更触发器，随事务/`savepoint` 同步回滚失效）记住某 `(sid, model, modalities, revision)` 已验过的 `context_items.position` 前缀，后续回合只增量检查新增上下文行、未归档工具输出与门外 `pending` 队列。
 
 ---
 

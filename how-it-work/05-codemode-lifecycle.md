@@ -29,14 +29,14 @@
 
 ## 快活当场结清，慢活打欠条转后台
 
-车间跑起来后，第一件事是跟当前 `step` 对账。模型发起一次 `codemode` 之后，在**怎么交还 `function_call_output`** 这一步一分为二（[src/codemode/mod.rs](../src/codemode/mod.rs#L759-L880)）：
+车间跑起来后，第一件事是跟当前 `step` 对账。模型发起一次 `codemode` 之后，在**怎么交还 `function_call_output`** 这一步一分为二（[src/codemode/mod.rs](../src/codemode/mod.rs#L837-L930)）：
 
 - **快活走前台**：默认（`background: false`）在当前 `step` 里先等等看。只要 **90 秒**（`FRONT_WAIT`）内跑完，最终输出直接写进配对的 `function_call_output`（此时 `codemode_call_item_id` 留空 `NULL`），当前 `step` 拿着完整答卷直接进下一轮，跟普通同步工具一模一样。
 - **慢活打欠条转后台**：只要满足“模型显式传了 `background: true`”或者“前台等满 **90 秒**还没交卷（且当前会话没收到硬暂停、进程没在关闭）”，程序就不再让当前 `step` 干陪着了——当场先写一张**后台收据**顶上 `function_call_output` 的坑位（告诉模型 `cm_<26位后缀>` 已转后台，状态 `background`，可以先干别的独立工作，要等结果就传 `{}` 调 `codemode_wait`），同时在这条结果行上盖一个特殊印章：**`codemode_call_item_id = "itm_<26位后缀>"`**。
 
 **`function_call_output` 上的 `codemode_call_item_id` 只管一件事：区分这笔工具结果交的是“最终答卷”，还是只打了张“后台欠条”。** 前台结清时它是 `NULL`；转后台打欠条时它指回原调用 `itm_<26位后缀>`。省掉这个印章，后面收到迟到结果或者崩溃重启翻账本时，光看见“已经有了一条 `function_call_output`”，程序根本分不清这单活是早就办完了，还是只打过欠条、还欠着真正的完工答卷！
 
-既然每个 `function_call` 唯一的 `function_call_output` 坑位已经被欠条占住了，退居后台的任务再想跟模型说话，就不能回头篡改旧收据，而是往 `items` 流水账里新记一种条目，叫 **`codemode_event`**（[schema.sql](../schema.sql#L102-L129)）。每笔事件用 `codemode_call_item_id` 指回原调用，带着递增序号 `sequence`（`1, 2, 3…`）和唯一索引防重，一共只记三类事：
+既然每个 `function_call` 唯一的 `function_call_output` 坑位已经被欠条占住了，退居后台的任务再想跟模型说话，就不能回头篡改旧收据，而是往 `items` 流水账里新记一种条目，叫 **`codemode_event`**（[schema.sql](../schema.sql#L104-L132)）。每笔事件用 `codemode_call_item_id` 指回原调用，带着递增序号 `sequence`（`1, 2, 3…`）和唯一索引防重，一共只记三类事：
 
 1. **`message`**：脚本中途调 `emitEvent(...)` 主动报信。为防死循环刷爆信箱，带了双重背压限流：单任务一个**令牌桶**（初始和上限 **8 个**令牌，每秒回充 **1 个**，且事务 `COMMIT` 成功才扣令牌），同时整场会话门外排队未读的 `message` **最多 128 条**。
 2. **`lease_warning`**：租期快到时的催单提醒。
@@ -53,12 +53,12 @@
 **共通的前半截**：
 - 都不去打断半路正在流式输出的 `step`，而是老老实实落进 `items` 流水账、排在 `input_queue_cursor` 后面等着；
 - 等当前 `step` 收尾开下一轮时，由 `take_pending` 从 `pending` 视图按 `items.id` 发生先后一视同仁地收进 `context_items` 上下文；
-- 在 [第 3 篇](03-catalog-media-and-billing.md) 的 `wire_message` 里，`codemode_event` 会在内容开头自动插一块身份牌（`"Codemode <event> event from cm_<26位后缀> (sequence N)."`），然后包装成一条 `role: "user"` 消息送去上游模型；
+- 在 [第 3 篇](03-catalog-media-and-billing.md) 的 `media::wire::model_input`（[src/media/wire.rs](../src/media/wire.rs)）里，`codemode_event` 会在内容数组开头自动插一块身份牌（`"Codemode <event> event from cm_<26位后缀> (sequence N)."`），然后包装成一条 `role: "user"` 消息送去上游模型；
 - 要是门外剩下的全是被撤回的消息或作废的提醒、`has_pending` 检查一圈发现没活可取，也会顺手把 `input_queue_cursor` 往前推过这批废单，省得次次重扫。
 
 **从哪一步开始分叉？分叉在两处：**
 
-1. **第一处分叉在“会话睡着时点不点火”与“多节点任务占位”**：用户往停着的会话发消息，“投信”和“点火”是分开的，得人工调 `PUT /sessions/{sid}/run` 才开工；可后台脚本半夜跑完交卷时，模型早就结束回合睡进 `idle` 了，外面没人替它点开关。所以只要新落盘的 `codemode_event` 带着 `notify = true`（且进程没关闭、会话没有活动 worker），宿主就会先登记 `pending_wakes` 占位并自动调 **`app.wake(sid)`**（[src/agent.rs](../src/agent.rs#L58-L92)）把会话拉起来开跑下一轮。在多节点集群里，**只要本机还有未收尾的后台任务或正处于 `pending_wakes` 唤醒交接中，哪怕 `sessions.status` 已经退回 `idle`，`PresenceState` 照样算该节点“正占有此会话”**——全网 `runner_node_id` 会一直挂在这台机器上，不准别的节点并发抢跑或删会话（直接返回 `409 Conflict`），直到任务全退光或被杀掉才清零；同样，`wake` 自己也会先检查 `remote_owner`，绝不越权抢跑别的节点已经接手的会话。**但 `wake` 比手动 `/run` 克制得多**：要是会话正停在 `paused`（比如用户手动暂停或上次报了错），事件只安静进队排队，**绝不越权替用户解开暂停**；反过来，要是会话原本在 `idle`、自动唤醒时却发现当时选的模型已经被归档了，[src/agent.rs](../src/agent.rs#L65-L79) 会把会话切到 `paused` 并写明原因，免得事件卡在 `idle` 里装死。
+1. **第一处分叉在“会话睡着时点不点火”与“多节点任务占位”**：用户往停着的会话发消息，“投信”和“点火”是分开的，得人工调 `PUT /sessions/{sid}/run` 才开工；可后台脚本半夜跑完交卷时，模型早就结束回合睡进 `idle` 了，外面没人替它点开关。所以只要新落盘的 `codemode_event` 带着 `notify = true`（且进程没关闭、会话没有活动 worker），宿主就会先登记 `pending_wakes` 占位并自动调 **`app.wake(sid)`**（[src/agent.rs](../src/agent.rs#L73-L137)）把会话拉起来开跑下一轮。在多节点集群里，**只要本机还有未收尾的后台任务或正处于 `pending_wakes` 唤醒交接中，哪怕 `sessions.status` 已经退回 `idle`，`PresenceState` 照样算该节点“正占有此会话”**——全网 `runner_node_id` 会一直挂在这台机器上，不准别的节点并发抢跑或删会话（直接返回 `409 Conflict`），直到任务全退光或被杀掉才清零；同样，`wake` 自己也会先检查 `remote_owner`，绝不越权抢跑别的节点已经接手的会话。**但 `wake` 比手动 `/run` 克制得多**：要是会话正停在 `paused`（比如用户手动暂停或上次报了错），事件只安静进队排队，**绝不越权替用户解开暂停**；反过来，要是会话原本在 `idle`、自动唤醒时却发现当时选的模型已经被归档了，[src/agent.rs](../src/agent.rs#L85-L120) 会把会话切到 `paused` 并写明原因，免得事件卡在 `idle` 里装死。
 2. **第二处分叉在“门外未读的信怎么作废”**：用户消息靠 `withdrawal` 撤回，过期租期提醒靠下面要讲的 `invalidated_warnings` 作废表跳过。
 
 ---
@@ -71,7 +71,7 @@
 
 拿它跟前面“前台 `codemode` 默认等 90 秒”并排对比：
 - **前半截完全共通**：都是在当前 `step` 里先扣住一条 `function_call_output` 不交账。只要它还没交账，整个 Agent 循环（`run_loop`）就稳稳停在当前 `step` 原地不动；会话状态照旧维持 `running`——**根本不需要给 `sessions.status` 硬造第五个 `waiting` 状态**，因为等待期间用户插话照样在门外排队、点暂停照样能停、崩溃重启照样按未完工具收残局，所有转移规矩跟 `running` 严丝合缝！
-- **它真正分叉在“进门查什么”和“什么信号能叫醒它”**（[src/codemode/mod.rs](../src/codemode/mod.rs#L503-L692)）：
+- **它真正分叉在“进门查什么”和“什么信号能叫醒它”**（[src/codemode/mod.rs](../src/codemode/mod.rs#L574-L761)）：
 
 ```
 进入 Wait::poll（在 SQLite 记账线程上原子判定，严格按以下优先级）：
@@ -118,13 +118,13 @@
 
 ## 限时工位、续命催单与“三秒等遗言”
 
-允许脚本常驻后台，就必须防它写个死循环永远赖在车间里。所以每个 `codemode` 任务出生自带 **2 小时（7200 秒）** 租期（[src/codemode/mod.rs](../src/codemode/mod.rs#L38-L44)）：
+允许脚本常驻后台，就必须防它写个死循环永远赖在车间里。所以每个 `codemode` 任务出生自带 **2 小时（7200 秒）** 租期（[src/codemode/mod.rs](../src/codemode/mod.rs#L42-L46)）：
 
 - **双档催单提醒**：看门协程的 `tick()` 盯着到期表，离到期只剩 **1 小时（3600s）** 和 **15 分钟（900s）** 时各往门外投一封 `lease_warning`（带着触发的 `threshold_seconds`）叫醒模型：
   - 模型觉得还需要跑，就调 **`codemode_task_renew`** 把剩余租期从当下重置成 **1 秒到 24 小时（86400s）**（系统自动按新剩余时长重新计算下一个提醒档位）；
   - 不需要了就调 **`codemode_task_kill`** 掐掉；
   - 置之不理，到点就自动按 `expired` 断电。
-- **门外作废表 `invalidated_warnings`**：如果剩 1 小时的提醒刚排进门外信箱、模型还没来得及读，任务自己跑完了或者模型刚续过命，下一轮把过期的“快到期了”喂给模型只会干扰判断。但流水账又只增不删、进过上下文的更不能改——所以程序单设了一张 **`invalidated_warnings`** 表（[schema.sql](../schema.sql#L131-L133)）。**它只管把“还在门外（`id > input_queue_cursor`）、没进过上下文的 `lease_warning`”标成作废。** 任务一续租、一结清或重启，门外未读提醒就进这张表，`pending` 视图自动绕过它，就像绕过被 `withdrawal` 撤回的用户消息一样。
+- **门外作废表 `invalidated_warnings`**：如果剩 1 小时的提醒刚排进门外信箱、模型还没来得及读，任务自己跑完了或者模型刚续过命，下一轮把过期的“快到期了”喂给模型只会干扰判断。但流水账又只增不删、进过上下文的更不能改——所以程序单设了一张 **`invalidated_warnings`** 表（[schema.sql](../schema.sql#L133-L135)）。**它只管把“还在门外（`id > input_queue_cursor`）、没进过上下文的 `lease_warning`”标成作废。** 任务一续租、一结清或重启，门外未读提醒就进这张表，`pending` 视图自动绕过它，就像绕过被 `withdrawal` 撤回的用户消息一样。
 
 **`codemode_task_kill` 里也藏着一个防止回声的小机关（“三秒等遗言”）**：
 模型下令 `kill` 停掉一个任务时，工具拉下取消闸门后不会扭头就走，而是原地最多等 **3 秒（`KILL_WAIT`）**：
@@ -140,7 +140,7 @@
 1. **软暂停**：只拦下一步不打断当前 `step`。正在等的前台 `codemode` 照旧等（满 90 秒照样打欠条转后台），后台任务更完全不受打扰（即使途中报信也只进队列排队，绝不唤醒 `paused` 会话）。但 **`codemode_wait` 一听到软暂停立刻收工**返回 `"session pausing"`；若挂着 `trigger_code` 探针，先拉闸等它把子进程清净、丢弃输出再交账。
 2. **硬暂停**：一边掐断模型流，一边把该会话名下全部前后台任务统一按 `killed` 拉闸，同时 `can_detach` 锁死，**绝不让刚好踩到 90 秒线的前台任务趁乱转后台**。前台 `codemode` 与 `codemode_wait` 当场松手让 `run_loop` 由 `publish_tools(..., recovering=true)` 补上 `"Execution interrupted; result unknown."` 停进 `paused`；等虚拟机在后台慢吞吞把子进程组拆干净回来交差时，`complete()` 检查 `original_pending` 发现原调用早被结清了，就安静摘牌退出，绝不写重账。
 3. **优雅退出**：第一步前 5 秒给活动会话发软暂停（正卡在 `codemode_wait` 的会话立刻脱身），同时**先把所有后台 `codemode` 任务按 `interrupted` 停掉**（前台脚本留 5 秒看能不能跟着当前 `step` 收完尾）；如果哪个原本睡在 `idle` 的会话因为断了后台任务受影响，顺手把它标成 `paused`（`"background task interrupted by shutdown"`）留痕；5 秒还没退完切第二步，剩下的前台任务和会话全部按硬暂停掐断再等 5 秒。
-4. **崩溃恢复（`ledger::recover`）**：强杀或断电重启后，内存里的所有车间和进程全没了，启动事务一口气收三摊残局（并且前两摊先对照 `sync_commits` 的最近 `author_node_id`，**只认当前本机节点写出的记录**，绝不误伤集群其他节点仍在跑的任务；所有恢复改动都会补记 `session_delta` 提交同步给同伴）：
+4. **崩溃恢复（`ledger::recover`）**：强杀或断电重启后，内存里的所有车间和进程全没了，启动事务一口气收三摊残局（直接按行上的 **`origin_node_id`** 过滤只认当前本机节点写出的记录，绝不误伤集群其他节点仍在跑的任务；单机下 `known_peer_count == 0` 且无冲突可写时当场补记 `session_delta` 同步提交，而**多节点下先把待恢复会话头记进 `deferred_crash_sessions`**，等后台 `deferred_recovery_loop` 凑齐多数派租约并核对最新头未变后再安全落盘同步，详见 [第 1 篇](01-agent-loop.md)）：
    - **第一摊**：把全库所有本机产出、门外未读的 `lease_warning` 全塞进 `invalidated_warnings` 作废——因为本机重启后没有哪个租期还活着；
    - **第二摊**：顺着 `codemode_receipts` 索引找出所有本机打过后台欠条（`codemode_call_item_id IS NOT NULL`）却还没等来 `completed` 事件的任务，挨个补写一笔 `"Daemon restarted; result unknown."`（`status: "interrupted"`）的 `completed` 事件，并把对应会话标成 `paused`——跟普通工具一样，绝不擅自重跑可能已产生的副作用；
    - **第三摊**：万一崩溃刚好卡在“后台事件刚写库提交，但 `app.wake` 还没来得及把 `idle` 会话拉起来”的那一微秒，就把这些门外压着未读 `codemode_event` 却仍停在 `idle` 的会话也统一标成 `paused`（`"daemon restarted with pending codemode events"`），等你下次点 `/run` 接手，绝不让事件沉底装死。

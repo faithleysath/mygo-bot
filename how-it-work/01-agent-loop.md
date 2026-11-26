@@ -35,16 +35,16 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 流水账 items（按发生顺序只增不删）          上下文 context_items（按 position 排齐喂模型）
   #1  user_message（老问题）        ───▶    pos 1 -> #1
   #2  assistant_message             ───▶    pos 2 -> #2
-  #3  function_call (A)             ───▶    pos 3 -> #3
-  #4  function_call (B)                     （等 B 返回后按调用序成对归档）
+  #3  function_call (A)                     （等整批工具返回后按调用序成对归档）
+  #4  function_call (B)
   #5  function_call_output (B先完)  ───┐
   #6  user_message（排队的插话）            （门外排队，本步不收）
   #7  user_message（误发）                  （被 #8 撤回，永不进上下文）
   #8  withdrawal -> target_id=#7
-  #9  function_call_output (A后完)  ───┴─▶  pos 4 -> #4, pos 5 -> #9, pos 6 -> #3?（先 A 后 B：#3->#9, #4->#5）
+  #9  function_call_output (A后完)  ───┴─▶  pos 3 -> #3, pos 4 -> #9, pos 5 -> #4, pos 6 -> #5（先 A 后 B 成对归档）
 ```
 
-> **类型防伪边界**：流水账里的 `kind` 分为两类——模型产出的项（如 `assistant_message`、`reasoning`、`function_call`、`image_generation_call`）和宿主系统写入的项（`user_message`、`withdrawal`、`function_call_output`、`codemode_event`）。[src/model.rs](../src/model.rs#L452-L468) 在接收模型输出时，会自动把 `type="message"` 且 `role="assistant"` 归档为 `assistant_message`，同时明确拒收任何冒充系统保留类型的输出项，防止上游异常响应污染账本语义。
+> **类型防伪边界**：流水账里的 `kind` 分为两类——模型产出的项（如 `assistant_message`、`reasoning`、`function_call`、`image_generation_call`）和宿主系统写入的项（`user_message`、`withdrawal`、`function_call_output`、`codemode_event`）。[src/model.rs](../src/model.rs#L458-L473) 在接收模型输出时，会自动把 `type="message"` 且 `role="assistant"` 归档为 `assistant_message`，同时明确拒收任何冒充系统保留类型的输出项，防止上游异常响应污染账本语义。
 
 ---
 
@@ -98,7 +98,7 @@ MyGo-Bot 把整个会话引擎拆得非常干净：**先把账目和排队分开
 
 反过来，当一个 `step` 正常收完尾、且没调工具时，`needs_model` 清零为 `0`。之后会话停着时门外再投进新信，投信本身不动 `needs_model`（依然是 `0`）；等下次调 `PUT /run` 点火，程序调 `take_pending` 把新信收进上下文并推走 `input_queue_cursor` 时，才顺手把 `needs_model` 置回 `1`。
 
-至于门外到底还有哪些“有效待收的信”，全库统一认一张 SQLite 视图 **`pending`**（[schema.sql](../schema.sql#L142-L147)）：
+至于门外到底还有哪些“有效待收的信”，全库统一认一张 SQLite 视图 **`pending`**（[schema.sql](../schema.sql#L144-L149)）：
 - 它只看 `id > sessions.input_queue_cursor` 的门外条目；
 - 如果是 `user_message`，必须没有被 `withdrawal` 撤回；
 - 如果是 `codemode_event`，必须带有 `notify = true` 且没被记进 `invalidated_warnings` 作废表（见 [第 5 篇](05-codemode-lifecycle.md)）。
@@ -161,19 +161,19 @@ stateDiagram-v2
 
 自动重试**有点像软暂停**：已派出去的工具照样干完写进库、归进上下文，只是收尾后不是停进 `paused`，而是保持 `running` 带着这批新结果接着问模型。**最多重试 3 次**（加上初次请求总共 **4 次**尝试），只要中间成功了就把重试计数清零；连续失败到第 4 次还没过，就会报 `"retry limit reached: ..."` 停进 `paused`。
 
-### 2. 优雅退出（`src/agent.rs:185-219` + `src/main.rs:543-550`）
+### 2. 优雅退出（`src/agent.rs:464-498` + `src/main.rs:622-635`）
 
 进程收到 `SIGINT` 或 `SIGTERM`（Windows 为 Ctrl-C）时，走的是**两步连招**：
 1. 先把记账员的 `closing` 标志设为 `true`（从此拒绝新点火，返回 `503`），立刻停掉所有后台 `codemode` 任务，并给全部活动会话发**软暂停**（理由写 `"daemon shutting down"`），最多等 **5 秒**让各 `step` 体面收尾；
 2. 5 秒后如果还有会话或前台脚本没退完，立刻切第二步：把剩下的所有任务和会话全部按**硬暂停**掐断，再等最多 **5 秒**让工作协程把进程组和工具账结清；
 3. 最后关闭全部 MCP 连接；外层 HTTP 服务器还有 **6 秒**宽限排空在途请求，Tokio 运行时离开前再兜底等 **1 秒**（专门防挂在无响应网络磁盘上的阻塞文件读写拖死进程退出）。
 
-### 3. 崩溃恢复与 Schema 守门（`src/store.rs:80-150` + `src/codemode/ledger.rs:343-475`）
+### 3. 崩溃恢复与 Schema 守门（`src/store.rs:94-215` + `src/codemode/ledger.rs:392-543`）
 
 **崩溃恢复专门拿来跟硬暂停做对照：硬暂停是程序还醒着，能自己把残局结清；`SIGKILL` 强杀或直接断电，是连最后一次结账的机会都没给。**
 
 所以进程重新拉起、打开数据库 `Db::open` 时，只认 SQLite WAL 最后一次提交的事务，在一个启动事务里做三件事：
-1. **验库、对齐时钟水位、加载租约并认领身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 **`7`**，紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L117-L161)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`、预统计同伴人数 `known_peer_count` 与空附件标记，并把 `session_leases` 里尚存的最高 `term` 与已授出租约载回内存（详见 [第 2 篇](02-storage-and-concurrency.md)）；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
+1. **验库、对齐时钟水位、加载租约并认领身份**：如果库不是空库，会先校验 `PRAGMA user_version` 是否等于当前版本 **`8`**（相比 `v7` 将 `items_by_target` 升级为部分唯一索引），紧接着在任何恢复写入之前调用 `id::seed_from_db`（[src/store.rs](../src/store.rs#L116-L161)）将 ID 生成器推进到库里已提交的最大 ID 与 `input_queue_cursor` 之上，防止时钟回拨重启导致新 ID 倒退，同时初始化或读取本机节点身份 `local_node`、预统计同伴人数 `known_peer_count` 与空附件标记、把 `session_leases` 里尚存的最高 `term` 与已授出租约载回内存（详见 [第 2 篇](02-storage-and-concurrency.md)），并顺手初始化连接级临时证明表 `verified_tips` 与媒体校验前缀缓存 `checked_input`；因为尚处早期开发，不写兼容性迁移脚本，一旦发现是旧版不兼容库，直接拒绝启动并报错提示换新目录建库。
 2. **只按源节点 `origin_node_id` 截停与延迟同步恢复**：建表时每行 `llm_calls` 和 `items` 都记录着写下这行原始数据的 `origin_node_id`。启动恢复只把 `origin_node_id == local_node_id` 且仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`），把本机原先是 `'running'` 或 `'pausing'` 的会话统一标成 `'paused'`，同时交给 `codemode::ledger::recover` 也按 `origin_node_id` 过滤后处理未结清的后台任务与过期租期提醒（详见 [第 5 篇](05-codemode-lifecycle.md)）——既不会从旧提交 JSON 里误扫出别的节点的任务，也绝不会越权修改冲突未决或只有半份目录头的远端会话。**在多节点环境下，本地恢复不再一启动就盲写集群同步提交**（避免节点刚刚接管完成、旧节点重启又往旧分支写停机记录制造分叉），而是先把“待宣布恢复”的会话头快照记进 **`deferred_crash_sessions`**，等后台 **`deferred_recovery_loop`** 凑齐当前多数派租约并核对最新头未变后再安全落盘同步；单机下（`known_peer_count == 0`）且无冲突、可写完整的流则当场补记同步提交。
 3. **等人工重开才补未果工具**：注意启动恢复时**绝不会擅自重跑上次没回来的普通工具调用**——因为账上没记 `function_call_output`，只说明**结果没落盘**，推不出**工具当时没执行过**（比如发邮件、扣款）。重启后这些工具的空缺先留着，等你下次手动调 `PUT /sessions/{sid}/run` 恢复会话时，程序再翻流水账收残局，调用 `publish_tools(..., recovering=true)` 补上 `"Execution interrupted; result unknown."`。补齐残局后要不要接着问模型，又稳稳地回到前面那两个书签：先看 `needs_model`，再看 `pending` 队列，有活接着跑，没活切回 `idle`。
 
