@@ -50,6 +50,22 @@ impl Notice {
         }
     }
 
+    pub fn publish_serializable<T: Serialize>(
+        channel: &broadcast::Sender<Self>,
+        name: &'static str,
+        data: &T,
+    ) {
+        if channel.receiver_count() > 0
+            && let Ok(text) = serde_json::to_string(data)
+        {
+            let _ = channel.send(Self {
+                seq: NEXT_SEQ.fetch_add(1, Ordering::AcqRel),
+                name,
+                data: text.into(),
+            });
+        }
+    }
+
     fn into_event(self) -> Event {
         Event::default().event(self.name).data(self.data.as_ref())
     }
@@ -383,11 +399,11 @@ pub enum NextSessionNotice {
         event: Cow<'static, str>,
         data: Arc<str>,
     },
+    ClusterActive,
     Closed,
 }
 
 pub struct SessionEventStream {
-    app: App,
     sid: SessionId,
     _channel: broadcast::Sender<Notice>,
     rx: broadcast::Receiver<Notice>,
@@ -414,13 +430,16 @@ impl SessionEventStream {
                 };
                 let initial = s.session_view(info);
                 let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, sid)?;
-                let mut val = serde_json::json!(initial);
-                if let Some(obj) = val.as_object_mut() {
-                    obj.insert("history_rev".to_owned(), serde_json::json!(history_rev));
+                let mut payload = serde_json::to_string(&initial)
+                    .map_err(|e| crate::Error::internal(e.to_string()))?;
+                if payload.ends_with('}') {
+                    payload.pop();
+                    use std::fmt::Write;
+                    let _ = write!(payload, ",\"history_rev\":{history_rev}}}");
                 }
                 let channel = s.channel(sid);
                 let rx = channel.subscribe();
-                Ok(Some((channel, rx, val.to_string())))
+                Ok(Some((channel, rx, payload)))
             })
             .await?;
         let Some((channel, rx, initial_payload)) = opened else {
@@ -428,7 +447,6 @@ impl SessionEventStream {
         };
         let (delta_tx, delta_rx, snapshot, min_seq) = app.streams.subscribe_delta(sid);
         Ok(Some(Self {
-            app: app.clone(),
             sid,
             _channel: channel,
             rx,
@@ -457,10 +475,9 @@ impl SessionEventStream {
             .push_back((Cow::Borrowed(notice.name), notice.data));
     }
 
-    async fn resync_payload(&self) -> Arc<str> {
+    async fn resync_payload(&self, app: &App) -> Arc<str> {
         let sid = self.sid;
-        let rev = self
-            .app
+        let rev = app
             .db
             .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
             .await
@@ -468,13 +485,29 @@ impl SessionEventStream {
         Arc::from(json!({"history_rev": rev}).to_string())
     }
 
-    pub async fn next(&mut self) -> NextSessionNotice {
+    pub async fn next(&mut self, app: &App) -> NextSessionNotice {
+        self.next_inner(app, None).await
+    }
+
+    async fn next_or_cluster(
+        &mut self,
+        app: &App,
+        cluster_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> NextSessionNotice {
+        self.next_inner(app, Some(cluster_rx)).await
+    }
+
+    async fn next_inner(
+        &mut self,
+        app: &App,
+        mut cluster_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    ) -> NextSessionNotice {
         loop {
             if let Some((event, data)) = self.queued.pop_front() {
                 return NextSessionNotice::Event { event, data };
             }
             while self.delta_lagged {
-                if self.app.stopping.is_cancelled() {
+                if app.stopping.is_cancelled() {
                     return NextSessionNotice::Closed;
                 }
                 self.buffered_delta = None;
@@ -484,7 +517,7 @@ impl SessionEventStream {
                             self.push_notice(d);
                         }
                         Err(TryRecvError::Lagged(_)) => {
-                            let data = self.resync_payload().await;
+                            let data = self.resync_payload(app).await;
                             self.queued.push_back((Cow::Borrowed("resync"), data));
                         }
                         Err(TryRecvError::Closed) => {
@@ -499,7 +532,7 @@ impl SessionEventStream {
                 if let Some((event, data)) = self.queued.pop_front() {
                     return NextSessionNotice::Event { event, data };
                 }
-                let (recovery, new_min_seq) = self.app.streams.recovery(self.sid);
+                let (recovery, new_min_seq) = app.streams.recovery(self.sid);
                 self.min_seq = self.min_seq.max(new_min_seq);
                 let mut relagged = false;
                 while self.buffered_delta.is_none() && self.delta_open {
@@ -527,7 +560,7 @@ impl SessionEventStream {
                     Err(TryRecvError::Lagged(_)) => {
                         return NextSessionNotice::Event {
                             event: Cow::Borrowed("resync"),
-                            data: self.resync_payload().await,
+                            data: self.resync_payload(app).await,
                         };
                     }
                     Err(TryRecvError::Closed) => return NextSessionNotice::Closed,
@@ -578,7 +611,7 @@ impl SessionEventStream {
                         self.delta_lagged = true;
                         return NextSessionNotice::Event {
                             event: Cow::Borrowed("resync"),
-                            data: self.resync_payload().await,
+                            data: self.resync_payload(app).await,
                         };
                     }
                     Err(TryRecvError::Closed) => {
@@ -612,14 +645,32 @@ impl SessionEventStream {
             enum Incoming {
                 Durable(std::result::Result<Notice, RecvError>),
                 Delta(std::result::Result<Notice, RecvError>),
+                ClusterChanged(std::result::Result<(), tokio::sync::watch::error::RecvError>),
             }
-            let received = tokio::select! {
-                biased;
-                _ = self.app.stopping.cancelled() => return NextSessionNotice::Closed,
-                msg = self.rx.recv() => Incoming::Durable(msg),
-                msg = self.delta_rx.recv(), if self.delta_open => Incoming::Delta(msg),
+            let received = match cluster_rx.as_deref_mut() {
+                Some(rx_cluster) => tokio::select! {
+                    biased;
+                    _ = app.stopping.cancelled() => return NextSessionNotice::Closed,
+                    res = rx_cluster.changed() => Incoming::ClusterChanged(res),
+                    msg = self.rx.recv() => Incoming::Durable(msg),
+                    msg = self.delta_rx.recv(), if self.delta_open => Incoming::Delta(msg),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = app.stopping.cancelled() => return NextSessionNotice::Closed,
+                    msg = self.rx.recv() => Incoming::Durable(msg),
+                    msg = self.delta_rx.recv(), if self.delta_open => Incoming::Delta(msg),
+                },
             };
             match received {
+                Incoming::ClusterChanged(res) => {
+                    if let Some(rx_cluster) = cluster_rx.as_deref_mut()
+                        && res.is_ok()
+                        && *rx_cluster.borrow_and_update()
+                    {
+                        return NextSessionNotice::ClusterActive;
+                    }
+                }
                 Incoming::Durable(Ok(d)) => {
                     let (older, lagged) = take_older_deltas(
                         &mut self.buffered_delta,
@@ -642,7 +693,7 @@ impl SessionEventStream {
                     self.delta_lagged = true;
                     return NextSessionNotice::Event {
                         event: Cow::Borrowed("resync"),
-                        data: self.resync_payload().await,
+                        data: self.resync_payload(app).await,
                     };
                 }
                 Incoming::Durable(Err(RecvError::Closed)) => return NextSessionNotice::Closed,
@@ -713,34 +764,35 @@ pub async fn subscribe(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
-    let multi_node =
-        app.exec.presence().known_peer_count() > 0 || !app.cluster.net.online_peer_ids().is_empty();
+    let multi_node = app.exec.presence().known_peer_count() > 0;
     if multi_node {
         app.cluster.ensure_session_watched(sid).await?;
     }
     let mut local = SessionEventStream::open(&app, sid)
         .await?
         .ok_or_else(|| crate::Error::from(rusqlite::Error::QueryReturnedNoRows))?;
+    let mut cluster_rx = app.exec.presence().subscribe_cluster_active();
     let stream = async_stream::stream! {
         yield Ok(Event::default().event("ready").data(local.initial_payload()));
-        if !multi_node {
+        let mut snapshot_sent = false;
+        if !multi_node && !*cluster_rx.borrow_and_update() {
             if let Some(snap) = local.take_initial_snapshot() {
                 yield Ok(Event::default().event("stream.snapshot").data(snap.as_ref()));
             }
+            snapshot_sent = true;
             loop {
-                let ev = tokio::select! {
-                    biased;
-                    _ = app.stopping.cancelled() => break,
-                    ev = local.next() => ev,
-                };
-                match ev {
+                match local.next_or_cluster(&app, &mut cluster_rx).await {
                     NextSessionNotice::Event { event, data } => {
                         yield Ok(Event::default().event(event).data(data.as_ref()));
                     }
-                    NextSessionNotice::Closed => break,
+                    NextSessionNotice::Closed => return,
+                    NextSessionNotice::ClusterActive => break,
                 }
             }
-            return;
+        }
+        drop(cluster_rx);
+        if !multi_node {
+            let _ = app.cluster.ensure_session_watched(sid).await;
         }
         let mut runner_rx = app.exec.presence().watch_remote_runner(sid);
         let mut relay: Option<ActiveRelay> = None;
@@ -751,7 +803,7 @@ pub async fn subscribe(
             relay = Some(ActiveRelay { peer_id, cancel, rx });
             seen = Some(SeenSavedItems::new());
             local.take_initial_snapshot();
-        } else if let Some(snap) = local.take_initial_snapshot() {
+        } else if !snapshot_sent && let Some(snap) = local.take_initial_snapshot() {
             yield Ok(Event::default().event("stream.snapshot").data(snap.as_ref()));
         } else {
             local.take_initial_snapshot();
@@ -771,20 +823,20 @@ pub async fn subscribe(
                     _ = app.stopping.cancelled() => break,
                     ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
                     ev = active.rx.recv() => SseTurn::Relayed(ev),
-                    ev = local.next() => SseTurn::Local(ev),
+                    ev = local.next(&app) => SseTurn::Local(ev),
                 },
                 (None, Some(deadline)) => tokio::select! {
                     biased;
                     _ = app.stopping.cancelled() => break,
                     ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
                     _ = tokio::time::sleep_until(deadline) => SseTurn::RetryTimer,
-                    ev = local.next() => SseTurn::Local(ev),
+                    ev = local.next(&app) => SseTurn::Local(ev),
                 },
                 (None, None) => tokio::select! {
                     biased;
                     _ = app.stopping.cancelled() => break,
                     ch = runner_rx.changed() => SseTurn::RunnerChanged(ch),
-                    ev = local.next() => SseTurn::Local(ev),
+                    ev = local.next(&app) => SseTurn::Local(ev),
                 },
             };
             match turn {
@@ -857,6 +909,7 @@ pub async fn subscribe(
                         yield Ok(Event::default().event(event).data(data.as_ref()));
                     }
                 }
+                SseTurn::Local(NextSessionNotice::ClusterActive) => continue,
                 SseTurn::Local(NextSessionNotice::Closed) => break,
             }
         }

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fs::OpenOptions,
     path::Path,
@@ -289,8 +290,17 @@ impl Db {
         content: Value,
         key: Option<String>,
     ) -> Result<Enqueued> {
-        self.enqueue_with_attachments(sid, content, key, Vec::new())
-            .await
+        self.write(
+            move |conn| Enqueue { sid, content, key }.insert(conn),
+            move |store, saved| {
+                if let Enqueued::Created(id) = saved {
+                    store.wake_waiters(sid);
+                    store.item_saved(sid, id)?;
+                }
+                Ok(saved)
+            },
+        )
+        .await
     }
 
     pub async fn enqueue_with_attachments(
@@ -573,10 +583,10 @@ impl Store {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT id,kind,payload,target_id,llm_call_id FROM items WHERE id=?",
             )?;
-            Notice::publish(
+            Notice::publish_serializable(
                 &channel,
                 "item.saved",
-                json!(stmt.query_row([id], history_row)?),
+                &stmt.query_row([id], history_row)?,
             );
         }
         Ok(())
@@ -627,17 +637,17 @@ impl Store {
         self.presence.is_local_lease_valid(sid)
     }
 
-    pub fn effective_runner_node_id(&self, sid: SessionId) -> Option<String> {
+    pub fn effective_runner_node_id(&self, sid: SessionId) -> Option<Cow<'_, str>> {
         if self.active.contains_key(&sid)
             || self.pending_wakes.contains(&sid)
             || crate::codemode::has_session_tasks(self, sid)
         {
-            return Some(self.local_node_id.clone());
+            return Some(Cow::Borrowed(&self.local_node_id));
         }
         if self.presence.known_peer_count() == 0 {
             return None;
         }
-        self.presence.remote_owner(sid).map(|(id, _)| id)
+        self.presence.remote_owner(sid).map(|(id, _)| Cow::Owned(id))
     }
 
     pub fn session_view(&self, mut s: Session) -> Session {
@@ -667,6 +677,13 @@ impl Store {
     }
 
     pub fn refresh_local_presence(&self, sid: SessionId) {
+        if self.presence.known_peer_count() == 0 && !self.presence.has_any_local_state() {
+            return;
+        }
+        self.force_refresh_local_presence(sid);
+    }
+
+    pub fn force_refresh_local_presence(&self, sid: SessionId) {
         let active = self.active.contains_key(&sid) || self.pending_wakes.contains(&sid);
         let active_tasks = crate::codemode::count_session_tasks(self, sid);
         if !active && active_tasks == 0 {
@@ -694,6 +711,9 @@ impl Store {
         reason: &str,
         updated_at: i64,
     ) {
+        if self.presence.known_peer_count() == 0 && !self.presence.has_any_local_state() {
+            return;
+        }
         let active = self.active.contains_key(&sid) || self.pending_wakes.contains(&sid);
         let active_tasks = crate::codemode::count_session_tasks(self, sid);
         if !active && active_tasks == 0 {
@@ -717,29 +737,57 @@ impl Store {
     }
 
     pub fn notify_status(&self, sid: SessionId, state: &str, reason: &str, updated_at: i64) {
+        let channel = self
+            .channels
+            .get(&sid)
+            .and_then(|w| w.upgrade())
+            .filter(|ch| ch.receiver_count() > 0);
+        let has_global = self.global_events.receiver_count() > 0;
+        if channel.is_none() && !has_global {
+            return;
+        }
+        #[derive(serde::Serialize)]
+        struct StatusNotice<'a> {
+            status: &'a str,
+            reason: &'a str,
+            updated_at: i64,
+            runner_node_id: Option<&'a str>,
+        }
+        #[derive(serde::Serialize)]
+        struct GlobalStatusNotice<'a> {
+            id: SessionId,
+            status: &'a str,
+            reason: &'a str,
+            updated_at: i64,
+            runner_node_id: Option<&'a str>,
+        }
         let runner_node_id = self.effective_runner_node_id(sid);
-        if let Some(channel) = self.channels.get(&sid).and_then(|w| w.upgrade()) {
-            Notice::publish(
+        let runner_ref = runner_node_id.as_deref();
+        if let Some(channel) = channel {
+            Notice::publish_serializable(
                 &channel,
                 "session.status",
-                json!({
-                    "status": state,
-                    "reason": reason,
-                    "updated_at": updated_at,
-                    "runner_node_id": runner_node_id,
-                }),
+                &StatusNotice {
+                    status: state,
+                    reason,
+                    updated_at,
+                    runner_node_id: runner_ref,
+                },
             );
         }
-        self.publish_global(
-            "session.status",
-            json!({
-                "id": sid,
-                "status": state,
-                "reason": reason,
-                "updated_at": updated_at,
-                "runner_node_id": runner_node_id,
-            }),
-        );
+        if has_global {
+            Notice::publish_serializable(
+                &self.global_events,
+                "session.status",
+                &GlobalStatusNotice {
+                    id: sid,
+                    status: state,
+                    reason,
+                    updated_at,
+                    runner_node_id: runner_ref,
+                },
+            );
+        }
     }
 }
 

@@ -110,6 +110,22 @@ impl ActiveLease {
     }
 }
 
+#[derive(Clone)]
+pub enum LocalLease {
+    Quorum(Arc<ActiveLease>),
+    ForcedOffline,
+}
+
+impl LocalLease {
+    fn active_term(&self) -> Option<u64> {
+        match self {
+            Self::Quorum(l) if l.is_valid() => Some(l.term),
+            Self::ForcedOffline => Some(0),
+            Self::Quorum(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LocalClaimPhase {
     Probing,
@@ -142,16 +158,19 @@ struct PresenceInner {
     local_claims: HashMap<SessionId, LocalClaim>,
     granted_leases: HashMap<SessionId, GrantedLease>,
     highest_terms: HashMap<SessionId, u64>,
-    active_local_leases: HashMap<SessionId, Arc<ActiveLease>>,
+    active_local_leases: HashMap<SessionId, LocalLease>,
     session_watchers: HashMap<SessionId, watch::Sender<Option<String>>>,
 }
 
 pub struct PresenceState {
     local_node_id: Mutex<String>,
     known_peer_count: AtomicUsize,
+    local_nonempty: AtomicBool,
     has_null_attachments: AtomicBool,
     deferred_recovery_pending: AtomicBool,
     recovery_notify: Notify,
+    membership_grew_notify: Notify,
+    cluster_active_tx: watch::Sender<bool>,
     inner: Mutex<PresenceInner>,
     local_changed: Notify,
 }
@@ -186,12 +205,16 @@ impl PresenceState {
         let mut raw = [0u8; 8];
         let _ = getrandom::fill(&mut raw);
         let instance_id = u64::from_le_bytes(raw).max(1);
+        let (cluster_active_tx, _) = watch::channel(false);
         Arc::new(Self {
             local_node_id: Mutex::new(String::new()),
             known_peer_count: AtomicUsize::new(0),
+            local_nonempty: AtomicBool::new(false),
             has_null_attachments: AtomicBool::new(false),
             deferred_recovery_pending: AtomicBool::new(false),
             recovery_notify: Notify::new(),
+            membership_grew_notify: Notify::new(),
+            cluster_active_tx,
             inner: Mutex::new(PresenceInner {
                 instance_id,
                 local_seq: 1,
@@ -217,11 +240,32 @@ impl PresenceState {
     }
 
     pub fn set_known_peer_count(&self, count: usize) {
-        self.known_peer_count.store(count, Ordering::Release);
+        let prev = self.known_peer_count.swap(count, Ordering::AcqRel);
+        if (prev == 0) != (count == 0) {
+            let _ = self.cluster_active_tx.send(count > 0);
+        }
+        if count > prev {
+            self.membership_grew_notify.notify_one();
+        }
     }
 
     pub fn known_peer_count(&self) -> usize {
         self.known_peer_count.load(Ordering::Acquire)
+    }
+
+    pub fn subscribe_cluster_active(&self) -> watch::Receiver<bool> {
+        self.cluster_active_tx.subscribe()
+    }
+
+    pub fn has_any_local_state(&self) -> bool {
+        self.local_nonempty.load(Ordering::Acquire)
+    }
+
+    fn update_local_nonempty_locked(&self, inner: &PresenceInner) {
+        self.local_nonempty.store(
+            !inner.local.is_empty() || !inner.active_local_leases.is_empty(),
+            Ordering::Release,
+        );
     }
 
     pub fn set_has_null_attachments(&self, v: bool) {
@@ -278,32 +322,69 @@ impl PresenceState {
     }
 
     pub fn set_active_local_lease(&self, sid: SessionId, lease: Arc<ActiveLease>) {
-        let mut inner = self.inner.lock().unwrap();
-        let cur = inner.highest_terms.entry(sid).or_insert(0);
-        *cur = (*cur).max(lease.term);
-        inner.active_local_leases.insert(sid, lease);
+        let prev = {
+            let mut inner = self.inner.lock().unwrap();
+            let cur = inner.highest_terms.entry(sid).or_insert(0);
+            *cur = (*cur).max(lease.term);
+            let old = inner
+                .active_local_leases
+                .insert(sid, LocalLease::Quorum(lease));
+            self.update_local_nonempty_locked(&inner);
+            old
+        };
+        if let Some(LocalLease::Quorum(old_l)) = prev {
+            old_l.stopped.cancel();
+        }
+    }
+
+    pub fn set_active_local_forced_offline(&self, sid: SessionId) {
+        let prev = {
+            let mut inner = self.inner.lock().unwrap();
+            let old = inner
+                .active_local_leases
+                .insert(sid, LocalLease::ForcedOffline);
+            self.update_local_nonempty_locked(&inner);
+            old
+        };
+        if let Some(LocalLease::Quorum(old_l)) = prev {
+            old_l.stopped.cancel();
+        }
     }
 
     pub fn clear_active_local_lease(&self, sid: SessionId, claim_id: &str) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(cur) = inner.active_local_leases.get(&sid)
+        if let Some(LocalLease::Quorum(cur)) = inner.active_local_leases.get(&sid)
             && cur.claim_id == claim_id
+            && let Some(LocalLease::Quorum(lease)) = inner.active_local_leases.remove(&sid)
         {
-            let lease = inner.active_local_leases.remove(&sid).unwrap();
+            self.update_local_nonempty_locked(&inner);
+            drop(inner);
             lease.stopped.cancel();
         }
     }
 
     pub fn active_local_lease(&self, sid: SessionId) -> Option<Arc<ActiveLease>> {
+        let inner = self.inner.lock().unwrap();
+        match inner.active_local_leases.get(&sid) {
+            Some(LocalLease::Quorum(l)) => Some(l.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn active_local_lease_kind(&self, sid: SessionId) -> Option<LocalLease> {
         self.inner.lock().unwrap().active_local_leases.get(&sid).cloned()
     }
 
     pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
+        if self.known_peer_count.load(Ordering::Acquire) == 0 {
+            return true;
+        }
         let inner = self.inner.lock().unwrap();
-        inner
-            .active_local_leases
-            .get(&sid)
-            .is_none_or(|l| l.is_valid())
+        match inner.active_local_leases.get(&sid) {
+            Some(LocalLease::Quorum(l)) => l.is_valid(),
+            Some(LocalLease::ForcedOffline) => true,
+            None => false,
+        }
     }
 
     pub fn observe_remote_term(&self, sid: SessionId, term: u64) {
@@ -369,19 +450,17 @@ impl PresenceState {
             let mut inner = self.inner.lock().unwrap();
             let unchanged = inner.local.get(&sid) == next.as_ref();
             let cleared = if next.is_none() {
-                if let Some(l) = inner.active_local_leases.get(&sid)
-                    && !l.revoked.is_cancelled()
-                {
-                    inner.active_local_leases.remove(&sid)
-                } else {
-                    None
+                match inner.active_local_leases.get(&sid) {
+                    Some(LocalLease::Quorum(l)) if !l.revoked.is_cancelled() => {
+                        inner.active_local_leases.remove(&sid)
+                    }
+                    Some(LocalLease::ForcedOffline) => inner.active_local_leases.remove(&sid),
+                    _ => None,
                 }
             } else {
                 None
             };
-            if unchanged {
-                (false, cleared)
-            } else {
+            if !unchanged {
                 match next {
                     Some(occ) => {
                         inner.local.insert(sid, occ);
@@ -391,10 +470,11 @@ impl PresenceState {
                     }
                 }
                 inner.local_seq = inner.local_seq.saturating_add(1);
-                (true, cleared)
             }
+            self.update_local_nonempty_locked(&inner);
+            (!unchanged, cleared)
         };
-        if let Some(lease) = cleared_lease {
+        if let Some(LocalLease::Quorum(lease)) = cleared_lease {
             lease.stopped.cancel();
         }
         if changed && self.known_peer_count.load(Ordering::Acquire) > 0 {
@@ -451,7 +531,7 @@ impl PresenceState {
             }
         }
         if let Some(lease) = inner.active_local_leases.get(&sid)
-            && lease.is_valid()
+            && lease.active_term().is_some()
         {
             return Some((local_id, false));
         }
@@ -585,7 +665,7 @@ impl PresenceState {
             ));
         }
         if let Some(lease) = inner.active_local_leases.get(&sid)
-            && lease.is_valid()
+            && lease.active_term().is_some()
         {
             return Err(("session is already running on this node".to_owned(), false));
         }
@@ -638,13 +718,15 @@ impl PresenceState {
                 highest_term: cur_term,
             };
         }
-        if let Some(lease) = inner.active_local_leases.get(&sid)
-            && lease.is_valid()
+        if let Some(term) = inner
+            .active_local_leases
+            .get(&sid)
+            .and_then(LocalLease::active_term)
         {
             return GrantOutcome::Occupied {
                 holder: local_id,
                 by_claim: false,
-                highest_term: cur_term.max(lease.term),
+                highest_term: cur_term.max(term),
             };
         }
         let same_holder = inner
@@ -729,24 +811,58 @@ impl PresenceState {
         claim_id: &str,
         term: u64,
         ttl_ms: u64,
+        local_occupied: bool,
+        remote_occupied: bool,
     ) -> std::result::Result<i64, u64> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         Self::prune_expired_claims_locked(&mut inner, now);
         let cur_term = inner.highest_terms.get(&sid).copied().unwrap_or(0);
-        if term < cur_term {
-            return Err(cur_term);
-        }
-        let Some(gl) = inner.granted_leases.get_mut(&sid) else {
-            return Err(cur_term);
-        };
-        if gl.holder_node_id != peer_id || gl.claim_id != claim_id || gl.term != term {
-            return Err(cur_term.max(gl.term));
-        }
         let clamped_ms = ttl_ms.clamp(2_000, 30_000);
-        gl.committed = true;
-        gl.expires_at = now + Duration::from_millis(clamped_ms);
-        Ok(chrono::Utc::now().timestamp_millis() + i64::try_from(clamped_ms).unwrap_or(10_000))
+        let expires_at = now + Duration::from_millis(clamped_ms);
+        let expires_at_ms =
+            chrono::Utc::now().timestamp_millis() + i64::try_from(clamped_ms).unwrap_or(10_000);
+
+        if let Some(gl) = inner.granted_leases.get_mut(&sid) {
+            if term < cur_term
+                || gl.holder_node_id != peer_id
+                || gl.claim_id != claim_id
+                || gl.term != term
+            {
+                return Err(cur_term.max(gl.term));
+            }
+            gl.committed = true;
+            gl.expires_at = expires_at;
+            return Ok(expires_at_ms);
+        }
+
+        // Newly joined peer can adopt an active remote runner's live term when locally free and higher than cur_term.
+        if term == 0
+            || term <= cur_term
+            || claim_id.is_empty()
+            || local_occupied
+            || remote_occupied
+            || inner.local_claims.contains_key(&sid)
+            || inner
+                .active_local_leases
+                .get(&sid)
+                .and_then(LocalLease::active_term)
+                .is_some()
+        {
+            return Err(cur_term);
+        }
+        inner.highest_terms.insert(sid, term);
+        inner.granted_leases.insert(
+            sid,
+            GrantedLease {
+                term,
+                holder_node_id: peer_id.to_owned(),
+                claim_id: claim_id.to_owned(),
+                expires_at,
+                committed: true,
+            },
+        );
+        Ok(expires_at_ms)
     }
 
     pub fn promote_local_claim_to_committing(
@@ -1088,19 +1204,23 @@ struct AcquiredLeaseGate {
     expected_head: Option<StreamHead>,
     lease: Option<Arc<ActiveLease>>,
     granted_peers: Vec<String>,
-    quorum: usize,
     claim_guard: Option<ClaimReleaseGuard>,
 }
 
 pub struct DeleteGateGuard {
     expected_head: Option<StreamHead>,
+    lease: Option<Arc<ActiveLease>>,
     guard: Option<ClaimReleaseGuard>,
-    _lock: OwnedMutexGuard<()>,
+    _lock: Option<OwnedMutexGuard<()>>,
 }
 
 impl DeleteGateGuard {
     pub fn expected_head(&self) -> Option<StreamHead> {
         self.expected_head.clone()
+    }
+
+    pub fn lease(&self) -> Option<Arc<ActiveLease>> {
+        self.lease.clone()
     }
 
     pub async fn release_now(mut self) {
@@ -1122,6 +1242,7 @@ pub struct ExecPlane {
     peer_sync_wake: Arc<Notify>,
     pending_peer_sync: Mutex<HashSet<String>>,
     acked_presence: Mutex<HashMap<String, u64>>,
+    app_slot: Mutex<Option<App>>,
     self_weak: OnceLock<Weak<ExecPlane>>,
 }
 
@@ -1146,13 +1267,15 @@ impl ExecPlane {
             peer_sync_wake: Arc::new(Notify::new()),
             pending_peer_sync: Mutex::default(),
             acked_presence: Mutex::default(),
+            app_slot: Mutex::default(),
             self_weak: OnceLock::new(),
         });
         let _ = arc.self_weak.set(Arc::downgrade(&arc));
         arc
     }
 
-    pub fn spawn_loops(self: &Arc<Self>) {
+    pub fn spawn_loops(self: &Arc<Self>, app: App) {
+        *self.app_slot.lock().unwrap() = Some(app.clone());
         let plane_bcast = self.clone();
         self.workers.spawn(async move {
             plane_bcast.presence_broadcast_loop().await;
@@ -1164,6 +1287,11 @@ impl ExecPlane {
         let plane_rec = self.clone();
         self.workers.spawn(async move {
             plane_rec.deferred_recovery_loop().await;
+        });
+        let plane_mem = self.clone();
+        self.workers.spawn(async move {
+            plane_mem.membership_reconcile_loop(app).await;
+            *plane_mem.app_slot.lock().unwrap() = None;
         });
     }
 
@@ -1186,11 +1314,148 @@ impl ExecPlane {
         lock
     }
 
-    pub fn on_peer_online(&self, peer_id: String) {
+    pub async fn on_peer_connected(&self, peer_id: String, peer_count: usize) {
+        self.presence.set_known_peer_count(peer_count);
+        let app = self.app_slot.lock().unwrap().clone();
+        if let Some(app) = app {
+            self.reconcile_standalone_leases(&app).await;
+        }
         {
             self.pending_peer_sync.lock().unwrap().insert(peer_id);
         }
         self.peer_sync_wake.notify_one();
+    }
+
+    async fn membership_reconcile_loop(&self, app: App) {
+        loop {
+            if self.presence.known_peer_count() > 0 {
+                self.reconcile_standalone_leases(&app).await;
+            }
+            tokio::select! {
+                biased;
+                _ = self.stopping.cancelled() => return,
+                _ = self.presence.membership_grew_notify.notified() => (),
+            }
+        }
+    }
+
+    async fn reconcile_standalone_leases(&self, app: &App) {
+        let presence = self.presence.clone();
+        let Ok((known_peers, candidates)) = self
+            .db
+            .call(move |s| {
+                let peers = refresh_known_peer_count(&s.conn, &presence)?;
+                if peers == 0 {
+                    return Ok((0usize, Vec::new()));
+                }
+                let mut seen = HashSet::new();
+                seen.extend(s.active.keys().copied());
+                seen.extend(s.pending_wakes.iter().copied());
+                seen.extend(codemode::task_session_ids(s));
+                let candidates: Vec<SessionId> = seen
+                    .into_iter()
+                    .filter(|&sid| s.presence.active_local_lease_kind(sid).is_none())
+                    .collect();
+                Ok((peers, candidates))
+            })
+            .await
+        else {
+            return;
+        };
+        if known_peers == 0 || candidates.is_empty() {
+            return;
+        }
+
+        for sid in candidates {
+            for retry in 0..8 {
+                if self.stopping.is_cancelled() {
+                    return;
+                }
+                let lock = self.start_lock(sid);
+                let guard = lock.lock().await;
+                let presence = self.presence.clone();
+                let still_unleased = self
+                    .db
+                    .call(move |s| {
+                        let peers = refresh_known_peer_count(&s.conn, &presence)?;
+                        if peers == 0 {
+                            return Ok(false);
+                        }
+                        let occupied = s.active.contains_key(&sid)
+                            || s.pending_wakes.contains(&sid)
+                            || codemode::has_session_tasks(s, sid);
+                        Ok(occupied && s.presence.active_local_lease_kind(sid).is_none())
+                    })
+                    .await
+                    .unwrap_or(false);
+                if !still_unleased {
+                    break;
+                }
+
+                match self.acquire_quorum_lease(sid, false, false).await {
+                    Ok(mut gate) => {
+                        let Some(lease) = gate.lease.take() else {
+                            break;
+                        };
+                        self.presence.set_active_local_lease(sid, lease.clone());
+                        let lease_for_db = lease.clone();
+                        let still_occupied = self
+                            .db
+                            .call(move |s| {
+                                let occupied = s.active.contains_key(&sid)
+                                    || s.pending_wakes.contains(&sid)
+                                    || codemode::has_session_tasks(s, sid);
+                                if !occupied {
+                                    return Ok(false);
+                                }
+                                if let Some(ctrl) = s.active.get_mut(&sid) {
+                                    ctrl.lease = Some(lease_for_db);
+                                }
+                                s.force_refresh_local_presence(sid);
+                                Ok(true)
+                            })
+                            .await
+                            .unwrap_or(false);
+                        if still_occupied {
+                            if let Some(cg) = gate.claim_guard.take() {
+                                cg.release_local_only();
+                            }
+                            self.spawn_lease_renew_loop(app.clone(), sid, lease);
+                            if !gate.granted_peers.is_empty() {
+                                self.broadcast_presence_to(&gate.granted_peers, None).await;
+                            }
+                        } else {
+                            self.presence.clear_active_local_lease(sid, &lease.claim_id);
+                            if let Some(cg) = gate.claim_guard.take() {
+                                cg.release_now().await;
+                            }
+                        }
+                        break;
+                    }
+                    Err(err)
+                        if err.0 == axum::http::StatusCode::SERVICE_UNAVAILABLE
+                            && retry < 7
+                            && !self.stopping.is_cancelled() =>
+                    {
+                        drop(guard);
+                        tokio::select! {
+                            biased;
+                            _ = self.stopping.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => (),
+                        }
+                    }
+                    Err(_) => {
+                        app.fence_session_local(
+                            sid,
+                            None,
+                            "cluster quorum unavailable after joining; session paused",
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     pub fn on_peer_offline(&self, peer_id: &str) {
@@ -1802,10 +2067,14 @@ impl ExecPlane {
         sid: SessionId,
         force_offline: bool,
     ) -> Result<Session> {
+        // Single-node fast path: zero start_lock, net mutex, or redundant DB pre-checks.
+        if self.presence.known_peer_count() == 0 {
+            return app.start_local_checked(sid, None, None).await;
+        }
+
         let lock = self.start_lock(sid);
         let _guard = lock.lock().await;
 
-        // Single-node fast path: zero extra cluster RPCs or redundant DB pre-checks.
         if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
             return app.start_local_checked(sid, None, None).await;
         }
@@ -1828,9 +2097,46 @@ impl ExecPlane {
             return Ok(view);
         }
 
+        // Idle lease holder with active background tasks already holds a valid LocalLease.
+        match self.presence.active_local_lease_kind(sid) {
+            Some(LocalLease::Quorum(existing)) => {
+                if !existing.is_valid() {
+                    return Err(Error::conflict("execution lease lost"));
+                }
+                let (expected_head, _, _) = self
+                    .validate_local_gate_preconditions(sid, true, Some(existing.term))
+                    .await?;
+                self.sync.ensure_session_attachments(sid).await?;
+                let started = app
+                    .start_local_checked(sid, expected_head, Some(existing))
+                    .await?;
+                let peers = self.net.online_peer_ids();
+                if !peers.is_empty() {
+                    self.broadcast_presence_to(&peers, None).await;
+                }
+                return Ok(started);
+            }
+            Some(LocalLease::ForcedOffline) if force_offline => {
+                let (expected_head, _, _) = self
+                    .validate_local_gate_preconditions(sid, true, None)
+                    .await?;
+                self.sync.ensure_session_attachments(sid).await?;
+                let started = app.start_local_checked(sid, expected_head, None).await?;
+                let peers = self.net.online_peer_ids();
+                if !peers.is_empty() {
+                    self.broadcast_presence_to(&peers, None).await;
+                }
+                return Ok(started);
+            }
+            Some(LocalLease::ForcedOffline) | None => {}
+        }
+
         let gate = self.acquire_quorum_lease(sid, force_offline, true).await?;
+        let forced_offline_bypass = gate.lease.is_none() && self.presence.known_peer_count() > 0;
         if let Some(ref lease) = gate.lease {
             self.presence.set_active_local_lease(sid, lease.clone());
+        } else if forced_offline_bypass {
+            self.presence.set_active_local_forced_offline(sid);
         }
         let started = app
             .start_local_checked(sid, gate.expected_head.clone(), gate.lease.clone())
@@ -1839,17 +2145,27 @@ impl ExecPlane {
     }
 
     pub async fn start_wake_run(&self, app: &App, sid: SessionId) -> Result<Session> {
+        if self.presence.known_peer_count() == 0 {
+            return app.start_wake_checked(sid, None, None).await;
+        }
+
         let lock = self.start_lock(sid);
         let _guard = lock.lock().await;
 
         if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
             return app.start_wake_checked(sid, None, None).await;
         }
-        if let Some(existing) = self.presence.active_local_lease(sid) {
-            if existing.is_valid() {
-                return app.start_wake_checked(sid, None, Some(existing)).await;
+        match self.presence.active_local_lease_kind(sid) {
+            Some(LocalLease::Quorum(existing)) => {
+                if existing.is_valid() {
+                    return app.start_wake_checked(sid, None, Some(existing)).await;
+                }
+                return Err(Error::conflict("execution lease lost"));
             }
-            return Err(Error::conflict("execution lease lost"));
+            Some(LocalLease::ForcedOffline) => {
+                return app.start_wake_checked(sid, None, None).await;
+            }
+            None => {}
         }
 
         let gate = self.acquire_quorum_lease(sid, false, true).await?;
@@ -1873,6 +2189,14 @@ impl ExecPlane {
             Err(e) => {
                 if let Some(ref lease) = gate.lease {
                     self.presence.clear_active_local_lease(sid, &lease.claim_id);
+                } else if self.presence.known_peer_count() > 0
+                    && self.presence.local_owner(sid).is_none()
+                    && matches!(
+                        self.presence.active_local_lease_kind(sid),
+                        Some(LocalLease::ForcedOffline)
+                    )
+                {
+                    self.presence.set_local(sid, None);
                 }
                 if let Some(cg) = gate.claim_guard.take() {
                     cg.release_now().await;
@@ -1891,7 +2215,7 @@ impl ExecPlane {
                         cg.release_local_only();
                     }
                     if let Some(lease) = gate.lease.take() {
-                        self.spawn_lease_renew_loop(app.clone(), sid, lease, gate.quorum);
+                        self.spawn_lease_renew_loop(app.clone(), sid, lease);
                     }
                     if !gate.granted_peers.is_empty() {
                         self.broadcast_presence_to(&gate.granted_peers, None).await;
@@ -1899,6 +2223,14 @@ impl ExecPlane {
                 } else {
                     if let Some(ref lease) = gate.lease {
                         self.presence.clear_active_local_lease(sid, &lease.claim_id);
+                    } else if self.presence.known_peer_count() > 0
+                        && self.presence.local_owner(sid).is_none()
+                        && matches!(
+                            self.presence.active_local_lease_kind(sid),
+                            Some(LocalLease::ForcedOffline)
+                        )
+                    {
+                        self.presence.set_local(sid, None);
                     }
                     if let Some(cg) = gate.claim_guard.take() {
                         cg.release_now().await;
@@ -1989,7 +2321,6 @@ impl ExecPlane {
                     expected_head,
                     lease: None,
                     granted_peers: Vec::new(),
-                    quorum,
                     claim_guard: None,
                 });
             }
@@ -2071,7 +2402,6 @@ impl ExecPlane {
                         expected_head,
                         lease: None,
                         granted_peers: Vec::new(),
-                        quorum: quorum_now,
                         claim_guard: None,
                     });
                 }
@@ -2091,7 +2421,6 @@ impl ExecPlane {
                     expected_head,
                     lease: None,
                     granted_peers: Vec::new(),
-                    quorum: 1,
                     claim_guard: None,
                 });
             }
@@ -2221,7 +2550,6 @@ impl ExecPlane {
                         expected_head,
                         lease: None,
                         granted_peers: Vec::new(),
-                        quorum: quorum_now,
                         claim_guard: None,
                     });
                 }
@@ -2250,7 +2578,6 @@ impl ExecPlane {
                 expected_head,
                 lease: Some(lease),
                 granted_peers,
-                quorum: quorum_now,
                 claim_guard: Some(claim_guard),
             });
         }
@@ -2258,13 +2585,7 @@ impl ExecPlane {
         Err(Error::conflict("failed to acquire cluster execution lease"))
     }
 
-    fn spawn_lease_renew_loop(
-        &self,
-        app: App,
-        sid: SessionId,
-        lease: Arc<ActiveLease>,
-        quorum: usize,
-    ) {
+    fn spawn_lease_renew_loop(&self, app: App, sid: SessionId, lease: Arc<ActiveLease>) {
         let Some(plane) = self.self_weak.get().and_then(Weak::upgrade) else {
             return;
         };
@@ -2275,7 +2596,8 @@ impl ExecPlane {
                 let deadline = lease.deadline();
                 if now >= deadline {
                     lease.revoked.cancel();
-                    app.fence_session_local(sid, lease.term).await;
+                    app.fence_session_local(sid, Some(lease.term), "execution lease lost")
+                        .await;
                     return;
                 }
                 let rem = deadline.saturating_duration_since(now);
@@ -2315,6 +2637,8 @@ impl ExecPlane {
                     continue;
                 }
                 let round_start = Instant::now();
+                let total = 1usize.saturating_add(plane.presence.known_peer_count());
+                let quorum = total / 2 + 1;
                 let online = plane.net.online_peer_ids();
                 let ttl_ms = u64::try_from(LEASE_TTL.as_millis()).unwrap_or(10_000);
                 let req = ExecReq::RenewLease {
@@ -2347,7 +2671,8 @@ impl ExecPlane {
                 if max_term > lease.term {
                     lease.revoked.cancel();
                     plane.presence.observe_remote_term(sid, max_term);
-                    app.fence_session_local(sid, lease.term).await;
+                    app.fence_session_local(sid, Some(lease.term), "execution lease lost")
+                        .await;
                     return;
                 }
                 if acks >= quorum {
@@ -2355,7 +2680,8 @@ impl ExecPlane {
                     fast_retry = false;
                 } else if Instant::now() >= lease.deadline() {
                     lease.revoked.cancel();
-                    app.fence_session_local(sid, lease.term).await;
+                    app.fence_session_local(sid, Some(lease.term), "execution lease lost")
+                        .await;
                     return;
                 } else {
                     fast_retry = true;
@@ -2365,9 +2691,10 @@ impl ExecPlane {
     }
 
     pub async fn pause_run(&self, app: &App, sid: SessionId, hard: bool) -> Result<Session> {
-        if self.presence.known_peer_count() > 0 || !self.net.online_peer_ids().is_empty() {
-            self.sync.ensure_session_watched(sid).await?;
+        if self.presence.known_peer_count() == 0 {
+            return app.pause_local(sid, hard).await;
         }
+        self.sync.ensure_session_watched(sid).await?;
         if self.presence.local_owner(sid).is_some() {
             return app.pause_local(sid, hard).await;
         }
@@ -2398,6 +2725,9 @@ impl ExecPlane {
     }
 
     pub async fn resolve_session_writer(&self, sid: SessionId) -> Result<WriterTarget> {
+        if self.presence.known_peer_count() == 0 {
+            return Ok(WriterTarget::Local);
+        }
         if self.presence.local_owner(sid).is_some() {
             return Ok(WriterTarget::Local);
         }
@@ -2491,6 +2821,14 @@ impl ExecPlane {
     }
 
     pub async fn acquire_delete_gate(&self, sid: SessionId) -> Result<DeleteGateGuard> {
+        if self.presence.known_peer_count() == 0 {
+            return Ok(DeleteGateGuard {
+                expected_head: None,
+                lease: None,
+                guard: None,
+                _lock: None,
+            });
+        }
         let lock_guard = self.start_lock(sid).lock_owned().await;
         if self.presence.local_owner(sid).is_some()
             || self.presence.remote_owner(sid).is_some()
@@ -2503,8 +2841,9 @@ impl ExecPlane {
         if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
             return Ok(DeleteGateGuard {
                 expected_head: None,
+                lease: None,
                 guard: None,
-                _lock: lock_guard,
+                _lock: Some(lock_guard),
             });
         }
         for attempt in 0..2 {
@@ -2541,8 +2880,9 @@ impl ExecPlane {
             if total == 1 {
                 return Ok(DeleteGateGuard {
                     expected_head,
+                    lease: None,
                     guard: None,
-                    _lock: lock_guard,
+                    _lock: Some(lock_guard),
                 });
             }
             let (claim_id, term) = self
@@ -2556,6 +2896,7 @@ impl ExecPlane {
                 claim_id.clone(),
             );
             claim_guard.track_peers(&online);
+            let grant_start = Instant::now();
             let req = ExecReq::CheckOccupancy {
                 session_id: sid,
                 claim: Some(RunClaim {
@@ -2652,10 +2993,13 @@ impl ExecPlane {
                 claim_guard.release_now().await;
                 return Err(Error::conflict(msg));
             }
+            let lease_ttl = LEASE_TTL.saturating_sub(LEASE_SAFETY_MARGIN);
+            let lease = ActiveLease::new(term, claim_id, grant_start + lease_ttl);
             return Ok(DeleteGateGuard {
                 expected_head,
+                lease: Some(lease),
                 guard: Some(claim_guard),
-                _lock: lock_guard,
+                _lock: Some(lock_guard),
             });
         }
         Err(Error::conflict("failed to acquire cluster delete gate"))
@@ -3091,19 +3435,28 @@ impl ExecServer {
                 term,
                 ttl_ms,
             } => {
-                let resp = match self.app.exec.presence().renew_remote_lease(
-                    session_id,
-                    &from_peer,
-                    &claim_id,
-                    term,
-                    ttl_ms,
-                ) {
-                    Ok(expires_at_ms) => {
-                        let holder = from_peer.clone();
-                        match self
-                            .app
-                            .db
-                            .call(move |s| {
+                let presence = self.app.exec.presence().clone();
+                let holder = from_peer.clone();
+                let resp = match self
+                    .app
+                    .db
+                    .call(move |s| {
+                        let local_occupied = s.active.contains_key(&session_id)
+                            || s.pending_wakes.contains(&session_id)
+                            || codemode::count_session_tasks(s, session_id) > 0
+                            || presence.local_owner(session_id).is_some();
+                        let remote_occupied =
+                            presence.remote_owner_excluding(session_id, &holder).is_some();
+                        match presence.renew_remote_lease(
+                            session_id,
+                            &holder,
+                            &claim_id,
+                            term,
+                            ttl_ms,
+                            local_occupied,
+                            remote_occupied,
+                        ) {
+                            Ok(expires_at_ms) => {
                                 persist_lease_grant(
                                     &s.conn,
                                     session_id,
@@ -3111,21 +3464,22 @@ impl ExecServer {
                                     &holder,
                                     &claim_id,
                                     expires_at_ms,
-                                )
-                            })
-                            .await
-                        {
-                            Ok(()) => ExecResp::LeaseRenewed {
-                                granted: true,
-                                highest_term: term,
-                            },
-                            Err(e) => Self::to_wire_err(e),
+                                )?;
+                                Ok(ExecResp::LeaseRenewed {
+                                    granted: true,
+                                    highest_term: term,
+                                })
+                            }
+                            Err(highest_term) => Ok(ExecResp::LeaseRenewed {
+                                granted: false,
+                                highest_term,
+                            }),
                         }
-                    }
-                    Err(highest_term) => ExecResp::LeaseRenewed {
-                        granted: false,
-                        highest_term,
-                    },
+                    })
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => Self::to_wire_err(e),
                 };
                 Self::send_reply(&mut send, &resp).await;
             }
@@ -3514,7 +3868,7 @@ impl ExecServer {
                 _ = self.app.stopping.cancelled() => break,
                 _ = peer_cancel.cancelled() => break,
                 _ = send.stopped() => break,
-                ev = stream.next() => ev,
+                ev = stream.next(&self.app) => ev,
             };
             match next {
                 NextSessionNotice::Event { event, data } => {
@@ -3531,6 +3885,7 @@ impl ExecServer {
                         return;
                     }
                 }
+                NextSessionNotice::ClusterActive => continue,
                 NextSessionNotice::Closed => {
                     let _ = write_exec_frame(&mut send, &ExecResp::SseEnd).await;
                     let _ = send.finish();

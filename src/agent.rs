@@ -60,6 +60,9 @@ pub async fn start(
     } else {
         serde_json::from_slice(&body).map_err(|e| Error::bad(e.to_string()))?
     };
+    if req.node.is_none() && app.exec.presence().known_peer_count() == 0 {
+        return app.start_local_checked(sid, None, None).await.map(Json);
+    }
     app.exec
         .start_run(&app, sid, req.node, req.force_offline)
         .await
@@ -216,18 +219,16 @@ impl App {
                     }
                     let run_epoch = crate::cluster::ledger::stream_head(conn, sid.as_str())?
                         .map_or(1, |h| h.epoch);
-                    let unfinished: bool = conn.query_row(
-                        "SELECT needs_model FROM sessions WHERE id=?",
-                        [sid],
-                        |r| r.get(0),
-                    )?;
+                    let unfinished: bool = conn
+                        .prepare_cached("SELECT needs_model FROM sessions WHERE id=?")?
+                        .query_row([sid], |r| r.get(0))?;
                     let now = chrono::Utc::now().timestamp_millis();
                     if !unfinished && !store::has_pending(conn, sid)? {
                         if current.status == SessionStatus::Paused {
-                            conn.execute(
+                            conn.prepare_cached(
                                 "UPDATE sessions SET status='idle',last_error='',updated_at=?2 WHERE id=?1",
-                                (sid, now),
-                            )?;
+                            )?
+                            .execute((sid, now))?;
                             crate::cluster::ledger::record_session_delta_at_epoch(
                                 conn,
                                 sid,
@@ -247,10 +248,10 @@ impl App {
                         Vec::new()
                     };
                     store::take_pending(conn, sid)?;
-                    conn.execute(
+                    conn.prepare_cached(
                         "UPDATE sessions SET status='running',last_error='',updated_at=?2 WHERE id=?1",
-                        (sid, now),
-                    )?;
+                    )?
+                    .execute((sid, now))?;
                     Ok((
                         session(conn, sid)?,
                         StartEffect::Worker(recovered, now, run_epoch),
@@ -304,18 +305,32 @@ impl App {
             .await
     }
 
-    pub async fn fence_session_local(&self, sid: SessionId, fenced_term: u64) {
+    pub async fn fence_session_local(
+        &self,
+        sid: SessionId,
+        fenced_term: Option<u64>,
+        reason: &'static str,
+    ) {
         let _ = self
             .db
             .call(move |s| {
-                let lease_matches = s
-                    .active
-                    .get(&sid)
-                    .and_then(|c| c.lease.as_ref())
-                    .is_some_and(|l| l.term == fenced_term)
-                    || s.presence
-                        .active_local_lease(sid)
-                        .is_some_and(|l| l.term == fenced_term);
+                let lease_matches = match fenced_term {
+                    Some(term) => {
+                        s.active
+                            .get(&sid)
+                            .and_then(|c| c.lease.as_ref())
+                            .is_some_and(|l| l.term == term)
+                            || s.presence
+                                .active_local_lease(sid)
+                                .is_some_and(|l| l.term == term)
+                    }
+                    None => {
+                        (s.active.contains_key(&sid)
+                            || s.pending_wakes.contains(&sid)
+                            || crate::codemode::has_session_tasks(s, sid))
+                            && s.presence.active_local_lease_kind(sid).is_none()
+                    }
+                };
                 if !lease_matches {
                     return Ok(());
                 }
@@ -331,11 +346,11 @@ impl App {
                 let now = chrono::Utc::now().timestamp_millis();
                 // Self-fencing must not append a synced commit so surviving majority quorum never forks.
                 let _ = s.conn.execute(
-                    "UPDATE sessions SET status='paused',last_error='execution lease lost',updated_at=?2 WHERE id=?1",
-                    (sid, now),
+                    "UPDATE sessions SET status='paused',last_error=?2,updated_at=?3 WHERE id=?1",
+                    (sid, reason, now),
                 );
                 s.presence.set_local(sid, None);
-                s.notify_status(sid, "paused", "execution lease lost", now);
+                s.notify_status(sid, "paused", reason, now);
                 Ok(())
             })
             .await;
@@ -441,7 +456,8 @@ impl App {
     async fn run(self, sid: SessionId, control: Control, channel: broadcast::Sender<Notice>) {
         let outcome = self.run_loop(sid, &control, &channel).await;
         if let Err(problem) = outcome {
-            let lease_fenced = !control.lease_valid();
+            let lease_fenced =
+                !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid);
             let settled = self
                 .db
                 .call(move |s| {
@@ -456,6 +472,23 @@ impl App {
                     }
                     s.refresh_local_presence(sid);
                     if lease_fenced || !s.is_local_lease_valid(sid) {
+                        crate::codemode::stop_session(s, sid);
+                        if let Ok(current) = session(&s.conn, sid)
+                            && matches!(
+                                current.status,
+                                SessionStatus::Running | SessionStatus::Pausing
+                            )
+                        {
+                            let now = chrono::Utc::now().timestamp_millis();
+                            let reason = problem.1.as_str();
+                            // Local-only fallback pause if lease lapsed before fence_session_local ran.
+                            let _ = s.conn.execute(
+                                "UPDATE sessions SET status='paused',last_error=?2,updated_at=?3 WHERE id=?1",
+                                (sid, reason, now),
+                            );
+                            s.presence.set_local(sid, None);
+                            s.notify_status(sid, "paused", reason, now);
+                        }
                         return Ok(());
                     }
                     let stream = crate::cluster::ledger::stream_head(&s.conn, sid.as_str())?;
@@ -500,51 +533,72 @@ impl App {
         let run_epoch = control.epoch;
         let run_gen = control.run_gen;
         loop {
-            if !control.lease_valid() {
+            if !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid) {
                 return Err(Error::conflict("execution lease lost"));
             }
+            enum BeginOutcome {
+                Input(model::Input),
+                Idle(i64),
+            }
+            let soft = control.soft.clone();
             let input = self
                 .db
-                .call(move |s| {
-                    if !s.is_local_lease_valid(sid) {
-                        return Err(Error::conflict("execution lease lost"));
-                    }
-                    if s.run_gen(sid) != run_gen {
-                        return Err(Error::conflict("session superseded"));
-                    }
-                    let Some(ctrl) = s.active.get(&sid) else {
-                        return Err(Error::conflict("session superseded"));
-                    };
-                    if ctrl.soft.is_cancelled() || ctrl.epoch != run_epoch || ctrl.run_gen != run_gen
-                    {
-                        return Err(Error::conflict("paused"));
-                    }
-                    if crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?
-                        || crate::cluster::ledger::stream_head(&s.conn, sid.as_str())?
-                            .is_some_and(|h| h.epoch != run_epoch || h.deleted || h.retired)
-                    {
-                        return Err(Error::conflict("session epoch superseded or conflicted"));
-                    }
-                    let tx = s.conn.transaction()?;
-                    store::take_pending(&tx, sid)?;
-                    let needed: bool =
-                        tx.query_row("SELECT needs_model FROM sessions WHERE id=?", [sid], |r| {
-                            r.get(0)
-                        })?;
-                    // A queued message can be withdrawn before this worker takes it.
-                    if !needed {
-                        tx.commit()?;
-                        if s.active.get(&sid).is_some_and(|c| c.run_gen == run_gen) {
-                            s.active.remove(&sid);
+                .write_for_run(
+                    sid,
+                    run_gen,
+                    move |conn| {
+                        if soft.is_cancelled() {
+                            return Err(Error::conflict("paused"));
                         }
-                        s.status(sid, "idle", "")?;
-                        return Ok(None);
-                    }
-                    let end = store::max_context_position(&tx, sid)?;
-                    let input = calls::begin(&tx, sid, end)?;
-                    tx.commit()?;
-                    Ok(Some(input))
-                })
+                        if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
+                            || crate::cluster::ledger::stream_head(conn, sid.as_str())?
+                                .is_some_and(|h| h.epoch != run_epoch || h.deleted || h.retired)
+                        {
+                            return Err(Error::conflict("session epoch superseded or conflicted"));
+                        }
+                        store::take_pending(conn, sid)?;
+                        let needed: bool = conn
+                            .prepare_cached("SELECT needs_model FROM sessions WHERE id=?")?
+                            .query_row([sid], |r| r.get(0))?;
+                        // A queued message can be withdrawn before this worker takes it.
+                        if !needed {
+                            if !crate::cluster::ledger::is_session_writable_local(conn, sid)? {
+                                return Err(Error::conflict(
+                                    "session history is incomplete or deleted; sync before modifying",
+                                ));
+                            }
+                            let now = chrono::Utc::now().timestamp_millis();
+                            conn.prepare_cached(
+                                "UPDATE sessions SET status='idle',last_error='',updated_at=?2 WHERE id=?1",
+                            )?
+                            .execute((sid, now))?;
+                            crate::cluster::ledger::record_session_delta_at_epoch(
+                                conn,
+                                sid,
+                                "session_delta",
+                                &[],
+                                Vec::new(),
+                                Vec::new(),
+                                Some(run_epoch),
+                            )?;
+                            return Ok(BeginOutcome::Idle(now));
+                        }
+                        let end = store::max_context_position(conn, sid)?;
+                        let input = calls::begin(conn, sid, end)?;
+                        Ok(BeginOutcome::Input(input))
+                    },
+                    move |s, outcome| match outcome {
+                        BeginOutcome::Input(input) => Ok(Some(input)),
+                        BeginOutcome::Idle(now) => {
+                            if s.active.get(&sid).is_some_and(|c| c.run_gen == run_gen) {
+                                s.active.remove(&sid);
+                            }
+                            s.refresh_local_presence_with(sid, SessionStatus::Idle, "", now);
+                            s.notify_status(sid, "idle", "", now);
+                            Ok(None)
+                        }
+                    },
+                )
                 .await?;
             let Some(input) = input else {
                 return Ok(());
@@ -553,27 +607,35 @@ impl App {
             let call_id = input.call_id;
             self.streams.start_call(sid, call_id);
             let mut output = model::Output::default();
-            let streamed = tokio::select! {
-                biased;
-                _ = control.hard.cancelled() => Err(Failure::Cancelled),
-                _ = async {
-                    match &control.lease {
-                        Some(lease) => lease.revoked.cancelled().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => Err(Failure::Cancelled),
-                result = async {
-                    if self.exec.presence().has_null_attachments()
-                        || self.exec.presence().known_peer_count() > 0
-                    {
-                        self.cluster
-                            .ensure_session_attachments(sid)
+            let has_null_att = self.exec.presence().has_null_attachments();
+            let multi_node = self.exec.presence().known_peer_count() > 0;
+            let streamed = if control.lease.is_none() && !has_null_att && !multi_node {
+                tokio::select! {
+                    biased;
+                    _ = control.hard.cancelled() => Err(Failure::Cancelled),
+                    result = self.stream(sid, input, &mut output, &control.hard, (run_epoch, run_gen)) => result,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = control.hard.cancelled() => Err(Failure::Cancelled),
+                    _ = async {
+                        match &control.lease {
+                            Some(lease) => lease.revoked.cancelled().await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => Err(Failure::Cancelled),
+                    result = async {
+                        if has_null_att || multi_node {
+                            self.cluster
+                                .ensure_session_attachments(sid)
+                                .await
+                                .map_err(Failure::Fatal)?;
+                        }
+                        self.stream(sid, input, &mut output, &control.hard, (run_epoch, run_gen))
                             .await
-                            .map_err(Failure::Fatal)?;
-                    }
-                    self.stream(sid, input, &mut output, &control.hard, (run_epoch, run_gen))
-                        .await
-                } => result,
+                    } => result,
+                }
             };
             let finished_at = chrono::Utc::now().timestamp_millis();
             let report = std::mem::take(&mut output.report);
@@ -613,7 +675,10 @@ impl App {
                 self.streams.clear_call(sid, call_id, true);
             }
             // A call may have reached the store just as the stream was cancelled, before spawn.
-            if (interrupted || (output.tools && streamed.is_err())) && control.lease_valid() {
+            if (interrupted || (output.tools && streamed.is_err()))
+                && control.lease_valid()
+                && self.exec.presence().is_local_lease_valid(sid)
+            {
                 self.db
                     .call(move |s| {
                         if s.run_gen(sid) != run_gen || !s.is_local_lease_valid(sid) {
@@ -638,7 +703,7 @@ impl App {
             if interrupted {
                 return Err(Error::conflict("paused"));
             }
-            if !control.lease_valid() {
+            if !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid) {
                 return Err(Error::conflict("execution lease lost"));
             }
             match streamed {
@@ -713,10 +778,10 @@ impl App {
                             "idle"
                         };
                         let now = chrono::Utc::now().timestamp_millis();
-                        conn.execute(
+                        conn.prepare_cached(
                             "UPDATE sessions SET needs_model=?2,status=?3,updated_at=?4 WHERE id=?1",
-                            (sid, tools, state, now),
-                        )?;
+                        )?
+                        .execute((sid, tools, state, now))?;
                         crate::cluster::ledger::record_session_delta_at_epoch(
                             conn,
                             sid,
@@ -737,8 +802,12 @@ impl App {
                                 s.active.remove(&sid);
                             }
                             s.refresh_local_presence(sid);
-                            let info = session(&s.conn, sid)?;
-                            s.notify_status(sid, state, &info.last_error, now);
+                            if state == "idle" {
+                                s.notify_status(sid, "idle", "", now);
+                            } else {
+                                let info = session(&s.conn, sid)?;
+                                s.notify_status(sid, state, &info.last_error, now);
+                            }
                         }
                         Ok(state != "running")
                     },

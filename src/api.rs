@@ -174,7 +174,9 @@ async fn create_session(
             },
             |s, created| {
                 let view = s.session_view(created);
-                s.publish_global("session.created", json!(view));
+                if s.global_events.receiver_count() > 0 {
+                    Notice::publish_serializable(&s.global_events, "session.created", &view);
+                }
                 Ok(view)
             },
         )
@@ -183,7 +185,7 @@ async fn create_session(
 }
 
 async fn get_session(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Session>> {
-    if app.exec.presence().known_peer_count() > 0 || !app.cluster.net.online_peer_ids().is_empty() {
+    if app.exec.presence().known_peer_count() > 0 {
         app.cluster.ensure_session_watched(sid).await?;
     }
     app.db
@@ -267,11 +269,12 @@ async fn delete_session(
     State(app): State<App>,
     Path(sid): Path<SessionId>,
 ) -> Result<StatusCode> {
-    if app.exec.presence().known_peer_count() > 0 || !app.cluster.net.online_peer_ids().is_empty() {
+    if app.exec.presence().known_peer_count() > 0 {
         app.cluster.ensure_session_watched(sid).await?;
     }
     let delete_gate = app.exec.acquire_delete_gate(sid).await?;
     let expected_head = delete_gate.expected_head();
+    let delete_lease = delete_gate.lease();
     let res = app
         .db
         .call(move |s| {
@@ -288,6 +291,21 @@ async fn delete_session(
                 ));
             }
             let tx = s.conn.transaction()?;
+            if let Some(ref lease) = delete_lease {
+                if !lease.is_valid() {
+                    return Err(Error::conflict("delete lease expired before commit; retry"));
+                }
+            } else if s.presence.known_peer_count() > 0 {
+                return Err(Error::conflict(
+                    "cluster membership changed before delete commit; retry",
+                ));
+            }
+            if s.presence.remote_owner(sid).is_some() || s.presence.has_committed_remote_lease(sid)
+            {
+                return Err(Error::conflict(
+                    "pause the session and stop active tasks before deleting",
+                ));
+            }
             crate::cluster::ledger::assert_no_conflict(&tx, sid.as_str())?;
             if let Some(ref exp) = expected_head {
                 let cur = crate::cluster::ledger::stream_head(&tx, sid.as_str())?;
@@ -415,21 +433,28 @@ async fn enqueue(
     if keys.next().is_some() || key.as_ref().is_some_and(|k| k.is_empty() || k.len() > 256) {
         return Err(Error::bad("invalid idempotency key"));
     }
-    let (status, id) = match app.exec.resolve_session_writer(sid).await? {
-        WriterTarget::Remote(peer_id) => {
-            match app
-                .exec
-                .enqueue_remote(&peer_id, sid, message.content, key)
-                .await?
-            {
-                (true, id) => (StatusCode::CREATED, id),
-                (false, id) => (StatusCode::OK, id),
-            }
-        }
-        WriterTarget::Local => match app.db.enqueue(sid, message.content, key).await? {
+    let (status, id) = if app.exec.presence().known_peer_count() == 0 {
+        match app.db.enqueue(sid, message.content, key).await? {
             store::Enqueued::Created(id) => (StatusCode::CREATED, id),
             store::Enqueued::Existing(id) => (StatusCode::OK, id),
-        },
+        }
+    } else {
+        match app.exec.resolve_session_writer(sid).await? {
+            WriterTarget::Remote(peer_id) => {
+                match app
+                    .exec
+                    .enqueue_remote(&peer_id, sid, message.content, key)
+                    .await?
+                {
+                    (true, id) => (StatusCode::CREATED, id),
+                    (false, id) => (StatusCode::OK, id),
+                }
+            }
+            WriterTarget::Local => match app.db.enqueue(sid, message.content, key).await? {
+                store::Enqueued::Created(id) => (StatusCode::CREATED, id),
+                store::Enqueued::Existing(id) => (StatusCode::OK, id),
+            },
+        }
     };
     Ok((status, Json(MessageId { id })))
 }
@@ -489,7 +514,9 @@ async fn messages(
     ) {
         return Err(Error::bad("unknown message status"));
     }
-    app.cluster.ensure_session_watched(sid).await?;
+    if app.exec.presence().known_peer_count() > 0 {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
     app.db
         .call(move |s| {
             session(&s.conn, sid)?;
@@ -618,7 +645,9 @@ async fn history(
         page.tail,
         page.limit,
     )?;
-    app.cluster.ensure_session_watched(sid).await?;
+    if app.exec.presence().known_peer_count() > 0 {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
     let (range, history_rev) = app
         .db
         .call(move |s| {
@@ -663,7 +692,9 @@ async fn context(
             "expected after >= 0, before > 0, and limit 1..200",
         ));
     }
-    app.cluster.ensure_session_watched(sid).await?;
+    if app.exec.presence().known_peer_count() > 0 {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
     let range = app
         .db
         .call(move |s| {
@@ -685,7 +716,9 @@ async fn context(
 }
 
 async fn list_tasks(State(app): State<App>, Path(sid): Path<SessionId>) -> Result<Json<Value>> {
-    app.cluster.ensure_session_watched(sid).await?;
+    if app.exec.presence().known_peer_count() > 0 {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
     app.exec.list_tasks(sid).await.map(Json)
 }
 
@@ -693,6 +726,8 @@ async fn kill_task(
     State(app): State<App>,
     Path((sid, tid)): Path<(SessionId, String)>,
 ) -> Result<Json<Value>> {
-    app.cluster.ensure_session_watched(sid).await?;
+    if app.exec.presence().known_peer_count() > 0 {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
     app.exec.kill_task(sid, tid).await.map(Json)
 }

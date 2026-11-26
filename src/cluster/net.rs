@@ -1172,17 +1172,19 @@ impl ClusterNet {
         }
         let remote_id = remote_peer.node_id.clone();
         let self_id = self.local_node_id.clone();
-        let ok = self
+        let peer_count = self
             .db
             .call(move |s| {
                 let now = chrono::Utc::now().timestamp_millis();
                 upsert_peer_if_gen(&s.conn, &self_id, &remote_peer, now, true, mgen)?;
-                crate::cluster::exec::refresh_known_peer_count(&s.conn, &s.presence)?;
-                Ok(())
+                Ok(list_peers(&s.conn)?.len())
             })
-            .await
-            .is_ok();
-        if !ok || gen_cancel.is_cancelled() || self.membership_gen() != mgen {
+            .await;
+        let Ok(peer_count) = peer_count else {
+            conn.close(2u32.into(), b"cluster changed");
+            return;
+        };
+        if gen_cancel.is_cancelled() || self.membership_gen() != mgen {
             conn.close(2u32.into(), b"cluster changed");
             return;
         }
@@ -1227,11 +1229,9 @@ impl ClusterNet {
                 .insert(remote_id.clone());
         }
         self.connect_notify.notify_one();
-        if let Some(plane) = self.exec_plane.lock().unwrap().as_ref().and_then(Weak::upgrade) {
-            plane.on_peer_online(remote_id.clone());
-        }
 
         let net = self.clone();
+        let reader_remote = remote_id.clone();
         self.tasks.spawn(async move {
             loop {
                 tokio::select! {
@@ -1242,7 +1242,7 @@ impl ClusterNet {
                         match bi {
                             Ok((send, recv)) => {
                                 let handler = net.handler.lock().unwrap().as_ref().and_then(Weak::upgrade);
-                                let from = remote_id.clone();
+                                let from = reader_remote.clone();
                                 let n = net.clone();
                                 let gc = gen_cancel.clone();
                                 net.tasks.spawn(async move {
@@ -1258,15 +1258,25 @@ impl ClusterNet {
             }
             let removed = {
                 let mut peers = net.peers.lock().unwrap();
-                if peers.get(&remote_id).is_some_and(|e| e.conn_id == conn_id) {
-                    peers.remove(&remote_id).is_some()
+                if peers.get(&reader_remote).is_some_and(|e| e.conn_id == conn_id) {
+                    peers.remove(&reader_remote).is_some()
                 } else {
                     false
                 }
             };
             if removed {
-                net.notify_peer_offline(&remote_id);
+                net.notify_peer_offline(&reader_remote);
             }
         });
+
+        let plane = self.exec_plane.lock().unwrap().as_ref().and_then(Weak::upgrade);
+        if let Some(plane) = plane {
+            plane.on_peer_connected(remote_id, peer_count).await;
+        } else {
+            let _ = self
+                .db
+                .call(|s| crate::cluster::exec::refresh_known_peer_count(&s.conn, &s.presence))
+                .await;
+        }
     }
 }

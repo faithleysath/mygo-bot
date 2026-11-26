@@ -449,6 +449,10 @@ pub fn has_session_tasks(s: &Store, sid: SessionId) -> bool {
     s.tasks.values().any(|t| t.origin.sid == sid)
 }
 
+pub fn task_session_ids(s: &Store) -> impl Iterator<Item = SessionId> + '_ {
+    s.tasks.values().map(|t| t.origin.sid)
+}
+
 pub fn count_session_tasks(s: &Store, sid: SessionId) -> usize {
     s.tasks.values().filter(|t| t.origin.sid == sid).count()
 }

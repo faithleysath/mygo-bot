@@ -9,7 +9,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{io, time::Duration};
+use std::{io, sync::OnceLock, time::Duration};
 use tokio::{
     task::JoinSet,
     time::{Instant, timeout, timeout_at},
@@ -72,19 +72,24 @@ const INSTRUCTIONS: &str = concat!(
 );
 
 async fn body(db: Db, sid: SessionId, input: &Input) -> Result<reqwest::Body> {
-    let mut header =
-        json!({"model":input.model,"tools":tools::definitions(),"stream":true,"store":false});
+    static STATIC_TOOLS_AND_DEV: OnceLock<Vec<u8>> = OnceLock::new();
+    let tools_and_dev = STATIC_TOOLS_AND_DEV.get_or_init(|| {
+        let tools = serde_json::to_string(&tools::definitions()).expect("serialize tool definitions");
+        let dev = json!({"role":"developer","content":[{"type":"input_text","text":INSTRUCTIONS}]})
+            .to_string();
+        format!(r#","tools":{tools},"stream":true,"store":false,"input":[{dev}"#).into_bytes()
+    });
+    let mut prefix = Vec::with_capacity(tools_and_dev.len() + 128);
+    prefix.extend_from_slice(b"{\"model\":");
+    serde_json::to_writer(&mut prefix, &input.model)
+        .map_err(|e| Error::internal(format!("encode model name: {e}")))?;
     if let Some(e) = &input.effort {
-        header["reasoning"] = json!({"effort":e});
+        prefix.extend_from_slice(b",\"reasoning\":{\"effort\":");
+        serde_json::to_writer(&mut prefix, e)
+            .map_err(|err| Error::internal(format!("encode effort: {err}")))?;
+        prefix.push(b'}');
     }
-    let mut prefix = header.to_string().into_bytes();
-    prefix.pop();
-    prefix.extend_from_slice(b",\"input\":[");
-    prefix.extend_from_slice(
-        json!({"role":"developer","content":[{"type":"input_text","text":INSTRUCTIONS}]})
-            .to_string()
-            .as_bytes(),
-    );
+    prefix.extend_from_slice(tools_and_dev);
     if input.end > 0 {
         prefix.push(b',');
     }

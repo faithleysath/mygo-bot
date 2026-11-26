@@ -556,18 +556,18 @@ async fn serve(
             workers.clone(),
         );
         cluster.net.attach_exec_plane(Arc::downgrade(&exec));
-        exec.spawn_loops();
         let app = App {
             codemode: Arc::new(codemode::Engine::new(threads, make_client()?)?),
             mcp_probes: Arc::new(tokio::sync::Semaphore::new(4)),
             db,
             cluster,
-            exec,
+            exec: exec.clone(),
             client,
             streams,
             stopping,
             workers,
         };
+        exec.spawn_loops(app.clone());
         let cap_server = Arc::new(cluster::cap::CapServer::new(app.clone()));
         app.cluster.net.attach_cap_handler(Arc::downgrade(&cap_server));
         let exec_server = Arc::new(cluster::exec::ExecServer::new(app.clone()));
