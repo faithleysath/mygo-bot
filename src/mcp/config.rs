@@ -222,7 +222,7 @@ impl Stored {
 }
 fn load(conn: &Connection, id: McpServerId) -> Result<Stored> {
     Ok(conn
-        .prepare_cached(&format!("{SELECT} WHERE id=?"))?
+        .prepare_cached(&format!("{SELECT} WHERE deleted=0 AND id=?"))?
         .query_row([id], stored)?)
 }
 fn by_id(conn: &Connection, id: McpServerId) -> Result<McpServerInfo> {
@@ -232,17 +232,24 @@ pub(super) fn endpoint_by_id(conn: &Connection, id: McpServerId) -> Result<Endpo
     load(conn, id)?.endpoint(true)
 }
 pub(super) fn endpoint(conn: &Connection, name: &str) -> Result<Endpoint> {
-    conn.prepare_cached(&format!("{SELECT} WHERE enabled AND name=?1"))?
-        .query_row([name], stored)
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Error::bad("MCP server is unknown or disabled"),
-            other => other.into(),
-        })?
-        .endpoint(false)
+    let mut stmt = conn.prepare_cached(&format!(
+        "{SELECT} WHERE deleted=0 AND enabled=1 AND (id=?1 OR name=?1) LIMIT 2"
+    ))?;
+    let mut rows = stmt
+        .query_map([name], stored)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match rows.len() {
+        0 => Err(Error::bad("MCP server is unknown or disabled")),
+        1 => rows.pop().unwrap().endpoint(false),
+        _ => Err(Error::conflict(
+            "ambiguous MCP server name; specify server id or rename duplicate",
+        )),
+    }
 }
 pub(super) fn enabled_servers(conn: &Connection) -> Result<Value> {
-    let mut stmt =
-        conn.prepare_cached("SELECT name,description FROM mcp_servers WHERE enabled ORDER BY name")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT name,description FROM mcp_servers WHERE deleted=0 AND enabled=1 ORDER BY name",
+    )?;
     let mut rows = stmt.query([])?;
     let mut servers = Vec::new();
     let mut bytes = 2;
@@ -375,8 +382,13 @@ fn save(
         .map_err(|_| Error::bad("invalid MCP configuration fields or types"))?;
     validate(&mut c)?;
     let connection = connection_document(&c);
-    let auth_changed = old.as_ref().is_some_and(|s| {
+    let config_changed = old.as_ref().is_some_and(|s| {
         s.cfg.transport != c.transport || connection_document(&s.cfg) != connection
+    });
+    let oauth_invalidated = old.as_ref().is_some_and(|s| {
+        s.cfg.transport != c.transport
+            || s.cfg.url != c.url
+            || serde_json::to_value(&s.cfg.oauth).ok() != serde_json::to_value(&c.oauth).ok()
     });
     let transport = match c.transport {
         McpTransport::StreamableHttp => "streamable-http",
@@ -386,13 +398,12 @@ fn save(
     if let Some((old_id, mcp)) = update
         && old.as_ref().is_some_and(|s| s.cfg.shared && !c.shared)
     {
-        crate::cluster::ledger::assert_no_conflict(conn, old_id.as_str())?;
-        let _grant_guard = if auth_changed {
+        let _grant_guard = if oauth_invalidated {
             None
         } else {
             oauth::guard_grant_copy(conn, mcp, old_id)?
         };
-        let old_oauth = if !auth_changed {
+        let old_oauth = if !oauth_invalidated {
             conn.query_row(
                 "SELECT generation,binding,credentials,rejected FROM mcp_oauth
                  WHERE server_id=? AND (credentials IS NOT NULL OR rejected=1)",
@@ -410,73 +421,113 @@ fn save(
         } else {
             None
         };
+        crate::cluster::ledger::tombstone_shared_mcp(conn, old_id)?;
         let new_id = McpServerId::new()?;
-        conn.execute("DELETE FROM mcp_servers WHERE id=?", [old_id])?;
+        let name_taken: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE name=?1 AND deleted=0 AND id!=?2)",
+            )?
+            .query_row(params![&c.name, new_id], |r| r.get(0))?;
+        if name_taken {
+            return Err(Error::conflict("MCP server name already exists"));
+        }
+        let ts = crate::cluster::ledger::tick_hlc(conn)?;
         conn.execute(
-            "INSERT INTO mcp_servers(id,name,description,enabled,shared,transport,config_json,allowed_tools,timeout_ms,revision)
-             VALUES(?,?,?,?,0,?,?,?,?,1)",
+            "INSERT INTO mcp_servers(
+                id,name,name_ts,description,description_ts,enabled,enabled_ts,shared,transport,
+                allowed_tools,allowed_tools_ts,config_json,timeout_ms,timeout_ts,revision,
+                config_ts,oauth_ts,deleted,sync_rev
+             ) VALUES(?1,?2,?9,?3,?9,?4,?9,0,?5,?6,?9,?7,?8,?9,1,?9,?9,0,0)",
             params![
                 new_id,
                 c.name,
                 c.description,
                 c.enabled,
                 transport,
-                connection,
                 c.allowed_tools.as_ref().map(|names| json!(names)),
-                c.timeout_ms
+                connection,
+                c.timeout_ms,
+                ts,
             ],
-        )
-        .map_err(|e| match e.sqlite_error().map(|code| code.extended_code) {
-            Some(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE) => {
-                Error::conflict("MCP server name already exists")
-            }
-            _ => e.into(),
-        })?;
+        )?;
         if let Some((generation, binding, credentials, rejected)) = old_oauth {
             conn.execute(
-                "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,staged_credentials,rejected)
+                "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,pending_refresh,rejected)
                  VALUES(?,?,?,NULL,?,NULL,?)",
                 params![new_id, generation, binding, credentials, rejected],
             )?;
         }
-        crate::cluster::ledger::record_mcp_deleted(conn, old_id)?;
-        return Ok((by_id(conn, new_id)?, auth_changed, Some(old_id)));
+        return Ok((by_id(conn, new_id)?, config_changed, Some(old_id)));
     }
 
-    let sql = "INSERT INTO mcp_servers(id,name,description,enabled,shared,transport,config_json,allowed_tools,timeout_ms,revision)
-        VALUES(?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET description=excluded.description,enabled=excluded.enabled,
-        shared=excluded.shared,transport=excluded.transport,config_json=excluded.config_json,allowed_tools=excluded.allowed_tools,
-        timeout_ms=excluded.timeout_ms,revision=mcp_servers.revision+1 RETURNING id";
     let id = match id {
         Some(id) => id,
         None => McpServerId::new()?,
     };
-    let id = conn
-        .query_row(
-            sql,
-            params![
-                id,
-                c.name,
-                c.description,
-                c.enabled,
-                c.shared,
-                transport,
-                connection,
-                c.allowed_tools.as_ref().map(|names| json!(names)),
-                c.timeout_ms
-            ],
-            |r| r.get(0),
-        )
-        .map_err(|e| match e.sqlite_error().map(|code| code.extended_code) {
-            Some(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE) => {
-                Error::conflict("MCP server name already exists")
-            }
-            _ => e.into(),
-        })?;
-    if c.shared {
-        crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
+    let name_taken: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE name=?1 AND deleted=0 AND id!=?2)",
+        )?
+        .query_row(params![&c.name, id], |r| r.get(0))?;
+    if name_taken {
+        return Err(Error::conflict("MCP server name already exists"));
     }
-    Ok((by_id(conn, id)?, auth_changed, None))
+    let ts = crate::cluster::ledger::tick_hlc(conn)?;
+    let sync_rev = if c.shared {
+        crate::cluster::ledger::next_catalog_rev()
+    } else {
+        0
+    };
+    let sql = "INSERT INTO mcp_servers(
+            id,name,name_ts,description,description_ts,enabled,enabled_ts,shared,transport,
+            allowed_tools,allowed_tools_ts,config_json,timeout_ms,timeout_ts,revision,
+            config_ts,oauth_ts,deleted,sync_rev
+        ) VALUES(?1,?2,?10,?3,?10,?4,?10,?5,?6,?7,?10,?8,?9,?10,1,?10,?10,0,?11)
+        ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,
+            name_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.name != excluded.name THEN ?10 ELSE mcp_servers.name_ts END,
+            description=excluded.description,
+            description_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.description != excluded.description THEN ?10 ELSE mcp_servers.description_ts END,
+            enabled=excluded.enabled,
+            enabled_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.enabled != excluded.enabled THEN ?10 ELSE mcp_servers.enabled_ts END,
+            shared=excluded.shared,
+            transport=excluded.transport,
+            allowed_tools=excluded.allowed_tools,
+            allowed_tools_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.allowed_tools IS NOT excluded.allowed_tools THEN ?10 ELSE mcp_servers.allowed_tools_ts END,
+            config_json=excluded.config_json,
+            timeout_ms=excluded.timeout_ms,
+            timeout_ts=CASE WHEN mcp_servers.shared < excluded.shared OR mcp_servers.timeout_ms != excluded.timeout_ms THEN ?10 ELSE mcp_servers.timeout_ts END,
+            revision=mcp_servers.revision+1,
+            config_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?12 THEN ?10 ELSE mcp_servers.config_ts END,
+            oauth_ts=CASE WHEN mcp_servers.shared < excluded.shared OR ?12 THEN ?10 ELSE mcp_servers.oauth_ts END,
+            sync_rev=excluded.sync_rev
+        WHERE mcp_servers.deleted=0
+        RETURNING id";
+    let id = conn.query_row(
+        sql,
+        params![
+            id,
+            c.name,
+            c.description,
+            c.enabled,
+            c.shared,
+            transport,
+            c.allowed_tools.as_ref().map(|names| json!(names)),
+            connection,
+            c.timeout_ms,
+            ts,
+            sync_rev,
+            config_changed,
+        ],
+        |r| r.get(0),
+    )?;
+    if oauth_invalidated {
+        conn.execute("DELETE FROM mcp_oauth WHERE server_id=?", [id])?;
+    }
+    if c.shared {
+        crate::cluster::ledger::stage_catalog();
+    }
+    Ok((by_id(conn, id)?, config_changed, None))
 }
 
 async fn list_servers(State(app): State<App>) -> Result<Json<Vec<McpServerInfo>>> {
@@ -484,7 +535,7 @@ async fn list_servers(State(app): State<App>) -> Result<Json<Vec<McpServerInfo>>
         .call(|s| {
             Ok(Json(
                 s.conn
-                    .prepare_cached(&format!("{SELECT} ORDER BY id"))?
+                    .prepare_cached(&format!("{SELECT} WHERE deleted=0 ORDER BY id"))?
                     .query_map([], |row| stored(row).map(Stored::info))?
                     .collect::<rusqlite::Result<_>>()?,
             ))
@@ -534,11 +585,9 @@ async fn delete_server(State(app): State<App>, Path(id): Path<McpServerId>) -> R
     app.db
         .write(
             move |conn| {
-                crate::cluster::ledger::assert_no_conflict(conn, id.as_str())?;
-                if conn.execute("DELETE FROM mcp_servers WHERE id=?", [id])? == 0 {
+                if !crate::cluster::ledger::tombstone_shared_mcp(conn, id)? {
                     return Err(rusqlite::Error::QueryReturnedNoRows.into());
                 }
-                crate::cluster::ledger::record_mcp_deleted(conn, id)?;
                 Ok(())
             },
             move |s, ()| {

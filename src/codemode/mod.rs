@@ -267,7 +267,6 @@ impl Host {
                 if task_superseded(&s.conn, s.reset_gen(sid), task)? || !s.is_local_lease_valid(sid) {
                     return Err(Error::conflict("session superseded or conflicted"));
                 }
-                let expected_epoch = task.session_epoch;
                 if blocks.parts.is_empty() {
                     return Err(Error::bad("empty event"));
                 }
@@ -282,15 +281,7 @@ impl Host {
                 }
                 let tx = s.conn.transaction()?;
                 let content = ledger::materialize(&tx, sid, &blocks)?;
-                let id = ledger::event_at_epoch(
-                    &tx,
-                    sid,
-                    origin,
-                    "message",
-                    &content,
-                    true,
-                    Some(expected_epoch),
-                )?;
+                let id = ledger::event(&tx, sid, origin, "message", &content, true)?;
                 tx.commit()?;
                 let task = s.tasks.get_mut(&origin).expect("task checked above");
                 task.tokens = tokens - 1.0;
@@ -312,23 +303,6 @@ pub struct Call {
 impl Call {
     fn save(&self, conn: &Connection, output: &Value, background: bool) -> Result<ItemId> {
         ledger::tool(conn, self.sid, self.id, &self.call, output, background)
-    }
-    fn save_at_epoch(
-        &self,
-        conn: &Connection,
-        output: &Value,
-        background: bool,
-        expected_epoch: Option<i64>,
-    ) -> Result<ItemId> {
-        ledger::tool_at_epoch(
-            conn,
-            self.sid,
-            self.id,
-            &self.call,
-            output,
-            background,
-            expected_epoch,
-        )
     }
     pub fn reply(&self, store: &mut Store, body: Value) -> Result<()> {
         let id = self.save(&store.conn, &Value::String(body.to_string()), false)?;
@@ -360,9 +334,7 @@ pub struct Task {
     last_status_fingerprint: Option<ProgressFingerprint>,
     live: Arc<Mutex<LiveState>>,
     origin: Call,
-    session_epoch: i64,
     session_reset_gen: u64,
-    history_rev: i64,
     label: String,
     created: Instant,
     started_at: DateTime<Utc>,
@@ -782,7 +754,6 @@ pub async fn renew(
                     json!({"status":"error", "error":"task is stopping or expired"}),
                 );
             }
-            let session_epoch = task.session_epoch;
             if task_superseded(&s.conn, s.reset_gen(call.sid), task)? {
                 return Err(Error::conflict("session superseded"));
             }
@@ -793,13 +764,8 @@ pub async fn renew(
                 "expires_at": expires.to_rfc3339(), "remaining_seconds": seconds
             });
             let tx = s.conn.transaction()?;
-            ledger::invalidate_at_epoch(&tx, call.sid, id, Some(session_epoch))?;
-            let saved = call.save_at_epoch(
-                &tx,
-                &Value::String(response.to_string()),
-                false,
-                Some(session_epoch),
-            )?;
+            ledger::invalidate(&tx, call.sid, id)?;
+            let saved = call.save(&tx, &Value::String(response.to_string()), false)?;
             tx.commit()?;
             s.tasks.get_mut(&id).unwrap().lease(now, duration);
             notice(s, call.sid, saved);
@@ -851,18 +817,17 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
                 json!({"status":"error","error":"task capacity reached or daemon closing"}),
             );
         }
-        if crate::cluster::ledger::has_conflict(&s.conn, call.sid.as_str())?
-            || !crate::cluster::ledger::is_session_writable_local(&s.conn, call.sid)?
-        {
+        let deleted: bool = s
+            .conn
+            .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 1)")?
+            .query_row([call.sid], |r| r.get(0))?;
+        if deleted {
             return call.reply(
                 s,
-                json!({"status":"error","error":"session is conflicted or read-only locally"}),
+                json!({"status":"error","error":"session deleted or missing"}),
             );
         }
-        let session_epoch = crate::cluster::ledger::stream_head(&s.conn, call.sid.as_str())?
-            .map_or(1, |h| h.epoch);
         let session_reset_gen = s.reset_gen(call.sid);
-        let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, call.sid)?;
         let now = Instant::now();
         let (deadline, lease) = watch::channel(now + LEASE);
         let cancel = CancellationToken::new();
@@ -878,9 +843,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             last_status_fingerprint: None,
             live: host.live.clone(),
             origin: call,
-            session_epoch,
             session_reset_gen,
-            history_rev,
             label: script.label,
             created: now,
             started_at: Utc::now(),
@@ -897,12 +860,7 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
             refilled: now,
         };
         if task.background {
-            let saved = task.origin.save_at_epoch(
-                &s.conn,
-                &task.receipt(),
-                true,
-                Some(session_epoch),
-            )?;
+            let saved = task.origin.save(&s.conn, &task.receipt(), true)?;
             notice(s, sid, saved);
             task.delivered();
         }
@@ -930,15 +888,13 @@ pub async fn run(app: App, call: Call, script: Script, hard: CancellationToken) 
 }
 
 fn task_superseded(conn: &Connection, reset_gen: u64, task: &Task) -> Result<bool> {
-    let sid = task.origin.sid;
-    if reset_gen != task.session_reset_gen
-        || crate::cluster::ledger::has_conflict(conn, sid.as_str())?
-        || crate::cluster::ledger::session_history_rev(conn, sid)? != task.history_rev
-    {
+    if reset_gen != task.session_reset_gen {
         return Ok(true);
     }
-    Ok(crate::cluster::ledger::stream_head(conn, sid.as_str())?
-        .is_some_and(|h| h.epoch != task.session_epoch || h.deleted || h.retired))
+    let deleted: bool = conn
+        .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 1)")?
+        .query_row([task.origin.sid], |r| r.get(0))?;
+    Ok(deleted)
 }
 
 fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
@@ -948,16 +904,14 @@ fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
         s.tasks.get_mut(&id).unwrap().stop("superseded");
         return Ok(None);
     }
-    let exp_epoch = s.tasks[&id].session_epoch;
     let now = Instant::now();
     if s.tasks[&id].kill.as_ref().is_some_and(|k| now >= k.until) {
         let saved = {
             let k = s.tasks[&id].kill.as_ref().unwrap();
-            k.call.save_at_epoch(
+            k.call.save(
                 &s.conn,
                 &Value::String(json!({"status":"stopping","id":id.task_id()}).to_string()),
                 false,
-                Some(exp_epoch),
             )?
         };
         let task = s.tasks.get_mut(&id).unwrap();
@@ -969,9 +923,7 @@ fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
         (task.can_detach(s.closing) && now >= task.created + FRONT_WAIT).then(|| task.receipt())
     };
     if let Some(receipt) = receipt {
-        let saved = s.tasks[&id]
-            .origin
-            .save_at_epoch(&s.conn, &receipt, true, Some(exp_epoch))?;
+        let saved = s.tasks[&id].origin.save(&s.conn, &receipt, true)?;
         let task = s.tasks.get_mut(&id).unwrap();
         task.background = true;
         task.delivered();
@@ -996,15 +948,7 @@ fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
         );
         info["threshold_seconds"] = json!(WARNINGS[task.warning + crossed - 1].as_secs());
         let content = json!([{"type":"text","text":info.to_string()}]);
-        let saved = ledger::event_at_epoch(
-            &s.conn,
-            sid,
-            id,
-            "lease_warning",
-            &content,
-            true,
-            Some(exp_epoch),
-        )?;
+        let saved = ledger::event(&s.conn, sid, id, "lease_warning", &content, true)?;
         s.tasks.get_mut(&id).unwrap().warning += crossed;
         event_saved(s, app, sid, saved, true);
     }
@@ -1096,9 +1040,9 @@ fn remove_task(s: &mut Store, id: ItemId) -> Task {
 }
 
 fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()> {
-    let (sid, exp_epoch, cur_gen) = {
+    let (sid, cur_gen) = {
         let task = &s.tasks[&id];
-        (task.origin.sid, task.session_epoch, s.reset_gen(task.origin.sid))
+        (task.origin.sid, s.reset_gen(task.origin.sid))
     };
     if task_superseded(&s.conn, cur_gen, &s.tasks[&id])? || !s.is_local_lease_valid(sid) {
         let mut task = remove_task(s, id);
@@ -1160,27 +1104,16 @@ fn complete(s: &mut Store, app: &App, id: ItemId, result: &Outcome) -> Result<()
     let (content, text_output) =
         pack_output(summary, parts, original_pending || task.kill.is_some());
     let wire = text_output.as_ref().unwrap_or(&content);
-    ledger::invalidate_at_epoch(&tx, sid, id, Some(exp_epoch))?;
+    ledger::invalidate(&tx, sid, id)?;
     if task.background {
         let notify = task.kill.is_none();
-        let completed = ledger::event_at_epoch(
-            &tx,
-            sid,
-            id,
-            "completed",
-            &content,
-            notify,
-            Some(exp_epoch),
-        )?;
+        let completed = ledger::event(&tx, sid, id, "completed", &content, notify)?;
         saved.push((completed, notify));
     } else if original_pending {
-        saved.push((
-            task.origin.save_at_epoch(&tx, wire, false, Some(exp_epoch))?,
-            false,
-        ));
+        saved.push((task.origin.save(&tx, wire, false)?, false));
     }
     if let Some(k) = &task.kill {
-        saved.push((k.call.save_at_epoch(&tx, wire, false, Some(exp_epoch))?, false));
+        saved.push((k.call.save(&tx, wire, false)?, false));
     }
     tx.commit()?;
     let mut task = remove_task(s, id);

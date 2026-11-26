@@ -57,7 +57,7 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
             move |conn| {
                 let (raw, revision, timeout, oauth): (String, i64, u32, bool) = conn.query_row(
                     "SELECT config_json,revision,timeout_ms,json_type(config_json,'$.oauth') IS 'object'
-                     FROM mcp_servers WHERE id=?",
+                     FROM mcp_servers WHERE id=? AND deleted=0",
                     [id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )?;
@@ -68,7 +68,7 @@ pub(super) async fn start(app: &App, id: McpServerId) -> Result<Login> {
                 server.oauth.validate()?;
                 let sql = format!(
                     "INSERT INTO mcp_oauth(server_id,generation) VALUES(?,?) ON CONFLICT(server_id)
-                     DO UPDATE SET generation=excluded.generation,binding=NULL,pending=NULL,credentials=NULL,staged_credentials=NULL,pending_refresh=NULL,rejected=0
+                     DO UPDATE SET generation=excluded.generation,binding=NULL,pending=NULL,credentials=NULL,pending_refresh=NULL,rejected=0
                      WHERE NOT {}",
                     super::storage::AUTHORIZED_SQL
                 );
@@ -274,7 +274,7 @@ pub(super) async fn complete(
     let (binding, endpoint, revision, generation, timeout, pending) = db
         .call(move |s| {
             let sql = "SELECT binding,json_extract(config_json,'$.url'),revision,generation,timeout_ms,pending
-                FROM mcp_oauth JOIN mcp_servers ON id=server_id WHERE id=?1
+                FROM mcp_oauth JOIN mcp_servers ON id=server_id WHERE id=?1 AND deleted=0
                 AND json_extract(pending,'$.csrf_token')=?2 AND json_extract(pending,'$.created_at')+?3>unixepoch()";
             let row = s
                 .conn

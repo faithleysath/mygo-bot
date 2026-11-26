@@ -13,14 +13,30 @@ pub(super) struct Account {
 // Every credential/state mutation is an UPDATE tied to the login that issued it. Only
 // the login endpoint may create a row. A late callback or refresh cannot recreate it.
 const CURRENT: &str = "server_id=?1 AND generation=?2 AND EXISTS(SELECT 1 FROM mcp_servers
-    WHERE id=?1 AND revision=?3)";
+    WHERE id=?1 AND deleted=0 AND revision=?3)";
 
 // A refreshable grant can survive an expired or peer-rejected access token. A public
 // client is allowed to receive just an access token, in which case login must reopen.
-pub(super) const AUTHORIZED_SQL: &str = "coalesce(coalesce(staged_credentials,credentials) IS NOT NULL AND (
-    json_extract(coalesce(staged_credentials,credentials),'$.token_response.refresh_token') IS NOT NULL OR
-    (NOT rejected AND (json_extract(coalesce(staged_credentials,credentials),'$.token_response.expires_in') IS NULL OR
-     json_extract(coalesce(staged_credentials,credentials),'$.token_received_at') + json_extract(coalesce(staged_credentials,credentials),'$.token_response.expires_in') > unixepoch()))),0)";
+pub(super) const AUTHORIZED_SQL: &str = "coalesce(credentials IS NOT NULL AND (
+    json_extract(credentials,'$.token_response.refresh_token') IS NOT NULL OR
+    (NOT rejected AND (json_extract(credentials,'$.token_response.expires_in') IS NULL OR
+     json_extract(credentials,'$.token_received_at') + json_extract(credentials,'$.token_response.expires_in') > unixepoch()))),0)";
+
+pub(super) fn touch_shared_mcp_oauth(conn: &rusqlite::Connection, id: McpServerId) -> Result<()> {
+    let active_shared: bool = conn
+        .prepare_cached(
+            "SELECT coalesce((SELECT shared=1 AND deleted=0 FROM mcp_servers WHERE id=?), 0)",
+        )?
+        .query_row([id], |r| r.get(0))?;
+    if active_shared {
+        let ts = crate::cluster::ledger::tick_hlc(conn)?;
+        let rev = crate::cluster::ledger::next_catalog_rev();
+        conn.prepare_cached("UPDATE mcp_servers SET oauth_ts=?2, sync_rev=?3 WHERE id=?1")?
+            .execute(params![id, ts, rev])?;
+        crate::cluster::ledger::stage_catalog();
+    }
+    Ok(())
+}
 
 impl Account {
     // Both issuer paths hold the generation gate through the network request and save.
@@ -33,8 +49,8 @@ impl Account {
             .call(move |s| {
                 let sql = format!(
                     "SELECT EXISTS(SELECT 1 FROM mcp_oauth WHERE {CURRENT}
-                     AND pending_refresh IS NULL AND NOT EXISTS(SELECT 1 FROM sync_conflicts WHERE stream_id=?1)
-                     AND json_extract(coalesce(staged_credentials,credentials),'$.token_response.refresh_token')=?4)"
+                     AND pending_refresh IS NULL
+                     AND json_extract(credentials,'$.token_response.refresh_token')=?4)"
                 );
                 Ok(s.conn.prepare_cached(&sql)?
                     .query_row(params![id, generation, revision, token], |r| r.get(0))?)
@@ -61,8 +77,8 @@ impl Account {
                             "OAuth login expired or configuration changed",
                         ));
                     }
-                    if sync && !crate::cluster::ledger::has_conflict(conn, id.as_str())? {
-                        crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
+                    if sync {
+                        touch_shared_mcp_oauth(conn, id)?;
                     }
                     Ok(())
                 },
@@ -91,31 +107,19 @@ impl Account {
         // A callback creates the grant and needs its original revision. A refresh
         // rotates an existing grant: an unrelated description/access edit retires
         // this caller, but the new connection still needs the issuer's rotated token.
-        // If a cluster conflict arrived while the network refresh was in flight, stage
-        // the rotated credentials locally so single-use refresh tokens are never lost (P1-27).
         self.db
             .write(
                 move |conn| {
-                    if crate::cluster::ledger::has_conflict(conn, id.as_str())? {
-                        let sql = "UPDATE mcp_oauth SET staged_credentials=?4,pending_refresh=NULL
-                            WHERE server_id=?1 AND generation=?2 AND pending IS NULL AND
-                            (credentials IS NOT NULL OR staged_credentials IS NOT NULL
-                             OR EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND revision=?3))
-                            RETURNING (SELECT revision=?3 FROM mcp_servers WHERE id=?1)";
-                        return Ok(conn.query_row(sql, params![id, generation, revision, value], |row| {
-                            row.get::<_, bool>(0)
-                        })?);
-                    }
-                    let sql = "UPDATE mcp_oauth SET credentials=?4,staged_credentials=NULL,pending_refresh=NULL,rejected=0
+                    let sql = "UPDATE mcp_oauth SET credentials=?4,pending_refresh=NULL,rejected=0
                         WHERE server_id=?1 AND generation=?2 AND pending IS NULL AND
-                        (credentials IS NOT NULL OR staged_credentials IS NOT NULL
-                         OR EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND revision=?3))
-                        RETURNING (SELECT revision=?3 FROM mcp_servers WHERE id=?1)";
+                        (credentials IS NOT NULL
+                         OR EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND deleted=0 AND revision=?3))
+                        RETURNING (SELECT deleted=0 AND revision=?3 FROM mcp_servers WHERE id=?1)";
                     let current = conn
                         .query_row(sql, params![id, generation, revision, value], |row| {
                             row.get::<_, bool>(0)
                         })?;
-                    crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
+                    touch_shared_mcp_oauth(conn, id)?;
                     Ok(current)
                 },
                 |_, current| Ok(current),
@@ -130,7 +134,7 @@ impl Account {
         self.db
             .call(move |s| {
                 let sql = format!(
-                    "SELECT coalesce(staged_credentials,credentials),rejected FROM mcp_oauth WHERE {CURRENT} AND {AUTHORIZED_SQL}"
+                    "SELECT credentials,rejected FROM mcp_oauth WHERE {CURRENT} AND {AUTHORIZED_SQL}"
                 );
                 let row: Option<(Option<String>, bool)> = s
                     .conn
@@ -151,10 +155,8 @@ impl Account {
         let _ = self
             .update(
                 "rejected=1,credentials=CASE WHEN json_extract(credentials,'$.token_response.refresh_token') IS NULL
-                 THEN NULL ELSE credentials END,
-                 staged_credentials=CASE WHEN json_extract(staged_credentials,'$.token_response.refresh_token') IS NULL
-                 THEN NULL ELSE staged_credentials END",
-                "AND json_extract(coalesce(staged_credentials,credentials),'$.token_response.access_token')=?4",
+                 THEN NULL ELSE credentials END",
+                "AND json_extract(credentials,'$.token_response.access_token')=?4",
                 Some(token),
                 true,
             )
@@ -169,13 +171,11 @@ impl Account {
             .write(
                 move |conn| {
                     conn.execute(
-                        "UPDATE mcp_oauth SET credentials=NULL,staged_credentials=NULL,pending_refresh=NULL,rejected=0 WHERE server_id=? AND generation=?
-                        AND json_extract(coalesce(staged_credentials,credentials),'$.token_response.refresh_token')=?",
+                        "UPDATE mcp_oauth SET credentials=NULL,pending_refresh=NULL,rejected=0 WHERE server_id=? AND generation=?
+                        AND json_extract(credentials,'$.token_response.refresh_token')=?",
                         params![id, generation, token],
                     )?;
-                    if !crate::cluster::ledger::has_conflict(conn, id.as_str())? {
-                        crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
-                    }
+                    touch_shared_mcp_oauth(conn, id)?;
                     Ok(())
                 },
                 |_, ()| Ok(()),
@@ -201,7 +201,7 @@ pub(super) async fn save_pending_and_binding(
         move |conn| {
             if conn.execute(
                 "UPDATE mcp_oauth SET binding=?1,pending=?2 WHERE server_id=?3 AND generation=?4
-                 AND EXISTS(SELECT 1 FROM mcp_servers WHERE id=?3 AND revision=?5)",
+                 AND EXISTS(SELECT 1 FROM mcp_servers WHERE id=?3 AND deleted=0 AND revision=?5)",
                 params![binding, pending, id, generation, revision],
             )? != 1
             {

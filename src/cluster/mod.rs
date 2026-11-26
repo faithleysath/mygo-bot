@@ -22,7 +22,7 @@ use crate::{
     store::Db,
 };
 
-const MAX_STAGED_SIGNALS: usize = 8192;
+const MAX_STAGED_SESSIONS: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub enum SyncSignal {
@@ -31,9 +31,18 @@ pub enum SyncSignal {
 
 #[derive(Default)]
 struct SignalState {
-    streams: HashSet<String>,
+    catalog: bool,
+    sessions: HashSet<SessionId>,
     self_meta: bool,
-    full_sync_needed: bool,
+    full_sync: bool,
+}
+
+#[derive(Default)]
+pub struct DirtyBatch {
+    pub catalog: bool,
+    pub sessions: Vec<SessionId>,
+    pub self_meta: bool,
+    pub full_sync: bool,
 }
 
 pub struct ClusterSignal {
@@ -55,18 +64,21 @@ impl ClusterSignal {
         }
     }
 
-    pub fn notify_streams(&self, ids: Vec<String>) {
-        if ids.is_empty() {
+    pub fn notify_changes(&self, catalog: bool, sessions: Vec<SessionId>) {
+        if !catalog && sessions.is_empty() {
             return;
         }
         {
             let mut st = self.state.lock().unwrap();
-            if !st.full_sync_needed {
-                if st.streams.len().saturating_add(ids.len()) > MAX_STAGED_SIGNALS {
-                    st.streams.clear();
-                    st.full_sync_needed = true;
+            if catalog {
+                st.catalog = true;
+            }
+            if !st.full_sync && !sessions.is_empty() {
+                if st.sessions.len().saturating_add(sessions.len()) > MAX_STAGED_SESSIONS {
+                    st.sessions.clear();
+                    st.full_sync = true;
                 } else {
-                    st.streams.extend(ids);
+                    st.sessions.extend(sessions);
                 }
             }
         }
@@ -78,12 +90,14 @@ impl ClusterSignal {
         self.notify.notify_one();
     }
 
-    pub fn take(&self) -> (Vec<String>, bool, bool) {
+    pub fn take(&self) -> DirtyBatch {
         let mut st = self.state.lock().unwrap();
-        let streams: Vec<String> = st.streams.drain().collect();
-        let self_meta = std::mem::take(&mut st.self_meta);
-        let full_sync_needed = std::mem::take(&mut st.full_sync_needed);
-        (streams, self_meta, full_sync_needed)
+        DirtyBatch {
+            catalog: std::mem::take(&mut st.catalog),
+            sessions: st.sessions.drain().collect(),
+            self_meta: std::mem::take(&mut st.self_meta),
+            full_sync: std::mem::take(&mut st.full_sync),
+        }
     }
 
     pub async fn notified(&self) {
@@ -136,7 +150,6 @@ impl Cluster {
             start.streams,
             net.clone(),
             start.signal.clone(),
-            start.presence.clone(),
         );
         net.attach_handler(Arc::downgrade(&sync));
         if bind_on_start {
@@ -181,12 +194,14 @@ impl Cluster {
                         move |conn| {
                             let (changed, next_gen, secret, peer) =
                                 identity::apply_join(conn, secret, peer, force)?;
-                            let count = identity::list_peers(conn)?.len();
-                            Ok((changed, next_gen, secret, peer, count))
+                            let peers = identity::list_peers(conn)?;
+                            Ok((changed, next_gen, secret, peer, peers))
                         },
-                        move |_, res| {
-                            presence.set_known_peer_count(res.4);
-                            Ok(res)
+                        move |_, (changed, next_gen, secret, peer, peers)| {
+                            let count = peers.len();
+                            presence.set_peer_roles(&peers);
+                            presence.set_known_peer_count(count);
+                            Ok((changed, next_gen, secret, peer, count))
                         },
                     )
                     .await?;

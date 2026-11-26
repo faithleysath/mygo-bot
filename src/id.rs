@@ -81,6 +81,12 @@ impl Prefix for Item {
     const LABEL: &'static str = "itm";
 }
 
+pub enum ContextNode {}
+impl Prefix for ContextNode {
+    const PREFIX: &'static [u8; 3] = b"ctx";
+    const LABEL: &'static str = "ctx";
+}
+
 pub type ProviderId = Id<Provider>;
 pub type ModelId = Id<Model>;
 pub type McpServerId = Id<McpServer>;
@@ -88,6 +94,7 @@ pub type SessionId = Id<Session>;
 pub type CallId = Id<Call>;
 pub type AttachmentId = Id<Attachment>;
 pub type ItemId = Id<Item>;
+pub type ContextNodeId = Id<ContextNode>;
 
 pub struct Id<K: Prefix> {
     bytes: [u8; 30],
@@ -218,10 +225,10 @@ pub fn seed_from_db(conn: &Connection) -> Result<()> {
         "SELECT max(id) FROM llm_models",
         "SELECT max(id) FROM mcp_servers",
         "SELECT max(id) FROM sessions",
-        "SELECT max(input_queue_cursor) FROM sessions WHERE input_queue_cursor != ''",
         "SELECT max(id) FROM llm_calls",
         "SELECT max(id) FROM attachments",
         "SELECT max(id) FROM items",
+        "SELECT max(id) FROM context_nodes",
     ];
     for sql in QUERIES {
         let max_id: Option<String> = conn.query_row(sql, [], |r| r.get(0))?;

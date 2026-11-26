@@ -444,14 +444,8 @@ impl SessionEventStream {
                     Err(e) => return Err(e),
                 };
                 let initial = s.session_view(info);
-                let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, sid)?;
-                let mut payload = serde_json::to_string(&initial)
+                let payload = serde_json::to_string(&initial)
                     .map_err(|e| crate::Error::internal(e.to_string()))?;
-                if payload.ends_with('}') {
-                    payload.pop();
-                    use std::fmt::Write;
-                    let _ = write!(payload, ",\"history_rev\":{history_rev}}}");
-                }
                 let channel = s.channel(sid);
                 let rx = channel.subscribe();
                 Ok(Some((channel, rx, payload)))
@@ -491,14 +485,8 @@ impl SessionEventStream {
             .push_back((Cow::Borrowed(notice.name), notice.data));
     }
 
-    async fn resync_payload(&self, app: &App) -> Arc<str> {
-        let sid = self.sid;
-        let rev = app
-            .db
-            .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
-            .await
-            .unwrap_or(0);
-        Arc::from(json!({"history_rev": rev}).to_string())
+    async fn resync_payload(&self) -> Arc<str> {
+        Arc::from("{}")
     }
 
     pub async fn next(&mut self, app: &App) -> NextSessionNotice {
@@ -533,7 +521,7 @@ impl SessionEventStream {
                             self.push_notice(d);
                         }
                         Err(TryRecvError::Lagged(_)) => {
-                            let data = self.resync_payload(app).await;
+                            let data = self.resync_payload().await;
                             self.queued.push_back((Cow::Borrowed("resync"), data));
                         }
                         Err(TryRecvError::Closed) => {
@@ -576,7 +564,7 @@ impl SessionEventStream {
                     Err(TryRecvError::Lagged(_)) => {
                         return NextSessionNotice::Event {
                             event: Cow::Borrowed("resync"),
-                            data: self.resync_payload(app).await,
+                            data: self.resync_payload().await,
                         };
                     }
                     Err(TryRecvError::Closed) => return NextSessionNotice::Closed,
@@ -627,7 +615,7 @@ impl SessionEventStream {
                         self.delta_lagged = true;
                         return NextSessionNotice::Event {
                             event: Cow::Borrowed("resync"),
-                            data: self.resync_payload(app).await,
+                            data: self.resync_payload().await,
                         };
                     }
                     Err(TryRecvError::Closed) => {
@@ -709,7 +697,7 @@ impl SessionEventStream {
                     self.delta_lagged = true;
                     return NextSessionNotice::Event {
                         event: Cow::Borrowed("resync"),
-                        data: self.resync_payload(app).await,
+                        data: self.resync_payload().await,
                     };
                 }
                 Incoming::Durable(Err(RecvError::Closed)) => return NextSessionNotice::Closed,
@@ -901,12 +889,7 @@ pub async fn subscribe(
                     if let Some(old) = relay.take() {
                         old.cancel.cancel();
                     }
-                    let rev = app
-                        .db
-                        .call(move |s| crate::cluster::ledger::session_history_rev(&s.conn, sid))
-                        .await
-                        .unwrap_or(0);
-                    yield Ok(Event::default().event("resync").data(json!({"history_rev": rev}).to_string()));
+                    yield Ok(Event::default().event("resync").data("{}"));
                     if runner_rx.borrow().is_some() {
                         let shift = retry_attempts.min(3);
                         let delay_ms = 250u64 << shift;

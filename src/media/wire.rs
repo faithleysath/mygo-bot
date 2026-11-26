@@ -149,7 +149,7 @@ impl Page {
             position: after,
         };
         let mut stmt = conn.prepare_cached(
-            "SELECT c.position,i.payload,i.kind FROM context_items c JOIN items i ON i.id=c.item_id
+            "SELECT c.position,i.payload,i.kind FROM active_context c JOIN items i ON i.id=c.item_id
              WHERE c.session_id=? AND c.position>? AND c.position<=? ORDER BY c.position LIMIT 256",
         )?;
         let mut rows = stmt.query((sid, after, end))?;

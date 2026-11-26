@@ -1,6 +1,6 @@
 use crate::{
     App, Error, Result, calls,
-    cluster::{exec::ActiveLease, ledger::StreamHead},
+    cluster::exec::ActiveLease,
     events::Notice,
     id::{ItemId, SessionId},
     model::{self, Failure},
@@ -21,7 +21,6 @@ use tokio_util::sync::CancellationToken;
 pub struct Control {
     pub soft: CancellationToken,
     pub hard: CancellationToken,
-    pub epoch: i64,
     pub run_gen: u64,
     pub lease: Option<Arc<ActiveLease>>,
 }
@@ -35,7 +34,7 @@ impl Control {
 enum StartEffect {
     None,
     Idle(i64),
-    Worker(Vec<ItemId>, i64, i64),
+    Worker(Vec<ItemId>, i64),
 }
 
 #[derive(Deserialize, Default)]
@@ -61,7 +60,7 @@ pub async fn start(
         serde_json::from_slice(&body).map_err(|e| Error::bad(e.to_string()))?
     };
     if req.node.is_none() && app.exec.presence().known_peer_count() == 0 {
-        return app.start_local_checked(sid, None, None).await.map(Json);
+        return app.start_local_checked(sid, None).await.map(Json);
     }
     app.exec
         .start_run(&app, sid, req.node, req.force_offline)
@@ -76,7 +75,7 @@ impl App {
             let result = if app.exec.presence().known_peer_count() > 0 {
                 app.exec.start_wake_run(&app, sid).await
             } else {
-                app.start_worker_inner(sid, true, None, None).await
+                app.start_worker_inner(sid, true, None).await
             };
             if let Err(e) = result
                 && !app.stopping.is_cancelled()
@@ -139,28 +138,23 @@ impl App {
     pub async fn start_local_checked(
         &self,
         sid: SessionId,
-        expected_head: Option<StreamHead>,
         lease: Option<Arc<ActiveLease>>,
     ) -> Result<Session> {
-        self.start_worker_inner(sid, false, expected_head, lease)
-            .await
+        self.start_worker_inner(sid, false, lease).await
     }
 
     pub(crate) async fn start_wake_checked(
         &self,
         sid: SessionId,
-        expected_head: Option<StreamHead>,
         lease: Option<Arc<ActiveLease>>,
     ) -> Result<Session> {
-        self.start_worker_inner(sid, true, expected_head, lease)
-            .await
+        self.start_worker_inner(sid, true, lease).await
     }
 
     async fn start_worker_inner(
         &self,
         sid: SessionId,
         automatic: bool,
-        expected_head: Option<StreamHead>,
         lease: Option<Arc<ActiveLease>>,
     ) -> Result<Session> {
         if automatic && self.exec.presence().remote_owner(sid).is_some() {
@@ -198,46 +192,22 @@ impl App {
                     if active {
                         return Ok((current, StartEffect::None));
                     }
-                    crate::cluster::ledger::assert_no_conflict(conn, sid.as_str())?;
-                    if !crate::cluster::ledger::is_session_writable_local(conn, sid)? {
+                    if !crate::cluster::ledger::session_branch_complete(conn, sid)? {
                         return Err(Error::conflict(
-                            "session history is incomplete or read-only locally; sync before running",
+                            "session history is incomplete locally; sync before running",
                         ));
                     }
-                    if let Some(ref exp) = expected_head {
-                        let cur = crate::cluster::ledger::stream_head(conn, sid.as_str())?;
-                        let matches = cur.as_ref().is_some_and(|h| {
-                            h.epoch == exp.epoch
-                                && h.head_seq == exp.head_seq
-                                && h.head_hash == exp.head_hash
-                        });
-                        if !matches {
-                            return Err(Error::conflict(
-                                "session history changed concurrently before run start",
-                            ));
-                        }
-                    }
-                    let run_epoch = crate::cluster::ledger::stream_head(conn, sid.as_str())?
-                        .map_or(1, |h| h.epoch);
-                    let unfinished: bool = conn
-                        .prepare_cached("SELECT needs_model FROM sessions WHERE id=?")?
-                        .query_row([sid], |r| r.get(0))?;
+                    let unfinished = store::needs_model(conn, sid)?;
                     let now = chrono::Utc::now().timestamp_millis();
                     if !unfinished && !store::has_pending(conn, sid)? {
                         if current.status == SessionStatus::Paused {
+                            let status_ts = crate::cluster::ledger::tick_hlc(conn)?;
+                            let rev = crate::cluster::ledger::next_catalog_rev();
                             conn.prepare_cached(
-                                "UPDATE sessions SET status='idle',last_error='',updated_at=?2 WHERE id=?1",
+                                "UPDATE sessions SET status='idle',last_error='',updated_at=max(updated_at,?2),status_ts=?3,sync_rev=?4 WHERE id=?1",
                             )?
-                            .execute((sid, now))?;
-                            crate::cluster::ledger::record_session_delta_at_epoch(
-                                conn,
-                                sid,
-                                "session_delta",
-                                Vec::new(),
-                                Vec::new(),
-                                Vec::new(),
-                                Some(run_epoch),
-                            )?;
+                            .execute((sid, now, status_ts, rev))?;
+                            crate::cluster::ledger::stage_catalog();
                             return Ok((session(conn, sid)?, StartEffect::Idle(now)));
                         }
                         return Ok((current, StartEffect::None));
@@ -249,13 +219,10 @@ impl App {
                     };
                     store::take_pending(conn, sid)?;
                     conn.prepare_cached(
-                        "UPDATE sessions SET status='running',last_error='',updated_at=?2 WHERE id=?1",
+                        "UPDATE sessions SET status='running',last_error='',updated_at=max(updated_at,?2) WHERE id=?1",
                     )?
                     .execute((sid, now))?;
-                    Ok((
-                        session(conn, sid)?,
-                        StartEffect::Worker(recovered, now, run_epoch),
-                    ))
+                    Ok((session(conn, sid)?, StartEffect::Worker(recovered, now)))
                 },
                 move |s, (current, effect)| {
                     s.pending_wakes.remove(&sid);
@@ -272,7 +239,7 @@ impl App {
                             s.refresh_local_presence_with(sid, SessionStatus::Idle, "", updated_at);
                             s.notify_status(sid, "idle", "", updated_at);
                         }
-                        StartEffect::Worker(recovered, updated_at, run_epoch) => {
+                        StartEffect::Worker(recovered, updated_at) => {
                             let notices = recovered
                                 .into_iter()
                                 .try_for_each(|id| s.item_saved(sid, id));
@@ -281,7 +248,6 @@ impl App {
                             let control = Control {
                                 soft: CancellationToken::new(),
                                 hard: CancellationToken::new(),
-                                epoch: run_epoch,
                                 run_gen,
                                 lease,
                             };
@@ -364,15 +330,6 @@ fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
 }
 
 fn pause_failed_run(s: &mut Store, sid: SessionId, control: &Control, problem: Error) -> Result<()> {
-    let stream = crate::cluster::ledger::stream_head(&s.conn, sid.as_str())?;
-    let conflicted = crate::cluster::ledger::has_conflict(&s.conn, sid.as_str())?;
-    let epoch_ok = stream.as_ref().is_none_or(|st| {
-        st.epoch == control.epoch && !st.deleted && !st.retired
-    });
-    let writable = crate::cluster::ledger::is_session_writable_local(&s.conn, sid)?;
-    if conflicted || !epoch_ok || !writable {
-        return Ok(());
-    }
     let Ok(current) = session(&s.conn, sid) else {
         return Ok(());
     };
@@ -530,7 +487,6 @@ impl App {
     ) -> Result<()> {
         let mut retries = 0;
         let mut attempt = 0u64;
-        let run_epoch = control.epoch;
         let run_gen = control.run_gen;
         loop {
             if !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid) {
@@ -550,37 +506,24 @@ impl App {
                         if soft.is_cancelled() {
                             return Err(Error::conflict("paused"));
                         }
-                        if crate::cluster::ledger::has_conflict(conn, sid.as_str())?
-                            || crate::cluster::ledger::stream_head(conn, sid.as_str())?
-                                .is_some_and(|h| h.epoch != run_epoch || h.deleted || h.retired)
+                        if conn
+                            .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                            .query_row([sid], |r| r.get::<_, bool>(0))?
                         {
-                            return Err(Error::conflict("session epoch superseded or conflicted"));
+                            return Err(Error::conflict("session deleted"));
                         }
                         store::take_pending(conn, sid)?;
-                        let needed: bool = conn
-                            .prepare_cached("SELECT needs_model FROM sessions WHERE id=?")?
-                            .query_row([sid], |r| r.get(0))?;
+                        let needed = store::needs_model(conn, sid)?;
                         // A queued message can be withdrawn before this worker takes it.
                         if !needed {
-                            if !crate::cluster::ledger::is_session_writable_local(conn, sid)? {
-                                return Err(Error::conflict(
-                                    "session history is incomplete or deleted; sync before modifying",
-                                ));
-                            }
                             let now = chrono::Utc::now().timestamp_millis();
+                            let status_ts = crate::cluster::ledger::tick_hlc(conn)?;
+                            let rev = crate::cluster::ledger::next_catalog_rev();
                             conn.prepare_cached(
-                                "UPDATE sessions SET status='idle',last_error='',updated_at=?2 WHERE id=?1",
+                                "UPDATE sessions SET status='idle',last_error='',updated_at=max(updated_at,?2),status_ts=?3,sync_rev=?4 WHERE id=?1",
                             )?
-                            .execute((sid, now))?;
-                            crate::cluster::ledger::record_session_delta_at_epoch(
-                                conn,
-                                sid,
-                                "session_delta",
-                                Vec::new(),
-                                Vec::new(),
-                                Vec::new(),
-                                Some(run_epoch),
-                            )?;
+                            .execute((sid, now, status_ts, rev))?;
+                            crate::cluster::ledger::stage_catalog();
                             return Ok(BeginOutcome::Idle(now));
                         }
                         let end = store::max_context_position(conn, sid)?;
@@ -613,7 +556,7 @@ impl App {
                 tokio::select! {
                     biased;
                     _ = control.hard.cancelled() => Err(Failure::Cancelled),
-                    result = self.stream(sid, input, &mut output, &control.hard, (run_epoch, run_gen)) => result,
+                    result = self.stream(sid, input, &mut output, &control.hard, run_gen) => result,
                 }
             } else {
                 tokio::select! {
@@ -632,7 +575,7 @@ impl App {
                                 .await
                                 .map_err(Failure::Fatal)?;
                         }
-                        self.stream(sid, input, &mut output, &control.hard, (run_epoch, run_gen))
+                        self.stream(sid, input, &mut output, &control.hard, run_gen)
                             .await
                     } => result,
                 }
@@ -687,9 +630,9 @@ impl App {
                             return Ok(());
                         }
                         let tx = s.conn.transaction()?;
-                        if crate::cluster::ledger::has_conflict(&tx, sid.as_str())?
-                            || crate::cluster::ledger::stream_head(&tx, sid.as_str())?
-                                .is_some_and(|h| h.epoch != run_epoch || h.deleted || h.retired)
+                        if tx
+                            .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                            .query_row([sid], |r| r.get::<_, bool>(0))?
                         {
                             return Ok(());
                         }
@@ -742,10 +685,11 @@ impl App {
                     sid,
                     run_gen,
                     move |conn| {
-                        if crate::cluster::ledger::stream_head(conn, sid.as_str())?
-                            .is_some_and(|h| h.epoch != run_epoch || h.deleted || h.retired)
+                        if conn
+                            .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                            .query_row([sid], |r| r.get::<_, bool>(0))?
                         {
-                            return Err(Error::conflict("session epoch superseded"));
+                            return Err(Error::conflict("session deleted"));
                         }
                         if tools {
                             store::publish_tools(conn, sid, false)?;
@@ -753,26 +697,20 @@ impl App {
                         if let Some(report) = final_report {
                             report.finish(conn, call_id, "succeeded", None, finished_at)?;
                         }
-                        let mut added_items = Vec::new();
-                        let mut added_ctx = Vec::new();
                         let saved = if let Some(item) = output.final_item {
-                            let (saved, pos) = store::add_context_item_raw(
+                            Some(store::add_context_item(
                                 conn,
                                 sid,
                                 "assistant_message",
                                 &item,
                                 call_id,
-                            )?;
-                            let id = saved.id;
-                            added_items.push(saved);
-                            added_ctx.push(crate::cluster::ledger::ContextPos {
-                                position: pos,
-                                item_id: id,
-                            });
-                            Some(id)
+                            )?)
                         } else {
                             None
                         };
+                        if !tools {
+                            crate::cluster::ledger::mark_turn_settled(conn, sid)?;
+                        }
                         let state = if soft.is_cancelled() {
                             "paused"
                         } else if tools || store::has_pending(conn, sid)? {
@@ -781,19 +719,20 @@ impl App {
                             "idle"
                         };
                         let now = chrono::Utc::now().timestamp_millis();
-                        conn.prepare_cached(
-                            "UPDATE sessions SET needs_model=?2,status=?3,updated_at=?4 WHERE id=?1",
-                        )?
-                        .execute((sid, tools, state, now))?;
-                        crate::cluster::ledger::record_session_delta_at_epoch(
-                            conn,
-                            sid,
-                            "session_delta",
-                            added_items,
-                            added_ctx,
-                            Vec::new(),
-                            Some(run_epoch),
-                        )?;
+                        if matches!(state, "idle" | "paused") {
+                            let status_ts = crate::cluster::ledger::tick_hlc(conn)?;
+                            let rev = crate::cluster::ledger::next_catalog_rev();
+                            conn.prepare_cached(
+                                "UPDATE sessions SET status=?2,updated_at=max(updated_at,?3),status_ts=?4,sync_rev=?5 WHERE id=?1",
+                            )?
+                            .execute((sid, state, now, status_ts, rev))?;
+                            crate::cluster::ledger::stage_catalog();
+                        } else {
+                            conn.prepare_cached(
+                                "UPDATE sessions SET status=?2,updated_at=max(updated_at,?3) WHERE id=?1",
+                            )?
+                            .execute((sid, state, now))?;
+                        }
                         Ok((saved, state, now))
                     },
                     move |s, (saved, state, now)| {

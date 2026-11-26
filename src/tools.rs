@@ -25,7 +25,7 @@ pub fn definitions() -> Value {
                 "- Native file and HTTP APIs work on nodes without shell utilities.\n\n",
                 "Cluster (cluster):\n",
                 "- There are no bare global fs, http, proc, mcp, or mygo.request APIs; every host capability is accessed via a node handle.\n",
-                "- await cluster.nodes() returns [{id,name,description,os,arch,online}] sorted by (name, id) (e.g. os: 'macos'|'linux'|'windows', arch: 'aarch64'|'x86_64').\n",
+                "- await cluster.nodes() returns [{id,name,description,role,os,arch,online}] sorted by (name, id) (e.g. role: 'voter'|'edge', os: 'macos'|'linux'|'windows', arch: 'aarch64'|'x86_64').\n",
                 "- const n = cluster.node(target) creates a handle for a node by exact id or unique name, exposing n.fs, n.http, n.proc, n.mcp, and n.mygo.\n",
                 "- Node resolution/transport errors set error.code: ENODENOTFOUND (unknown target), ENODEAMBIGUOUS (duplicate name; pass id), ENODEUNREACH (node offline or disconnected mid-call).\n\n",
                 "Files (n.fs):\n",

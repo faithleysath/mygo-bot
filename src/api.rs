@@ -90,13 +90,6 @@ struct Selection {
 }
 
 impl Selection {
-    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            model_id: row.get(0)?,
-            reasoning_effort: row.get(1)?,
-        })
-    }
-
     fn apply(self, fields: Map<String, Value>) -> Result<Self> {
         if fields.get("model_id").is_some_and(Value::is_null) {
             return Err(Error::bad("model_id cannot be null"));
@@ -158,18 +151,15 @@ async fn create_session(
                     .ok_or_else(|| Error::bad("model_id is required"))?;
                 let id = SessionId::new()?;
                 let now = chrono::Utc::now().timestamp_millis();
+                let ts = crate::cluster::ledger::tick_hlc(conn)?;
+                let rev = crate::cluster::ledger::next_catalog_rev();
                 conn.execute(
-                    "INSERT INTO sessions(id,title,created_at,updated_at,model_id,reasoning_effort) VALUES(?,?,?,?,?,?)",
-                    params![id, title, now, now, model_id, next.reasoning_effort],
+                    "INSERT INTO sessions(id,title,title_ts,created_at,updated_at,status_ts,model_id,reasoning_effort,selection_ts,sync_rev)
+                     VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    params![id, title, ts, now, now, ts, model_id, next.reasoning_effort, ts, rev],
                 )?;
-                crate::cluster::ledger::record_session_delta(
-                    conn,
-                    id,
-                    "session_delta",
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )?;
+                crate::cluster::ledger::mark_session_watched(conn, id)?;
+                crate::cluster::ledger::stage_catalog();
                 session(conn, id)
             },
             |s, created| {
@@ -219,40 +209,104 @@ pub(crate) async fn patch_session_local(
     if fields.is_empty() {
         return Err(Error::bad("expected session settings"));
     }
+    let has_selection =
+        fields.contains_key("model_id") || fields.contains_key("reasoning_effort");
     let title = extract_title(&mut fields)?;
+    let active_head_req: Option<crate::id::ContextNodeId> = match fields.remove("active_head") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| Error::bad("active_head must be a ctx_ ID string"))?;
+            Some(
+                s.parse()
+                    .map_err(|e: String| Error::bad(format!("invalid active_head: {e}")))?,
+            )
+        }
+    };
     app.db
         .write(
             move |conn| {
-                let current = conn.query_row(
-                    "SELECT model_id,reasoning_effort FROM sessions WHERE id=?",
-                    [sid],
-                    Selection::read,
-                )?;
+                let cur_sess = session(conn, sid)?;
+                if active_head_req.is_some()
+                    && matches!(
+                        cur_sess.status,
+                        SessionStatus::Running | SessionStatus::Pausing
+                    )
+                {
+                    return Err(Error::conflict(
+                        "pause the session before switching active branch",
+                    ));
+                }
+                let mut switched_branch = false;
+                if let Some(target_head) = active_head_req {
+                    if !crate::cluster::ledger::node_branch_complete(conn, sid, target_head)? {
+                        return Err(Error::conflict(
+                            "target branch head does not exist in this session or is incomplete",
+                        ));
+                    }
+                    if cur_sess.active_head != Some(target_head) {
+                        let ts = crate::cluster::ledger::tick_hlc(conn)?;
+                        conn.execute(
+                            "UPDATE sessions SET active_head=?2, active_head_ts=?3 WHERE id=?1",
+                            params![sid, target_head, ts],
+                        )?;
+                        switched_branch = matches!(
+                            crate::cluster::ledger::reconcile_active_context(conn, sid)?,
+                            crate::cluster::ledger::ActiveContextChange::Switched
+                                | crate::cluster::ledger::ActiveContextChange::Cleared
+                        );
+                    }
+                }
+                let current = Selection {
+                    model_id: Some(cur_sess.model_id),
+                    reasoning_effort: cur_sess.reasoning_effort,
+                };
                 let old_id = current.model_id;
                 let next = current.apply(fields)?;
                 let modalities = next.validate(conn)?;
-                if next.model_id != old_id {
+                if next.model_id != old_id || switched_branch {
                     crate::media::check_session(conn, sid, &modalities)?;
                 }
                 let model_id = next
                     .model_id
                     .ok_or_else(|| Error::bad("model_id is required"))?;
                 let now = chrono::Utc::now().timestamp_millis();
+                let ts = crate::cluster::ledger::tick_hlc(conn)?;
+                let rev = crate::cluster::ledger::next_catalog_rev();
+                let title_ts = title.as_ref().map(|_| ts.as_str());
+                let sel_ts = has_selection.then(|| ts.as_str());
                 conn.execute(
-                    "UPDATE sessions SET model_id=?,reasoning_effort=?,title=coalesce(?,title),updated_at=? WHERE id=?",
-                    params![model_id, next.reasoning_effort, title, now, sid],
+                    "UPDATE sessions
+                     SET model_id=?2,
+                         reasoning_effort=?3,
+                         selection_ts=coalesce(?4, selection_ts),
+                         title=coalesce(?5, title),
+                         title_ts=coalesce(?6, title_ts),
+                         updated_at=max(updated_at, ?7),
+                         sync_rev=?8
+                     WHERE id=?1 AND deleted=0",
+                    params![
+                        sid,
+                        model_id,
+                        next.reasoning_effort,
+                        sel_ts,
+                        title,
+                        title_ts,
+                        now,
+                        rev
+                    ],
                 )?;
-                crate::cluster::ledger::record_session_delta(
-                    conn,
-                    sid,
-                    "session_delta",
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )?;
-                session(conn, sid)
+                crate::cluster::ledger::stage_catalog();
+                Ok((session(conn, sid)?, switched_branch))
             },
-            move |s, updated| {
+            move |s, (updated, switched_branch)| {
+                if switched_branch {
+                    s.bump_reset_gen(sid);
+                    if let Some(channel) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
+                        Notice::publish(&channel, "session.reset", json!({}));
+                    }
+                }
                 let view = s.session_view(updated);
                 let data = json!(view);
                 if let Some(channel) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
@@ -282,7 +336,6 @@ async fn delete_session(
 }
 
 async fn finish_delete(app: App, sid: SessionId, delete_gate: DeleteGateGuard) -> Result<StatusCode> {
-    let expected_head = delete_gate.expected_head();
     let delete_lease = delete_gate.lease();
     let res = app
         .db
@@ -307,41 +360,8 @@ async fn finish_delete(app: App, sid: SessionId, delete_gate: DeleteGateGuard) -
                     "pause the session and stop active tasks before deleting",
                 ));
             }
-            crate::cluster::ledger::assert_no_conflict(&tx, sid.as_str())?;
-            if let Some(ref exp) = expected_head {
-                let cur = crate::cluster::ledger::stream_head(&tx, sid.as_str())?;
-                let matches = cur.as_ref().is_some_and(|h| {
-                    h.epoch == exp.epoch
-                        && h.head_seq == exp.head_seq
-                        && h.head_hash == exp.head_hash
-                });
-                if !matches {
-                    return Err(Error::conflict(
-                        "session history changed concurrently before delete",
-                    ));
-                }
-            }
-            let detached_calls = {
-                let mut stmt = tx.prepare("SELECT id FROM llm_calls WHERE session_id=? ORDER BY id")?;
-                stmt.query_map([sid], |r| r.get::<_, crate::id::CallId>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            tx.execute("DELETE FROM context_items WHERE session_id=?", [sid])?;
-            tx.execute(
-                "DELETE FROM invalidated_warnings WHERE item_id IN (SELECT id FROM items WHERE session_id=?)",
-                [sid],
-            )?;
-            tx.execute(
-                "DELETE FROM items WHERE session_id=? AND (target_id IS NOT NULL OR codemode_call_item_id IS NOT NULL)",
-                [sid],
-            )?;
-            tx.execute("DELETE FROM items WHERE session_id=?", [sid])?;
-            tx.execute("UPDATE llm_calls SET session_id=NULL WHERE session_id=?", [sid])?;
-            for &cid in &detached_calls {
-                crate::cluster::ledger::record_call(&tx, cid)?;
-            }
-            tx.execute("DELETE FROM sessions WHERE id=?", [sid])?;
-            crate::cluster::ledger::record_session_deleted(&tx, sid, &detached_calls)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            crate::cluster::ledger::tombstone_session(&tx, sid, now)?;
             s.presence.check_delete_lease(sid, delete_lease.as_deref())?;
             tx.commit()?;
             s.mcp.forget_session(sid);
@@ -386,8 +406,8 @@ async fn list_sessions(
     page.check()?;
     app.db
         .call(move |s| {
-            let sql = "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id FROM sessions
-                   WHERE id>? ORDER BY id LIMIT ?";
+            let sql = "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id,active_head
+                       FROM sessions WHERE deleted=0 AND id>? ORDER BY id LIMIT ?";
             let mut stmt = s.conn.prepare_cached(sql)?;
             let after = page.after.as_ref().map_or("", SessionId::as_str);
             let rows = stmt
@@ -474,11 +494,10 @@ macro_rules! messages_sql {
     ($filter:literal) => {
         concat!(
             "SELECT i.id, json_extract(i.payload,'$.content'),
-                    CASE WHEN w.id IS NOT NULL THEN 'withdrawn'
-                         WHEN c.item_id IS NOT NULL THEN 'included' ELSE 'queued' END AS status
-             FROM items i
-             LEFT JOIN items w ON w.target_id=i.id AND w.kind='withdrawal'
-             LEFT JOIN context_items c ON c.item_id=i.id ",
+                    CASE WHEN EXISTS(SELECT 1 FROM context_nodes c WHERE c.session_id=i.session_id AND c.item_id=i.id) THEN 'included'
+                         WHEN EXISTS(SELECT 1 FROM items w WHERE w.session_id=i.session_id AND w.kind='withdrawal' AND w.target_id=i.id) THEN 'withdrawn'
+                         ELSE 'queued' END AS status
+             FROM items i ",
             $filter
         )
     };
@@ -561,8 +580,8 @@ pub(crate) async fn withdraw_local(app: &App, sid: SessionId, mid: ItemId) -> Re
     app.db
         .write(
             move |conn| {
-                let sql = "SELECT EXISTS(SELECT 1 FROM items WHERE kind='withdrawal' AND target_id=?2),
-                              EXISTS(SELECT 1 FROM context_items WHERE item_id=?2)
+                let sql = "SELECT EXISTS(SELECT 1 FROM items WHERE session_id=?1 AND kind='withdrawal' AND target_id=?2),
+                              EXISTS(SELECT 1 FROM context_nodes WHERE session_id=?1 AND item_id=?2)
                        FROM items WHERE session_id=?1 AND id=?2 AND kind='user_message'";
                 let (withdrawn, included) = conn.query_row(sql, (sid, mid), |r| {
                     Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?))
@@ -571,16 +590,7 @@ pub(crate) async fn withdraw_local(app: &App, sid: SessionId, mid: ItemId) -> Re
                     return Err(Error::conflict("message already included"));
                 }
                 if !withdrawn {
-                    let item = store::add_item(conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
-                    let id = item.id;
-                    crate::cluster::ledger::record_session_delta(
-                        conn,
-                        sid,
-                        "session_delta",
-                        vec![item],
-                        Vec::new(),
-                        Vec::new(),
-                    )?;
+                    let id = store::add_item(conn, sid, "withdrawal", &json!({}), Some(mid), None)?;
                     Ok(Some(id))
                 } else {
                     Ok(None)
@@ -651,32 +661,24 @@ async fn history(
     if app.exec.presence().known_peer_count() > 0 {
         app.cluster.ensure_session_watched(sid).await?;
     }
-    let (range, history_rev) = app
+    let range = app
         .db
         .call(move |s| {
             session(&s.conn, sid)?;
-            let range = store::JsonRows::history_range(
+            store::JsonRows::history_range(
                 &s.conn,
                 sid,
                 page.after,
                 page.before,
                 page.tail,
                 page.limit,
-            )?;
-            let history_rev = crate::cluster::ledger::session_history_rev(&s.conn, sid)?;
-            Ok((range, history_rev))
+            )
         })
         .await?;
     let body = store::JsonRows::History
-        .history_body(app.db, sid, range, history_rev)
+        .history_body(app.db, sid, range)
         .await?;
-    let mut resp = json_response(body);
-    resp.headers_mut().insert(
-        header::HeaderName::from_static("x-history-rev"),
-        header::HeaderValue::from_str(&history_rev.to_string())
-            .map_err(|e| Error::internal(e.to_string()))?,
-    );
-    Ok(resp)
+    Ok(json_response(body))
 }
 
 async fn context(

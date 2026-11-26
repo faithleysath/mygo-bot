@@ -21,15 +21,18 @@ use crate::{
     agent::Control,
     cluster::{
         ClusterSignal, SyncSignal,
-        exec::{PresenceState, SessionOccupancy, merge_remote_attachment_refs},
+        exec::{PresenceState, SessionOccupancy},
         ledger::{
-            AttachmentRef, ContextPos, ItemSnapshot, clear_staged, has_conflict, is_session_writable_local,
-            record_call, record_session_delta, returning_item_snapshot, take_staged, with_savepoint,
+            AttachmentRef, CALLS_SCOPE, append_context_items, clear_staged, list_session_leaves,
+            mark_session_watched, merge_attachment_refs, next_catalog_rev, next_origin_seq,
+            on_item_inserted, seed_catalog_rev, seed_hlc_from_db, session_scope, stage_catalog,
+            stage_session, take_staged, tick_hlc_for, with_savepoint,
         },
     },
     events::Notice,
-    id::{CallId, ItemId, ModelId, SessionId},
+    id::{CallId, ContextNodeId, ItemId, ModelId, SessionId},
 };
+pub use crate::cluster::ledger::BranchHead;
 
 // One owner serializes transactions and the matching in-memory worker transitions.
 // A slow disk never blocks the HTTP executor. No job holds SQLite across network I/O.
@@ -118,7 +121,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 8 {
+            if version != 9 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
@@ -126,16 +129,16 @@ impl Db {
             crate::id::seed_from_db(&tx)?;
             crate::cluster::identity::ensure_local_node(&tx)?;
         }
-        crate::cluster::ledger::init_verified_tips(&tx)?;
+        seed_hlc_from_db(&tx)?;
+        seed_catalog_rev(&tx)?;
         crate::media::init_validation_cache(&tx)?;
-        let local_node_id = crate::cluster::identity::local_node_id(&tx)?.to_string();
+        let local = crate::cluster::identity::load_local_node(&tx)?;
+        let local_node_id = local.node_id.clone();
         presence.set_local_node_id(local_node_id.clone());
-        let peer_count: usize = usize::try_from(tx.query_row(
-            "SELECT count(*) FROM cluster_peers",
-            [],
-            |r| r.get::<_, i64>(0),
-        )?)
-        .unwrap_or(0);
+        presence.set_local_role(local.role);
+        let peers = crate::cluster::identity::list_peers(&tx)?;
+        let peer_count = peers.len();
+        presence.set_peer_roles(&peers);
         presence.set_known_peer_count(peer_count);
         let has_null_att: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM attachments WHERE data IS NULL)",
@@ -167,52 +170,31 @@ impl Db {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for cid in call_ids {
+            let seq = next_origin_seq(&tx, CALLS_SCOPE, &local_node_id)?;
             tx.execute(
-                "UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted' WHERE id=?",
-                [cid],
+                "UPDATE llm_calls SET status='interrupted',error_summary='daemon restarted',origin_seq=?2 WHERE id=?1",
+                params![cid, seq],
             )?;
-            if !has_conflict(&tx, cid.as_str())? {
-                record_call(&tx, cid)?;
-            }
+            stage_catalog();
         }
         let running_sids = {
-            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE status IN ('running','pausing')")?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM sessions WHERE deleted=0 AND status IN ('running','pausing')",
+            )?;
             stmt.query_map([], |r| r.get::<_, SessionId>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let has_peers = peer_count > 0;
-        let mut deferred_recovery: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM deferred_crash_sessions)",
-            [],
-            |r| r.get(0),
-        )?;
+        let now = chrono::Utc::now().timestamp_millis();
         for sid in running_sids {
-            if has_peers
-                && !has_conflict(&tx, sid.as_str())?
-                && is_session_writable_local(&tx, sid)?
-            {
-                crate::codemode::ledger::record_deferred_crash_session(
-                    &tx,
-                    sid,
-                    "daemon restarted",
-                )?;
-                deferred_recovery = true;
-            }
+            let status_ts = tick_hlc_for(&local_node_id);
+            let rev = next_catalog_rev();
             tx.execute(
-                "UPDATE sessions SET status='paused', last_error='daemon restarted' WHERE id=?",
-                [sid],
+                "UPDATE sessions SET status='paused', last_error='daemon restarted', updated_at=max(updated_at,?2), status_ts=?3, sync_rev=?4 WHERE id=?1",
+                params![sid, now, status_ts, rev],
             )?;
-            if !has_peers
-                && !has_conflict(&tx, sid.as_str())?
-                && is_session_writable_local(&tx, sid)?
-            {
-                record_session_delta(&tx, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
-            }
+            stage_catalog();
         }
-        if crate::codemode::ledger::recover(&tx, !has_peers)? {
-            deferred_recovery = true;
-        }
-        presence.set_deferred_recovery_pending(deferred_recovery);
+        crate::codemode::ledger::recover(&tx)?;
         tx.commit()?;
         clear_staged();
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
@@ -246,8 +228,8 @@ impl Db {
                         Command::Call(call) => {
                             clear_staged();
                             if call(&mut store) {
-                                let staged = take_staged();
-                                store.notify_streams(staged);
+                                let (catalog, sessions) = take_staged();
+                                store.notify_staged(catalog, sessions);
                             } else {
                                 clear_staged();
                             }
@@ -315,14 +297,17 @@ impl Db {
         key: Option<String>,
         attachments: Vec<AttachmentRef>,
     ) -> Result<Enqueued> {
-        let has_refs = !attachments.is_empty();
         self.write(
             move |conn| {
-                merge_remote_attachment_refs(conn, &attachments)?;
-                Enqueue { sid, content, key }.insert(conn)
+                let has_null = if attachments.is_empty() {
+                    false
+                } else {
+                    merge_attachment_refs(conn, &attachments)?
+                };
+                Ok((Enqueue { sid, content, key }.insert(conn)?, has_null))
             },
-            move |store, saved| {
-                if has_refs {
+            move |store, (saved, has_null)| {
+                if has_null {
                     store.presence.set_has_null_attachments(true);
                 }
                 if let Enqueued::Created(id) = saved {
@@ -432,20 +417,29 @@ impl Enqueue {
             }
         }
         let model_id: ModelId = conn
-            .prepare_cached("SELECT model_id FROM sessions WHERE id=?")?
+            .prepare_cached("SELECT model_id FROM sessions WHERE id=? AND deleted=0")?
             .query_row([self.sid], |row| row.get(0))?;
         let (modalities, _) = crate::catalog::available_capabilities(conn, model_id)?;
         crate::media::validate_message(conn, &self.content, &modalities)?;
         let origin = crate::cluster::identity::local_node_id(conn)?;
         let id = ItemId::new()?;
-        let item = conn.prepare_cached(returning_item_snapshot!(
-            "INSERT INTO items(id,session_id,kind,payload,idempotency_key,origin_node_id)
-             VALUES(?1,?2,'user_message',json_object('content',json(?3),'role','user'),?4,?5)"
-        ))?.query_row(params![id, self.sid, self.content, self.key, origin], ItemSnapshot::from_row)?;
+        let seq = next_origin_seq(conn, &session_scope(self.sid), &origin)?;
+        let payload = json!({"content": self.content, "role": "user"});
+        conn.prepare_cached(
+            "INSERT INTO items(id,session_id,kind,payload,idempotency_key,origin_node_id,origin_seq)
+             VALUES(?1,?2,'user_message',?3,?4,?5,?6)",
+        )?
+        .execute(params![id, self.sid, payload, self.key, &*origin, seq])?;
+        on_item_inserted(conn, self.sid, id, "user_message", &payload, None)?;
         let now = chrono::Utc::now().timestamp_millis();
-        conn.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
-            .execute((self.sid, now))?;
-        record_session_delta(conn, self.sid, "session_delta", vec![item], Vec::new(), Vec::new())?;
+        let rev = next_catalog_rev();
+        conn.prepare_cached(
+            "UPDATE sessions SET updated_at=max(updated_at,?2), sync_rev=?3 WHERE id=?1",
+        )?
+        .execute(params![self.sid, now, rev])?;
+        mark_session_watched(conn, self.sid)?;
+        stage_session(self.sid);
+        stage_catalog();
         Ok(Enqueued::Created(id))
     }
 }
@@ -457,9 +451,9 @@ impl Store {
         }
     }
 
-    pub fn notify_streams(&self, ids: Vec<String>) {
-        if self.presence.known_peer_count() > 0 {
-            self.sync_tx.notify_streams(ids);
+    pub fn notify_staged(&self, catalog: bool, sessions: Vec<SessionId>) {
+        if self.presence.known_peer_count() > 0 && (catalog || !sessions.is_empty()) {
+            self.sync_tx.notify_changes(catalog, sessions);
         }
     }
 
@@ -487,7 +481,8 @@ impl Store {
         let starting = batch[0].start_session.is_some();
         let mut replies = Vec::with_capacity(batch.len());
         let mut pending = batch.drain(..);
-        let mut staged = Vec::new();
+        let mut staged_catalog = false;
+        let mut staged_sessions: Vec<SessionId> = Vec::new();
         clear_staged();
         let committed = (|| -> Result<()> {
             if starting && self.closing {
@@ -528,7 +523,13 @@ impl Store {
                 let savepoint = savepoint?;
                 if ok {
                     savepoint.commit()?;
-                    staged.extend(take_staged());
+                    let (cat, sess) = take_staged();
+                    staged_catalog |= cat;
+                    for s_id in sess {
+                        if !staged_sessions.contains(&s_id) {
+                            staged_sessions.push(s_id);
+                        }
+                    }
                 } else {
                     clear_staged();
                     savepoint.finish()?;
@@ -541,7 +542,7 @@ impl Store {
             clear_staged();
             replies.extend(pending.map(|write| (write.apply)(Err(error.clone()), false).1));
         } else {
-            self.notify_streams(staged);
+            self.notify_staged(staged_catalog, staged_sessions);
         }
         for reply in replies {
             reply(self, &committed);
@@ -614,26 +615,22 @@ impl Store {
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         with_savepoint(&self.conn, "store_status", || {
-            has_conflict(&self.conn, sid.as_str()).and_then(|c| {
-                if c {
-                    Err(Error::conflict(format!(
-                        "sync conflict on {sid}; resolve it before modifying"
-                    )))
-                } else {
-                    Ok(())
-                }
-            })?;
-            if !is_session_writable_local(&self.conn, sid)? {
-                return Err(Error::conflict(
-                    "session history is incomplete or deleted; sync before modifying",
-                ));
-            }
-            self.conn.execute(
-                "UPDATE sessions SET status=?2,last_error=?3,updated_at=?4 WHERE id=?1",
-                (sid, state, reason, now),
-            )?;
-            if matches!(state, "idle" | "paused") {
-                record_session_delta(&self.conn, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
+            let durable = matches!(state, "idle" | "paused");
+            if durable {
+                let status_ts = tick_hlc_for(&self.local_node_id);
+                let rev = next_catalog_rev();
+                self.conn.execute(
+                    "UPDATE sessions SET status=?2,last_error=?3,updated_at=max(updated_at,?4),status_ts=?5,sync_rev=?6
+                     WHERE id=?1 AND deleted=0",
+                    params![sid, state, reason, now, status_ts, rev],
+                )?;
+                stage_catalog();
+            } else {
+                self.conn.execute(
+                    "UPDATE sessions SET status=?2,last_error=?3,updated_at=max(updated_at,?4)
+                     WHERE id=?1 AND deleted=0",
+                    params![sid, state, reason, now],
+                )?;
             }
             before_commit(self)
         })?;
@@ -687,6 +684,9 @@ impl Store {
             }
         } else {
             s.runner_node_id = None;
+        }
+        if let Ok(branches) = list_session_leaves(&self.conn, s.id) {
+            s.branches = branches;
         }
         s
     }
@@ -827,7 +827,7 @@ fn history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> {
 
 pub fn session(conn: &Connection, sid: SessionId) -> Result<Session> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id FROM sessions WHERE id=?",
+        "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id,active_head FROM sessions WHERE id=? AND deleted=0",
     )?;
     Ok(stmt.query_row([sid], session_row)?)
 }
@@ -842,6 +842,10 @@ pub struct Session {
     pub reasoning_effort: Option<String>,
     pub last_error: String,
     pub model_id: ModelId,
+    #[serde(default)]
+    pub active_head: Option<ContextNodeId>,
+    #[serde(default)]
+    pub branches: Vec<BranchHead>,
     #[serde(default)]
     pub runner_node_id: Option<String>,
 }
@@ -886,105 +890,66 @@ pub fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         reasoning_effort: row.get(5)?,
         last_error: row.get(6)?,
         model_id: row.get(7)?,
+        active_head: row.get(8)?,
+        branches: Vec::new(),
         runner_node_id: None,
     })
 }
 
-// This view is shared by queue inspection, consumption and the idle transition.
+pub fn needs_model(conn: &Connection, sid: SessionId) -> Result<bool> {
+    let active_head: Option<ContextNodeId> = conn
+        .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+        .query_row([sid], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let Some(head_id) = active_head else {
+        return Ok(false);
+    };
+    let settled: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM turn_settled WHERE context_node_id=?)")?
+        .query_row([head_id], |r| r.get(0))?;
+    Ok(!settled)
+}
+
 pub fn has_pending(conn: &Connection, sid: SessionId) -> Result<bool> {
-    let ready: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id=?)",
-        [sid],
-        |r| r.get(0),
-    )?;
-    // The caller can go idle without calling take_pending when only discarded inputs remain.
-    if !ready {
-        with_savepoint(conn, "advance_pending", || {
-            if advance_queue(conn, sid, false)? {
-                record_session_delta(conn, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
-            }
-            Ok(())
-        })?;
-    }
-    Ok(ready)
+    Ok(conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM pending_inputs WHERE session_id=?)")?
+        .query_row([sid], |r| r.get(0))?)
 }
 
 pub fn pending_reason(conn: &Connection, sid: SessionId) -> Result<Option<&'static str>> {
-    let (user, event): (bool, bool) = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pending p JOIN items i ON i.id=p.id WHERE p.session_id=?1 AND i.kind='user_message'),
-                EXISTS(SELECT 1 FROM pending p JOIN items i ON i.id=p.id WHERE p.session_id=?1 AND i.kind='codemode_event')",
-        [sid],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
+    let (user, event): (bool, bool) = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM pending_inputs WHERE session_id=?1 AND kind='user_message'),
+                    EXISTS(SELECT 1 FROM pending_inputs WHERE session_id=?1 AND kind='codemode_event')",
+        )?
+        .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?)))?;
     match (user, event) {
         (true, true) => Ok(Some("pending_input")),
         (true, false) => Ok(Some("user_message")),
         (false, true) => Ok(Some("task_event")),
-        (false, false) => {
-            with_savepoint(conn, "advance_pending_reason", || {
-                if advance_queue(conn, sid, false)? {
-                    record_session_delta(conn, sid, "session_delta", Vec::new(), Vec::new(), Vec::new())?;
-                }
-                Ok(())
-            })?;
-            Ok(None)
-        }
+        (false, false) => Ok(None),
     }
 }
 
 pub fn max_context_position(conn: &Connection, sid: SessionId) -> Result<i64> {
     Ok(conn
-        .prepare_cached("SELECT coalesce(max(position),0) FROM context_items WHERE session_id=?")?
+        .prepare_cached("SELECT coalesce(max(position),0) FROM active_context WHERE session_id=?")?
         .query_row([sid], |r| r.get(0))?)
 }
 
 pub fn take_pending(tx: &Connection, sid: SessionId) -> Result<()> {
-    let base = max_context_position(tx, sid)?;
-    let added = tx.execute(
-        "INSERT INTO context_items(session_id,position,item_id)
-         SELECT session_id, ?2 + row_number() OVER (ORDER BY id), id
-         FROM pending WHERE session_id=?1 ORDER BY id",
-        (sid, base),
-    )?;
-    let mut ctx_added = Vec::new();
-    if added > 0 {
+    let ids = {
         let mut stmt = tx.prepare_cached(
-            "SELECT position,item_id FROM context_items WHERE session_id=? AND position>? ORDER BY position",
+            "SELECT item_id FROM pending_inputs WHERE session_id=?1 ORDER BY item_id",
         )?;
-        ctx_added = stmt
-            .query_map((sid, base), |r| {
-                Ok(ContextPos {
-                    position: r.get(0)?,
-                    item_id: r.get(1)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-    }
-    let advanced = advance_queue(tx, sid, added > 0)?;
-    if !ctx_added.is_empty() || advanced {
-        record_session_delta(tx, sid, "session_delta", Vec::new(), ctx_added, Vec::new())?;
+        stmt.query_map([sid], |r| r.get::<_, ItemId>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !ids.is_empty() {
+        append_context_items(tx, sid, &ids, None)?;
     }
     Ok(())
-}
-
-fn advance_queue(conn: &Connection, sid: SessionId, added: bool) -> Result<bool> {
-    let changed = conn.execute(
-        "UPDATE sessions SET input_queue_cursor=last_id,needs_model=needs_model OR ?2
-         FROM (SELECT max(id) AS last_id FROM items WHERE session_id=?1 AND kind IN ('user_message','codemode_event'))
-         WHERE sessions.id=?1 AND input_queue_cursor<last_id",
-        (sid, added),
-    )?;
-    if changed == 0 && added {
-        let mut updated = 0;
-        if added {
-            updated = conn.execute(
-                "UPDATE sessions SET needs_model=1 WHERE id=?1 AND needs_model=0",
-                [sid],
-            )?;
-        }
-        return Ok(updated > 0);
-    }
-    Ok(changed > 0)
 }
 
 pub fn add_item(
@@ -994,28 +959,18 @@ pub fn add_item(
     payload: &Value,
     target: Option<ItemId>,
     llm_call_id: Option<CallId>,
-) -> Result<ItemSnapshot> {
+) -> Result<ItemId> {
     let id = ItemId::new()?;
     let origin = crate::cluster::identity::local_node_id(conn)?;
-    Ok(conn.prepare_cached(returning_item_snapshot!(
-        "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id,origin_node_id) VALUES(?,?,?,?,?,?,?)"
-    ))?.query_row(params![id, sid, kind, payload, target, llm_call_id, origin], ItemSnapshot::from_row)?)
-}
-
-pub fn add_context_item_raw(
-    tx: &Connection,
-    sid: SessionId,
-    kind: &str,
-    item: &Value,
-    call_id: CallId,
-) -> Result<(ItemSnapshot, i64)> {
-    let saved = add_item(tx, sid, kind, item, None, Some(call_id))?;
-    let pos = max_context_position(tx, sid)? + 1;
-    tx.execute(
-        "INSERT INTO context_items(session_id,position,item_id) VALUES(?,?,?)",
-        (sid, pos, saved.id),
-    )?;
-    Ok((saved, pos))
+    let seq = next_origin_seq(conn, &session_scope(sid), &origin)?;
+    conn.prepare_cached(
+        "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id,origin_node_id,origin_seq)
+         VALUES(?,?,?,?,?,?,?,?)",
+    )?
+    .execute(params![id, sid, kind, payload, target, llm_call_id, &*origin, seq])?;
+    on_item_inserted(conn, sid, id, kind, payload, target)?;
+    stage_session(sid);
+    Ok(id)
 }
 
 pub fn add_context_item(
@@ -1024,22 +979,9 @@ pub fn add_context_item(
     kind: &str,
     item: &Value,
     call_id: CallId,
-    expected_epoch: Option<i64>,
 ) -> Result<ItemId> {
-    let (saved, pos) = add_context_item_raw(tx, sid, kind, item, call_id)?;
-    let id = saved.id;
-    crate::cluster::ledger::record_session_delta_at_epoch(
-        tx,
-        sid,
-        "session_delta",
-        vec![saved],
-        vec![ContextPos {
-            position: pos,
-            item_id: id,
-        }],
-        Vec::new(),
-        expected_epoch,
-    )?;
+    let id = add_item(tx, sid, kind, item, None, Some(call_id))?;
+    append_context_items(tx, sid, &[id], None)?;
     Ok(id)
 }
 
@@ -1047,14 +989,14 @@ pub fn add_context_item(
 // is recorded explicitly: replaying an already executed tool could repeat its effect.
 pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Result<Vec<ItemId>> {
     let mut recovered = Vec::new();
-    let mut ctx_added = Vec::new();
+    let mut to_append = Vec::new();
     let mut after: Option<ItemId> = None;
-    let mut pos = max_context_position(tx, sid)? + 1;
     let mut pending = tx.prepare_cached(
-        "SELECT c.id, json_extract(c.payload,'$.call_id'), r.id FROM items c
-         LEFT JOIN items r ON r.kind='function_call_output' AND r.target_id=c.id
+        "SELECT c.id, json_extract(c.payload,'$.call_id'),
+                (SELECT r.id FROM items r WHERE r.session_id=c.session_id AND r.kind='function_call_output' AND r.target_id=c.id ORDER BY r.id LIMIT 1)
+         FROM items c
          WHERE c.session_id=?1 AND c.kind='function_call' AND c.id>?2
-           AND NOT EXISTS(SELECT 1 FROM context_items WHERE item_id=c.id)
+           AND NOT EXISTS(SELECT 1 FROM context_nodes n WHERE n.session_id=?1 AND n.item_id=c.id)
          ORDER BY c.id LIMIT 1",
     )?;
     while let Some((id, call, output)) = pending
@@ -1072,43 +1014,34 @@ pub fn publish_tools(tx: &Connection, sid: SessionId, recovering: bool) -> Resul
             Some(id) => id,
             None if recovering => {
                 let payload = json!({"type":"function_call_output","call_id":call,"output":"Execution interrupted; result unknown."});
-                let result = add_item(tx, sid, "function_call_output", &payload, Some(id), None)?;
-                let result_id = result.id;
-                recovered.push(result);
+                let result_id = add_item(tx, sid, "function_call_output", &payload, Some(id), None)?;
+                recovered.push(result_id);
                 result_id
             }
             None => return Err(Error::internal("missing tool result")),
         };
-        tx.execute(
-            "INSERT INTO context_items(session_id,position,item_id) VALUES(?1,?2,?3),(?1,?4,?5)",
-            (sid, pos, id, pos + 1, result),
-        )?;
-        ctx_added.push(ContextPos {
-            position: pos,
-            item_id: id,
-        });
-        ctx_added.push(ContextPos {
-            position: pos + 1,
-            item_id: result,
-        });
-        pos += 2;
+        to_append.push(id);
+        to_append.push(result);
     }
-    let recovered_ids = recovered.iter().map(|item| item.id).collect();
-    if !recovered.is_empty() || !ctx_added.is_empty() {
-        record_session_delta(
-            tx,
-            sid,
-            "session_delta",
-            recovered,
-            ctx_added,
-            Vec::new(),
-        )?;
+    if !to_append.is_empty() {
+        append_context_items(tx, sid, &to_append, None)?;
     }
-    Ok(recovered_ids)
+    Ok(recovered)
 }
 
 const BATCH_ITEMS: i64 = 256;
 const BATCH_BYTES: usize = 64 * 1024;
+const HISTORY_BRANCH_FILTER: &str = " AND (EXISTS(SELECT 1 FROM active_context ac WHERE ac.session_id=items.session_id AND ac.item_id=items.id) \
+      OR NOT EXISTS(SELECT 1 FROM context_nodes cn WHERE cn.session_id=items.session_id AND cn.item_id=items.id))";
+
+fn has_inactive_branch(conn: &Connection, sid: SessionId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM session_leaves l
+             WHERE l.session_id=?1 AND l.head_id != coalesce((SELECT active_head FROM sessions WHERE id=?1), ''))",
+        )?
+        .query_row([sid], |r| r.get(0))?)
+}
 
 trait Cursor: Copy + Eq + Ord + Send + ToSql + FromSql + 'static {}
 impl Cursor for i64 {}
@@ -1129,17 +1062,18 @@ fn page_bounds<C: Cursor>(
     before: Option<C>,
     tail: bool,
     limit: i64,
+    extra_where: &str,
 ) -> Result<Option<(C, C)>> {
     let pair = if tail {
         let sql = format!(
-            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 ORDER BY {col} DESC LIMIT ?2)"
+            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1{extra_where} ORDER BY {col} DESC LIMIT ?2)"
         );
         conn.prepare_cached(&sql)?.query_row((sid, limit), |r| {
             Ok((r.get::<_, Option<C>>(0)?, r.get::<_, Option<C>>(1)?))
         })?
     } else if let Some(before) = before {
         let sql = format!(
-            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}<?2 ORDER BY {col} DESC LIMIT ?3)"
+            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}<?2{extra_where} ORDER BY {col} DESC LIMIT ?3)"
         );
         conn.prepare_cached(&sql)?
             .query_row((sid, before, limit), |r| {
@@ -1147,7 +1081,7 @@ fn page_bounds<C: Cursor>(
             })?
     } else {
         let sql = format!(
-            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}>?2 ORDER BY {col} LIMIT ?3)"
+            "SELECT min(k), max(k) FROM (SELECT {col} AS k FROM {table} WHERE session_id=?1 AND {col}>?2{extra_where} ORDER BY {col} LIMIT ?3)"
         );
         conn.prepare_cached(&sql)?
             .query_row(params![sid, after, limit], |r| {
@@ -1168,6 +1102,11 @@ impl JsonRows {
         tail: bool,
         limit: i64,
     ) -> Result<Option<(ItemId, ItemId)>> {
+        let extra = if has_inactive_branch(conn, sid)? {
+            HISTORY_BRANCH_FILTER
+        } else {
+            ""
+        };
         page_bounds(
             conn,
             "items",
@@ -1177,6 +1116,7 @@ impl JsonRows {
             before,
             tail,
             limit,
+            extra,
         )
     }
 
@@ -1190,13 +1130,14 @@ impl JsonRows {
     ) -> Result<Option<(i64, i64)>> {
         page_bounds(
             conn,
-            "context_items",
+            "active_context",
             "position",
             sid,
             after.unwrap_or(0),
             before,
             tail,
             limit,
+            "",
         )
     }
 
@@ -1214,13 +1155,20 @@ impl JsonRows {
         let sql = match self {
             Self::Context => format!(
                 "SELECT c.position,json_object('position',c.position,'item_id',i.id,'llm_call_id',i.llm_call_id,'payload',json(i.payload))
-                 FROM context_items c JOIN items i ON i.id=c.item_id
+                 FROM active_context c JOIN items i ON i.id=c.item_id
                  WHERE c.session_id=? AND c.position{cmp}? AND c.position<=? ORDER BY c.position LIMIT ?"
             ),
-            Self::History => format!(
-                "SELECT id,json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'llm_call_id',llm_call_id)
-                 FROM items WHERE session_id=? AND id{cmp}? AND id<=? ORDER BY id LIMIT ?"
-            ),
+            Self::History => {
+                let extra = if has_inactive_branch(conn, sid)? {
+                    HISTORY_BRANCH_FILTER
+                } else {
+                    ""
+                };
+                format!(
+                    "SELECT id,json_object('id',id,'kind',kind,'payload',json(payload),'target_id',target_id,'llm_call_id',llm_call_id)
+                     FROM items WHERE session_id=? AND id{cmp}? AND id<=?{extra} ORDER BY id LIMIT ?"
+                )
+            }
         };
         let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query((sid, cursor, end, BATCH_ITEMS))?;
@@ -1251,9 +1199,8 @@ impl JsonRows {
         db: Db,
         sid: SessionId,
         range: Option<(ItemId, ItemId)>,
-        history_rev: i64,
     ) -> Result<Body> {
-        self.body_with_range(db, sid, range, vec![b'['], b"]", Some(history_rev)).await
+        self.body_with_range(db, sid, range, vec![b'['], b"]").await
     }
 
     pub async fn context_body(
@@ -1264,7 +1211,7 @@ impl JsonRows {
         prefix: Vec<u8>,
         suffix: &'static [u8],
     ) -> Result<Body> {
-        self.body_with_range(db, sid, range, prefix, suffix, None).await
+        self.body_with_range(db, sid, range, prefix, suffix).await
     }
 
     async fn body_with_range<C: Cursor>(
@@ -1274,18 +1221,12 @@ impl JsonRows {
         range: Option<(C, C)>,
         mut prefix: Vec<u8>,
         suffix: &'static [u8],
-        history_rev: Option<i64>,
     ) -> Result<Body> {
         let Some((start, end)) = range else {
             prefix.extend_from_slice(suffix);
             return Ok(Body::from(prefix));
         };
         let read_batch = move |conn: &Connection, cursor, inclusive, bytes, comma| {
-            if let Some(expected) = history_rev
-                && crate::cluster::ledger::session_history_rev(conn, sid)? != expected
-            {
-                return Err(Error::conflict("session history changed; retry this page"));
-            }
             self.batch(conn, sid, cursor, end, inclusive, bytes, comma)
         };
         let (mut bytes, mut position) = db

@@ -94,22 +94,65 @@ async fn set_archived<K: Prefix>(
         .write(
             move |conn| {
                 let timestamp = archive.then(|| chrono::Utc::now().timestamp_millis());
-                let value = if archive {
-                    "coalesce(archived_at, ?1)"
-                } else {
-                    "?1"
-                };
-                let sql = format!("UPDATE {table} SET archived_at={value} WHERE id=?2");
-                if conn.execute(&sql, (timestamp, id)).map_err(catalog_error)? == 0 {
-                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
-                }
+                let ts = crate::cluster::ledger::tick_hlc(conn)?;
+                let rev = crate::cluster::ledger::next_catalog_rev();
                 if table == "llm_providers" {
-                    let pid: ProviderId = id.as_str().parse().map_err(|_| Error::internal("invalid provider id"))?;
-                    crate::cluster::ledger::record_provider(conn, pid)?;
+                    if !archive {
+                        let clash: bool = conn
+                            .prepare_cached(
+                                "SELECT EXISTS(
+                                    SELECT 1 FROM llm_providers a JOIN llm_providers b ON b.id=?1
+                                    WHERE a.id != b.id AND a.archived_at IS NULL AND a.name = b.name
+                                )",
+                            )?
+                            .query_row([id], |r| r.get(0))?;
+                        if clash {
+                            return Err(Error::conflict(
+                                "name is already in use by an active catalog entry",
+                            ));
+                        }
+                    }
+                    let val_sql = if archive {
+                        "coalesce(archived_at, ?1)"
+                    } else {
+                        "?1"
+                    };
+                    let sql = format!(
+                        "UPDATE llm_providers SET archived_at={val_sql}, archived_ts=?2, sync_rev=?3 WHERE id=?4"
+                    );
+                    if conn.execute(&sql, params![timestamp, ts, rev, id]).map_err(catalog_error)? == 0 {
+                        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                    }
                 } else if table == "llm_models" {
-                    let mid: ModelId = id.as_str().parse().map_err(|_| Error::internal("invalid model id"))?;
-                    crate::cluster::ledger::record_model(conn, mid)?;
+                    if !archive {
+                        let clash: bool = conn
+                            .prepare_cached(
+                                "SELECT EXISTS(
+                                    SELECT 1 FROM llm_models a JOIN llm_models b ON b.id=?1
+                                    WHERE a.id != b.id AND a.archived_at IS NULL
+                                      AND a.provider_id = b.provider_id AND a.model_key = b.model_key
+                                )",
+                            )?
+                            .query_row([id], |r| r.get(0))?;
+                        if clash {
+                            return Err(Error::conflict(
+                                "name is already in use by an active catalog entry",
+                            ));
+                        }
+                    }
+                    let val_sql = if archive {
+                        "coalesce(archived_at, ?1)"
+                    } else {
+                        "?1"
+                    };
+                    let sql = format!(
+                        "UPDATE llm_models SET archived_at={val_sql}, archived_ts=?2, sync_rev=?3 WHERE id=?4"
+                    );
+                    if conn.execute(&sql, params![timestamp, ts, rev, id]).map_err(catalog_error)? == 0 {
+                        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                    }
                 }
+                crate::cluster::ledger::stage_catalog();
                 Ok(())
             },
             |_, ()| Ok(StatusCode::NO_CONTENT),
@@ -240,6 +283,9 @@ fn save_provider(
             )
         })
         .transpose()?;
+    let has_name = fields.contains_key("name");
+    let has_base_url = fields.contains_key("base_url");
+    let has_api_key = fields.contains_key("api_key");
     let provider = document(old.as_ref(), fields)?;
     let url =
         reqwest::Url::parse(&provider.base_url).map_err(|_| Error::bad("invalid base_url"))?;
@@ -261,14 +307,52 @@ fn save_provider(
         Some(id) => id,
         None => ProviderId::new()?,
     };
-    let id: ProviderId = conn.query_row(
-        "INSERT INTO llm_providers(id,name,base_url,api_key) VALUES(?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,api_key=excluded.api_key
-         RETURNING id",
-        params![id, provider.name, provider.base_url, provider.api_key.filter(|k| !k.is_empty())],
-        |r| r.get(0),
-    ).map_err(catalog_error)?;
-    crate::cluster::ledger::record_provider(conn, id)?;
+    let clash: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM llm_providers WHERE name=?1 AND archived_at IS NULL AND id!=?2)",
+        )?
+        .query_row(params![&provider.name, id], |r| r.get(0))?;
+    if clash {
+        return Err(Error::conflict(
+            "name is already in use by an active catalog entry",
+        ));
+    }
+    let ts = crate::cluster::ledger::tick_hlc(conn)?;
+    let rev = crate::cluster::ledger::next_catalog_rev();
+    let api_key = provider.api_key.filter(|k| !k.is_empty());
+    let name_ts = (old.is_none() || has_name).then(|| ts.as_str());
+    let base_url_ts = (old.is_none() || has_base_url).then(|| ts.as_str());
+    let api_key_ts = (old.is_none() || has_api_key).then(|| ts.as_str());
+    let id: ProviderId = conn
+        .query_row(
+            "INSERT INTO llm_providers(id,name,name_ts,base_url,base_url_ts,api_key,api_key_ts,sync_rev)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO UPDATE SET
+               name=excluded.name,
+               name_ts=coalesce(?9, llm_providers.name_ts),
+               base_url=excluded.base_url,
+               base_url_ts=coalesce(?10, llm_providers.base_url_ts),
+               api_key=excluded.api_key,
+               api_key_ts=coalesce(?11, llm_providers.api_key_ts),
+               sync_rev=excluded.sync_rev
+             RETURNING id",
+            params![
+                id,
+                provider.name,
+                ts,
+                provider.base_url,
+                ts,
+                api_key,
+                ts,
+                rev,
+                name_ts,
+                base_url_ts,
+                api_key_ts
+            ],
+            |r| r.get(0),
+        )
+        .map_err(catalog_error)?;
+    crate::cluster::ledger::stage_catalog();
     record(conn, PROVIDER, id, public_provider)
 }
 
@@ -377,7 +461,7 @@ impl Model {
         }
         let modalities = json!(self.input_modalities);
         let mut sessions = conn.prepare_cached(
-            "SELECT id,reasoning_effort FROM sessions WHERE model_id=? ORDER BY id",
+            "SELECT id,reasoning_effort FROM sessions WHERE model_id=? AND deleted=0 ORDER BY id",
         )?;
         let mut rows = sessions.query([id])?;
         while let Some(row) = rows.next()? {
@@ -391,28 +475,12 @@ impl Model {
                 )));
             }
             if fewer_modalities {
-                let head = crate::cluster::ledger::stream_head(conn, sid.as_str())?;
-                if head.as_ref().is_none_or(|st| st.is_body_complete()) {
-                    media::check_session(conn, sid, &modalities)?;
-                } else if let Some(st) = head {
-                    let supported = st
-                        .head_snapshot
-                        .as_deref()
-                        .and_then(|raw| {
-                            serde_json::from_str::<crate::cluster::ledger::SessionSnapshot>(raw)
-                                .ok()
-                        })
-                        .is_some_and(|snap| {
-                            snap.required_modalities
-                                .iter()
-                                .all(|m| self.input_modalities.contains(m))
-                        });
-                    if !supported {
-                        return Err(Error::conflict(format!(
-                            "cannot remove input modality needed by session {sid}"
-                        )));
-                    }
+                if !crate::cluster::ledger::session_branch_complete(conn, sid)? {
+                    return Err(Error::conflict(format!(
+                        "session {sid} history is incomplete locally; sync before removing model input modalities"
+                    )));
                 }
+                media::check_session(conn, sid, &modalities)?;
             }
         }
         Ok(())
@@ -471,6 +539,11 @@ fn save_model(conn: &Connection, id: Option<ModelId>, fields: Document) -> Resul
     let old = id
         .map(|id| record(conn, MODEL, id, Model::read))
         .transpose()?;
+    let has_identity = fields.contains_key("provider_id") || fields.contains_key("model_key");
+    let has_cw = fields.contains_key("context_window_tokens");
+    let has_modalities = fields.contains_key("input_modalities");
+    let has_efforts = fields.contains_key("reasoning_efforts");
+    let has_pricing = fields.contains_key("pricing");
     let model = document(old.as_ref(), fields)?;
     model.validate()?;
     if old
@@ -490,26 +563,78 @@ fn save_model(conn: &Connection, id: Option<ModelId>, fields: Document) -> Resul
             None => return Err(Error::bad("unknown provider_id")),
         }
     }
-    if let (Some(id), Some(old)) = (id, old) {
-        model.check_update(conn, id, &old)?;
+    if let (Some(id), Some(old)) = (id, old.as_ref()) {
+        model.check_update(conn, id, old)?;
     }
     let id = match id {
         Some(id) => id,
         None => ModelId::new()?,
     };
-    let id: ModelId = conn.query_row(
-        "INSERT INTO llm_models(id,provider_id,model_key,context_window_tokens,input_modalities,reasoning_efforts,pricing)
-         VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,
-         model_key=excluded.model_key,context_window_tokens=excluded.context_window_tokens,
-         input_modalities=excluded.input_modalities,reasoning_efforts=excluded.reasoning_efforts,pricing=excluded.pricing
-         RETURNING id",
-        params![
-            id, model.provider_id, model.model_key, model.context_window_tokens,
-            json!(model.input_modalities), json!(model.reasoning_efforts), model.pricing
-        ],
-        |r| r.get(0),
-    ).map_err(catalog_error)?;
-    crate::cluster::ledger::record_model(conn, id)?;
+    let clash: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM llm_models WHERE provider_id=?1 AND model_key=?2 AND archived_at IS NULL AND id!=?3)",
+        )?
+        .query_row(params![model.provider_id, &model.model_key, id], |r| r.get(0))?;
+    if clash {
+        return Err(Error::conflict(
+            "name is already in use by an active catalog entry",
+        ));
+    }
+    let ts = crate::cluster::ledger::tick_hlc(conn)?;
+    let rev = crate::cluster::ledger::next_catalog_rev();
+    let is_new = old.is_none();
+    let id_ts = (is_new || has_identity).then(|| ts.as_str());
+    let cw_ts = (is_new || has_cw).then(|| ts.as_str());
+    let mod_ts = (is_new || has_modalities).then(|| ts.as_str());
+    let eff_ts = (is_new || has_efforts).then(|| ts.as_str());
+    let price_ts = (is_new || has_pricing).then(|| ts.as_str());
+    let id: ModelId = conn
+        .query_row(
+            "INSERT INTO llm_models(
+                id,provider_id,model_key,identity_ts,
+                context_window_tokens,context_window_ts,
+                input_modalities,input_modalities_ts,
+                reasoning_efforts,reasoning_efforts_ts,
+                pricing,pricing_ts,sync_rev
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(id) DO UPDATE SET
+               provider_id=excluded.provider_id,
+               model_key=excluded.model_key,
+               identity_ts=coalesce(?14, llm_models.identity_ts),
+               context_window_tokens=excluded.context_window_tokens,
+               context_window_ts=coalesce(?15, llm_models.context_window_ts),
+               input_modalities=excluded.input_modalities,
+               input_modalities_ts=coalesce(?16, llm_models.input_modalities_ts),
+               reasoning_efforts=excluded.reasoning_efforts,
+               reasoning_efforts_ts=coalesce(?17, llm_models.reasoning_efforts_ts),
+               pricing=excluded.pricing,
+               pricing_ts=coalesce(?18, llm_models.pricing_ts),
+               sync_rev=excluded.sync_rev
+             RETURNING id",
+            params![
+                id,
+                model.provider_id,
+                model.model_key,
+                ts,
+                model.context_window_tokens,
+                ts,
+                json!(model.input_modalities),
+                ts,
+                json!(model.reasoning_efforts),
+                ts,
+                model.pricing,
+                ts,
+                rev,
+                id_ts,
+                cw_ts,
+                mod_ts,
+                eff_ts,
+                price_ts
+            ],
+            |r| r.get(0),
+        )
+        .map_err(catalog_error)?;
+    crate::cluster::ledger::stage_catalog();
     record(conn, MODEL, id, public_model)
 }
 

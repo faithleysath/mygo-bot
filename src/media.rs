@@ -1,8 +1,6 @@
 mod wire;
 pub(crate) use wire::model_input;
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -18,7 +16,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     App, Error, Result,
-    id::{AttachmentId, ItemId, ModelId, SessionId},
+    id::{AttachmentId, ModelId, SessionId},
     store::Db,
 };
 
@@ -442,19 +440,19 @@ pub fn check_event(conn: &Connection, content: &Value, modalities: &Value) -> Re
 pub fn init_validation_cache(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TEMP TABLE checked_input (
-            sid TEXT UNIQUE, model TEXT, modalities TEXT, revision INTEGER, position INTEGER
+            sid TEXT UNIQUE, model TEXT, modalities TEXT, position INTEGER
          );
          CREATE TEMP TRIGGER trim_checked_input AFTER INSERT ON checked_input
          WHEN (SELECT count(*) FROM checked_input)>256 BEGIN
             DELETE FROM checked_input WHERE rowid=(SELECT min(rowid) FROM checked_input);
          END;
-         CREATE TEMP TRIGGER invalidate_context_insert AFTER INSERT ON main.context_items BEGIN
+         CREATE TEMP TRIGGER invalidate_context_insert AFTER INSERT ON main.active_context BEGIN
             DELETE FROM checked_input WHERE sid=NEW.session_id AND position>=NEW.position;
          END;
-         CREATE TEMP TRIGGER invalidate_context_replace AFTER UPDATE ON main.context_items BEGIN
+         CREATE TEMP TRIGGER invalidate_context_replace AFTER UPDATE ON main.active_context BEGIN
             DELETE FROM checked_input WHERE sid IN (OLD.session_id,NEW.session_id);
          END;
-         CREATE TEMP TRIGGER invalidate_context_delete AFTER DELETE ON main.context_items BEGIN
+         CREATE TEMP TRIGGER invalidate_context_delete AFTER DELETE ON main.active_context BEGIN
             DELETE FROM checked_input WHERE sid=OLD.session_id;
          END;
          CREATE TEMP TRIGGER invalidate_item_edit AFTER UPDATE OF kind,payload ON main.items BEGIN
@@ -480,13 +478,18 @@ pub fn check_call_input(
     modalities: &Value,
     end: i64,
 ) -> Result<()> {
-    let revision = crate::cluster::ledger::session_history_rev(conn, sid)?;
-    let prefix = conn.prepare_cached(
-        "SELECT position FROM checked_input WHERE sid=? AND model=? AND modalities=? AND revision=? AND position<=?",
-    )?.query_row((sid, model, modalities, revision, end), |row| row.get(0)).optional()?.unwrap_or(0);
+    let prefix = conn
+        .prepare_cached(
+            "SELECT position FROM checked_input WHERE sid=? AND model=? AND modalities=? AND position<=?",
+        )?
+        .query_row((sid, model, modalities, end), |row| row.get(0))
+        .optional()?
+        .unwrap_or(0);
     check_session_after(conn, sid, modalities, prefix)?;
-    conn.prepare_cached("INSERT OR REPLACE INTO checked_input(sid,model,modalities,revision,position) VALUES(?,?,?,?,?)")?
-        .execute((sid, model, modalities, revision, end))?;
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO checked_input(sid,model,modalities,position) VALUES(?,?,?,?)",
+    )?
+    .execute((sid, model, modalities, end))?;
     Ok(())
 }
 
@@ -498,12 +501,12 @@ fn check_session_after(conn: &Connection, sid: SessionId, modalities: &Value, po
     // Match context order first, then the tool results publish_tools will append in
     // call order, and finally the unwithdrawn queue take_pending will append by id.
     let queries = [
-        "SELECT i.id,i.kind,i.payload FROM context_items c JOIN items i ON i.id=c.item_id
+        "SELECT i.id,i.kind,i.payload FROM active_context c JOIN items i ON i.id=c.item_id
          WHERE c.session_id=?1 AND c.position>?2 AND i.kind IN ('user_message','codemode_event','assistant_message','reasoning','function_call_output','image_generation_call')
          ORDER BY c.position",
-        "SELECT r.id,r.kind,r.payload FROM items c JOIN items r ON r.target_id=c.id AND r.kind='function_call_output'
+        "SELECT r.id,r.kind,r.payload FROM items c JOIN items r ON r.session_id=c.session_id AND r.target_id=c.id AND r.kind='function_call_output'
          WHERE c.session_id=? AND c.kind='function_call'
-           AND NOT EXISTS (SELECT 1 FROM context_items WHERE item_id=c.id)
+           AND NOT EXISTS (SELECT 1 FROM context_nodes n WHERE n.session_id=?1 AND n.item_id=c.id)
          ORDER BY c.id",
         "SELECT i.id,i.kind,i.payload FROM pending p JOIN items i ON i.id=p.id
          WHERE p.session_id=? ORDER BY p.id",
@@ -543,129 +546,6 @@ fn check_session_after(conn: &Connection, sid: SessionId, modalities: &Value, po
     Ok(())
 }
 
-fn collect_part_modalities(
-    conn: &Connection,
-    parts: &Value,
-    set: &mut std::collections::BTreeSet<String>,
-) -> Result<()> {
-    if parts.is_string() {
-        set.insert("text".to_owned());
-        return Ok(());
-    }
-    let Some(arr) = parts.as_array() else {
-        return Ok(());
-    };
-    for part in arr {
-        match part["type"].as_str() {
-            Some(
-                "input_text" | "output_text" | "refusal" | "reasoning_text" | "summary_text"
-                | "text",
-            ) => {
-                set.insert("text".to_owned());
-            }
-            Some("input_image" | "output_image" | "image") => {
-                set.insert("image".to_owned());
-            }
-            Some("input_audio" | "output_audio" | "audio") => {
-                set.insert("audio".to_owned());
-            }
-            Some("video") => {
-                set.insert("video".to_owned());
-            }
-            Some("input_file") => {
-                if let Some(family) = part["file_data"]
-                    .as_str()
-                    .and_then(|url| url.strip_prefix("data:"))
-                    .and_then(|data| data.split_once('/'))
-                    .map(|(f, _)| f)
-                    && matches!(family, "audio" | "video" | "image" | "text")
-                {
-                    set.insert(family.to_owned());
-                }
-            }
-            _ => {
-                if let Ok(block) = ContentBlock::parse(part)
-                    && let Ok(m) = block.modality(conn)
-                {
-                    set.insert(m.to_owned());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn item_required_modalities(
-    conn: &Connection,
-    kind: &str,
-    payload: &Value,
-    mods: &mut std::collections::BTreeSet<String>,
-) -> Result<()> {
-    match kind {
-        "user_message" | "assistant_message" => {
-            collect_part_modalities(conn, &payload["content"], mods)?;
-        }
-        "codemode_event" => {
-            mods.insert("text".to_owned());
-            collect_part_modalities(conn, &payload["content"], mods)?;
-        }
-        "function_call_output" => collect_part_modalities(conn, &payload["output"], mods)?,
-        "reasoning" => {
-            for key in ["summary", "content"] {
-                if let Some(parts) = payload.get(key).filter(|v| !v.is_null()) {
-                    collect_part_modalities(conn, parts, mods)?;
-                }
-            }
-        }
-        "image_generation_call" if payload["result"].is_string() => {
-            mods.insert("image".to_owned());
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-pub fn session_required_modalities(conn: &Connection, sid: SessionId) -> Result<Vec<String>> {
-    session_required_modalities_with_items(conn, sid, &BTreeMap::new())
-}
-
-// A withdrawal or invalidated warning needs a full scan of the *effective* inputs. Membership
-// still comes from SQLite, but newly appended rows already had their payload inspected.
-pub fn session_required_modalities_with_items(
-    conn: &Connection,
-    sid: SessionId,
-    new_items: &BTreeMap<ItemId, BTreeSet<String>>,
-) -> Result<Vec<String>> {
-    let mut mods = std::collections::BTreeSet::new();
-    let queries = [
-        "SELECT i.kind,i.payload,i.id FROM context_items c JOIN items i ON i.id=c.item_id
-         WHERE c.session_id=? AND i.kind IN ('user_message','codemode_event','assistant_message','reasoning','function_call_output','image_generation_call')
-         ORDER BY c.position",
-        "SELECT r.kind,r.payload,r.id FROM items c JOIN items r ON r.target_id=c.id AND r.kind='function_call_output'
-         WHERE c.session_id=? AND c.kind='function_call'
-           AND NOT EXISTS (SELECT 1 FROM context_items WHERE item_id=c.id)
-         ORDER BY c.id",
-        "SELECT i.kind,i.payload,i.id FROM pending p JOIN items i ON i.id=p.id
-         WHERE p.session_id=? ORDER BY p.id",
-    ];
-    for query in queries {
-        let mut stmt = conn.prepare_cached(query)?;
-        let mut rows = stmt.query([sid])?;
-        while let Some(row) = rows.next()? {
-            if !new_items.is_empty()
-                && let Some(known) = new_items.get(&row.get::<_, ItemId>(2)?)
-            {
-                mods.extend(known.iter().cloned());
-                continue;
-            }
-            let kind: String = row.get(0)?;
-            let payload: Value = row.get(1)?;
-            item_required_modalities(conn, &kind, &payload, &mut mods)?;
-        }
-    }
-    Ok(mods.into_iter().collect())
-}
-
 pub fn missing_session_context_attachments(
     conn: &Connection,
     sid: SessionId,
@@ -675,7 +555,7 @@ pub fn missing_session_context_attachments(
          WHERE i.session_id=?1
            AND i.kind IN ('user_message','codemode_event','function_call_output')
            AND (
-             EXISTS (SELECT 1 FROM context_items c WHERE c.session_id=?1 AND c.item_id=i.id)
+             EXISTS (SELECT 1 FROM active_context c WHERE c.session_id=?1 AND c.item_id=i.id)
              OR EXISTS (SELECT 1 FROM pending p WHERE p.session_id=?1 AND p.id=i.id)
            )
          ORDER BY i.id",

@@ -1,489 +1,68 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashSet},
-    io::{self, Write},
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::atomic::{AtomicI64, Ordering},
 };
 
-use reqwest::Url;
-use rusqlite::{Connection, OptionalExtension, ffi, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     Error, Result,
-    cluster::identity::{load_local_node, local_node_id},
-    id::{self, AttachmentId, CallId, ItemId, McpServerId, ModelId, ProviderId, SessionId},
+    cluster::identity::local_node_id,
+    id::{
+        self, AttachmentId, CallId, ContextNodeId, ItemId, McpServerId, ModelId, ProviderId,
+        SessionId,
+    },
 };
 
-const MAX_SESSION_CHUNK_BYTES: usize = 900 * 1024;
-const MAX_SESSION_CHUNK_ITEMS: usize = 200;
-pub const MAX_INLINE_COMMIT_PAYLOAD_BYTES: usize = 1_500_000;
-pub const COMMIT_CHUNK_BYTES: usize = 512 * 1024;
-pub const MAX_COMMIT_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-const MAX_MCP_ANCESTOR_HASHES: usize = 8192;
-const MAX_SYNC_RESOLUTIONS: i64 = 2048;
+pub const CALLS_SCOPE: &str = "calls";
+const MAX_DELTA_BYTES: usize = 1_500_000;
+const DELTA_PAGE_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct StagedSignals {
+    catalog: bool,
+    sessions: Vec<SessionId>,
+}
 
 thread_local! {
-    static SYNC_STAGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static SYNC_STAGED: RefCell<StagedSignals> = const { RefCell::new(StagedSignals { catalog: false, sessions: Vec::new() }) };
 }
 
-pub fn stage_stream(stream_id: &str) {
+pub fn stage_catalog() {
     SYNC_STAGED.with(|cell| {
-        let mut list = cell.borrow_mut();
-        if !list.iter().any(|s| s == stream_id) {
-            list.push(stream_id.to_owned());
+        cell.borrow_mut().catalog = true;
+    });
+}
+
+pub fn stage_session(sid: SessionId) {
+    SYNC_STAGED.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if !st.sessions.contains(&sid) {
+            st.sessions.push(sid);
         }
     });
 }
 
-pub fn take_staged() -> Vec<String> {
-    SYNC_STAGED.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
-}
-
-pub fn clear_staged() {
-    SYNC_STAGED.with(|cell| cell.borrow_mut().clear());
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StreamKind {
-    Provider,
-    Model,
-    Mcp,
-    Session,
-    Call,
-}
-
-impl StreamKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Provider => "provider",
-            Self::Model => "model",
-            Self::Mcp => "mcp",
-            Self::Session => "session",
-            Self::Call => "call",
-        }
-    }
-
-    pub fn from_db(s: &str) -> Result<Self> {
-        match s {
-            "provider" => Ok(Self::Provider),
-            "model" => Ok(Self::Model),
-            "mcp" => Ok(Self::Mcp),
-            "session" => Ok(Self::Session),
-            "call" => Ok(Self::Call),
-            _ => Err(Error::internal(format!("unknown sync stream kind: {s}"))),
-        }
-    }
-
-    pub fn prefix(self) -> &'static str {
-        match self {
-            Self::Provider => "prv_",
-            Self::Model => "mdl_",
-            Self::Mcp => "mcp_",
-            Self::Session => "ses_",
-            Self::Call => "cal_",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CommitWire {
-    pub stream_id: String,
-    pub kind: StreamKind,
-    pub epoch: i64,
-    pub seq: i64,
-    pub parent_hash: [u8; 32],
-    pub commit_hash: [u8; 32],
-    pub author_node_id: String,
-    pub op_type: String,
-    pub payload: String,
-    pub created_at: i64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CommitMeta {
-    pub stream_id: String,
-    pub kind: StreamKind,
-    pub epoch: i64,
-    pub seq: i64,
-    pub parent_hash: [u8; 32],
-    pub commit_hash: [u8; 32],
-    pub author_node_id: String,
-    pub op_type: String,
-    pub payload_len: i64,
-    pub created_at: i64,
-}
-
-#[derive(Clone, Debug)]
-pub struct CommitsPage {
-    pub commits: Vec<CommitWire>,
-    pub oversized_next: Option<CommitMeta>,
-    pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ResolutionReceipt {
-    pub stream_id: String,
-    pub kind: StreamKind,
-    pub chosen: String,
-    pub resolver_node_id: String,
-    pub local_epoch: i64,
-    pub local_seq: i64,
-    pub local_hash: [u8; 32],
-    pub remote_epoch: i64,
-    pub remote_seq: i64,
-    pub remote_hash: [u8; 32],
-    pub winner_epoch: i64,
-    pub winner_seq: i64,
-    pub winner_hash: [u8; 32],
-    pub resolved_at: i64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StreamHead {
-    pub stream_id: String,
-    pub kind: StreamKind,
-    pub epoch: i64,
-    pub head_seq: i64,
-    pub head_hash: [u8; 32],
-    #[serde(default)]
-    pub body_complete: bool,
-    #[serde(default)]
-    pub checkpoint_seq: i64,
-    pub deleted: bool,
-    #[serde(default)]
-    pub retired: bool,
-    pub head_snapshot: Option<String>,
-    pub updated_at: i64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LocalStreamState {
-    pub stream_id: String,
-    pub kind: StreamKind,
-    pub epoch: i64,
-    pub head_seq: i64,
-    pub head_hash: [u8; 32],
-    pub synced_epoch: i64,
-    pub synced_seq: i64,
-    pub synced_hash: [u8; 32],
-    pub checkpoint_seq: i64,
-    pub watched: bool,
-    pub deleted: bool,
-    pub retired: bool,
-    pub head_snapshot: Option<String>,
-    pub updated_at: i64,
-}
-
-impl LocalStreamState {
-    pub fn is_body_complete(&self) -> bool {
-        self.watched
-            && self.synced_epoch == self.epoch
-            && self.synced_seq == self.head_seq
-            && self.synced_hash == self.head_hash
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ConflictInfo {
-    pub stream_id: String,
-    pub kind: StreamKind,
-    pub local_epoch: i64,
-    pub local_seq: i64,
-    pub local_hash_hex: String,
-    pub remote_epoch: i64,
-    pub remote_seq: i64,
-    pub remote_hash_hex: String,
-    pub remote_node_id: String,
-    pub reason: String,
-    pub related_local_id: Option<String>,
-    pub remote_summary: Option<Value>,
-    pub detected_at: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConflictRecord {
-    pub stream_id: String,
-    pub kind: StreamKind,
-    pub local_epoch: i64,
-    pub local_seq: i64,
-    pub local_hash: [u8; 32],
-    pub remote_epoch: i64,
-    pub remote_seq: i64,
-    pub remote_hash: [u8; 32],
-    pub remote_node_id: String,
-    pub reason: String,
-    pub related_local_id: Option<String>,
-    pub remote_snapshot: Option<String>,
-}
-
-impl ConflictRecord {
-    pub fn detaches_mcp(&self) -> bool {
-        self.kind == StreamKind::Mcp
-            && self.reason != "name_conflict"
-            && (self.reason == "retired_diverged"
-                || self.remote_snapshot.as_deref()
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .is_some_and(|v| v.get("base_epoch").is_some() || v.get("server").is_none()))
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AttachmentRef {
-    pub id: AttachmentId,
-    pub mime_type: String,
-    pub content_hash: [u8; 32],
-    pub byte_len: i64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ItemSnapshot {
-    pub id: ItemId,
-    pub session_id: SessionId,
-    pub kind: String,
-    pub payload: String,
-    pub target_id: Option<ItemId>,
-    pub llm_call_id: Option<CallId>,
-    pub idempotency_key: Option<String>,
-    pub codemode_call_item_id: Option<ItemId>,
-    #[serde(default)]
-    pub origin_node_id: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContextPos {
-    pub position: i64,
-    pub item_id: ItemId,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionSnapshot {
-    pub id: SessionId,
-    pub title: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub status: String,
-    pub reasoning_effort: Option<String>,
-    pub last_error: String,
-    pub model_id: ModelId,
-    pub input_queue_cursor: String,
-    pub needs_model: bool,
-    #[serde(default)]
-    pub required_modalities: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionDelta {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<AttachmentRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<ItemSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_items: Vec<ContextPos>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub invalidated_warnings: Vec<ItemId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<SessionSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub detached_call_ids: Vec<CallId>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProviderSnapshot {
-    pub id: ProviderId,
-    pub name: String,
-    pub base_url: String,
-    pub api_key: Option<String>,
-    pub archived_at: Option<i64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ModelSnapshot {
-    pub id: ModelId,
-    pub provider_id: ProviderId,
-    pub model_key: String,
-    pub context_window_tokens: Option<i64>,
-    pub input_modalities: String,
-    pub reasoning_efforts: String,
-    pub pricing: Option<String>,
-    pub archived_at: Option<i64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct McpServerSnapshot {
-    pub id: McpServerId,
-    pub name: String,
-    pub description: String,
-    pub enabled: bool,
-    pub shared: bool,
-    pub transport: String,
-    pub allowed_tools: Option<String>,
-    pub config_json: String,
-    pub timeout_ms: i64,
-    pub revision: i64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct McpOAuthSnapshot {
-    pub generation: String,
-    pub binding: Option<String>,
-    pub credentials: Option<String>,
-    pub rejected: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct McpSyncSnapshot {
-    pub server: McpServerSnapshot,
-    pub oauth: Option<McpOAuthSnapshot>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CallSnapshot {
-    pub id: CallId,
-    pub session_id: Option<SessionId>,
-    pub model_id: ModelId,
-    pub reasoning_effort: Option<String>,
-    pub input_end_position: Option<i64>,
-    pub started_at: i64,
-    pub finished_at: Option<i64>,
-    pub status: String,
-    pub upstream_response_id: Option<String>,
-    pub http_status: Option<i64>,
-    pub error_summary: Option<String>,
-    pub raw_usage: Option<String>,
-    pub input_uncached_tokens: Option<i64>,
-    pub cache_read_tokens: Option<i64>,
-    pub cache_write_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub pricing_snapshot: Option<String>,
-    pub cost_nano_usd: Option<i64>,
-    #[serde(default)]
-    pub origin_node_id: String,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct McpChange {
-    pub id: McpServerId,
-    pub cancel_login: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AncestorProof {
-    None,
-    Verified {
-        epoch: i64,
-        seq: i64,
-        hash: [u8; 32],
-    },
-    Diverged {
-        epoch: i64,
-        seq: i64,
-        hash: [u8; 32],
-    },
-}
-
-pub enum ApplyOutcome {
-    Applied {
-        updated: bool,
-        session_id: Option<SessionId>,
-        session_reset_epoch: Option<i64>,
-        deleted_session: bool,
-        new_items: Vec<ItemId>,
-        mcp_changes: Vec<McpChange>,
-        unblocked_conflicts: Vec<String>,
-        resolved_conflict: bool,
-    },
-    Conflict {
-        newly_recorded: bool,
-    },
-    BlockedOnDependency,
-    Ignored,
-    StaleProof,
-}
-
-pub struct CommitHashInput<'a> {
-    pub stream_id: &'a str,
-    pub kind: StreamKind,
-    pub epoch: i64,
-    pub seq: i64,
-    pub parent_hash: &'a [u8; 32],
-    pub author_node_id: &'a str,
-    pub op_type: &'a str,
-    pub payload: &'a str,
-    pub created_at: i64,
-}
-
-pub fn compute_commit_hash(input: &CommitHashInput<'_>) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"mygo-commit-v1\0");
-    let push_str = |h: &mut blake3::Hasher, s: &str| {
-        let b = s.as_bytes();
-        h.update(&(b.len() as u32).to_be_bytes());
-        h.update(b);
-    };
-    push_str(&mut hasher, input.stream_id);
-    push_str(&mut hasher, input.kind.as_str());
-    hasher.update(&input.epoch.to_be_bytes());
-    hasher.update(&input.seq.to_be_bytes());
-    hasher.update(input.parent_hash);
-    push_str(&mut hasher, input.author_node_id);
-    push_str(&mut hasher, input.op_type);
-    push_str(&mut hasher, input.payload);
-    hasher.update(&input.created_at.to_be_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-pub fn verify_commit(c: &CommitWire, expected_seq: i64, expected_parent: &[u8; 32]) -> bool {
-    if !c.stream_id.starts_with(c.kind.prefix())
-        || c.seq != expected_seq
-        || &c.parent_hash != expected_parent
-        || c.epoch <= 0
-    {
-        return false;
-    }
-    let expected = compute_commit_hash(&CommitHashInput {
-        stream_id: &c.stream_id,
-        kind: c.kind,
-        epoch: c.epoch,
-        seq: c.seq,
-        parent_hash: &c.parent_hash,
-        author_node_id: &c.author_node_id,
-        op_type: &c.op_type,
-        payload: &c.payload,
-        created_at: c.created_at,
-    });
-    expected == c.commit_hash
-}
-
-fn to_hash32(bytes: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
-    bytes.try_into().map_err(|_| {
-        rusqlite::Error::InvalidColumnType(0, "hash".into(), rusqlite::types::Type::Blob)
+pub fn take_staged() -> (bool, Vec<SessionId>) {
+    SYNC_STAGED.with(|cell| {
+        let st = std::mem::take(&mut *cell.borrow_mut());
+        (st.catalog, st.sessions)
     })
 }
 
-pub fn hex_hash(hash: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(64);
-    for b in hash {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+pub fn clear_staged() {
+    SYNC_STAGED.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.catalog = false;
+        st.sessions.clear();
+    });
 }
 
-pub fn has_conflict(conn: &Connection, stream_id: &str) -> Result<bool> {
-    Ok(conn
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM sync_conflicts WHERE stream_id=?)")?
-        .query_row([stream_id], |r| r.get(0))?)
-}
-
-pub fn assert_no_conflict(conn: &Connection, stream_id: &str) -> Result<()> {
-    if has_conflict(conn, stream_id)? {
-        return Err(Error::conflict(format!(
-            "sync conflict on {stream_id}; resolve it before modifying"
-        )));
-    }
-    Ok(())
+pub fn session_scope(sid: SessionId) -> String {
+    format!("session:{sid}")
 }
 
 pub fn with_savepoint<T>(
@@ -504,4535 +83,2834 @@ pub fn with_savepoint<T>(
     }
 }
 
-pub fn verify_local_prefix(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    checkpoint_seq: i64,
-    target_seq: i64,
-    target_hash: &[u8; 32],
-) -> Result<bool> {
-    if target_seq <= 0 || checkpoint_seq <= 0 || checkpoint_seq > target_seq {
-        return Ok(false);
-    }
-    let st = stream_head(conn, stream_id)?;
-    let Some(st) = st else {
-        return Ok(false);
-    };
-    let kind = st.kind;
-    let mut stmt = conn.prepare_cached(
-        "SELECT seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-         FROM sync_commits
-         WHERE stream_id=?1 AND epoch=?2 AND seq BETWEEN ?3 AND ?4
-         ORDER BY seq ASC",
-    )?;
-    let mut rows = stmt.query(params![stream_id, epoch, checkpoint_seq, target_seq])?;
-
-    let mut expected_seq = checkpoint_seq;
-    let mut expected_parent = [0u8; 32];
-    let mut last_hash = [0u8; 32];
-    let mut count = 0i64;
-    while let Some(r) = rows.next()? {
-        let seq: i64 = r.get(0)?;
-        let parent_hash = to_hash32(r.get::<_, Vec<u8>>(1)?)?;
-        let commit_hash = to_hash32(r.get::<_, Vec<u8>>(2)?)?;
-        if count == 0 && checkpoint_seq > 1 {
-            // A terminal checkpoint may start cleanly above seq 1.
-            expected_parent = parent_hash;
-        }
-        let wire = CommitWire {
-            stream_id: stream_id.to_owned(),
-            kind,
-            epoch,
-            seq,
-            parent_hash,
-            commit_hash,
-            author_node_id: r.get(3)?,
-            op_type: r.get(4)?,
-            payload: r.get(5)?,
-            created_at: r.get(6)?,
-        };
-        if !verify_commit(&wire, expected_seq, &expected_parent) {
-            return Ok(false);
-        }
-        expected_parent = commit_hash;
-        last_hash = commit_hash;
-        expected_seq += 1;
-        count += 1;
-    }
-    let expected_len = target_seq - checkpoint_seq + 1;
-    Ok(count == expected_len && &last_hash == target_hash)
+#[derive(Clone, Copy)]
+struct HlcState {
+    wall_ms: u64,
+    logical: u32,
 }
 
-/// The store holds an exclusive SQLite connection. Its temporary proofs follow the
-/// same transactions (including ROLLBACK TO) as the rows they describe.
-/// Mutations to sync_commits use SQL DML. SQLite's incremental BLOB writer
-/// bypasses triggers and must not be used on that table.
-pub(crate) fn init_verified_tips(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        // REPLACE implicitly deletes conflicting rows. SQLite fires DELETE
-        // triggers for these rows only when recursive triggers are enabled.
-        "PRAGMA recursive_triggers=ON;
-         CREATE TEMP TABLE verified_tips (
-             slot INTEGER PRIMARY KEY CHECK (slot BETWEEN 0 AND 255),
-             stream_id TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
-             epoch INTEGER NOT NULL, seq INTEGER NOT NULL, hash BLOB NOT NULL
-         );
-         CREATE TEMP TRIGGER tip_delete AFTER DELETE ON main.sync_commits BEGIN
-             DELETE FROM verified_tips WHERE stream_id=OLD.stream_id AND epoch=OLD.epoch
-                 AND (OLD.seq=1 OR seq=OLD.seq);
-         END;
-         CREATE TEMP TRIGGER tip_update AFTER UPDATE ON main.sync_commits BEGIN
-             DELETE FROM verified_tips WHERE stream_id=OLD.stream_id AND epoch=OLD.epoch
-                 AND (OLD.seq=1 OR seq=OLD.seq);
-         END;",
-    )?;
-    Ok(())
+static HLC: std::sync::Mutex<HlcState> = std::sync::Mutex::new(HlcState {
+    wall_ms: 0,
+    logical: 0,
+});
+
+fn parse_hlc(ts: &str) -> Option<(u64, u32)> {
+    let b = ts.as_bytes();
+    if b.len() < 27 || b.len() > 256 || b[16] != b':' || b[25] != b':' {
+        return None;
+    }
+    let valid_hex = |slice: &[u8]| slice.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+    if !valid_hex(&b[..16]) || !valid_hex(&b[17..25]) {
+        return None;
+    }
+    let node_part = &b[26..];
+    if node_part.is_empty() || node_part.contains(&0) {
+        return None;
+    }
+    let wall_ms = u64::from_str_radix(&ts[..16], 16).ok()?;
+    let logical = u32::from_str_radix(&ts[17..25], 16).ok()?;
+    Some((wall_ms, logical))
 }
 
-fn remember_verified_tip(
-    conn: &Connection,
-    stream_id: &str,
-    kind: StreamKind,
-    epoch: i64,
-    seq: i64,
-    hash: &[u8; 32],
-) -> Result<()> {
-    // Local IDs are 30 bytes. Keep even a malformed remote ID from growing this cache.
-    if stream_id.len() > 64 {
+pub fn validate_hlc(ts: &str) -> Result<()> {
+    if ts.is_empty() {
         return Ok(());
     }
-    conn.prepare_cached(
-        "INSERT OR REPLACE INTO temp.verified_tips(slot,stream_id,kind,epoch,seq,hash)
-         VALUES(?,?,?,?,?,?)",
-    )?
-    .execute(params![hash[0], stream_id, kind.as_str(), epoch, seq, hash])?;
+    parse_hlc(ts).ok_or_else(|| Error::bad("invalid HLC timestamp"))?;
     Ok(())
 }
 
-fn verify_local_tip_commit(conn: &Connection, st: &LocalStreamState) -> Result<bool> {
-    if st.checkpoint_seq != 1 || !st.is_body_complete() {
-        return Ok(false);
-    }
-    if st.head_seq == 0 {
-        return Ok(st.head_hash == [0u8; 32]);
-    }
-    if st.epoch <= 0 || !st.stream_id.starts_with(st.kind.prefix()) {
-        return Ok(false);
-    }
-    let cached: bool = conn
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM temp.verified_tips
-             WHERE slot=? AND stream_id=? AND kind=? AND epoch=? AND seq=? AND hash=?)",
-        )?
-        .query_row(
-            params![st.head_hash[0], &st.stream_id, st.kind.as_str(), st.epoch, st.head_seq, &st.head_hash],
-            |r| r.get(0),
-        )?;
-    if cached {
-        return Ok(true);
-    }
-    let mut stmt = conn.prepare_cached(
-        "SELECT parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-         FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=?3 AND
-             (?3=1 OR EXISTS(SELECT 1 FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=1))",
-    )?;
-    let valid = stmt.query_row(params![&st.stream_id, st.epoch, st.head_seq], |r| {
-        let parent_hash: [u8; 32] = r.get(0)?;
-        let commit_hash: [u8; 32] = r.get(1)?;
-        if commit_hash != st.head_hash || (st.head_seq == 1 && parent_hash != [0; 32]) {
-            return Ok(false);
+pub fn observe_hlc(ts: &str) {
+    if let Some((w, l)) = parse_hlc(ts) {
+        let mut st = HLC.lock().unwrap();
+        if (w, l) > (st.wall_ms, st.logical) {
+            st.wall_ms = w;
+            st.logical = l;
         }
-        let computed = compute_commit_hash(&CommitHashInput {
-            stream_id: &st.stream_id,
-            kind: st.kind,
-            epoch: st.epoch,
-            seq: st.head_seq,
-            parent_hash: &parent_hash,
-            author_node_id: r.get_ref(2)?.as_str()?,
-            op_type: r.get_ref(3)?.as_str()?,
-            payload: r.get_ref(4)?.as_str()?,
-            created_at: r.get(5)?,
-        });
-        Ok(computed == commit_hash)
-    }).optional()?.unwrap_or(false);
-    if valid {
-        remember_verified_tip(
-            conn, &st.stream_id, st.kind, st.epoch, st.head_seq, &st.head_hash,
-        )?;
     }
-    Ok(valid)
 }
 
-pub fn is_session_writable_local(conn: &Connection, sid: SessionId) -> Result<bool> {
-    let Some(st) = stream_head(conn, sid.as_str())? else {
-        return Ok(true);
-    };
-    if st.deleted || st.retired {
-        return Ok(false);
-    }
-    verify_local_tip_commit(conn, &st)
-}
-
-fn encode_commit(value: &impl Serialize) -> Result<String> {
-    serde_json::to_string(value).map_err(|e| Error::internal(format!("commit encode failed: {e}")))
-}
-
-fn record_commit_with_epoch(
-    conn: &Connection,
-    stream_id: &str,
-    kind: StreamKind,
-    op_type: &str,
-    deleted: bool,
-    expected_epoch: Option<i64>,
-    build: impl FnOnce(Option<&LocalStreamState>) -> Result<(String, Option<String>)>,
-) -> Result<()> {
-    with_savepoint(conn, "cluster_commit", || {
-        assert_no_conflict(conn, stream_id)?;
-        let author = local_node_id(conn)?;
-        let now = chrono::Utc::now().timestamp_millis();
-        let existing = stream_head(conn, stream_id)?;
-        let (epoch, seq, parent_hash, checkpoint_seq) = match existing.as_ref() {
-            Some(e) => {
-                if e.deleted || e.retired {
-                    return Err(Error::conflict(format!(
-                        "stream {stream_id} has been deleted or retired"
-                    )));
-                }
-                if expected_epoch.is_some_and(|exp| exp != e.epoch) {
-                    return Err(Error::conflict(format!(
-                        "stream {stream_id} epoch superseded; aborting stale write"
-                    )));
-                }
-                if kind == StreamKind::Session && !verify_local_tip_commit(conn, e)? {
-                    return Err(Error::conflict(format!(
-                        "session {stream_id} history is incomplete; sync full history before writing"
-                    )));
-                }
-                (e.epoch, e.head_seq + 1, e.head_hash, e.checkpoint_seq)
-            }
-            None => {
-                if let Some(exp) = expected_epoch
-                    && exp != 1
-                {
-                    return Err(Error::conflict("unexpected session stream epoch"));
-                }
-                (1, 1, [0u8; 32], 1)
-            }
-        };
-        let (payload, head_snapshot) = build(existing.as_ref())?;
-        let commit_hash = compute_commit_hash(&CommitHashInput {
-            stream_id,
-            kind,
-            epoch,
-            seq,
-            parent_hash: &parent_hash,
-            author_node_id: &author,
-            op_type,
-            payload: &payload,
-            created_at: now,
-        });
-        // Install the computed proof in this savepoint. Triggers invalidate a changed row,
-        // and rolling back the write also rolls back the proof.
-        if kind == StreamKind::Session {
-            remember_verified_tip(conn, stream_id, kind, epoch, seq, &commit_hash)?;
-        }
-        conn.prepare_cached(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?3,?4,?5,?6,1,?7,0,?8,?9)
-             ON CONFLICT(stream_id) DO UPDATE SET
-               epoch=excluded.epoch,
-               head_seq=excluded.head_seq,
-               head_hash=excluded.head_hash,
-               synced_epoch=excluded.synced_epoch,
-               synced_seq=excluded.synced_seq,
-               synced_hash=excluded.synced_hash,
-               checkpoint_seq=excluded.checkpoint_seq,
-               watched=1,
-               deleted=excluded.deleted,
-               retired=0,
-               head_snapshot=coalesce(excluded.head_snapshot, sync_streams.head_snapshot),
-               updated_at=excluded.updated_at",
-        )?.execute(params![
-                stream_id,
-                kind.as_str(),
-                epoch,
-                seq,
-                commit_hash.as_slice(),
-                checkpoint_seq,
-                deleted,
-                head_snapshot,
-                now
-            ])?;
-        let inserted = conn.prepare_cached(
-            "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-             VALUES(?,?,?,?,?,?,?,?,?)",
-        )?.execute(params![
-                stream_id,
-                epoch,
-                seq,
-                parent_hash.as_slice(),
-                commit_hash.as_slice(),
-                author,
-                op_type,
-                payload,
-                now
-            ])?;
-        if inserted != 1 {
-            return Err(Error::internal("commit row was not inserted"));
-        }
-        stage_stream(stream_id);
-        Ok(())
-    })
-}
-
-fn record_commit(
-    conn: &Connection,
-    stream_id: &str,
-    kind: StreamKind,
-    op_type: &str,
-    payload_val: &impl Serialize,
-    deleted: bool,
-) -> Result<()> {
-    let payload = encode_commit(payload_val)?;
-    record_commit_with_epoch(conn, stream_id, kind, op_type, deleted, None, |_| {
-        Ok((payload, None))
-    })
-}
-
-// --- Per-table Snapshot & Record Helpers ---
-
-pub fn read_provider_snapshot(conn: &Connection, id: ProviderId) -> Result<ProviderSnapshot> {
-    Ok(conn.query_row(
-        "SELECT id,name,base_url,api_key,archived_at FROM llm_providers WHERE id=?",
-        [id],
-        |r| {
-            Ok(ProviderSnapshot {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                base_url: r.get(2)?,
-                api_key: r.get(3)?,
-                archived_at: r.get(4)?,
-            })
-        },
-    )?)
-}
-
-pub fn record_provider(conn: &Connection, id: ProviderId) -> Result<()> {
-    let snap = read_provider_snapshot(conn, id)?;
-    record_commit(
-        conn,
-        id.as_str(),
-        StreamKind::Provider,
-        "provider_upsert",
-        &snap,
-        false,
-    )
-}
-
-pub fn read_model_snapshot(conn: &Connection, id: ModelId) -> Result<ModelSnapshot> {
-    Ok(conn.query_row(
-        "SELECT id,provider_id,model_key,context_window_tokens,input_modalities,reasoning_efforts,pricing,archived_at
-         FROM llm_models WHERE id=?",
-        [id],
-        |r| {
-            Ok(ModelSnapshot {
-                id: r.get(0)?,
-                provider_id: r.get(1)?,
-                model_key: r.get(2)?,
-                context_window_tokens: r.get(3)?,
-                input_modalities: r.get(4)?,
-                reasoning_efforts: r.get(5)?,
-                pricing: r.get(6)?,
-                archived_at: r.get(7)?,
-            })
-        },
-    )?)
-}
-
-pub fn record_model(conn: &Connection, id: ModelId) -> Result<()> {
-    let snap = read_model_snapshot(conn, id)?;
-    record_commit(
-        conn,
-        id.as_str(),
-        StreamKind::Model,
-        "model_upsert",
-        &snap,
-        false,
-    )
-}
-
-pub fn read_mcp_snapshot(conn: &Connection, id: McpServerId) -> Result<McpSyncSnapshot> {
-    let server = conn.query_row(
-        "SELECT id,name,description,enabled,shared,transport,allowed_tools,config_json,timeout_ms,revision
-         FROM mcp_servers WHERE id=?",
-        [id],
-        |r| {
-            Ok(McpServerSnapshot {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                description: r.get(2)?,
-                enabled: r.get(3)?,
-                shared: r.get(4)?,
-                transport: r.get(5)?,
-                allowed_tools: r.get(6)?,
-                config_json: r.get(7)?,
-                timeout_ms: r.get(8)?,
-                revision: r.get(9)?,
-            })
-        },
-    )?;
-    // Never sync pending login state; only sync binding/credentials once authorized or rejected.
-    let oauth = conn
-        .query_row(
-            "SELECT generation,binding,credentials,rejected FROM mcp_oauth
-             WHERE server_id=? AND (credentials IS NOT NULL OR rejected=1)",
-            [id],
-            |r| {
-                Ok(McpOAuthSnapshot {
-                    generation: r.get(0)?,
-                    binding: r.get(1)?,
-                    credentials: r.get(2)?,
-                    rejected: r.get(3)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(McpSyncSnapshot { server, oauth })
-}
-
-pub fn record_mcp_if_shared(conn: &Connection, id: McpServerId) -> Result<()> {
-    let shared: Option<bool> = conn
-        .prepare_cached("SELECT shared FROM mcp_servers WHERE id=?")?
-        .query_row([id], |r| r.get(0))
-        .optional()?;
-    if shared == Some(true) {
-        let snap = read_mcp_snapshot(conn, id)?;
-        record_commit(
-            conn,
-            id.as_str(),
-            StreamKind::Mcp,
-            "mcp_upsert",
-            &snap,
-            false,
-        )?;
-    }
-    Ok(())
-}
-
-fn collect_ancestor_hashes_hex(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    up_to_seq: i64,
-) -> Result<(i64, Vec<String>)> {
-    if up_to_seq <= 0 {
-        return Ok((0, Vec::new()));
-    }
-    let mut stmt = conn.prepare_cached(
-        "SELECT seq, commit_hash FROM sync_commits
-         WHERE stream_id=?1 AND epoch=?2 AND seq<=?3
-         ORDER BY seq DESC LIMIT ?4",
-    )?;
-    let mut rows = stmt.query(params![
-        stream_id,
-        epoch,
-        up_to_seq,
-        MAX_MCP_ANCESTOR_HASHES as i64
-    ])?;
-    let mut desc = Vec::new();
-    let mut expected = up_to_seq;
-    while let Some(r) = rows.next()? {
-        let seq: i64 = r.get(0)?;
-        if seq != expected {
-            break;
-        }
-        let h = to_hash32(r.get::<_, Vec<u8>>(1)?)?;
-        desc.push(hex_hash(&h));
-        expected -= 1;
-    }
-    desc.reverse();
-    let start_seq = if desc.is_empty() {
-        0
-    } else {
-        up_to_seq - i64::try_from(desc.len()).unwrap_or(0) + 1
-    };
-    Ok((start_seq, desc))
-}
-
-/// Write a higher-epoch terminal deletion checkpoint for an unshared/deleted MCP server and purge
-/// all older history commits containing sensitive configuration or OAuth credentials (P1-09).
-pub fn record_mcp_deleted(conn: &Connection, id: McpServerId) -> Result<()> {
-    let Some(st) = stream_head(conn, id.as_str())? else {
-        return Ok(());
-    };
-    with_savepoint(conn, "mcp_delete_checkpoint", || {
-        assert_no_conflict(conn, id.as_str())?;
-        if st.retired || st.deleted {
-            return Ok(());
-        }
-        let (ancestor_start_seq, ancestor_hashes_hex) =
-            collect_ancestor_hashes_hex(conn, id.as_str(), st.epoch, st.head_seq)?;
-        let new_epoch = st.epoch + 1;
-        let payload = json!({
-            "id": id,
-            "base_epoch": st.epoch,
-            "base_seq": st.head_seq,
-            "base_hash_hex": hex_hash(&st.head_hash),
-            "ancestor_start_seq": ancestor_start_seq,
-            "ancestor_hashes_hex": ancestor_hashes_hex,
-        })
-        .to_string();
-        replace_stream_with_epoch_snapshot(
-            conn,
-            EpochSnapshot {
-                stream_id: id.as_str(),
-                kind: StreamKind::Mcp,
-                new_epoch,
-                op_type: "mcp_delete",
-                payload,
-                deleted: true,
-                retired: true,
-                head_snapshot: None,
-            },
-        )?;
-        Ok(())
-    })
-}
-
-pub fn read_call_snapshot(conn: &Connection, id: CallId) -> Result<CallSnapshot> {
-    Ok(conn.query_row(
-        "SELECT id,session_id,model_id,reasoning_effort,input_end_position,started_at,finished_at,status,
-                upstream_response_id,http_status,error_summary,raw_usage,input_uncached_tokens,
-                cache_read_tokens,cache_write_tokens,output_tokens,pricing_snapshot,cost_nano_usd,origin_node_id
-         FROM llm_calls WHERE id=?",
-        [id],
-        |r| {
-            Ok(CallSnapshot {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                model_id: r.get(2)?,
-                reasoning_effort: r.get(3)?,
-                input_end_position: r.get(4)?,
-                started_at: r.get(5)?,
-                finished_at: r.get(6)?,
-                status: r.get(7)?,
-                upstream_response_id: r.get(8)?,
-                http_status: r.get(9)?,
-                error_summary: r.get(10)?,
-                raw_usage: r.get(11)?,
-                input_uncached_tokens: r.get(12)?,
-                cache_read_tokens: r.get(13)?,
-                cache_write_tokens: r.get(14)?,
-                output_tokens: r.get(15)?,
-                pricing_snapshot: r.get(16)?,
-                cost_nano_usd: r.get(17)?,
-                origin_node_id: r.get(18)?,
-            })
-        },
-    )?)
-}
-
-pub fn record_call(conn: &Connection, id: CallId) -> Result<()> {
-    let snap = read_call_snapshot(conn, id)?;
-    record_commit(
-        conn,
-        id.as_str(),
-        StreamKind::Call,
-        "call_upsert",
-        &snap,
-        false,
-    )
-}
-
-fn read_session_snapshot_with_modalities(
-    conn: &Connection,
-    sid: SessionId,
-    required_modalities: Vec<String>,
-) -> Result<SessionSnapshot> {
-    conn.prepare_cached(
-        "SELECT id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id,input_queue_cursor,needs_model
-         FROM sessions WHERE id=?",
-    )?
-    .query_row([sid], |r| {
-        let raw_status: String = r.get(4)?;
-        let status = if raw_status == "idle" {
-            "idle".to_owned()
+pub fn tick_hlc_for(node_id: &str) -> String {
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis().max(0)).unwrap_or(0);
+    let (wall_ms, logical) = {
+        let mut st = HLC.lock().unwrap();
+        if now_ms > st.wall_ms {
+            st.wall_ms = now_ms;
+            st.logical = 0;
+        } else if st.logical < u32::MAX {
+            st.logical += 1;
         } else {
-            // Transient running/pausing states never replicate as durable states.
-            "paused".to_owned()
-        };
-        Ok(SessionSnapshot {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            created_at: r.get(2)?,
-            updated_at: r.get(3)?,
-            status,
-            reasoning_effort: r.get(5)?,
-            last_error: r.get(6)?,
-            model_id: r.get(7)?,
-            input_queue_cursor: r.get(8)?,
-            needs_model: r.get(9)?,
-            required_modalities,
-        })
-    })
-    .map_err(Into::into)
-}
-
-pub fn read_session_snapshot(conn: &Connection, sid: SessionId) -> Result<SessionSnapshot> {
-    let required_modalities = crate::media::session_required_modalities(conn, sid)?;
-    read_session_snapshot_with_modalities(conn, sid, required_modalities)
-}
-
-macro_rules! returning_item_snapshot {
-    ($insert:literal) => {
-        concat!($insert, " RETURNING id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id")
+            st.wall_ms = st.wall_ms.saturating_add(1);
+            st.logical = 0;
+        }
+        (st.wall_ms, st.logical)
     };
-}
-pub(crate) use returning_item_snapshot;
-
-impl ItemSnapshot {
-    pub fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: r.get(0)?,
-            session_id: r.get(1)?,
-            kind: r.get(2)?,
-            payload: r.get(3)?,
-            target_id: r.get(4)?,
-            llm_call_id: r.get(5)?,
-            idempotency_key: r.get(6)?,
-            codemode_call_item_id: r.get(7)?,
-            origin_node_id: r.get(8)?,
-        })
-    }
+    format!("{wall_ms:016x}:{logical:08x}:{node_id}")
 }
 
-pub fn read_item_snapshot(conn: &Connection, id: ItemId) -> Result<ItemSnapshot> {
-    Ok(conn.prepare_cached(
-        "SELECT id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id
-         FROM items WHERE id=?",
-    )?.query_row([id], ItemSnapshot::from_row)?)
+pub fn tick_hlc(conn: &Connection) -> Result<String> {
+    let node_id = local_node_id(conn)?;
+    Ok(tick_hlc_for(&node_id))
 }
 
-fn collect_attachment_ids(kind: &str, payload: &Value, out: &mut HashSet<AttachmentId>) {
-    let parts = match kind {
-        "user_message" | "codemode_event" => &payload["content"],
-        "function_call_output" => &payload["output"],
-        _ => return,
-    };
-    if let Some(parts) = parts.as_array() {
-        for part in parts {
-            if let Some(id_str) = part.get("attachment_id").and_then(Value::as_str)
-                && let Ok(id) = id_str.parse::<AttachmentId>()
-            {
-                out.insert(id);
-            }
+pub fn seed_hlc_from_db(conn: &Connection) -> Result<()> {
+    const QUERIES: [&str; 21] = [
+        "SELECT max(name_ts) FROM llm_providers",
+        "SELECT max(base_url_ts) FROM llm_providers",
+        "SELECT max(api_key_ts) FROM llm_providers",
+        "SELECT max(archived_ts) FROM llm_providers",
+        "SELECT max(identity_ts) FROM llm_models",
+        "SELECT max(context_window_ts) FROM llm_models",
+        "SELECT max(input_modalities_ts) FROM llm_models",
+        "SELECT max(reasoning_efforts_ts) FROM llm_models",
+        "SELECT max(pricing_ts) FROM llm_models",
+        "SELECT max(archived_ts) FROM llm_models",
+        "SELECT max(name_ts) FROM mcp_servers",
+        "SELECT max(description_ts) FROM mcp_servers",
+        "SELECT max(enabled_ts) FROM mcp_servers",
+        "SELECT max(allowed_tools_ts) FROM mcp_servers",
+        "SELECT max(timeout_ts) FROM mcp_servers",
+        "SELECT max(config_ts) FROM mcp_servers",
+        "SELECT max(oauth_ts) FROM mcp_servers",
+        "SELECT max(title_ts) FROM sessions",
+        "SELECT max(status_ts) FROM sessions",
+        "SELECT max(selection_ts) FROM sessions",
+        "SELECT max(active_head_ts) FROM sessions",
+    ];
+    for sql in QUERIES {
+        if let Some(ts) = conn.query_row(sql, [], |r| r.get::<_, Option<String>>(0))? {
+            observe_hlc(&ts);
         }
     }
-}
-
-fn collect_attachment_ids_from_item(item: &ItemSnapshot, out: &mut HashSet<AttachmentId>) {
-    if let Ok(payload) = serde_json::from_str::<Value>(&item.payload) {
-        collect_attachment_ids(&item.kind, &payload, out);
-    }
-}
-
-fn load_attachment_refs(
-    conn: &Connection,
-    ids: HashSet<AttachmentId>,
-) -> Result<Vec<AttachmentRef>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut sorted: Vec<AttachmentId> = ids.into_iter().collect();
-    sorted.sort();
-    let mut refs = Vec::with_capacity(sorted.len());
-    let mut stmt = conn
-        .prepare_cached("SELECT id,mime_type,content_hash,byte_len FROM attachments WHERE id=?")?;
-    for id in sorted {
-        if let Some(r) = stmt
-            .query_row([id], |r| {
-                let hash_vec: Vec<u8> = r.get(2)?;
-                Ok(AttachmentRef {
-                    id: r.get(0)?,
-                    mime_type: r.get(1)?,
-                    content_hash: to_hash32(hash_vec)?,
-                    byte_len: r.get(3)?,
-                })
-            })
-            .optional()?
-        {
-            refs.push(r);
+    const SESSION_QUERIES: [&str; 4] = [
+        "SELECT max(title_ts) FROM sessions",
+        "SELECT max(status_ts) FROM sessions",
+        "SELECT max(selection_ts) FROM sessions",
+        "SELECT max(active_head_ts) FROM sessions",
+    ];
+    for sql in SESSION_QUERIES {
+        if let Some(ts) = conn.query_row(sql, [], |r| r.get::<_, Option<String>>(0))? {
+            observe_hlc(&ts);
         }
     }
-    Ok(refs)
+    Ok(())
 }
 
-pub fn record_session_delta(
-    conn: &Connection,
-    sid: SessionId,
-    op_type: &str,
-    items: Vec<ItemSnapshot>,
-    context_items: Vec<ContextPos>,
-    invalidated_warnings: Vec<ItemId>,
-) -> Result<()> {
-    record_session_delta_at_epoch(
-        conn,
-        sid,
-        op_type,
-        items,
-        context_items,
-        invalidated_warnings,
-        None,
-    )
-}
+static CATALOG_REV: AtomicI64 = AtomicI64::new(0);
 
-pub fn record_session_delta_at_epoch(
-    conn: &Connection,
-    sid: SessionId,
-    op_type: &str,
-    mut items: Vec<ItemSnapshot>,
-    context_items: Vec<ContextPos>,
-    invalidated_warnings: Vec<ItemId>,
-    expected_epoch: Option<i64>,
-) -> Result<()> {
-    record_commit_with_epoch(
-        conn,
-        sid.as_str(),
-        StreamKind::Session,
-        op_type,
-        false,
-        expected_epoch,
-        |existing| {
-            items.sort_by_key(|item| item.id);
-            let previous = existing
-                .and_then(|s| s.head_snapshot.as_deref())
-                .filter(|_| {
-                    invalidated_warnings.is_empty() && items.iter().all(|i| i.kind != "withdrawal")
-                })
-                .and_then(|raw| serde_json::from_str::<SessionSnapshot>(raw).ok());
-            let mut modalities =
-                previous.map(|s| s.required_modalities.into_iter().collect::<BTreeSet<_>>());
-            let mut attachment_ids = HashSet::new();
-            let mut new_modalities = std::collections::BTreeMap::new();
-            for item in &items {
-                if let Ok(payload) = serde_json::from_str::<Value>(&item.payload) {
-                    collect_attachment_ids(&item.kind, &payload, &mut attachment_ids);
-                    let mods = if let Some(mods) = &mut modalities {
-                        if item.kind == "codemode_event"
-                            && payload.get("notify").and_then(Value::as_bool) != Some(true)
-                            && !context_items.iter().any(|c| c.item_id == item.id)
-                        {
-                            continue;
-                        }
-                        mods
-                    } else {
-                        new_modalities.entry(item.id).or_default()
-                    };
-                    crate::media::item_required_modalities(conn, &item.kind, &payload, mods)?;
-                }
-            }
-            let attachments = load_attachment_refs(conn, attachment_ids)?;
-            let required_modalities = if let Some(mut mods) = modalities {
-                for ctx in &context_items {
-                    if items.iter().any(|it| it.id == ctx.item_id) {
-                        continue;
-                    }
-                    if let Some((kind, raw_payload)) = conn
-                        .prepare_cached("SELECT kind, payload FROM items WHERE id=?")?
-                        .query_row([ctx.item_id], |r| {
-                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                        })
-                        .optional()?
-                        && let Ok(payload) = serde_json::from_str::<Value>(&raw_payload)
-                    {
-                        crate::media::item_required_modalities(conn, &kind, &payload, &mut mods)?;
-                    }
-                }
-                mods.into_iter().collect()
-            } else {
-                crate::media::session_required_modalities_with_items(conn, sid, &new_modalities)?
-            };
-            let snap = read_session_snapshot_with_modalities(conn, sid, required_modalities)?;
-            let head_snapshot = serde_json::to_string(&snap)
-                .map_err(|e| Error::internal(format!("session snapshot encode failed: {e}")))?;
-            // All receivers derive the same head snapshot from the canonical session in the delta.
-            let delta = SessionDelta {
-                attachments,
-                items,
-                context_items,
-                invalidated_warnings,
-                session: Some(snap),
-                detached_call_ids: Vec::new(),
-            };
-            Ok((encode_commit(&delta)?, Some(head_snapshot)))
-        },
-    )
-}
-
-pub fn record_session_deleted(
-    conn: &Connection,
-    sid: SessionId,
-    detached_call_ids: &[CallId],
-) -> Result<()> {
-    record_commit(
-        conn,
-        sid.as_str(),
-        StreamKind::Session,
-        "session_delete",
-        &json!({ "id": sid, "detached_call_ids": detached_call_ids }),
-        true,
-    )
-}
-
-// --- Manifest, Commit Queries, and Staging ---
-
-pub fn local_manifest_page(
-    conn: &Connection,
-    after_stream_id: Option<&str>,
-    limit: usize,
-) -> Result<(Vec<StreamHead>, Option<String>)> {
-    let limit = limit.clamp(1, 512);
-    let fetch = i64::try_from(limit + 1).unwrap_or(513);
-    let mut stmt = conn.prepare_cached(
-        "SELECT stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at
-         FROM sync_streams
-         WHERE stream_id > ?1
-         ORDER BY stream_id ASC
-         LIMIT ?2",
-    )?;
-    // Every stream id begins with its kind prefix, so the empty cursor starts at the first id.
-    let rows = stmt
-        .query_map(params![after_stream_id.unwrap_or(""), fetch], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, Vec<u8>>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, Vec<u8>>(7)?,
-                r.get::<_, i64>(8)?,
-                r.get::<_, bool>(9)?,
-                r.get::<_, bool>(10)?,
-                r.get::<_, bool>(11)?,
-                r.get::<_, Option<String>>(12)?,
-                r.get::<_, i64>(13)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut heads: Vec<StreamHead> = Vec::with_capacity(limit.min(rows.len()));
-    let mut next_cursor = None;
-    for (idx, row) in rows.into_iter().enumerate() {
-        if idx >= limit {
-            if let Some(last) = heads.last() {
-                next_cursor = Some(last.stream_id.clone());
-            }
-            break;
-        }
-        let (
-            stream_id,
-            kind_str,
-            epoch,
-            head_seq,
-            hash_vec,
-            synced_epoch,
-            synced_seq,
-            synced_vec,
-            checkpoint_seq,
-            watched,
-            deleted,
-            retired,
-            head_snapshot,
-            updated_at,
-        ) = row;
-        let head_hash = to_hash32(hash_vec)?;
-        let synced_hash = to_hash32(synced_vec)?;
-        let body_complete = watched
-            && synced_epoch == epoch
-            && synced_seq == head_seq
-            && synced_hash == head_hash;
-        heads.push(StreamHead {
-            stream_id,
-            kind: StreamKind::from_db(&kind_str)?,
-            epoch,
-            head_seq,
-            head_hash,
-            body_complete,
-            checkpoint_seq,
-            deleted,
-            retired,
-            head_snapshot,
-            updated_at,
-        });
+pub fn seed_catalog_rev(conn: &Connection) -> Result<()> {
+    const QUERIES: [&str; 4] = [
+        "SELECT coalesce(max(sync_rev), 0) FROM llm_providers",
+        "SELECT coalesce(max(sync_rev), 0) FROM llm_models",
+        "SELECT coalesce(max(sync_rev), 0) FROM mcp_servers WHERE shared = 1",
+        "SELECT coalesce(max(sync_rev), 0) FROM sessions",
+    ];
+    let mut max_rev = 0i64;
+    for sql in QUERIES {
+        let rev: i64 = conn.query_row(sql, [], |r| r.get(0))?;
+        max_rev = max_rev.max(rev);
     }
-    Ok((heads, next_cursor))
+    CATALOG_REV.store(max_rev, Ordering::Release);
+    Ok(())
 }
 
-pub fn stream_head(conn: &Connection, stream_id: &str) -> Result<Option<LocalStreamState>> {
-    let row = conn
+pub fn current_catalog_rev() -> i64 {
+    CATALOG_REV.load(Ordering::Acquire)
+}
+
+pub fn next_catalog_rev() -> i64 {
+    CATALOG_REV.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+pub fn next_origin_seq(conn: &Connection, scope: &str, node_id: &str) -> Result<i64> {
+    let seq: i64 = conn
         .prepare_cached(
-            "SELECT stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at
-             FROM sync_streams WHERE stream_id=?",
+            "INSERT INTO sync_vectors(scope, node_id, seq) VALUES(?1, ?2, 1)
+             ON CONFLICT(scope, node_id) DO UPDATE SET seq = sync_vectors.seq + 1
+             RETURNING seq",
         )?
-        .query_row([stream_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, Vec<u8>>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, Vec<u8>>(7)?,
-                r.get::<_, i64>(8)?,
-                r.get::<_, bool>(9)?,
-                r.get::<_, bool>(10)?,
-                r.get::<_, bool>(11)?,
-                r.get::<_, Option<String>>(12)?,
-                r.get::<_, i64>(13)?,
-            ))
-        })
-        .optional()?;
-    let Some((
-        stream_id,
-        kind_str,
-        epoch,
-        head_seq,
-        hash_vec,
-        synced_epoch,
-        synced_seq,
-        synced_vec,
-        checkpoint_seq,
-        watched,
-        deleted,
-        retired,
-        head_snapshot,
-        updated_at,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    Ok(Some(LocalStreamState {
-        stream_id,
-        kind: StreamKind::from_db(&kind_str)?,
-        epoch,
-        head_seq,
-        head_hash: to_hash32(hash_vec)?,
-        synced_epoch,
-        synced_seq,
-        synced_hash: to_hash32(synced_vec)?,
-        checkpoint_seq,
-        watched,
-        deleted,
-        retired,
-        head_snapshot,
-        updated_at,
-    }))
+        .query_row(params![scope, node_id], |r| r.get(0))?;
+    Ok(seq)
 }
 
-pub fn stream_head_wire(conn: &Connection, stream_id: &str) -> Result<Option<StreamHead>> {
-    Ok(stream_head(conn, stream_id)?.map(|st| {
-        let body_complete = st.is_body_complete();
-        StreamHead {
-            stream_id: st.stream_id,
-            kind: st.kind,
-            epoch: st.epoch,
-            head_seq: st.head_seq,
-            head_hash: st.head_hash,
-            body_complete,
-            checkpoint_seq: st.checkpoint_seq,
-            deleted: st.deleted,
-            retired: st.retired,
-            head_snapshot: st.head_snapshot,
-            updated_at: st.updated_at,
-        }
-    }))
-}
-
-pub fn read_commits_range(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    after_seq: i64,
-    up_to_seq: Option<i64>,
-    max_count: usize,
-    max_bytes: usize,
-) -> Result<(Vec<CommitWire>, bool)> {
-    let page = read_commits_page(conn, stream_id, epoch, after_seq, up_to_seq, max_count, max_bytes)?;
-    if page.oversized_next.is_some() {
-        return Err(Error::bad(
-            "commit payload exceeds inline limit; use chunked commit fetch",
-        ));
+pub fn advance_vector(conn: &Connection, scope: &str, node_id: &str, seq: i64) -> Result<()> {
+    if seq <= 0 || node_id.is_empty() {
+        return Ok(());
     }
-    Ok((page.commits, page.has_more))
+    conn.prepare_cached(
+        "INSERT INTO sync_vectors(scope, node_id, seq) VALUES(?1, ?2, ?3)
+         ON CONFLICT(scope, node_id) DO UPDATE SET seq = max(sync_vectors.seq, excluded.seq)",
+    )?
+    .execute(params![scope, node_id, seq])?;
+    Ok(())
+}
+
+pub fn read_vector(conn: &Connection, scope: &str) -> Result<BTreeMap<String, i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT node_id, seq FROM sync_vectors WHERE scope = ?1 ORDER BY node_id",
+    )?;
+    let rows = stmt
+        .query_map([scope], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+    Ok(rows)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BranchHead {
+    pub head_id: ContextNodeId,
+    pub depth: i64,
+    pub last_item_id: ItemId,
+    pub origin_node_id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveContextChange {
+    Unchanged,
+    Appended(usize),
+    Switched,
+    Cleared,
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct McpChange {
+    pub id: McpServerId,
+    pub cancel_login: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttachmentRef {
+    pub id: AttachmentId,
+    pub mime_type: String,
+    pub content_hash: [u8; 32],
+    pub byte_len: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderWire {
+    pub id: ProviderId,
+    pub name: String,
+    pub name_ts: String,
+    pub base_url: String,
+    pub base_url_ts: String,
+    pub api_key: Option<String>,
+    pub api_key_ts: String,
+    pub archived_at: Option<i64>,
+    pub archived_ts: String,
+    pub sync_rev: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelWire {
+    pub id: ModelId,
+    pub provider_id: ProviderId,
+    pub model_key: String,
+    pub identity_ts: String,
+    pub context_window_tokens: Option<i64>,
+    pub context_window_ts: String,
+    pub input_modalities: String,
+    pub input_modalities_ts: String,
+    pub reasoning_efforts: String,
+    pub reasoning_efforts_ts: String,
+    pub pricing: Option<String>,
+    pub pricing_ts: String,
+    pub archived_at: Option<i64>,
+    pub archived_ts: String,
+    pub sync_rev: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpOAuthGrantWire {
+    pub generation: String,
+    pub binding: Option<String>,
+    pub credentials: Option<String>,
+    pub rejected: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpServerWire {
+    pub id: McpServerId,
+    pub name: String,
+    pub name_ts: String,
+    pub description: String,
+    pub description_ts: String,
+    pub enabled: bool,
+    pub enabled_ts: String,
+    pub transport: String,
+    pub allowed_tools: Option<String>,
+    pub allowed_tools_ts: String,
+    pub config_json: String,
+    pub timeout_ms: i64,
+    pub timeout_ts: String,
+    pub config_ts: String,
+    pub oauth: Option<McpOAuthGrantWire>,
+    pub oauth_ts: String,
+    pub deleted: bool,
+    pub sync_rev: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionWire {
+    pub id: SessionId,
+    pub title: String,
+    pub title_ts: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub status: String,
+    pub last_error: String,
+    pub status_ts: String,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+    pub selection_ts: String,
+    pub active_head: Option<ContextNodeId>,
+    pub active_head_ts: String,
+    pub deleted: bool,
+    pub sync_rev: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LlmCallWire {
+    pub id: CallId,
+    pub session_id: Option<SessionId>,
+    pub model_id: ModelId,
+    pub reasoning_effort: Option<String>,
+    pub input_end_position: Option<i64>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub status: String,
+    pub upstream_response_id: Option<String>,
+    pub http_status: Option<i64>,
+    pub error_summary: Option<String>,
+    pub raw_usage: Option<String>,
+    pub input_uncached_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub pricing_snapshot: Option<String>,
+    pub cost_nano_usd: Option<i64>,
+    pub origin_node_id: String,
+    pub origin_seq: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ItemWire {
+    pub id: ItemId,
+    pub session_id: SessionId,
+    pub kind: String,
+    pub payload: String,
+    pub target_id: Option<ItemId>,
+    pub llm_call_id: Option<CallId>,
+    pub idempotency_key: Option<String>,
+    pub codemode_call_item_id: Option<ItemId>,
+    pub origin_node_id: String,
+    pub origin_seq: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextNodeWire {
+    pub id: ContextNodeId,
+    pub session_id: SessionId,
+    pub parent_id: Option<ContextNodeId>,
+    pub depth: i64,
+    pub item_id: ItemId,
+    pub origin_node_id: String,
+    pub origin_seq: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TurnSettledWire {
+    pub context_node_id: ContextNodeId,
+    pub session_id: SessionId,
+    pub origin_node_id: String,
+    pub origin_seq: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvalidatedWarningWire {
+    pub item_id: ItemId,
+    pub session_id: SessionId,
+    pub origin_node_id: String,
+    pub origin_seq: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CatalogDelta {
+    pub db_epoch: String,
+    pub head_rev: i64,
+    pub next_rev: i64,
+    pub has_more: bool,
+    #[serde(default)]
+    pub providers: Vec<ProviderWire>,
+    #[serde(default)]
+    pub models: Vec<ModelWire>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerWire>,
+    #[serde(default)]
+    pub sessions: Vec<SessionWire>,
+    #[serde(default)]
+    pub calls: Vec<LlmCallWire>,
+    #[serde(default)]
+    pub calls_vector: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionDelta {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRef>,
+    #[serde(default)]
+    pub items: Vec<ItemWire>,
+    #[serde(default)]
+    pub context_nodes: Vec<ContextNodeWire>,
+    #[serde(default)]
+    pub turn_settled: Vec<TurnSettledWire>,
+    #[serde(default)]
+    pub invalidated_warnings: Vec<InvalidatedWarningWire>,
+    #[serde(default)]
+    pub advanced_vector: BTreeMap<String, i64>,
 }
 
 #[derive(Default)]
-struct ByteCount(usize);
-
-impl Write for ByteCount {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.saturating_add(buf.len());
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+pub struct CatalogMergeOutcome {
+    pub changed: bool,
+    pub catalog_changed: bool,
+    pub mcp_changes: Vec<McpChange>,
+    pub changed_sessions: BTreeSet<SessionId>,
+    pub resync_sessions: BTreeSet<SessionId>,
+    pub switched_sessions: BTreeSet<SessionId>,
+    pub deleted_sessions: BTreeSet<SessionId>,
 }
 
-fn encoded_len(value: &(impl Serialize + ?Sized)) -> Result<usize> {
-    let mut count = ByteCount::default();
-    serde_json::to_writer(&mut count, value).map_err(|e| Error::internal(e.to_string()))?;
-    Ok(count.0)
+#[derive(Default)]
+pub struct SessionMergeOutcome {
+    pub changed: bool,
+    pub deleted: bool,
+    pub reset_view: bool,
+    pub new_items: Vec<ItemId>,
+    pub has_null_attachments: bool,
 }
 
-fn read_inline_payload(
-    stmt: &mut rusqlite::Statement<'_>,
-    rowid: i64,
-    len: usize,
-    budget: usize,
-) -> Result<Option<(String, usize)>> {
-    // Keep the existing small-commit estimate. Larger strings need at least two JSON quotes.
-    let small = len <= 256 * 1024;
-    let lower_bound = if small {
-        len * 2 + 256
+fn lww_take<T>(cur_val: &mut T, cur_ts: &mut String, in_val: T, in_ts: &str) -> bool {
+    if in_ts > cur_ts.as_str() {
+        *cur_val = in_val;
+        *cur_ts = in_ts.to_owned();
+        true
     } else {
-        len.saturating_add(258)
-    };
-    if lower_bound > budget {
-        return Ok(None);
+        false
     }
-    let mut rows = stmt.query([rowid])?;
-    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-    let payload = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
-    let estimate = if small {
-        lower_bound
+}
+
+fn lww_take_pair<A, B>(
+    cur_a: &mut A,
+    cur_b: &mut B,
+    cur_ts: &mut String,
+    in_a: A,
+    in_b: B,
+    in_ts: &str,
+) -> bool {
+    if in_ts > cur_ts.as_str() {
+        *cur_a = in_a;
+        *cur_b = in_b;
+        *cur_ts = in_ts.to_owned();
+        true
     } else {
-        encoded_len(payload)?.saturating_add(256)
-    };
-    Ok((estimate <= budget).then(|| (payload.to_owned(), estimate)))
-}
-
-pub fn read_commits_page(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    after_seq: i64,
-    up_to_seq: Option<i64>,
-    max_count: usize,
-    max_bytes: usize,
-) -> Result<CommitsPage> {
-    let stream_kind = conn
-        .prepare_cached("SELECT kind FROM sync_streams WHERE stream_id=?")?
-        .query_row([stream_id], |r| r.get::<_, String>(0))
-        .optional()?;
-    let Some(kind_str) = stream_kind else {
-        return Ok(CommitsPage {
-            commits: Vec::new(),
-            oversized_next: None,
-            has_more: false,
-        });
-    };
-    let kind = StreamKind::from_db(&kind_str)?;
-    let max_count = max_count.clamp(1, 256);
-    let inline_single_limit = max_bytes.min(MAX_INLINE_COMMIT_PAYLOAD_BYTES);
-    // octet_length on a table column reads its byte length from the record header, even for TEXT.
-    let mut stmt = conn.prepare_cached(
-        "SELECT seq,parent_hash,commit_hash,author_node_id,op_type,octet_length(payload),created_at,rowid
-         FROM sync_commits
-         WHERE stream_id=?1 AND epoch=?2 AND seq>?3 AND (?4 IS NULL OR seq<=?4)
-         ORDER BY seq ASC",
-    )?;
-    let mut payload_stmt = conn.prepare_cached("SELECT payload FROM sync_commits WHERE rowid=?")?;
-    let mut rows = stmt.query(params![stream_id, epoch, after_seq, up_to_seq])?;
-    let mut out = Vec::new();
-    let mut oversized_next = None;
-    let mut remaining = max_bytes;
-    let mut has_more = false;
-    while let Some(row) = rows.next()? {
-        if out.len() == max_count {
-            has_more = true;
-            break;
-        }
-        let budget = if out.is_empty() {
-            inline_single_limit
-        } else {
-            remaining
-        };
-        let len = usize::try_from(row.get::<_, i64>(5)?)
-            .map_err(|_| Error::internal("invalid commit payload length"))?;
-        let Some((payload, estimate)) =
-            read_inline_payload(&mut payload_stmt, row.get(7)?, len, budget)?
-        else {
-            if out.is_empty() {
-                oversized_next = Some(CommitMeta {
-                    stream_id: stream_id.to_owned(),
-                    kind,
-                    epoch,
-                    seq: row.get(0)?,
-                    parent_hash: row.get(1)?,
-                    commit_hash: row.get(2)?,
-                    author_node_id: row.get(3)?,
-                    op_type: row.get(4)?,
-                    payload_len: row.get(5)?,
-                    created_at: row.get(6)?,
-                });
-                has_more = rows.next()?.is_some();
-            } else {
-                has_more = true;
-            }
-            break;
-        };
-        remaining -= estimate;
-        out.push(CommitWire {
-            stream_id: stream_id.to_owned(),
-            kind,
-            epoch,
-            seq: row.get(0)?,
-            parent_hash: row.get(1)?,
-            commit_hash: row.get(2)?,
-            author_node_id: row.get(3)?,
-            op_type: row.get(4)?,
-            payload,
-            created_at: row.get(6)?,
-        });
-    }
-    Ok(CommitsPage {
-        commits: out,
-        oversized_next,
-        has_more,
-    })
-}
-
-pub fn read_commit_payload_chunk(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    seq: i64,
-    expected_commit_hash: &[u8; 32],
-    offset: u64,
-    max_bytes: usize,
-) -> Result<Option<(Vec<u8>, bool)>> {
-    let limit = i64::try_from(max_bytes.clamp(1, COMMIT_CHUNK_BYTES)).unwrap_or(512 * 1024);
-    let offset_i64 = i64::try_from(offset).map_err(|_| Error::bad("chunk offset overflow"))?;
-    let sql_offset = offset_i64
-        .checked_add(1)
-        .ok_or_else(|| Error::bad("chunk offset overflow"))?;
-    let row: Option<(i64, Vec<u8>)> = conn
-        .prepare_cached(
-            "SELECT length(CAST(payload AS BLOB)), substr(CAST(payload AS BLOB), ?5, ?6)
-             FROM sync_commits
-             WHERE stream_id=?1 AND epoch=?2 AND seq=?3 AND commit_hash=?4",
-        )?
-        .query_row(
-            params![
-                stream_id,
-                epoch,
-                seq,
-                expected_commit_hash.as_slice(),
-                sql_offset,
-                limit
-            ],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((total_len, chunk)) = row else {
-        return Ok(None);
-    };
-    if offset_i64 < 0 || offset_i64 > total_len {
-        return Err(Error::bad("commit chunk offset out of bounds"));
-    }
-    let end = offset_i64 + i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-    Ok(Some((chunk, end >= total_len)))
-}
-
-pub fn session_history_rev(conn: &Connection, sid: SessionId) -> Result<i64> {
-    Ok(conn
-        .prepare_cached("SELECT reset_gen FROM sync_streams WHERE stream_id=?")?
-        .query_row([sid.as_str()], |r| r.get::<_, i64>(0))
-        .optional()?
-        .unwrap_or(0))
-}
-
-pub fn read_delete_commit(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    seq: i64,
-) -> Result<Option<CommitWire>> {
-    let Some(st) = stream_head(conn, stream_id)? else {
-        return Ok(None);
-    };
-    if !st.deleted {
-        return Ok(None);
-    }
-    let row = conn
-        .prepare_cached(
-            "SELECT parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-             FROM sync_commits
-             WHERE stream_id=?1 AND epoch=?2 AND seq=?3 AND op_type IN ('session_delete','mcp_delete')",
-        )?
-        .query_row(params![stream_id, epoch, seq], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        })
-        .optional()?;
-    let Some((pvec, cvec, author_node_id, op_type, payload, created_at)) = row else {
-        return Ok(None);
-    };
-    Ok(Some(CommitWire {
-        stream_id: stream_id.to_owned(),
-        kind: st.kind,
-        epoch,
-        seq,
-        parent_hash: to_hash32(pvec)?,
-        commit_hash: to_hash32(cvec)?,
-        author_node_id,
-        op_type,
-        payload,
-        created_at,
-    }))
-}
-
-pub fn commit_hash_at(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    seq: i64,
-) -> Result<Option<[u8; 32]>> {
-    let raw: Option<Vec<u8>> = conn
-        .prepare_cached(
-            "SELECT commit_hash FROM sync_commits WHERE stream_id=?1 AND epoch=?2 AND seq=?3",
-        )?
-        .query_row(params![stream_id, epoch, seq], |r| r.get(0))
-        .optional()?;
-    raw.map(to_hash32).transpose().map_err(Into::into)
-}
-
-pub fn has_commit_hash(
-    conn: &Connection,
-    stream_id: &str,
-    epoch: i64,
-    seq: i64,
-    expected_hash: &[u8; 32],
-) -> Result<bool> {
-    Ok(commit_hash_at(conn, stream_id, epoch, seq)?.is_some_and(|h| &h == expected_hash))
-}
-
-fn delete_session_local_rows(conn: &Connection, sid: SessionId) -> Result<()> {
-    conn.execute("DELETE FROM context_items WHERE session_id=?", [sid])?;
-    conn.execute(
-        "DELETE FROM invalidated_warnings WHERE item_id IN (SELECT id FROM items WHERE session_id=?)",
-        [sid],
-    )?;
-    conn.execute(
-        "DELETE FROM items WHERE session_id=? AND (target_id IS NOT NULL OR codemode_call_item_id IS NOT NULL)",
-        [sid],
-    )?;
-    conn.execute("DELETE FROM items WHERE session_id=?", [sid])?;
-    conn.execute("UPDATE llm_calls SET session_id=NULL WHERE session_id=?", [sid])?;
-    conn.execute("DELETE FROM sessions WHERE id=?", [sid])?;
-    Ok(())
-}
-
-fn clear_session_body_rows(conn: &Connection, sid: SessionId) -> Result<()> {
-    conn.execute(
-        "UPDATE sessions SET status='paused' WHERE id=? AND status IN ('running','pausing')",
-        [sid],
-    )?;
-    conn.execute("DELETE FROM context_items WHERE session_id=?", [sid])?;
-    conn.execute(
-        "DELETE FROM invalidated_warnings WHERE item_id IN (SELECT id FROM items WHERE session_id=?)",
-        [sid],
-    )?;
-    conn.execute(
-        "DELETE FROM items WHERE session_id=? AND (target_id IS NOT NULL OR codemode_call_item_id IS NOT NULL)",
-        [sid],
-    )?;
-    conn.execute("DELETE FROM items WHERE session_id=?", [sid])?;
-    Ok(())
-}
-
-// --- Sanitized Conflict Persistence & Listing (P0-03) ---
-
-fn sanitize_url_for_summary(raw: &str) -> String {
-    match Url::parse(raw) {
-        Ok(mut url) => {
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-            url.set_query(None);
-            url.set_fragment(None);
-            url.to_string()
-        }
-        Err(_) => "<invalid-url>".to_owned(),
+        false
     }
 }
 
-fn summarize_conflict_payload(kind: StreamKind, raw: Option<&str>) -> Option<String> {
-    let raw = raw?;
-    let val: Value = serde_json::from_str(raw).ok()?;
-    let summary = match kind {
-        StreamKind::Provider => {
-            if let Ok(p) = serde_json::from_value::<ProviderSnapshot>(val.clone()) {
-                json!({
-                    "id": p.id,
-                    "name": p.name,
-                    "base_url": sanitize_url_for_summary(&p.base_url),
-                    "has_api_key": p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
-                    "archived_at": p.archived_at,
-                })
-            } else {
-                return None;
-            }
-        }
-        StreamKind::Model => {
-            if let Ok(m) = serde_json::from_value::<ModelSnapshot>(val.clone()) {
-                json!({
-                    "id": m.id,
-                    "provider_id": m.provider_id,
-                    "model_key": m.model_key,
-                    "context_window_tokens": m.context_window_tokens,
-                    "archived_at": m.archived_at,
-                })
-            } else {
-                return None;
-            }
-        }
-        StreamKind::Mcp => {
-            if let Ok(m) = serde_json::from_value::<McpSyncSnapshot>(val.clone()) {
-                // Strict whitelist: NEVER include config_json (headers/args/env/query) or oauth credentials!
-                json!({
-                    "id": m.server.id,
-                    "name": m.server.name,
-                    "description": m.server.description,
-                    "enabled": m.server.enabled,
-                    "shared": m.server.shared,
-                    "transport": m.server.transport,
-                    "revision": m.server.revision,
-                    "has_oauth": m.oauth.is_some(),
-                })
-            } else if val.get("id").is_some() {
-                json!({
-                    "id": val["id"],
-                    "deleted": true,
-                })
-            } else {
-                return None;
-            }
-        }
-        StreamKind::Session => {
-            if let Ok(s) = serde_json::from_value::<SessionSnapshot>(val.clone()) {
-                json!({
-                    "id": s.id,
-                    "title": s.title,
-                    "status": s.status,
-                    "model_id": s.model_id,
-                    "updated_at": s.updated_at,
-                    "required_modalities": s.required_modalities,
-                })
-            } else if val.get("id").is_some() {
-                json!({
-                    "id": val["id"],
-                    "deleted": true,
-                })
-            } else {
-                return None;
-            }
-        }
-        StreamKind::Call => {
-            if let Ok(c) = serde_json::from_value::<CallSnapshot>(val) {
-                json!({
-                    "id": c.id,
-                    "session_id": c.session_id,
-                    "model_id": c.model_id,
-                    "status": c.status,
-                    "started_at": c.started_at,
-                    "finished_at": c.finished_at,
-                    "cost_nano_usd": c.cost_nano_usd,
-                })
-            } else {
-                return None;
-            }
-        }
-    };
-    serde_json::to_string(&summary).ok()
-}
-
-struct ConflictWrite<'a> {
-    stream_id: &'a str,
-    kind: StreamKind,
-    local_epoch: i64,
-    local_seq: i64,
-    local_hash: &'a [u8; 32],
-    remote: &'a StreamHead,
-    remote_node_id: &'a str,
-    reason: &'a str,
-    related_local_id: Option<&'a str>,
-    remote_snapshot: Option<&'a str>,
-}
-
-fn record_conflict_row(conn: &Connection, c: &ConflictWrite<'_>) -> Result<bool> {
-    let existing = get_conflict_opt(conn, c.stream_id)?;
-    let same = existing.as_ref().is_some_and(|e| {
-        e.local_epoch == c.local_epoch
-            && e.local_seq == c.local_seq
-            && &e.local_hash == c.local_hash
-            && e.remote_epoch == c.remote.epoch
-            && e.remote_seq == c.remote.head_seq
-            && e.remote_hash == c.remote.head_hash
-            && e.reason == c.reason
-            && e.related_local_id.as_deref() == c.related_local_id
-    });
-    let summary_json = summarize_conflict_payload(
-        c.kind,
-        c.remote_snapshot.or(c.remote.head_snapshot.as_deref()),
-    );
-    let now = chrono::Utc::now().timestamp_millis();
-    conn.execute(
-        "INSERT INTO sync_conflicts(stream_id,kind,local_epoch,local_seq,local_hash,remote_epoch,remote_seq,remote_hash,remote_node_id,reason,related_local_id,summary_json,remote_snapshot,detected_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-         ON CONFLICT(stream_id) DO UPDATE SET
-           kind=excluded.kind,
-           local_epoch=excluded.local_epoch,
-           local_seq=excluded.local_seq,
-           local_hash=excluded.local_hash,
-           remote_epoch=excluded.remote_epoch,
-           remote_seq=excluded.remote_seq,
-           remote_hash=excluded.remote_hash,
-           remote_node_id=excluded.remote_node_id,
-           reason=excluded.reason,
-           related_local_id=excluded.related_local_id,
-           summary_json=coalesce(excluded.summary_json, sync_conflicts.summary_json),
-           remote_snapshot=coalesce(excluded.remote_snapshot, sync_conflicts.remote_snapshot),
-           detected_at=excluded.detected_at",
-        params![
-            c.stream_id,
-            c.kind.as_str(),
-            c.local_epoch,
-            c.local_seq,
-            c.local_hash.as_slice(),
-            c.remote.epoch,
-            c.remote.head_seq,
-            c.remote.head_hash.as_slice(),
-            c.remote_node_id,
-            c.reason,
-            c.related_local_id,
-            summary_json,
-            c.remote_snapshot,
-            now
-        ],
-    )?;
-    Ok(!same)
-}
-
-pub fn list_conflicts(conn: &Connection) -> Result<Vec<ConflictInfo>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT stream_id,kind,local_epoch,local_seq,local_hash,remote_epoch,remote_seq,remote_hash,
-                remote_node_id,reason,related_local_id,summary_json,detected_at
-         FROM sync_conflicts ORDER BY detected_at DESC, stream_id",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, Vec<u8>>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, Vec<u8>>(7)?,
-                r.get::<_, String>(8)?,
-                r.get::<_, String>(9)?,
-                r.get::<_, Option<String>>(10)?,
-                r.get::<_, Option<String>>(11)?,
-                r.get::<_, i64>(12)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut out = Vec::with_capacity(rows.len());
-    for (
-        stream_id,
-        kind_str,
-        local_epoch,
-        local_seq,
-        lh,
-        remote_epoch,
-        remote_seq,
-        rh,
-        remote_node_id,
-        reason,
-        related_local_id,
-        raw_summary,
-        detected_at,
-    ) in rows
-    {
-        let remote_summary = raw_summary.and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        out.push(ConflictInfo {
-            stream_id,
-            kind: StreamKind::from_db(&kind_str)?,
-            local_epoch,
-            local_seq,
-            local_hash_hex: hex_hash(&to_hash32(lh)?),
-            remote_epoch,
-            remote_seq,
-            remote_hash_hex: hex_hash(&to_hash32(rh)?),
-            remote_node_id,
-            reason,
-            related_local_id,
-            remote_summary,
-            detected_at,
-        });
-    }
-    Ok(out)
-}
-
-pub fn get_conflict_opt(conn: &Connection, stream_id: &str) -> Result<Option<ConflictRecord>> {
-    let row = conn
-        .prepare_cached(
-            "SELECT kind,local_epoch,local_seq,local_hash,remote_epoch,remote_seq,remote_hash,
-                    remote_node_id,reason,related_local_id,remote_snapshot
-             FROM sync_conflicts WHERE stream_id=?",
-        )?
-        .query_row([stream_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, Vec<u8>>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, String>(8)?,
-                r.get::<_, Option<String>>(9)?,
-                r.get::<_, Option<String>>(10)?,
-            ))
-        })
-        .optional()?;
-    let Some((
-        kind_str,
-        local_epoch,
-        local_seq,
-        lh,
-        remote_epoch,
-        remote_seq,
-        rh,
-        remote_node_id,
-        reason,
-        related_local_id,
-        remote_snapshot,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    Ok(Some(ConflictRecord {
-        stream_id: stream_id.to_owned(),
-        kind: StreamKind::from_db(&kind_str)?,
-        local_epoch,
-        local_seq,
-        local_hash: to_hash32(lh)?,
-        remote_epoch,
-        remote_seq,
-        remote_hash: to_hash32(rh)?,
-        remote_node_id,
-        reason,
-        related_local_id,
-        remote_snapshot,
-    }))
-}
-
-pub fn get_conflict(conn: &Connection, stream_id: &str) -> Result<ConflictRecord> {
-    get_conflict_opt(conn, stream_id)?
-        .ok_or_else(|| Error::from(rusqlite::Error::QueryReturnedNoRows))
-}
-
-fn is_unique_constraint(err: &rusqlite::Error) -> bool {
-    matches!(
-        err.sqlite_error().map(|e| e.extended_code),
-        Some(ffi::SQLITE_CONSTRAINT_UNIQUE)
-    )
-}
-
-fn upsert_attachment_meta(conn: &Connection, att: &AttachmentRef) -> Result<()> {
-    id::observe_id(att.id);
-    conn.prepare_cached(
-        "INSERT INTO attachments(id,mime_type,content_hash,byte_len,data)
-         SELECT ?1,?2,?3,?4,(SELECT data FROM attachments WHERE content_hash=?3
-                             AND data IS NOT NULL AND length(data)=?4 LIMIT 1)
-         WHERE NOT EXISTS (SELECT 1 FROM attachments WHERE id=?1)
-         ON CONFLICT(id) DO NOTHING",
-    )?
-    .execute(params![
-        att.id,
-        att.mime_type,
-        att.content_hash,
-        att.byte_len
-    ])?;
-    Ok(())
-}
-
-fn upsert_session_snapshot(conn: &Connection, snap: &SessionSnapshot) -> Result<bool> {
-    id::observe_id(snap.id);
-    if !snap.input_queue_cursor.is_empty() {
-        id::observe_id_str(&snap.input_queue_cursor)?;
-    }
-    id::observe_id(snap.model_id);
-    let exists: bool = conn
-        .prepare_cached("SELECT EXISTS(SELECT 1 FROM llm_models WHERE id=?)")?
-        .query_row([snap.model_id], |r| r.get(0))?;
-    if !exists {
-        return Ok(false);
-    }
-    conn.execute(
-        "INSERT INTO sessions(id,title,created_at,updated_at,status,reasoning_effort,last_error,model_id,input_queue_cursor,needs_model)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-         ON CONFLICT(id) DO UPDATE SET
-           title=excluded.title,
-           created_at=excluded.created_at,
-           updated_at=excluded.updated_at,
-           status=CASE WHEN sessions.status IN ('running','pausing') THEN sessions.status ELSE excluded.status END,
-           reasoning_effort=excluded.reasoning_effort,
-           last_error=excluded.last_error,
-           model_id=excluded.model_id,
-           input_queue_cursor=excluded.input_queue_cursor,
-           needs_model=excluded.needs_model",
-        params![
-            snap.id,
-            snap.title,
-            snap.created_at,
-            snap.updated_at,
-            snap.status,
-            snap.reasoning_effort,
-            snap.last_error,
-            snap.model_id,
-            snap.input_queue_cursor,
-            snap.needs_model,
-        ],
-    )?;
-    Ok(true)
-}
-
-// --- Remote Commit Replay & Directory Head Application ---
-
-pub fn apply_unwatched_session_head(
-    conn: &Connection,
-    remote: &StreamHead,
-    remote_node_id: &str,
-    ancestor_proof: AncestorProof,
-) -> Result<ApplyOutcome> {
-    if remote.kind != StreamKind::Session {
-        return Err(Error::internal("expected session stream head"));
-    }
-    let sid: SessionId = remote
-        .stream_id
-        .parse()
-        .map_err(|_| Error::bad("invalid session stream_id"))?;
-    with_savepoint(conn, "unwatched_session", || {
-        let local = stream_head(conn, &remote.stream_id)?;
-        if let Some(ref l) = local {
-            if remote.epoch < l.epoch {
-                return Ok(ApplyOutcome::Ignored);
-            }
-            if remote.epoch == l.epoch {
-                if remote.head_seq == l.head_seq && remote.head_hash == l.head_hash {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                if l.watched || l.synced_seq > 0 {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                if remote.head_seq < l.head_seq {
-                    // Caller checks commit proof against holder when comparing multi-peer heads;
-                    // a shorter peer head on the same stream without conflict is ignored here.
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                if remote.head_seq == l.head_seq && remote.head_hash != l.head_hash {
-                    let newly_recorded = record_conflict_row(
-                        conn,
-                        &ConflictWrite {
-                            stream_id: &remote.stream_id,
-                            kind: StreamKind::Session,
-                            local_epoch: l.epoch,
-                            local_seq: l.head_seq,
-                            local_hash: &l.head_hash,
-                            remote,
-                            remote_node_id,
-                            reason: "diverged",
-                            related_local_id: None,
-                            remote_snapshot: remote.head_snapshot.as_deref(),
-                        },
-                    )?;
-                    return Ok(ApplyOutcome::Conflict { newly_recorded });
-                }
-                if l.head_seq > 0 {
-                    let verified = matches!(
-                        ancestor_proof,
-                        AncestorProof::Verified { epoch, seq, hash }
-                            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
-                    );
-                    let diverged = matches!(
-                        ancestor_proof,
-                        AncestorProof::Diverged { epoch, seq, hash }
-                            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
-                    );
-                    if verified {
-                        // Exact CAS match: local unwatched directory head is a proven ancestor.
-                    } else if diverged {
-                        let newly_recorded = record_conflict_row(
-                            conn,
-                            &ConflictWrite {
-                                stream_id: &remote.stream_id,
-                                kind: StreamKind::Session,
-                                local_epoch: l.epoch,
-                                local_seq: l.head_seq,
-                                local_hash: &l.head_hash,
-                                remote,
-                                remote_node_id,
-                                reason: "diverged",
-                                related_local_id: None,
-                                remote_snapshot: remote.head_snapshot.as_deref(),
-                            },
-                        )?;
-                        return Ok(ApplyOutcome::Conflict { newly_recorded });
-                    } else {
-                        return Ok(ApplyOutcome::Ignored);
-                    }
-                }
-            } else {
-                // Higher epoch supersedes unwatched session head. (Watched sessions go through
-                // staged epoch replay in phase 7 so we never wipe a body prematurely!)
-                if l.watched || l.synced_seq > 0 {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                conn.execute(
-                    "DELETE FROM sync_conflicts WHERE stream_id=?",
-                    [&remote.stream_id],
-                )?;
-                conn.execute(
-                    "DELETE FROM sync_commits WHERE stream_id=? AND epoch<?",
-                    params![&remote.stream_id, remote.epoch],
-                )?;
-            }
-        }
-        if remote.deleted {
-            // Terminal deletion is applied via apply_terminal_session_delete in phase 5.
-            return Ok(ApplyOutcome::Ignored);
-        }
-        let Some(raw_snap) = remote.head_snapshot.as_deref() else {
-            return Ok(ApplyOutcome::Ignored);
-        };
-        let snap: SessionSnapshot = serde_json::from_str(raw_snap)
-            .map_err(|e| Error::bad(format!("invalid session head snapshot: {e}")))?;
-        if snap.id != sid {
-            return Err(Error::bad("session snapshot ID mismatch"));
-        }
-        if !upsert_session_snapshot(conn, &snap)? {
-            return Ok(ApplyOutcome::BlockedOnDependency);
-        }
-        conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-             VALUES(?1,'session',?2,?3,?4,0,0,?5,0,0,0,0,?6,?7)
-             ON CONFLICT(stream_id) DO UPDATE SET
-               epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
-               synced_epoch=0,synced_seq=0,synced_hash=excluded.synced_hash,checkpoint_seq=0,
-               watched=0,deleted=0,retired=0,head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
-            params![
-                remote.stream_id,
-                remote.epoch,
-                remote.head_seq,
-                remote.head_hash.as_slice(),
-                [0u8; 32].as_slice(),
-                raw_snap,
-                remote.updated_at
-            ],
-        )?;
-        Ok(ApplyOutcome::Applied {
-            updated: true,
-            session_id: Some(sid),
-            session_reset_epoch: None,
-            deleted_session: false,
-            new_items: Vec::new(),
-            mcp_changes: Vec::new(),
-            unblocked_conflicts: Vec::new(),
-            resolved_conflict: false,
-        })
-    })
-}
-
-fn mcp_local_is_ancestor_of_tombstone(
-    local: &LocalStreamState,
-    delete_payload: &str,
-    proof_verified_for_local: bool,
-) -> bool {
-    if local.head_seq == 0 || proof_verified_for_local {
-        return true;
-    }
-    let val: Value = match serde_json::from_str(delete_payload) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let base_epoch = val.get("base_epoch").and_then(Value::as_i64).unwrap_or(0);
-    let base_seq = val.get("base_seq").and_then(Value::as_i64).unwrap_or(0);
-    let base_hash_hex = val.get("base_hash_hex").and_then(Value::as_str).unwrap_or("");
-    if local.epoch != base_epoch || base_seq <= 0 || local.head_seq > base_seq {
-        return false;
-    }
-    let local_hex = hex_hash(&local.head_hash);
-    if local.head_seq == base_seq {
-        return local_hex == base_hash_hex;
-    }
-    let start_seq = val
-        .get("ancestor_start_seq")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let Some(hashes) = val.get("ancestor_hashes_hex").and_then(Value::as_array) else {
-        return false;
-    };
-    if start_seq <= 0 || local.head_seq < start_seq {
-        return false;
-    }
-    let Ok(idx) = usize::try_from(local.head_seq - start_seq) else {
-        return false;
-    };
-    hashes
-        .get(idx)
-        .and_then(Value::as_str)
-        .is_some_and(|h| h == local_hex)
-}
-
-fn mcp_tombstone_covers_seq(local_epoch: i64, local_seq: i64, delete_payload: &str) -> bool {
-    if local_seq == 0 {
-        return true;
-    }
-    let Ok(val) = serde_json::from_str::<Value>(delete_payload) else {
-        return false;
-    };
-    let base_epoch = val.get("base_epoch").and_then(Value::as_i64).unwrap_or(0);
-    let base_seq = val.get("base_seq").and_then(Value::as_i64).unwrap_or(0);
-    if local_epoch != base_epoch || base_seq <= 0 {
-        return true;
-    }
-    if local_seq >= base_seq {
-        return true;
-    }
-    let start_seq = val
-        .get("ancestor_start_seq")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let Some(hashes) = val.get("ancestor_hashes_hex").and_then(Value::as_array) else {
-        return false;
-    };
-    start_seq > 0
-        && local_seq >= start_seq
-        && usize::try_from(local_seq - start_seq).is_ok_and(|idx| idx < hashes.len())
-}
-
-fn proof_matches_head(proof: AncestorProof, l: &LocalStreamState) -> (bool, bool, bool) {
-    let verified = matches!(
-        proof,
-        AncestorProof::Verified { epoch, seq, hash }
-            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
-    );
-    let diverged = matches!(
-        proof,
-        AncestorProof::Diverged { epoch, seq, hash }
-            if epoch == l.epoch && seq == l.head_seq && hash == l.head_hash
-    );
-    let stale = matches!(
-        proof,
-        AncestorProof::Verified { epoch, seq, hash } | AncestorProof::Diverged { epoch, seq, hash }
-            if epoch != l.epoch || seq != l.head_seq || hash != l.head_hash
-    );
-    (verified, diverged, stale)
-}
-
-fn remote_matches_expected_conflict(
-    remote_head: &StreamHead,
-    exp_c: &ConflictRecord,
-    ancestor_proof: AncestorProof,
-) -> bool {
-    let proof_matches = ancestor_proof
-        == AncestorProof::Verified {
-            epoch: exp_c.remote_epoch,
-            seq: exp_c.remote_seq,
-            hash: exp_c.remote_hash,
-        };
-    (remote_head.epoch == exp_c.remote_epoch
-        && remote_head.head_seq == exp_c.remote_seq
-        && remote_head.head_hash == exp_c.remote_hash)
-        || remote_head.epoch > exp_c.remote_epoch
-        || (remote_head.epoch == exp_c.remote_epoch
-            && remote_head.head_seq > exp_c.remote_seq
-            && proof_matches)
-}
-
-pub fn apply_terminal_session_delete(
-    conn: &Connection,
-    remote_head: &StreamHead,
-    delete_commit: &CommitWire,
-    ancestor_proof: AncestorProof,
-    remote_node_id: &str,
-    expected_conflict: Option<&ConflictRecord>,
-) -> Result<ApplyOutcome> {
-    if remote_head.kind != StreamKind::Session
-        || !remote_head.deleted
-        || delete_commit.kind != StreamKind::Session
-        || delete_commit.op_type != "session_delete"
-        || delete_commit.stream_id != remote_head.stream_id
-        || delete_commit.epoch != remote_head.epoch
-        || delete_commit.seq != remote_head.head_seq
-        || delete_commit.commit_hash != remote_head.head_hash
-        || !verify_commit(
-            delete_commit,
-            remote_head.head_seq,
-            &delete_commit.parent_hash,
-        )
-    {
-        return Err(Error::bad("invalid terminal session_delete checkpoint"));
-    }
-    let sid: SessionId = remote_head
-        .stream_id
-        .parse()
-        .map_err(|_| Error::bad("invalid session stream_id"))?;
-    with_savepoint(conn, "terminal_ses_del", || {
-        if let Some(exp_c) = expected_conflict {
-            let current_c = get_conflict(conn, &remote_head.stream_id)?;
-            if &current_c != exp_c {
-                return Err(Error::conflict(
-                    "sync conflict state changed concurrently; retry resolution",
-                ));
-            }
-            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_proof) {
-                return Err(Error::conflict(
-                    "remote terminal delete does not match conflicted branch",
-                ));
-            }
-        }
-        let local = stream_head(conn, &remote_head.stream_id)?;
-        let mut session_deleted_conflict = false;
-        if let Some(ref l) = local {
-            if expected_conflict.is_none() {
-                if remote_head.epoch < l.epoch {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                if remote_head.epoch == l.epoch {
-                    if l.deleted
-                        && l.head_seq == remote_head.head_seq
-                        && l.head_hash == remote_head.head_hash
-                    {
-                        return Ok(ApplyOutcome::Ignored);
-                    }
-                    if l.synced_seq == remote_head.head_seq
-                        && l.synced_hash == remote_head.head_hash
-                    {
-                        return Ok(ApplyOutcome::Ignored);
-                    }
-                    let (proof_verified_local, _proof_diverged_local, proof_stale) =
-                        proof_matches_head(ancestor_proof, l);
-                    let direct_parent_match = l.head_seq + 1 == remote_head.head_seq
-                        && delete_commit.parent_hash == l.head_hash;
-                    let direct_parent_mismatch = l.head_seq + 1 == remote_head.head_seq
-                        && delete_commit.parent_hash != l.head_hash;
-                    let is_ancestor = l.head_seq == 0
-                        || (l.head_seq < remote_head.head_seq
-                            && (proof_verified_local || direct_parent_match));
-                    if !is_ancestor {
-                        if l.head_seq < remote_head.head_seq
-                            && proof_stale
-                            && !direct_parent_mismatch
-                        {
-                            return Ok(ApplyOutcome::StaleProof);
-                        }
-                        let newly_recorded = record_conflict_row(
-                            conn,
-                            &ConflictWrite {
-                                stream_id: &remote_head.stream_id,
-                                kind: StreamKind::Session,
-                                local_epoch: l.epoch,
-                                local_seq: l.head_seq,
-                                local_hash: &l.head_hash,
-                                remote: remote_head,
-                                remote_node_id,
-                                reason: "diverged",
-                                related_local_id: None,
-                                remote_snapshot: None,
-                            },
-                        )?;
-                        return Ok(ApplyOutcome::Conflict { newly_recorded });
-                    }
-                } else {
-                    session_deleted_conflict = has_conflict(conn, &remote_head.stream_id)?;
-                }
-            } else {
-                session_deleted_conflict = true;
-            }
-        }
-        // Check if payload carries detached calls that might belong to us; deleting session
-        // unconditionally cleans items first and sets llm_calls.session_id = NULL, avoiding FK error (P1-01).
-        delete_session_local_rows(conn, sid)?;
-        let deleted_conflict_rows = conn.execute(
-            "DELETE FROM sync_conflicts WHERE stream_id=?",
-            [&remote_head.stream_id],
-        )?;
-        let resolved_conflict = session_deleted_conflict || deleted_conflict_rows > 0;
-        conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [&remote_head.stream_id])?;
-        conn.execute("DELETE FROM sync_staging_commits WHERE stream_id=?", [&remote_head.stream_id])?;
-        conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-             VALUES(?1,'session',?2,?3,?4,?2,?3,?4,?3,1,1,0,NULL,?5)
-             ON CONFLICT(stream_id) DO UPDATE SET
-               epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
-               synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
-               checkpoint_seq=excluded.checkpoint_seq,watched=1,deleted=1,retired=0,head_snapshot=NULL,updated_at=excluded.updated_at",
-            params![
-                remote_head.stream_id,
-                remote_head.epoch,
-                remote_head.head_seq,
-                remote_head.head_hash.as_slice(),
-                delete_commit.created_at
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-             VALUES(?,?,?,?,?,?,?,?,?)",
-            params![
-                delete_commit.stream_id,
-                delete_commit.epoch,
-                delete_commit.seq,
-                delete_commit.parent_hash.as_slice(),
-                delete_commit.commit_hash.as_slice(),
-                delete_commit.author_node_id,
-                delete_commit.op_type,
-                delete_commit.payload,
-                delete_commit.created_at
-            ],
-        )?;
-        if let Some(exp_c) = expected_conflict {
-            let resolver = load_local_node(conn)?.node_id;
-            let now = chrono::Utc::now().timestamp_millis();
-            record_resolution_receipt(
-                conn,
-                &ResolutionReceipt {
-                    stream_id: remote_head.stream_id.clone(),
-                    kind: StreamKind::Session,
-                    chosen: "cluster".to_owned(),
-                    resolver_node_id: resolver,
-                    local_epoch: exp_c.local_epoch,
-                    local_seq: exp_c.local_seq,
-                    local_hash: exp_c.local_hash,
-                    remote_epoch: exp_c.remote_epoch,
-                    remote_seq: exp_c.remote_seq,
-                    remote_hash: exp_c.remote_hash,
-                    winner_epoch: remote_head.epoch,
-                    winner_seq: remote_head.head_seq,
-                    winner_hash: remote_head.head_hash,
-                    resolved_at: now,
-                },
-            )?;
-        }
-        Ok(ApplyOutcome::Applied {
-            updated: true,
-            session_id: Some(sid),
-            session_reset_epoch: None,
-            deleted_session: true,
-            new_items: Vec::new(),
-            mcp_changes: Vec::new(),
-            unblocked_conflicts: Vec::new(),
-            resolved_conflict,
-        })
-    })
-}
-
-pub fn apply_terminal_mcp_delete(
-    conn: &Connection,
-    remote_head: &StreamHead,
-    delete_commit: &CommitWire,
-    ancestor_proof: AncestorProof,
-    remote_node_id: &str,
-    expected_conflict: Option<&ConflictRecord>,
-) -> Result<ApplyOutcome> {
-    if remote_head.kind != StreamKind::Mcp
-        || !remote_head.deleted
-        || delete_commit.kind != StreamKind::Mcp
-        || delete_commit.op_type != "mcp_delete"
-        || delete_commit.stream_id != remote_head.stream_id
-        || delete_commit.epoch != remote_head.epoch
-        || delete_commit.seq != remote_head.head_seq
-        || delete_commit.commit_hash != remote_head.head_hash
-        || !verify_commit(
-            delete_commit,
-            remote_head.head_seq,
-            &delete_commit.parent_hash,
-        )
-    {
-        return Err(Error::bad("invalid terminal mcp_delete checkpoint"));
-    }
-    let mid: McpServerId = remote_head
-        .stream_id
-        .parse()
-        .map_err(|_| Error::bad("invalid mcp stream_id"))?;
-    with_savepoint(conn, "terminal_mcp_del", || {
-        if let Some(exp_c) = expected_conflict {
-            let current_c = get_conflict(conn, &remote_head.stream_id)?;
-            if &current_c != exp_c {
-                return Err(Error::conflict(
-                    "sync conflict state changed concurrently; retry resolution",
-                ));
-            }
-            if !remote_matches_expected_conflict(remote_head, exp_c, ancestor_proof) {
-                return Err(Error::conflict(
-                    "remote terminal MCP delete does not match conflicted branch",
-                ));
-            }
-        }
-        let local = stream_head(conn, &remote_head.stream_id)?;
-
-        if expected_conflict.is_none()
-            && let Some(ref l) = local
-        {
-            if remote_head.epoch < l.epoch {
-                return Ok(ApplyOutcome::Ignored);
-            }
-            let (proof_verified_local, _proof_diverged_local, proof_stale) =
-                proof_matches_head(ancestor_proof, l);
-            if l.retired && l.deleted {
-                if l.epoch == remote_head.epoch
-                    && l.head_seq == remote_head.head_seq
-                    && l.head_hash == remote_head.head_hash
-                {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-            } else if !mcp_local_is_ancestor_of_tombstone(
-                l,
-                &delete_commit.payload,
-                proof_verified_local,
-            ) {
-                if proof_stale && !mcp_tombstone_covers_seq(l.epoch, l.head_seq, &delete_commit.payload)
-                {
-                    return Ok(ApplyOutcome::StaleProof);
-                }
-                // Detect any offline edits (shorter, equal, or longer) without proven ancestry.
-                let newly_recorded = record_conflict_row(
-                    conn,
-                    &ConflictWrite {
-                        stream_id: &remote_head.stream_id,
-                        kind: StreamKind::Mcp,
-                        local_epoch: l.epoch,
-                        local_seq: l.head_seq,
-                        local_hash: &l.head_hash,
-                        remote: remote_head,
-                        remote_node_id,
-                        reason: "retired_diverged",
-                        related_local_id: None,
-                        remote_snapshot: Some(&delete_commit.payload),
-                    },
-                )?;
-                return Ok(ApplyOutcome::Conflict { newly_recorded });
-            }
-            if remote_head.epoch == l.epoch && l.head_seq >= remote_head.head_seq {
-                if l.head_hash == remote_head.head_hash {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                let newly_recorded = record_conflict_row(
-                    conn,
-                    &ConflictWrite {
-                        stream_id: &remote_head.stream_id,
-                        kind: StreamKind::Mcp,
-                        local_epoch: l.epoch,
-                        local_seq: l.head_seq,
-                        local_hash: &l.head_hash,
-                        remote: remote_head,
-                        remote_node_id,
-                        reason: "retired_diverged",
-                        related_local_id: None,
-                        remote_snapshot: Some(&delete_commit.payload),
-                    },
-                )?;
-                return Ok(ApplyOutcome::Conflict { newly_recorded });
-            }
-        }
-        conn.execute("DELETE FROM mcp_servers WHERE id=?", [mid])?;
-        let resolved_conflict = conn.execute(
-            "DELETE FROM sync_conflicts WHERE stream_id=?",
-            [&remote_head.stream_id],
-        )? > 0
-            || expected_conflict.is_some();
-        let mut unblocked = collect_unblocked_conflicts(conn, &remote_head.stream_id)?;
-        conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [&remote_head.stream_id])?;
-        conn.execute("DELETE FROM sync_staging_commits WHERE stream_id=?", [&remote_head.stream_id])?;
-        conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-             VALUES(?1,'mcp',?2,?3,?4,?2,?3,?4,?3,1,1,1,NULL,?5)
-             ON CONFLICT(stream_id) DO UPDATE SET
-               epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
-               synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
-               checkpoint_seq=excluded.checkpoint_seq,watched=1,deleted=1,retired=1,head_snapshot=NULL,updated_at=excluded.updated_at",
-            params![
-                remote_head.stream_id,
-                remote_head.epoch,
-                remote_head.head_seq,
-                remote_head.head_hash.as_slice(),
-                delete_commit.created_at
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-             VALUES(?,?,?,?,?,?,?,?,?)",
-            params![
-                delete_commit.stream_id,
-                delete_commit.epoch,
-                delete_commit.seq,
-                delete_commit.parent_hash.as_slice(),
-                delete_commit.commit_hash.as_slice(),
-                delete_commit.author_node_id,
-                delete_commit.op_type,
-                delete_commit.payload,
-                delete_commit.created_at
-            ],
-        )?;
-        if let Some(exp_c) = expected_conflict {
-            let resolver = load_local_node(conn)?.node_id;
-            let now = chrono::Utc::now().timestamp_millis();
-            record_resolution_receipt(
-                conn,
-                &ResolutionReceipt {
-                    stream_id: remote_head.stream_id.clone(),
-                    kind: StreamKind::Mcp,
-                    chosen: "cluster".to_owned(),
-                    resolver_node_id: resolver,
-                    local_epoch: exp_c.local_epoch,
-                    local_seq: exp_c.local_seq,
-                    local_hash: exp_c.local_hash,
-                    remote_epoch: exp_c.remote_epoch,
-                    remote_seq: exp_c.remote_seq,
-                    remote_hash: exp_c.remote_hash,
-                    winner_epoch: remote_head.epoch,
-                    winner_seq: remote_head.head_seq,
-                    winner_hash: remote_head.head_hash,
-                    resolved_at: now,
-                },
-            )?;
-        }
-        Ok(ApplyOutcome::Applied {
-            updated: true,
-            session_id: None,
-            session_reset_epoch: None,
-            deleted_session: false,
-            new_items: Vec::new(),
-            mcp_changes: vec![McpChange {
-                id: mid,
-                cancel_login: true,
-            }],
-            unblocked_conflicts: {
-                unblocked.sort();
-                unblocked.dedup();
-                unblocked
-            },
-            resolved_conflict,
-        })
-    })
-}
-
-fn collect_unblocked_conflicts(conn: &Connection, local_id: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare_cached("SELECT stream_id FROM sync_conflicts WHERE related_local_id=?")?;
-    Ok(stmt
-        .query_map([local_id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-enum CommitEffect {
-    Applied {
-        deleted: bool,
-        retired: bool,
-        head_snapshot: Option<String>,
-        session_id: Option<SessionId>,
-        deleted_session: bool,
-        new_items: Vec<ItemId>,
-        mcp_change: Option<McpChange>,
-    },
-    NameConflict {
-        related_local_id: Option<String>,
-    },
-    Blocked,
-}
-
-fn apply_one_commit(conn: &Connection, c: &CommitWire) -> Result<CommitEffect> {
-    match c.kind {
-        StreamKind::Provider => {
-            let snap: ProviderSnapshot = serde_json::from_str(&c.payload)
-                .map_err(|e| Error::bad(format!("invalid provider commit: {e}")))?;
-            if snap.id.as_str() != c.stream_id {
-                return Err(Error::bad("provider commit ID mismatch"));
-            }
-            id::observe_id(snap.id);
-            let res = conn.execute(
-                "INSERT INTO llm_providers(id,name,base_url,api_key,archived_at) VALUES(?,?,?,?,?)
-                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,base_url=excluded.base_url,
-                   api_key=excluded.api_key,archived_at=excluded.archived_at",
-                params![snap.id, snap.name, snap.base_url, snap.api_key, snap.archived_at],
-            );
-            if let Err(err) = res {
-                if is_unique_constraint(&err) {
-                    let existing_id: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM llm_providers WHERE name=? AND archived_at IS NULL AND id!=?",
-                            params![snap.name, snap.id],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    return Ok(CommitEffect::NameConflict {
-                        related_local_id: existing_id,
-                    });
-                }
-                return Err(err.into());
-            }
-            Ok(CommitEffect::Applied {
-                deleted: false,
-                retired: false,
-                head_snapshot: None,
-                session_id: None,
-                deleted_session: false,
-                new_items: Vec::new(),
-                mcp_change: None,
-            })
-        }
-        StreamKind::Model => {
-            let snap: ModelSnapshot = serde_json::from_str(&c.payload)
-                .map_err(|e| Error::bad(format!("invalid model commit: {e}")))?;
-            if snap.id.as_str() != c.stream_id {
-                return Err(Error::bad("model commit ID mismatch"));
-            }
-            id::observe_id(snap.id);
-            id::observe_id(snap.provider_id);
-            let has_provider: bool = conn
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM llm_providers WHERE id=?)")?
-                .query_row([snap.provider_id], |r| r.get(0))?;
-            if !has_provider {
-                return Ok(CommitEffect::Blocked);
-            }
-            let res = conn.execute(
-                "INSERT INTO llm_models(id,provider_id,model_key,context_window_tokens,input_modalities,reasoning_efforts,pricing,archived_at)
-                 VALUES(?,?,?,?,?,?,?,?)
-                 ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,model_key=excluded.model_key,
-                   context_window_tokens=excluded.context_window_tokens,input_modalities=excluded.input_modalities,
-                   reasoning_efforts=excluded.reasoning_efforts,pricing=excluded.pricing,archived_at=excluded.archived_at",
-                params![
-                    snap.id,
-                    snap.provider_id,
-                    snap.model_key,
-                    snap.context_window_tokens,
-                    snap.input_modalities,
-                    snap.reasoning_efforts,
-                    snap.pricing,
-                    snap.archived_at
-                ],
-            );
-            if let Err(err) = res {
-                if is_unique_constraint(&err) {
-                    let existing_id: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM llm_models WHERE provider_id=? AND model_key=? AND archived_at IS NULL AND id!=?",
-                            params![snap.provider_id, snap.model_key, snap.id],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    return Ok(CommitEffect::NameConflict {
-                        related_local_id: existing_id,
-                    });
-                }
-                return Err(err.into());
-            }
-            Ok(CommitEffect::Applied {
-                deleted: false,
-                retired: false,
-                head_snapshot: None,
-                session_id: None,
-                deleted_session: false,
-                new_items: Vec::new(),
-                mcp_change: None,
-            })
-        }
-        StreamKind::Mcp => {
-            let id: McpServerId = c
-                .stream_id
-                .parse()
-                .map_err(|_| Error::bad("invalid mcp stream_id"))?;
-            id::observe_id(id);
-            if c.op_type == "mcp_delete" {
-                conn.execute("DELETE FROM mcp_servers WHERE id=?", [id])?;
-                return Ok(CommitEffect::Applied {
-                    deleted: true,
-                    retired: true,
-                    head_snapshot: None,
-                    session_id: None,
-                    deleted_session: false,
-                    new_items: Vec::new(),
-                    mcp_change: Some(McpChange {
-                        id,
-                        cancel_login: true,
-                    }),
-                });
-            }
-            let retired: bool = conn
-                .prepare_cached("SELECT coalesce((SELECT retired FROM sync_streams WHERE stream_id=?), 0)")?
-                .query_row([&c.stream_id], |r| r.get(0))?;
-            if retired {
-                return Err(Error::conflict("cannot reopen retired shared MCP stream"));
-            }
-            let old_server: Option<(String, String)> = conn
-                .prepare_cached("SELECT transport,config_json FROM mcp_servers WHERE id=?")?
-                .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            let old_oauth: Option<(String, Option<String>)> = conn
-                .prepare_cached("SELECT generation,pending_refresh FROM mcp_oauth WHERE server_id=?")?
-                .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            let snap: McpSyncSnapshot = serde_json::from_str(&c.payload)
-                .map_err(|e| Error::bad(format!("invalid mcp commit: {e}")))?;
-            if snap.server.id != id {
-                return Err(Error::bad("mcp commit ID mismatch"));
-            }
-            let s = &snap.server;
-            // Always upsert mcp_servers BEFORE mcp_oauth because invalidate_mcp_oauth trigger fires on UPDATE.
-            let res = conn.execute(
-                "INSERT INTO mcp_servers(id,name,description,enabled,shared,transport,allowed_tools,config_json,timeout_ms,revision)
-                 VALUES(?,?,?,?,?,?,?,?,?,?)
-                 ON CONFLICT(id) DO UPDATE SET
-                   name=excluded.name,description=excluded.description,enabled=excluded.enabled,
-                   shared=excluded.shared,transport=excluded.transport,allowed_tools=excluded.allowed_tools,
-                   config_json=excluded.config_json,timeout_ms=excluded.timeout_ms,revision=excluded.revision",
-                params![
-                    s.id,
-                    s.name,
-                    s.description,
-                    s.enabled,
-                    s.shared,
-                    s.transport,
-                    s.allowed_tools,
-                    s.config_json,
-                    s.timeout_ms,
-                    s.revision
-                ],
-            );
-            if let Err(err) = res {
-                if is_unique_constraint(&err) {
-                    let existing_id: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM mcp_servers WHERE name=? AND id!=?",
-                            params![s.name, s.id],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    return Ok(CommitEffect::NameConflict {
-                        related_local_id: existing_id,
-                    });
-                }
-                return Err(err.into());
-            }
-            let auth_changed = old_server
-                .as_ref()
-                .is_some_and(|(t, cfg)| t != &s.transport || cfg != &s.config_json);
-            let mut oauth_cancel = auth_changed;
-            if let Some(oauth) = &snap.oauth {
-                let old_oauth_gen = old_oauth.as_ref().map(|(g, _)| g.as_str());
-                if old_oauth_gen != Some(oauth.generation.as_str()) {
-                    oauth_cancel = true;
-                }
-                let snap_fp =
-                    crate::mcp::oauth::credentials_fingerprint(oauth.credentials.as_deref());
-                let kept_pending_refresh: Option<String> = if !auth_changed
-                    && old_oauth_gen == Some(oauth.generation.as_str())
-                {
-                    old_oauth.and_then(|(_, pr)| pr).filter(|raw| {
-                        serde_json::from_str::<crate::mcp::oauth::PendingRefreshState>(raw)
-                            .ok()
-                            .is_some_and(|st| snap_fp.as_deref() == Some(st.fp.as_str()))
-                    })
-                } else {
-                    None
-                };
-                conn.execute(
-                    "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,staged_credentials,pending_refresh,rejected)
-                     VALUES(?1,?2,?3,NULL,?4,NULL,?5,?6)
-                     ON CONFLICT(server_id) DO UPDATE SET
-                       generation=excluded.generation,binding=excluded.binding,pending=NULL,
-                       credentials=excluded.credentials,staged_credentials=NULL,
-                       pending_refresh=excluded.pending_refresh,rejected=excluded.rejected",
-                    params![
-                        s.id,
-                        oauth.generation,
-                        oauth.binding,
-                        oauth.credentials,
-                        kept_pending_refresh,
-                        oauth.rejected
-                    ],
-                )?;
-            } else {
-                // Only remove local OAuth if there is no active pending login (P1-20).
-                let deleted_oauth = conn.execute(
-                    "DELETE FROM mcp_oauth WHERE server_id=? AND pending IS NULL",
-                    [s.id],
-                )?;
-                if deleted_oauth > 0 {
-                    oauth_cancel = true;
-                }
-            }
-            Ok(CommitEffect::Applied {
-                deleted: false,
-                retired: false,
-                head_snapshot: None,
-                session_id: None,
-                deleted_session: false,
-                new_items: Vec::new(),
-                mcp_change: Some(McpChange {
-                    id,
-                    cancel_login: oauth_cancel,
-                }),
-            })
-        }
-        StreamKind::Call => {
-            let snap: CallSnapshot = serde_json::from_str(&c.payload)
-                .map_err(|e| Error::bad(format!("invalid call commit: {e}")))?;
-            if snap.id.as_str() != c.stream_id {
-                return Err(Error::bad("call commit ID mismatch"));
-            }
-            id::observe_id(snap.id);
-            id::observe_id(snap.model_id);
-            let has_model: bool = conn
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM llm_models WHERE id=?)")?
-                .query_row([snap.model_id], |r| r.get(0))?;
-            if !has_model {
-                return Ok(CommitEffect::Blocked);
-            }
-            let session_id = match snap.session_id {
-                Some(sid) => {
-                    id::observe_id(sid);
-                    let tombstoned: bool = conn
-                        .prepare_cached(
-                            "SELECT EXISTS(SELECT 1 FROM sync_streams WHERE stream_id=? AND deleted=1)",
-                        )?
-                        .query_row([sid.as_str()], |r| r.get(0))?;
-                    if tombstoned {
-                        None
-                    } else {
-                        let exists: bool = conn
-                            .prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)")?
-                            .query_row([sid], |r| r.get(0))?;
-                        if !exists {
-                            return Ok(CommitEffect::Blocked);
-                        }
-                        Some(sid)
-                    }
-                }
-                None => None,
-            };
-            // P1-01: if updating llm_calls changes or clears session_id while local items still hold
-            // composite FK (session_id, llm_call_id), block instead of failing SQLite with 500!
-            let prev_sid: Option<Option<SessionId>> = conn
-                .prepare_cached("SELECT session_id FROM llm_calls WHERE id=?")?
-                .query_row([snap.id], |r| r.get(0))
-                .optional()?;
-            if let Some(Some(old_sid)) = prev_sid
-                && Some(old_sid) != session_id
-            {
-                let referenced: bool = conn
-                    .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM items WHERE session_id=?1 AND llm_call_id=?2)",
-                    )?
-                    .query_row(params![old_sid, snap.id], |r| r.get(0))?;
-                if referenced {
-                    return Ok(CommitEffect::Blocked);
-                }
-            }
-            conn.execute(
-                "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,finished_at,status,
-                   upstream_response_id,http_status,error_summary,raw_usage,input_uncached_tokens,
-                   cache_read_tokens,cache_write_tokens,output_tokens,pricing_snapshot,cost_nano_usd,origin_node_id)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                 ON CONFLICT(id) DO UPDATE SET
-                   session_id=excluded.session_id,model_id=excluded.model_id,reasoning_effort=excluded.reasoning_effort,
-                   input_end_position=excluded.input_end_position,started_at=excluded.started_at,
-                   finished_at=excluded.finished_at,status=excluded.status,upstream_response_id=excluded.upstream_response_id,
-                   http_status=excluded.http_status,error_summary=excluded.error_summary,raw_usage=excluded.raw_usage,
-                   input_uncached_tokens=excluded.input_uncached_tokens,cache_read_tokens=excluded.cache_read_tokens,
-                   cache_write_tokens=excluded.cache_write_tokens,output_tokens=excluded.output_tokens,
-                   pricing_snapshot=excluded.pricing_snapshot,cost_nano_usd=excluded.cost_nano_usd,
-                   origin_node_id=excluded.origin_node_id",
-                params![
-                    snap.id,
-                    session_id,
-                    snap.model_id,
-                    snap.reasoning_effort,
-                    snap.input_end_position,
-                    snap.started_at,
-                    snap.finished_at,
-                    snap.status,
-                    snap.upstream_response_id,
-                    snap.http_status,
-                    snap.error_summary,
-                    snap.raw_usage,
-                    snap.input_uncached_tokens,
-                    snap.cache_read_tokens,
-                    snap.cache_write_tokens,
-                    snap.output_tokens,
-                    snap.pricing_snapshot,
-                    snap.cost_nano_usd,
-                    if snap.origin_node_id.is_empty() {
-                        &c.author_node_id
-                    } else {
-                        &snap.origin_node_id
-                    }
-                ],
-            )?;
-            Ok(CommitEffect::Applied {
-                deleted: false,
-                retired: false,
-                head_snapshot: None,
-                session_id: None,
-                deleted_session: false,
-                new_items: Vec::new(),
-                mcp_change: None,
-            })
-        }
-        StreamKind::Session => {
-            let sid: SessionId = c
-                .stream_id
-                .parse()
-                .map_err(|_| Error::bad("invalid session stream_id"))?;
-            id::observe_id(sid);
-            if c.op_type == "session_delete" {
-                delete_session_local_rows(conn, sid)?;
-                return Ok(CommitEffect::Applied {
-                    deleted: true,
-                    retired: false,
-                    head_snapshot: None,
-                    session_id: Some(sid),
-                    deleted_session: true,
-                    new_items: Vec::new(),
-                    mcp_change: None,
-                });
-            }
-            let delta: SessionDelta = serde_json::from_str(&c.payload)
-                .map_err(|e| Error::bad(format!("invalid session delta commit: {e}")))?;
-            if let Some(snap) = &delta.session {
-                if snap.id != sid {
-                    return Err(Error::bad("session delta ID mismatch"));
-                }
-                if !upsert_session_snapshot(conn, snap)? {
-                    return Ok(CommitEffect::Blocked);
-                }
-            }
-            for att in &delta.attachments {
-                upsert_attachment_meta(conn, att)?;
-            }
-            let mut new_items = Vec::new();
-            for item in &delta.items {
-                if item.session_id != sid {
-                    return Err(Error::bad("session item session_id mismatch"));
-                }
-                id::observe_id(item.id);
-                if let Some(tid) = item.target_id {
-                    id::observe_id(tid);
-                }
-                if let Some(cid) = item.codemode_call_item_id {
-                    id::observe_id(cid);
-                }
-                if let Some(call_id) = item.llm_call_id {
-                    id::observe_id(call_id);
-                    let has_call: bool = conn
-                        .prepare_cached(
-                            "SELECT EXISTS(SELECT 1 FROM llm_calls WHERE session_id=? AND id=?)",
-                        )?
-                        .query_row(params![sid, call_id], |r| r.get(0))?;
-                    if !has_call {
-                        return Ok(CommitEffect::Blocked);
-                    }
-                }
-                let origin = if item.origin_node_id.is_empty() {
-                    &c.author_node_id
-                } else {
-                    &item.origin_node_id
-                };
-                let inserted = conn.execute(
-                    "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id)
-                     VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
-                    params![
-                        item.id,
-                        item.session_id,
-                        item.kind,
-                        item.payload,
-                        item.target_id,
-                        item.llm_call_id,
-                        item.idempotency_key,
-                        item.codemode_call_item_id,
-                        origin
-                    ],
-                )?;
-                if inserted > 0 {
-                    new_items.push(item.id);
-                }
-            }
-            for ctx in &delta.context_items {
-                id::observe_id(ctx.item_id);
-                conn.execute(
-                    "INSERT INTO context_items(session_id,position,item_id) VALUES(?,?,?)
-                     ON CONFLICT(session_id, position) DO UPDATE SET item_id=excluded.item_id",
-                    params![sid, ctx.position, ctx.item_id],
-                )?;
-            }
-            for warn_id in &delta.invalidated_warnings {
-                id::observe_id(*warn_id);
-                conn.execute(
-                    "INSERT INTO invalidated_warnings(item_id) VALUES(?) ON CONFLICT(item_id) DO NOTHING",
-                    [warn_id],
-                )?;
-            }
-            let head_snapshot = delta
-                .session
-                .as_ref()
-                .map(|snap| {
-                    serde_json::to_string(snap).map_err(|e| {
-                        Error::internal(format!("failed to encode session head_snapshot: {e}"))
-                    })
-                })
-                .transpose()?;
-            Ok(CommitEffect::Applied {
-                deleted: false,
-                retired: false,
-                head_snapshot,
-                session_id: Some(sid),
-                deleted_session: false,
-                new_items,
-                mcp_change: None,
-            })
-        }
-    }
-}
-
-pub fn apply_remote_commits_page(
-    conn: &Connection,
-    fixed_target: &StreamHead,
-    commits: &[CommitWire],
-    remote_node_id: &str,
-    mark_watched: bool,
-) -> Result<ApplyOutcome> {
-    if commits.is_empty() {
-        return Ok(ApplyOutcome::Ignored);
-    }
-    with_savepoint(conn, "apply_remote_page", || {
-        let local = stream_head(conn, &fixed_target.stream_id)?;
-        let (start_seq, start_parent) = match &local {
-            None => (1i64, [0u8; 32]),
-            Some(l) => {
-                if fixed_target.epoch < l.epoch {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                if fixed_target.epoch > l.epoch {
-                    return Err(Error::bad(
-                        "higher-epoch commits must stream via staging before commit",
-                    ));
-                }
-                if has_conflict(conn, &fixed_target.stream_id)? {
-                    return Ok(ApplyOutcome::Conflict {
-                        newly_recorded: false,
-                    });
-                }
-                if l.retired && commits.iter().any(|c| c.op_type != "mcp_delete") {
-                    return Ok(ApplyOutcome::Ignored);
-                }
-                if l.synced_seq == 0 {
-                    (1i64, [0u8; 32])
-                } else {
-                    if l.synced_epoch != l.epoch {
-                        return Err(Error::internal("corrupt synced_epoch state"));
-                    }
-                    (l.synced_seq + 1, l.synced_hash)
-                }
-            }
-        };
-
-        let first = commits.first().unwrap();
-        if first.epoch != fixed_target.epoch || first.stream_id != fixed_target.stream_id {
-            return Err(Error::bad("commit stream or epoch mismatch"));
-        }
-        if first.seq != start_seq || first.parent_hash != start_parent {
-            if let Some(l) = &local {
-                let newly_recorded = record_conflict_row(
-                    conn,
-                    &ConflictWrite {
-                        stream_id: &fixed_target.stream_id,
-                        kind: fixed_target.kind,
-                        local_epoch: l.epoch,
-                        local_seq: l.head_seq,
-                        local_hash: &l.head_hash,
-                        remote: fixed_target,
-                        remote_node_id,
-                        reason: "diverged",
-                        related_local_id: None,
-                        remote_snapshot: fixed_target.head_snapshot.as_deref(),
-                    },
-                )?;
-                return Ok(ApplyOutcome::Conflict { newly_recorded });
-            }
-            return Err(Error::bad("non-contiguous commit batch for new stream"));
-        }
-
-        let mut expected_parent = start_parent;
-        for (expected_seq, c) in (start_seq..).zip(commits.iter()) {
-            if c.epoch != fixed_target.epoch
-                || c.stream_id != fixed_target.stream_id
-                || c.seq > fixed_target.head_seq
-                || !verify_commit(c, expected_seq, &expected_parent)
-            {
-                return Err(Error::bad("invalid commit hash chain"));
-            }
-            if c.seq == fixed_target.head_seq && c.commit_hash != fixed_target.head_hash {
-                return Err(Error::bad("commit batch did not match pledged target head_hash"));
-            }
-            if let Some(ref l) = local
-                && l.head_seq > 0
-                && l.synced_seq < l.head_seq
-                && c.seq == l.head_seq
-                && c.commit_hash != l.head_hash
-            {
-                let newly_recorded = record_conflict_row(
-                    conn,
-                    &ConflictWrite {
-                        stream_id: &fixed_target.stream_id,
-                        kind: fixed_target.kind,
-                        local_epoch: l.epoch,
-                        local_seq: l.head_seq,
-                        local_hash: &l.head_hash,
-                        remote: fixed_target,
-                        remote_node_id,
-                        reason: "diverged",
-                        related_local_id: None,
-                        remote_snapshot: fixed_target.head_snapshot.as_deref(),
-                    },
-                )?;
-                return Ok(ApplyOutcome::Conflict { newly_recorded });
-            }
-            expected_parent = c.commit_hash;
-        }
-
-        let mut all_new_items = Vec::new();
-        let mut deleted = false;
-        let mut retired = local.as_ref().is_some_and(|l| l.retired);
-        let mut last_snapshot = local.as_ref().and_then(|l| l.head_snapshot.clone());
-        let mut session_id = None;
-        let mut deleted_session = false;
-        let mut mcp_changes = Vec::new();
-        let mut last_commit = commits.first().unwrap();
-
-        for c in commits {
-            match apply_one_commit(conn, c)? {
-                CommitEffect::Applied {
-                    deleted: d,
-                    retired: ret,
-                    head_snapshot,
-                    session_id: s_id,
-                    deleted_session: ds,
-                    new_items,
-                    mcp_change,
-                } => {
-                    deleted = d;
-                    retired |= ret;
-                    if d {
-                        last_snapshot = None;
-                    } else if head_snapshot.is_some() {
-                        last_snapshot = head_snapshot;
-                    }
-                    if s_id.is_some() {
-                        session_id = s_id;
-                    }
-                    deleted_session |= ds;
-                    all_new_items.extend(new_items);
-                    if let Some(mc) = mcp_change {
-                        mcp_changes.push(mc);
-                    }
-                    last_commit = c;
-                }
-                CommitEffect::Blocked => {
-                    conn.execute_batch("ROLLBACK TO apply_remote_page")?;
-                    return Ok(ApplyOutcome::BlockedOnDependency);
-                }
-                CommitEffect::NameConflict { related_local_id } => {
-                    let payload = c.payload.clone();
-                    let le = local.as_ref().map_or(0, |l| l.epoch);
-                    let ls = local.as_ref().map_or(0, |l| l.head_seq);
-                    let lh = local.as_ref().map_or([0u8; 32], |l| l.head_hash);
-                    conn.execute_batch("ROLLBACK TO apply_remote_page")?;
-                    let newly_recorded = record_conflict_row(
-                        conn,
-                        &ConflictWrite {
-                            stream_id: &fixed_target.stream_id,
-                            kind: fixed_target.kind,
-                            local_epoch: le,
-                            local_seq: ls,
-                            local_hash: &lh,
-                            remote: fixed_target,
-                            remote_node_id,
-                            reason: "name_conflict",
-                            related_local_id: related_local_id.as_deref(),
-                            remote_snapshot: Some(&payload),
-                        },
-                    )?;
-                    return Ok(ApplyOutcome::Conflict { newly_recorded });
-                }
-            }
-        }
-
-        // Preserve pinned target head on intermediate pages, and set watched=1 ONLY upon
-        // reaching fixed_target's exact (seq, hash) (P1-03).
-        let (final_head_seq, final_head_hash) = if local
-            .as_ref()
-            .is_some_and(|l| l.head_seq > fixed_target.head_seq)
-        {
-            let l = local.as_ref().unwrap();
-            (l.head_seq, l.head_hash)
-        } else if fixed_target.head_seq > last_commit.seq {
-            (fixed_target.head_seq, fixed_target.head_hash)
-        } else {
-            (last_commit.seq, last_commit.commit_hash)
-        };
-        let reached_head =
-            last_commit.seq == final_head_seq && last_commit.commit_hash == final_head_hash;
-        // Treat Session `watched` as persistent watch intent; body readiness is tracked via
-        // is_body_complete() using synced_epoch/synced_seq/synced_hash.
-        let watched = match fixed_target.kind {
-            StreamKind::Session => {
-                mark_watched || local.as_ref().is_some_and(|l| l.watched) || deleted
-            }
-            _ => reached_head,
-        };
-        let checkpoint_seq = local
-            .as_ref()
-            .filter(|l| l.checkpoint_seq > 0)
-            .map_or(1, |l| l.checkpoint_seq);
-        let head_snap = if last_commit.seq < final_head_seq {
-            local.as_ref().and_then(|l| l.head_snapshot.clone()).or(fixed_target.head_snapshot.clone()).or(last_snapshot)
-        } else {
-            last_snapshot
-        };
-        let updated_at = if last_commit.seq < final_head_seq {
-            fixed_target.updated_at.max(last_commit.created_at)
-        } else {
-            last_commit.created_at
-        };
-
-        conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?3,?6,?7,?8,?9,?10,?11,?12,?13)
-             ON CONFLICT(stream_id) DO UPDATE SET
-               epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
-               synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
-               checkpoint_seq=excluded.checkpoint_seq,watched=excluded.watched,
-               deleted=excluded.deleted,retired=excluded.retired,
-               head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
-            params![
-                fixed_target.stream_id,
-                fixed_target.kind.as_str(),
-                last_commit.epoch,
-                final_head_seq,
-                final_head_hash.as_slice(),
-                last_commit.seq,
-                last_commit.commit_hash.as_slice(),
-                checkpoint_seq,
-                watched,
-                deleted,
-                retired,
-                head_snap,
-                updated_at
-            ],
-        )?;
-        for c in commits {
-            conn.execute(
-                "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(stream_id,epoch,seq) DO NOTHING",
-                params![
-                    c.stream_id,
-                    c.epoch,
-                    c.seq,
-                    c.parent_hash.as_slice(),
-                    c.commit_hash.as_slice(),
-                    c.author_node_id,
-                    c.op_type,
-                    c.payload,
-                    c.created_at
-                ],
-            )?;
-        }
-
-        // P1-05: if a stream that previously failed name_conflict just applied cleanly (e.g. local=None
-        // succeeded after the colliding entry was archived), remove its stale sync_conflicts row!
-        let resolved_conflict = reached_head
-            && conn.execute(
-                "DELETE FROM sync_conflicts WHERE stream_id=?",
-                [&fixed_target.stream_id],
-            )? > 0;
-        let mut unblocked_conflicts = Vec::new();
-        if matches!(fixed_target.kind, StreamKind::Provider | StreamKind::Model | StreamKind::Mcp) {
-            unblocked_conflicts = collect_unblocked_conflicts(conn, &fixed_target.stream_id)?;
-            unblocked_conflicts.sort();
-            unblocked_conflicts.dedup();
-        }
-
-        Ok(ApplyOutcome::Applied {
-            updated: true,
-            session_id,
-            session_reset_epoch: None,
-            deleted_session,
-            new_items: all_new_items,
-            mcp_changes,
-            unblocked_conflicts,
-            resolved_conflict,
-        })
-    })
-}
-
-pub fn mark_session_watched(conn: &Connection, stream_id: &str) -> Result<bool> {
-    let changed = conn.execute(
-        "UPDATE sync_streams SET watched=1 WHERE stream_id=? AND kind='session' AND watched=0",
-        [stream_id],
-    )?;
+pub fn mark_session_watched(conn: &Connection, sid: SessionId) -> Result<bool> {
+    let changed = conn
+        .prepare_cached("INSERT OR IGNORE INTO watched_sessions(session_id) VALUES(?)")?
+        .execute([sid])?;
     Ok(changed > 0)
 }
 
-pub fn pin_session_target_head(
-    conn: &Connection,
-    remote: &StreamHead,
-    remote_node_id: &str,
-) -> Result<ApplyOutcome> {
-    if remote.kind != StreamKind::Session {
-        return Err(Error::internal("expected session head"));
-    }
-    with_savepoint(conn, "pin_session_head", || {
-        let Some(l) = stream_head(conn, &remote.stream_id)? else {
-            return Ok(ApplyOutcome::Ignored);
-        };
-        if remote.epoch < l.epoch || remote.epoch > l.epoch {
-            return Ok(ApplyOutcome::Ignored);
-        }
-        if remote.head_seq > l.head_seq {
-            if let Some(raw_snap) = &remote.head_snapshot {
-                let snap: SessionSnapshot = serde_json::from_str(raw_snap)
-                    .map_err(|e| Error::bad(format!("invalid session snapshot: {e}")))?;
-                if !upsert_session_snapshot(conn, &snap)? {
-                    return Ok(ApplyOutcome::BlockedOnDependency);
-                }
-            }
-            conn.execute(
-                "UPDATE sync_streams
-                 SET head_seq=?2, head_hash=?3,
-                     head_snapshot=coalesce(?4, head_snapshot), updated_at=?5
-                 WHERE stream_id=?1",
-                params![
-                    remote.stream_id,
-                    remote.head_seq,
-                    remote.head_hash.as_slice(),
-                    remote.head_snapshot,
-                    remote.updated_at
-                ],
-            )?;
-            return Ok(ApplyOutcome::Applied {
-                updated: true,
-                session_id: remote.stream_id.parse().ok(),
-                session_reset_epoch: None,
-                deleted_session: false,
-                new_items: Vec::new(),
-                mcp_changes: Vec::new(),
-                unblocked_conflicts: Vec::new(),
-                resolved_conflict: false,
-            });
-        }
-        let _ = remote_node_id;
-        Ok(ApplyOutcome::Ignored)
-    })
+pub fn is_session_watched(conn: &Connection, sid: SessionId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM watched_sessions WHERE session_id=?)")?
+        .query_row([sid], |r| r.get(0))?)
 }
 
-// --- Staging Table Operations for High-Epoch / Cluster Atomic Overwrites (P1-13) ---
-
-pub fn clear_staging_for_stream(conn: &Connection, stream_id: &str) -> Result<()> {
-    conn.execute("DELETE FROM sync_staging_commits WHERE stream_id=?", [stream_id])?;
-    Ok(())
-}
-
-pub fn stage_remote_commits_page(
-    conn: &Connection,
-    target_head: &StreamHead,
-    commits: &[CommitWire],
-) -> Result<i64> {
-    if commits.is_empty() {
-        return Err(Error::bad("empty staged commit page"));
-    }
-    with_savepoint(conn, "stage_commits", || {
-        let last_staged: Option<(i64, Vec<u8>)> = conn
-            .prepare_cached(
-                "SELECT seq, commit_hash FROM sync_staging_commits
-                 WHERE stream_id=?1 AND epoch=?2 ORDER BY seq DESC LIMIT 1",
-            )?
-            .query_row(params![&target_head.stream_id, target_head.epoch], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?;
-        let (expected_start_seq, expected_start_parent) = match last_staged {
-            Some((seq, hvec)) => (seq + 1, to_hash32(hvec)?),
-            None => (1, [0u8; 32]),
-        };
-
-        let mut expected_parent = expected_start_parent;
-        for (expected_seq, c) in (expected_start_seq..).zip(commits.iter()) {
-            if c.stream_id != target_head.stream_id
-                || c.epoch != target_head.epoch
-                || c.seq > target_head.head_seq
-                || !verify_commit(c, expected_seq, &expected_parent)
-            {
-                return Err(Error::bad("invalid staged commit hash chain"));
-            }
-            if c.seq == target_head.head_seq && c.commit_hash != target_head.head_hash {
-                return Err(Error::bad("staged commits did not reach pledged head_hash"));
-            }
-            expected_parent = c.commit_hash;
-        }
-        for c in commits {
-            conn.execute(
-                "INSERT INTO sync_staging_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(stream_id,epoch,seq) DO NOTHING",
-                params![
-                    c.stream_id,
-                    c.epoch,
-                    c.seq,
-                    c.parent_hash.as_slice(),
-                    c.commit_hash.as_slice(),
-                    c.author_node_id,
-                    c.op_type,
-                    c.payload,
-                    c.created_at
-                ],
-            )?;
-        }
-        Ok(commits.last().unwrap().seq)
-    })
-}
-
-fn verify_staged_chain(
-    conn: &Connection,
-    head: &StreamHead,
-    invalid: impl Fn(&'static str) -> Error,
-) -> Result<()> {
+pub fn list_watched_sessions(conn: &Connection) -> Result<Vec<SessionId>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT seq,parent_hash,commit_hash FROM sync_staging_commits
-         WHERE stream_id=?1 AND epoch=?2 ORDER BY seq",
-    )?;
-    let mut rows = stmt.query(params![head.stream_id, head.epoch])?;
-    let mut last_seq = 0i64;
-    let mut last_hash = [0u8; 32];
-    while let Some(row) = rows.next()? {
-        let seq: i64 = row.get(0)?;
-        if last_seq.checked_add(1) != Some(seq) || row.get::<_, [u8; 32]>(1)? != last_hash {
-            return Err(invalid("non-contiguous staged commit chain"));
-        }
-        last_seq = seq;
-        last_hash = row.get(2)?;
-    }
-    if last_seq != head.head_seq {
-        return Err(invalid("incomplete staged commit chain"));
-    }
-    if last_hash != head.head_hash {
-        return Err(invalid("staged chain head_hash mismatch"));
-    }
-    Ok(())
-}
-
-pub fn commit_staged_epoch(
-    conn: &Connection,
-    target_head: &StreamHead,
-    remote_node_id: &str,
-    mark_watched: bool,
-    expected_conflict: Option<&ConflictRecord>,
-) -> Result<ApplyOutcome> {
-    with_savepoint(conn, "commit_staged", || {
-        verify_staged_chain(conn, target_head, Error::bad)?;
-
-        let mut extra_mcp_changes = Vec::new();
-        let mut resolved_conflict = false;
-        let local = stream_head(conn, &target_head.stream_id)?;
-
-        if let Some(exp_c) = expected_conflict {
-            let current_c = get_conflict(conn, &target_head.stream_id)?;
-            if &current_c != exp_c {
-                return Err(Error::conflict(
-                    "sync conflict state changed concurrently; retry resolution",
-                ));
-            }
-            let now = chrono::Utc::now().timestamp_millis();
-            // Name conflict retirement/rename of colliding local entity (P2-04).
-            if exp_c.reason == "name_conflict"
-                && let Some(local_id) = exp_c.related_local_id.as_deref()
-                && !local_id.is_empty()
-            {
-                match exp_c.kind {
-                    StreamKind::Provider => {
-                        if let Ok(pid) = local_id.parse::<ProviderId>() {
-                            conn.execute(
-                                "UPDATE llm_providers SET archived_at=coalesce(archived_at, ?) WHERE id=?",
-                                params![now, pid],
-                            )?;
-                            if stream_head(conn, pid.as_str())?.is_some() {
-                                record_provider(conn, pid)?;
-                            }
-                        }
-                    }
-                    StreamKind::Model => {
-                        if let Ok(mid) = local_id.parse::<ModelId>() {
-                            conn.execute(
-                                "UPDATE llm_models SET archived_at=coalesce(archived_at, ?) WHERE id=?",
-                                params![now, mid],
-                            )?;
-                            if stream_head(conn, mid.as_str())?.is_some() {
-                                record_model(conn, mid)?;
-                            }
-                        }
-                    }
-                    StreamKind::Mcp => {
-                        if let Ok(mid) = local_id.parse::<McpServerId>() {
-                            let shared: Option<bool> = conn
-                                .prepare_cached("SELECT shared FROM mcp_servers WHERE id=?")?
-                                .query_row([mid], |r| r.get(0))
-                                .optional()?;
-                            match shared {
-                                Some(true) => {
-                                    conn.execute("DELETE FROM mcp_servers WHERE id=?", [mid])?;
-                                    record_mcp_deleted(conn, mid)?;
-                                    extra_mcp_changes.push(McpChange {
-                                        id: mid,
-                                        cancel_login: true,
-                                    });
-                                }
-                                Some(false) => {
-                                    let old_name: String = conn.query_row(
-                                        "SELECT name FROM mcp_servers WHERE id=?",
-                                        [mid],
-                                        |r| r.get(0),
-                                    )?;
-                                    let mut n = 0usize;
-                                    let new_name = loop {
-                                        let suffix = if n == 0 {
-                                            format!("-local-{}", &mid.suffix()[..6])
-                                        } else {
-                                            format!("-local-{}-{n}", &mid.suffix()[..6])
-                                        };
-                                        let prefix_cap = 128usize.saturating_sub(suffix.len());
-                                        let candidate = format!(
-                                            "{}{}",
-                                            &old_name[..old_name.floor_char_boundary(prefix_cap)],
-                                            suffix
-                                        );
-                                        let taken: bool = conn.query_row(
-                                            "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE name=?)",
-                                            [&candidate],
-                                            |r| r.get(0),
-                                        )?;
-                                        if !taken {
-                                            break candidate;
-                                        }
-                                        n += 1;
-                                    };
-                                    conn.execute(
-                                        "UPDATE mcp_servers SET name=?, revision=revision+1 WHERE id=?",
-                                        params![new_name, mid],
-                                    )?;
-                                    extra_mcp_changes.push(McpChange {
-                                        id: mid,
-                                        cancel_login: false,
-                                    });
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            resolved_conflict = conn.execute(
-                "DELETE FROM sync_conflicts WHERE stream_id=?",
-                [&target_head.stream_id],
-            )? > 0;
-        } else if let Some(ref l) = local {
-            if target_head.epoch <= l.epoch {
-                return Ok(ApplyOutcome::Ignored);
-            }
-            if l.retired && !target_head.deleted {
-                return Err(Error::conflict("cannot reopen retired stream via higher epoch"));
-            }
-            resolved_conflict = conn.execute(
-                "DELETE FROM sync_conflicts WHERE stream_id=?",
-                [&target_head.stream_id],
-            )? > 0;
-        }
-
-        // Clear existing local session body cleanly BEFORE replaying winner epoch:
-        // ONLY unbind llm_calls / delete sessions if winner is actually deleted (P1-02).
-        if target_head.kind == StreamKind::Session
-            && let Ok(sid) = target_head.stream_id.parse::<SessionId>()
-        {
-            if target_head.deleted {
-                delete_session_local_rows(conn, sid)?;
-            } else {
-                clear_session_body_rows(conn, sid)?;
-            }
-        }
-        conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [&target_head.stream_id])?;
-
-        // Replay staged commits from SQLite in bounded cursor loop.
-        let mut all_new_items = Vec::new();
-        let mut deleted = false;
-        let mut retired = false;
-        let mut last_snapshot = None;
-        let mut session_id = None;
-        let mut deleted_session = false;
-        let mut mcp_changes = extra_mcp_changes;
-        let mut last_created_at = target_head.updated_at;
-
-        {
-            let mut replay_stmt = conn.prepare_cached(
-                "SELECT seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-                 FROM sync_staging_commits WHERE stream_id=?1 AND epoch=?2 ORDER BY seq ASC",
-            )?;
-            let mut rows =
-                replay_stmt.query(params![&target_head.stream_id, target_head.epoch])?;
-            while let Some(r) = rows.next()? {
-                let seq: i64 = r.get(0)?;
-                let pvec: Vec<u8> = r.get(1)?;
-                let cvec: Vec<u8> = r.get(2)?;
-                let author_node_id: String = r.get(3)?;
-                let op_type: String = r.get(4)?;
-                let payload: String = r.get(5)?;
-                let created_at: i64 = r.get(6)?;
-                last_created_at = created_at;
-                let wire = CommitWire {
-                    stream_id: target_head.stream_id.clone(),
-                    kind: target_head.kind,
-                    epoch: target_head.epoch,
-                    seq,
-                    parent_hash: to_hash32(pvec)?,
-                    commit_hash: to_hash32(cvec)?,
-                    author_node_id,
-                    op_type,
-                    payload,
-                    created_at,
-                };
-                match apply_one_commit(conn, &wire)? {
-                    CommitEffect::Applied {
-                        deleted: d,
-                        retired: ret,
-                        head_snapshot,
-                        session_id: s_id,
-                        deleted_session: ds,
-                        new_items,
-                        mcp_change,
-                    } => {
-                        deleted = d;
-                        retired |= ret;
-                        if d {
-                            last_snapshot = None;
-                        } else if head_snapshot.is_some() {
-                            last_snapshot = head_snapshot;
-                        }
-                        if s_id.is_some() {
-                            session_id = s_id;
-                        }
-                        deleted_session |= ds;
-                        all_new_items.extend(new_items);
-                        if let Some(mc) = mcp_change {
-                            mcp_changes.push(mc);
-                        }
-                    }
-                    CommitEffect::Blocked => {
-                        conn.execute_batch("ROLLBACK TO commit_staged")?;
-                        if expected_conflict.is_some() {
-                            return Err(Error::conflict(
-                                "cannot apply winning stream yet because a referenced provider, model, or call is missing",
-                            ));
-                        }
-                        return Ok(ApplyOutcome::BlockedOnDependency);
-                    }
-                    CommitEffect::NameConflict { related_local_id } => {
-                        let payload = wire.payload.clone();
-                        let le = local.as_ref().map_or(0, |l| l.epoch);
-                        let ls = local.as_ref().map_or(0, |l| l.head_seq);
-                        let lh = local.as_ref().map_or([0u8; 32], |l| l.head_hash);
-                        conn.execute_batch("ROLLBACK TO commit_staged")?;
-                        if expected_conflict.is_some() {
-                            return Err(Error::conflict(
-                                "winning stream hit another local unique name conflict",
-                            ));
-                        }
-                        let newly_recorded = record_conflict_row(
-                            conn,
-                            &ConflictWrite {
-                                stream_id: &target_head.stream_id,
-                                kind: target_head.kind,
-                                local_epoch: le,
-                                local_seq: ls,
-                                local_hash: &lh,
-                                remote: target_head,
-                                remote_node_id,
-                                reason: "name_conflict",
-                                related_local_id: related_local_id.as_deref(),
-                                remote_snapshot: Some(&payload),
-                            },
-                        )?;
-                        return Ok(ApplyOutcome::Conflict { newly_recorded });
-                    }
-                }
-            }
-        }
-
-        let watched = if target_head.kind == StreamKind::Session {
-            mark_watched
-                || local.as_ref().is_some_and(|l| l.watched)
-                || expected_conflict.is_some()
-                || deleted
-        } else {
-            true
-        };
-        conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,reset_gen,head_snapshot,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?3,?4,?5,1,?6,?7,?8,0,?9,?10)
-             ON CONFLICT(stream_id) DO UPDATE SET
-               epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
-               synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
-               checkpoint_seq=1,watched=excluded.watched,deleted=excluded.deleted,retired=excluded.retired,
-               reset_gen=CASE WHEN excluded.kind='session' AND NOT excluded.deleted THEN sync_streams.reset_gen+1 ELSE sync_streams.reset_gen END,
-               head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
-            params![
-                target_head.stream_id,
-                target_head.kind.as_str(),
-                target_head.epoch,
-                target_head.head_seq,
-                target_head.head_hash.as_slice(),
-                watched,
-                deleted,
-                retired,
-                last_snapshot,
-                last_created_at
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-             SELECT stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-             FROM sync_staging_commits WHERE stream_id=?1 AND epoch=?2 ORDER BY seq ASC",
-            params![&target_head.stream_id, target_head.epoch],
-        )?;
-        conn.execute(
-            "DELETE FROM sync_staging_commits WHERE stream_id=?",
-            [&target_head.stream_id],
-        )?;
-
-        if let Some(exp_c) = expected_conflict {
-            let resolver = load_local_node(conn)?.node_id;
-            let now = chrono::Utc::now().timestamp_millis();
-            record_resolution_receipt(
-                conn,
-                &ResolutionReceipt {
-                    stream_id: target_head.stream_id.clone(),
-                    kind: target_head.kind,
-                    chosen: "cluster".to_owned(),
-                    resolver_node_id: resolver,
-                    local_epoch: exp_c.local_epoch,
-                    local_seq: exp_c.local_seq,
-                    local_hash: exp_c.local_hash,
-                    remote_epoch: exp_c.remote_epoch,
-                    remote_seq: exp_c.remote_seq,
-                    remote_hash: exp_c.remote_hash,
-                    winner_epoch: target_head.epoch,
-                    winner_seq: target_head.head_seq,
-                    winner_hash: target_head.head_hash,
-                    resolved_at: now,
-                },
-            )?;
-        }
-
-        let mut unblocked_conflicts = Vec::new();
-        if matches!(target_head.kind, StreamKind::Provider | StreamKind::Model | StreamKind::Mcp) {
-            unblocked_conflicts = collect_unblocked_conflicts(conn, &target_head.stream_id)?;
-            unblocked_conflicts.sort();
-            unblocked_conflicts.dedup();
-        }
-        let session_reset_epoch =
-            (target_head.kind == StreamKind::Session && !deleted).then_some(target_head.epoch);
-
-        Ok(ApplyOutcome::Applied {
-            updated: true,
-            session_id,
-            session_reset_epoch,
-            deleted_session,
-            new_items: all_new_items,
-            mcp_changes,
-            unblocked_conflicts,
-            resolved_conflict,
-        })
-    })
-}
-
-pub fn record_fork_conflict(
-    conn: &Connection,
-    local: &LocalStreamState,
-    remote: &StreamHead,
-    remote_node_id: &str,
-) -> Result<bool> {
-    record_conflict_row(
-        conn,
-        &ConflictWrite {
-            stream_id: &local.stream_id,
-            kind: local.kind,
-            local_epoch: local.epoch,
-            local_seq: local.head_seq,
-            local_hash: &local.head_hash,
-            remote,
-            remote_node_id,
-            reason: "diverged",
-            related_local_id: None,
-            remote_snapshot: remote.head_snapshot.as_deref(),
-        },
-    )
-}
-
-fn record_resolution_receipt(conn: &Connection, r: &ResolutionReceipt) -> Result<()> {
-    conn.execute(
-        "INSERT INTO sync_resolutions(stream_id,kind,chosen,resolver_node_id,local_epoch,local_seq,local_hash,remote_epoch,remote_seq,remote_hash,winner_epoch,winner_seq,winner_hash,resolved_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-         ON CONFLICT(stream_id) DO UPDATE SET
-           kind=excluded.kind,chosen=excluded.chosen,resolver_node_id=excluded.resolver_node_id,
-           local_epoch=excluded.local_epoch,local_seq=excluded.local_seq,local_hash=excluded.local_hash,
-           remote_epoch=excluded.remote_epoch,remote_seq=excluded.remote_seq,remote_hash=excluded.remote_hash,
-           winner_epoch=excluded.winner_epoch,winner_seq=excluded.winner_seq,winner_hash=excluded.winner_hash,
-           resolved_at=excluded.resolved_at",
-        params![
-            r.stream_id,
-            r.kind.as_str(),
-            r.chosen,
-            r.resolver_node_id,
-            r.local_epoch,
-            r.local_seq,
-            r.local_hash.as_slice(),
-            r.remote_epoch,
-            r.remote_seq,
-            r.remote_hash.as_slice(),
-            r.winner_epoch,
-            r.winner_seq,
-            r.winner_hash.as_slice(),
-            r.resolved_at,
-        ],
-    )?;
-    // Clean up receipts whose stream has moved into a strictly higher epoch.
-    conn.execute(
-        "DELETE FROM sync_resolutions
-         WHERE EXISTS (
-             SELECT 1 FROM sync_streams s
-             WHERE s.stream_id = sync_resolutions.stream_id
-               AND s.epoch > sync_resolutions.winner_epoch
-         )",
-        [],
-    )?;
-    // Bound only epoch-bumping receipts; keep same-epoch receipts while stream stays at winner_epoch.
-    conn.execute(
-        "DELETE FROM sync_resolutions WHERE stream_id IN (
-            SELECT stream_id FROM sync_resolutions
-            WHERE winner_epoch > local_epoch AND winner_epoch > remote_epoch
-            ORDER BY resolved_at DESC, stream_id DESC
-            LIMIT -1 OFFSET ?1
-        )",
-        [MAX_SYNC_RESOLUTIONS],
-    )?;
-    Ok(())
-}
-
-pub fn list_conflict_probes_page(
-    conn: &Connection,
-    after_stream_id: Option<&str>,
-    limit: usize,
-) -> Result<Vec<(String, [u8; 32])>> {
-    let after = after_stream_id.unwrap_or("");
-    let lim = i64::try_from(limit.clamp(1, 256)).unwrap_or(256);
-    let mut stmt = conn.prepare_cached(
-        "SELECT stream_id,remote_hash FROM sync_conflicts WHERE stream_id>?1 ORDER BY stream_id ASC LIMIT ?2",
+        "SELECT w.session_id FROM watched_sessions w
+         JOIN sessions s ON s.id = w.session_id
+         WHERE s.deleted = 0
+         ORDER BY w.session_id",
     )?;
     let rows = stmt
-        .query_map(params![after, lim], |r| Ok((r.get(0)?, to_hash32(r.get(1)?)?)))?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<SessionId>>>()?;
+    Ok(rows)
+}
+
+pub fn list_session_leaves(conn: &Connection, sid: SessionId) -> Result<Vec<BranchHead>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT head_id, depth, last_item_id, origin_node_id
+         FROM session_leaves
+         WHERE session_id = ?1
+         ORDER BY depth DESC, head_id DESC",
+    )?;
+    let rows = stmt
+        .query_map([sid], |r| {
+            Ok(BranchHead {
+                head_id: r.get(0)?,
+                depth: r.get(1)?,
+                last_item_id: r.get(2)?,
+                origin_node_id: r.get(3)?,
+            })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-pub fn read_resolutions_for_streams(
+pub fn node_branch_complete(
     conn: &Connection,
-    stream_ids: &[String],
-) -> Result<Vec<ResolutionReceipt>> {
-    let mut out = Vec::new();
+    sid: SessionId,
+    head_id: ContextNodeId,
+) -> Result<bool> {
+    let Some(expected_depth) = conn
+        .prepare_cached("SELECT depth FROM context_nodes WHERE id=?1 AND session_id=?2")?
+        .query_row(params![head_id, sid], |r| r.get::<_, i64>(0))
+        .optional()?
+    else {
+        return Ok(false);
+    };
     let mut stmt = conn.prepare_cached(
-        "SELECT stream_id,kind,chosen,resolver_node_id,local_epoch,local_seq,local_hash,
-                remote_epoch,remote_seq,remote_hash,winner_epoch,winner_seq,winner_hash,resolved_at
-         FROM sync_resolutions WHERE stream_id=?",
+        "SELECT c.parent_id, c.depth
+         FROM context_nodes c
+         JOIN items i ON i.id = c.item_id AND i.session_id = c.session_id
+         WHERE c.id = ?1 AND c.session_id = ?2",
     )?;
-    for sid in stream_ids.iter().take(256) {
-        if let Some(r) = stmt
-            .query_row([sid], |row| {
+    let mut cur = Some(head_id);
+    let mut expect = expected_depth;
+    let mut visited = 0i64;
+    while let Some(nid) = cur {
+        let Some((parent_id, depth)) = stmt
+            .query_row(params![nid, sid], |r| {
+                Ok((r.get::<_, Option<ContextNodeId>>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        if depth != expect || visited >= expected_depth {
+            return Ok(false);
+        }
+        visited += 1;
+        expect -= 1;
+        if expect == 0 {
+            return Ok(parent_id.is_none() && visited == expected_depth);
+        }
+        if parent_id.is_none() {
+            return Ok(false);
+        }
+        cur = parent_id;
+    }
+    Ok(false)
+}
+
+pub fn session_branch_complete(conn: &Connection, sid: SessionId) -> Result<bool> {
+    let row: Option<(bool, Option<ContextNodeId>)> = conn
+        .prepare_cached("SELECT deleted, active_head FROM sessions WHERE id=?")?
+        .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((deleted, active_head)) = row else {
+        return Ok(true);
+    };
+    if deleted {
+        return Ok(false);
+    }
+    match active_head {
+        None => Ok(true),
+        Some(head_id) => node_branch_complete(conn, sid, head_id),
+    }
+}
+
+pub fn reconcile_active_context(
+    conn: &Connection,
+    sid: SessionId,
+) -> Result<ActiveContextChange> {
+    let row: Option<(bool, Option<ContextNodeId>)> = conn
+        .prepare_cached("SELECT deleted, active_head FROM sessions WHERE id=?")?
+        .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let active_head = match row {
+        Some((false, Some(head_id))) => head_id,
+        _ => {
+            let deleted = conn
+                .prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+                .execute([sid])?;
+            return Ok(if deleted > 0 {
+                ActiveContextChange::Cleared
+            } else {
+                ActiveContextChange::Unchanged
+            });
+        }
+    };
+
+    let cur_tip: Option<(i64, ContextNodeId)> = conn
+        .prepare_cached(
+            "SELECT position, node_id FROM active_context
+             WHERE session_id=?1 ORDER BY position DESC LIMIT 1",
+        )?
+        .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let had_rows = cur_tip.is_some();
+    let incomplete = if had_rows {
+        ActiveContextChange::Cleared
+    } else {
+        ActiveContextChange::Incomplete
+    };
+
+    let Some(target_depth) = conn
+        .prepare_cached("SELECT depth FROM context_nodes WHERE id=?1 AND session_id=?2")?
+        .query_row(params![active_head, sid], |r| r.get::<_, i64>(0))
+        .optional()?
+    else {
+        conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+            .execute([sid])?;
+        return Ok(incomplete);
+    };
+
+    if let Some((cur_pos, cur_node)) = cur_tip {
+        if cur_pos == target_depth && cur_node == active_head {
+            return Ok(ActiveContextChange::Unchanged);
+        }
+        if target_depth > cur_pos {
+            let mut stmt = conn.prepare_cached(
+                "SELECT c.parent_id, c.depth, c.item_id
+                 FROM context_nodes c
+                 JOIN items i ON i.id = c.item_id AND i.session_id = c.session_id
+                 WHERE c.id = ?1 AND c.session_id = ?2",
+            )?;
+            let mut cur = Some(active_head);
+            let mut expect = target_depth;
+            let mut tail = Vec::new();
+            let mut matched_prefix = false;
+            while let Some(nid) = cur {
+                if expect == cur_pos {
+                    matched_prefix = nid == cur_node;
+                    break;
+                }
+                if expect < cur_pos {
+                    break;
+                }
+                let Some((parent_id, depth, item_id)) = stmt
+                    .query_row(params![nid, sid], |r| {
+                        Ok((
+                            r.get::<_, Option<ContextNodeId>>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, ItemId>(2)?,
+                        ))
+                    })
+                    .optional()?
+                else {
+                    conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+                        .execute([sid])?;
+                    return Ok(incomplete);
+                };
+                if depth != expect {
+                    conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+                        .execute([sid])?;
+                    return Ok(incomplete);
+                }
+                tail.push((depth, nid, item_id));
+                expect -= 1;
+                cur = parent_id;
+            }
+            if matched_prefix && !tail.is_empty() {
+                tail.reverse();
+                let count = tail.len();
+                let mut ins = conn.prepare_cached(
+                    "INSERT INTO active_context(session_id, position, node_id, item_id)
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                for (pos, nid, item_id) in tail {
+                    ins.execute(params![sid, pos, nid, item_id])?;
+                }
+                return Ok(ActiveContextChange::Appended(count));
+            }
+        }
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.parent_id, c.depth, c.item_id
+         FROM context_nodes c
+         JOIN items i ON i.id = c.item_id AND i.session_id = c.session_id
+         WHERE c.id = ?1 AND c.session_id = ?2",
+    )?;
+    let mut cur = Some(active_head);
+    let mut expect = target_depth;
+    let mut chain = Vec::with_capacity(usize::try_from(target_depth).unwrap_or(0).min(1024));
+    while let Some(nid) = cur {
+        let Some((parent_id, depth, item_id)) = stmt
+            .query_row(params![nid, sid], |r| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Vec<u8>>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, i64>(11)?,
-                    row.get::<_, Vec<u8>>(12)?,
-                    row.get::<_, i64>(13)?,
+                    r.get::<_, Option<ContextNodeId>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, ItemId>(2)?,
                 ))
             })
             .optional()?
-        {
-            out.push(ResolutionReceipt {
-                stream_id: r.0,
-                kind: StreamKind::from_db(&r.1)?,
-                chosen: r.2,
-                resolver_node_id: r.3,
-                local_epoch: r.4,
-                local_seq: r.5,
-                local_hash: to_hash32(r.6)?,
-                remote_epoch: r.7,
-                remote_seq: r.8,
-                remote_hash: to_hash32(r.9)?,
-                winner_epoch: r.10,
-                winner_seq: r.11,
-                winner_hash: to_hash32(r.12)?,
-                resolved_at: r.13,
-            });
-        }
-    }
-    Ok(out)
-}
-
-pub fn read_resolutions_and_converged(
-    conn: &Connection,
-    stream_ids: &[String],
-) -> Result<(Vec<ResolutionReceipt>, Vec<StreamHead>)> {
-    // A cached receipt may settle a different fork. The current head can independently
-    // prove convergence to the counterparty that requested it.
-    let receipts = read_resolutions_for_streams(conn, stream_ids)?;
-    let mut converged_heads = Vec::new();
-    for sid in stream_ids.iter().take(256) {
-        if !has_conflict(conn, sid)?
-            && let Some(mut head) = stream_head_wire(conn, sid)?
-        {
-            head.head_snapshot = None;
-            converged_heads.push(head);
-        }
-    }
-    Ok((receipts, converged_heads))
-}
-
-pub fn apply_resolution_receipt(
-    conn: &Connection,
-    receipt: &ResolutionReceipt,
-) -> Result<bool> {
-    with_savepoint(conn, "apply_res_receipt", || {
-        let Some(l) = stream_head(conn, &receipt.stream_id)? else {
-            return Ok(false);
+        else {
+            conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+                .execute([sid])?;
+            return Ok(incomplete);
         };
-        let local_matches_winner = l.epoch == receipt.winner_epoch
-            && l.head_seq == receipt.winner_seq
-            && l.head_hash == receipt.winner_hash;
-        if !local_matches_winner {
-            return Ok(false);
+        if depth != expect || expect <= 0 {
+            conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+                .execute([sid])?;
+            return Ok(incomplete);
         }
-        let Some(c) = get_conflict_opt(conn, &receipt.stream_id)? else {
-            // Converged peers with matching winner head cache the receipt so they can relay it
-            // to long-offline peers even if the original resolver is later unavailable.
-            record_resolution_receipt(conn, receipt)?;
-            return Ok(false);
-        };
-        let exact_pair = (c.local_epoch == receipt.local_epoch
-            && c.local_seq == receipt.local_seq
-            && c.local_hash == receipt.local_hash
-            && c.remote_epoch == receipt.remote_epoch
-            && c.remote_seq == receipt.remote_seq
-            && c.remote_hash == receipt.remote_hash)
-            || (c.local_epoch == receipt.remote_epoch
-                && c.local_seq == receipt.remote_seq
-                && c.local_hash == receipt.remote_hash
-                && c.remote_epoch == receipt.local_epoch
-                && c.remote_seq == receipt.local_seq
-                && c.remote_hash == receipt.local_hash);
-        if exact_pair {
-            let deleted =
-                conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [&receipt.stream_id])? > 0;
-            if deleted {
-                record_resolution_receipt(conn, receipt)?;
+        chain.push((depth, nid, item_id));
+        expect -= 1;
+        if expect == 0 {
+            if parent_id.is_some() {
+                conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+                    .execute([sid])?;
+                return Ok(incomplete);
             }
-            return Ok(deleted);
+            break;
         }
-        Ok(false)
+        if parent_id.is_none() {
+            conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+                .execute([sid])?;
+            return Ok(incomplete);
+        }
+        cur = parent_id;
+    }
+    if expect != 0 {
+        conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+            .execute([sid])?;
+        return Ok(incomplete);
+    }
+
+    conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+        .execute([sid])?;
+    chain.reverse();
+    let count = chain.len();
+    let mut ins = conn.prepare_cached(
+        "INSERT INTO active_context(session_id, position, node_id, item_id)
+         VALUES(?1, ?2, ?3, ?4)",
+    )?;
+    for (pos, nid, item_id) in chain {
+        ins.execute(params![sid, pos, nid, item_id])?;
+    }
+    Ok(if had_rows {
+        ActiveContextChange::Switched
+    } else {
+        ActiveContextChange::Appended(count)
     })
 }
 
-pub fn apply_counterparty_convergence(
-    conn: &Connection,
-    from_peer: &str,
-    peer_head: &StreamHead,
-    expected_remote_hash: [u8; 32],
-    ancestor_proof: AncestorProof,
-) -> Result<bool> {
-    with_savepoint(conn, "apply_peer_conv", || {
-        let Some(c) = get_conflict_opt(conn, &peer_head.stream_id)? else {
-            return Ok(false);
-        };
-        if c.remote_node_id != from_peer || c.remote_hash != expected_remote_hash {
-            return Ok(false);
-        }
-        let Some(l) = stream_head(conn, &peer_head.stream_id)? else {
-            return Ok(false);
-        };
-        if l.epoch != c.local_epoch || l.head_seq != c.local_seq || l.head_hash != c.local_hash {
-            return Ok(false);
-        }
-        let exact_match = peer_head.epoch == c.local_epoch
-            && peer_head.head_seq == c.local_seq
-            && peer_head.head_hash == c.local_hash
-            && peer_head.deleted == l.deleted;
-        let verified_descendant = peer_head.epoch == c.local_epoch
-            && peer_head.head_seq > c.local_seq
-            && ancestor_proof
-                == AncestorProof::Verified {
-                    epoch: c.local_epoch,
-                    seq: c.local_seq,
-                    hash: c.local_hash,
-                };
-        if exact_match || verified_descendant {
-            let deleted =
-                conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [&peer_head.stream_id])?
-                    > 0;
-            return Ok(deleted);
-        }
-        Ok(false)
-    })
-}
-
-// --- Epoch Snapshot Writers & Local Conflict Resolution ---
-
-struct EpochSnapshot<'a> {
-    stream_id: &'a str,
-    kind: StreamKind,
-    new_epoch: i64,
-    op_type: &'a str,
-    payload: String,
-    deleted: bool,
-    retired: bool,
-    head_snapshot: Option<String>,
-}
-
-fn replace_stream_with_epoch_snapshot(conn: &Connection, snap: EpochSnapshot<'_>) -> Result<()> {
-    let author = load_local_node(conn)?.node_id;
-    let now = chrono::Utc::now().timestamp_millis();
-    let parent_hash = [0u8; 32];
-    let commit_hash = compute_commit_hash(&CommitHashInput {
-        stream_id: snap.stream_id,
-        kind: snap.kind,
-        epoch: snap.new_epoch,
-        seq: 1,
-        parent_hash: &parent_hash,
-        author_node_id: &author,
-        op_type: snap.op_type,
-        payload: &snap.payload,
-        created_at: now,
-    });
-    conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [snap.stream_id])?;
-    conn.execute(
-        "DELETE FROM sync_staging_commits WHERE stream_id=?",
-        [snap.stream_id],
-    )?;
-    conn.execute(
-        "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,head_snapshot,updated_at)
-         VALUES(?1,?2,?3,1,?4,?3,1,?4,1,1,?5,?6,?7,?8)
-         ON CONFLICT(stream_id) DO UPDATE SET
-           epoch=excluded.epoch,head_seq=1,head_hash=excluded.head_hash,
-           synced_epoch=excluded.epoch,synced_seq=1,synced_hash=excluded.head_hash,
-           checkpoint_seq=1,watched=1,deleted=excluded.deleted,retired=excluded.retired,
-           head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
-        params![
-            snap.stream_id,
-            snap.kind.as_str(),
-            snap.new_epoch,
-            commit_hash.as_slice(),
-            snap.deleted,
-            snap.retired,
-            snap.head_snapshot,
-            now
-        ],
-    )?;
-    conn.execute(
-        "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-         VALUES(?,?,1,?,?,?,?,?,?)",
-        params![
-            snap.stream_id,
-            snap.new_epoch,
-            parent_hash.as_slice(),
-            commit_hash.as_slice(),
-            author,
-            snap.op_type,
-            snap.payload,
-            now
-        ],
-    )?;
-    conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [snap.stream_id])?;
-    stage_stream(snap.stream_id);
-    Ok(())
-}
-
-/// Build the new epoch in staging. resolve_conflict_local's savepoint covers the stable source
-/// cursors, the attachment index, the head switch and the resolution receipt.
-fn replace_session_with_chunked_epoch_snapshot(
+pub fn on_item_inserted(
     conn: &Connection,
     sid: SessionId,
-    new_epoch: i64,
+    id: ItemId,
+    kind: &str,
+    payload: &Value,
+    target_id: Option<ItemId>,
 ) -> Result<()> {
-    let snap = read_session_snapshot(conn, sid)?;
-    let head_snap_json = serde_json::to_string(&snap)
-        .map_err(|e| Error::internal(format!("session snapshot encode failed: {e}")))?;
-    let mut chunk = SessionDelta {
-        session: Some(snap),
+    match kind {
+        "user_message" => {
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO pending_inputs(session_id, item_id, kind)
+                 SELECT ?1, ?2, 'user_message'
+                 WHERE NOT EXISTS(SELECT 1 FROM items w WHERE w.session_id=?1 AND w.kind='withdrawal' AND w.target_id=?2)
+                   AND NOT EXISTS(SELECT 1 FROM context_nodes c WHERE c.session_id=?1 AND c.item_id=?2)",
+            )?
+            .execute(params![sid, id])?;
+        }
+        "codemode_event" => {
+            if payload.get("notify").and_then(Value::as_bool) == Some(true) {
+                conn.prepare_cached(
+                    "INSERT OR IGNORE INTO pending_inputs(session_id, item_id, kind)
+                     SELECT ?1, ?2, 'codemode_event'
+                     WHERE NOT EXISTS(SELECT 1 FROM invalidated_warnings iw WHERE iw.item_id=?2)
+                       AND NOT EXISTS(SELECT 1 FROM context_nodes c WHERE c.session_id=?1 AND c.item_id=?2)",
+                )?
+                .execute(params![sid, id])?;
+            }
+        }
+        "withdrawal" => {
+            if let Some(target) = target_id {
+                conn.prepare_cached(
+                    "DELETE FROM pending_inputs WHERE session_id=?1 AND item_id=?2",
+                )?
+                .execute(params![sid, target])?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn on_context_node_inserted(
+    conn: &Connection,
+    sid: SessionId,
+    id: ContextNodeId,
+    parent_id: Option<ContextNodeId>,
+    depth: i64,
+    item_id: ItemId,
+    origin_node_id: &str,
+) -> Result<()> {
+    conn.prepare_cached("DELETE FROM pending_inputs WHERE session_id=?1 AND item_id=?2")?
+        .execute(params![sid, item_id])?;
+    if let Some(pid) = parent_id {
+        conn.prepare_cached("DELETE FROM session_leaves WHERE session_id=?1 AND head_id=?2")?
+            .execute(params![sid, pid])?;
+    }
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO session_leaves(session_id, head_id, depth, last_item_id, origin_node_id)
+         SELECT ?1, ?2, ?3, ?4, ?5
+         WHERE NOT EXISTS(SELECT 1 FROM context_nodes WHERE session_id=?1 AND parent_id=?2)",
+    )?
+    .execute(params![sid, id, depth, item_id, origin_node_id])?;
+    Ok(())
+}
+
+pub fn append_context_items(
+    conn: &Connection,
+    sid: SessionId,
+    item_ids: &[ItemId],
+    touch_updated_at: Option<i64>,
+) -> Result<Vec<ContextNodeId>> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let node_id = local_node_id(conn)?.to_string();
+    let scope = session_scope(sid);
+    let mut parent_id: Option<ContextNodeId> = conn
+        .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+        .query_row([sid], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let mut depth: i64 = match parent_id {
+        Some(hid) => conn
+            .prepare_cached("SELECT depth FROM context_nodes WHERE id=?1 AND session_id=?2")?
+            .query_row(params![hid, sid], |r| r.get(0))?,
+        None => 0,
+    };
+
+    let mut created = Vec::with_capacity(item_ids.len());
+    for &item_id in item_ids {
+        let cid = ContextNodeId::new()?;
+        depth += 1;
+        let origin_seq = next_origin_seq(conn, &scope, &node_id)?;
+        conn.prepare_cached(
+            "INSERT INTO context_nodes(id, session_id, parent_id, depth, item_id, origin_node_id, origin_seq)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?
+        .execute(params![cid, sid, parent_id, depth, item_id, &node_id, origin_seq])?;
+        on_context_node_inserted(conn, sid, cid, parent_id, depth, item_id, &node_id)?;
+        conn.prepare_cached(
+            "INSERT INTO active_context(session_id, position, node_id, item_id)
+             VALUES(?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![sid, depth, cid, item_id])?;
+        parent_id = Some(cid);
+        created.push(cid);
+    }
+
+    let last_head = *created.last().unwrap();
+    let ts = tick_hlc_for(&node_id);
+    let rev = next_catalog_rev();
+    if let Some(now) = touch_updated_at {
+        conn.prepare_cached(
+            "UPDATE sessions
+             SET active_head=?2, active_head_ts=?3, updated_at=max(updated_at, ?4), sync_rev=?5
+             WHERE id=?1",
+        )?
+        .execute(params![sid, last_head, ts, now, rev])?;
+    } else {
+        conn.prepare_cached(
+            "UPDATE sessions
+             SET active_head=?2, active_head_ts=?3, sync_rev=?4
+             WHERE id=?1",
+        )?
+        .execute(params![sid, last_head, ts, rev])?;
+    }
+    mark_session_watched(conn, sid)?;
+    stage_session(sid);
+    stage_catalog();
+    Ok(created)
+}
+
+pub fn mark_turn_settled(conn: &Connection, sid: SessionId) -> Result<bool> {
+    let active_head: Option<ContextNodeId> = conn
+        .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+        .query_row([sid], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let Some(head_id) = active_head else {
+        return Ok(false);
+    };
+    let already: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM turn_settled WHERE context_node_id=?)")?
+        .query_row([head_id], |r| r.get(0))?;
+    if already {
+        return Ok(false);
+    }
+    let node_id = local_node_id(conn)?;
+    let origin_seq = next_origin_seq(conn, &session_scope(sid), &node_id)?;
+    let changed = conn
+        .prepare_cached(
+            "INSERT OR IGNORE INTO turn_settled(context_node_id, session_id, origin_node_id, origin_seq)
+             VALUES(?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![head_id, sid, &*node_id, origin_seq])?;
+    if changed > 0 {
+        stage_session(sid);
+    }
+    Ok(changed > 0)
+}
+
+pub fn tombstone_session(conn: &Connection, sid: SessionId, now: i64) -> Result<bool> {
+    let exists: Option<bool> = conn
+        .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+        .query_row([sid], |r| r.get(0))
+        .optional()?;
+    let Some(already_deleted) = exists else {
+        return Ok(false);
+    };
+    let mut bump = false;
+    if !already_deleted {
+        let rev = next_catalog_rev();
+        conn.prepare_cached(
+            "UPDATE sessions
+             SET deleted=1, title='', title_ts='', updated_at=max(updated_at, ?2),
+                 status='idle', last_error='', status_ts='',
+                 model_id='', reasoning_effort=NULL, selection_ts='',
+                 active_head=NULL, active_head_ts='', sync_rev=?3
+             WHERE id=?1",
+        )?
+        .execute(params![sid, now, rev])?;
+        bump = true;
+    }
+    cleanup_deleted_session_data(conn, sid)?;
+    if bump {
+        stage_catalog();
+        stage_session(sid);
+    }
+    Ok(true)
+}
+
+fn cleanup_deleted_session_data(conn: &Connection, sid: SessionId) -> Result<()> {
+    conn.prepare_cached("UPDATE llm_calls SET session_id=NULL WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM active_context WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM pending_inputs WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM session_leaves WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM turn_settled WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM invalidated_warnings WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM context_nodes WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM items WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM watched_sessions WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM sync_vectors WHERE scope=?")?
+        .execute([session_scope(sid)])?;
+    Ok(())
+}
+
+pub fn tombstone_shared_mcp(conn: &Connection, id: McpServerId) -> Result<bool> {
+    let row: Option<(bool, bool)> = conn
+        .prepare_cached("SELECT shared, deleted FROM mcp_servers WHERE id=?")?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((shared, deleted)) = row else {
+        return Ok(false);
+    };
+    if !shared {
+        let changed = conn
+            .prepare_cached("DELETE FROM mcp_servers WHERE id=? AND shared=0")?
+            .execute([id])?;
+        conn.prepare_cached("DELETE FROM mcp_oauth WHERE server_id=?")?
+            .execute([id])?;
+        return Ok(changed > 0);
+    }
+    if deleted {
+        return Ok(false);
+    }
+    let ts = tick_hlc(conn)?;
+    let rev = next_catalog_rev();
+    conn.prepare_cached(
+        "UPDATE mcp_servers
+         SET deleted=1, name='', name_ts=?2,
+             description='', description_ts=?2,
+             enabled=0, enabled_ts=?2,
+             transport='streamable-http', config_json='{}', revision=revision+1, config_ts=?2,
+             allowed_tools=NULL, allowed_tools_ts=?2,
+             timeout_ms=1, timeout_ts=?2,
+             oauth_ts=?2, sync_rev=?3
+         WHERE id=?1",
+    )?
+    .execute(params![id, ts, rev])?;
+    conn.prepare_cached("DELETE FROM mcp_oauth WHERE server_id=?")?
+        .execute([id])?;
+    stage_catalog();
+    Ok(true)
+}
+
+pub fn load_mcp_wire(conn: &Connection, id: McpServerId) -> Result<Option<McpServerWire>> {
+    let row: Option<McpServerWire> = conn
+        .prepare_cached(
+            "SELECT m.id, m.name, m.name_ts, m.description, m.description_ts,
+                    m.enabled, m.enabled_ts, m.transport, m.allowed_tools, m.allowed_tools_ts,
+                    m.config_json, m.timeout_ms, m.timeout_ts, m.config_ts, m.oauth_ts,
+                    m.deleted, m.sync_rev,
+                    o.generation, o.binding, o.credentials, o.rejected
+             FROM mcp_servers m
+             LEFT JOIN mcp_oauth o ON o.server_id = m.id
+             WHERE m.id=?1 AND m.shared=1",
+        )?
+        .query_row([id], |r| {
+            let deleted: bool = r.get(15)?;
+            let oauth_gen: Option<String> = r.get(17)?;
+            let credentials: Option<String> = r.get(19)?;
+            let rejected: Option<bool> = r.get(20)?;
+            let oauth = if !deleted
+                && let Some(generation) = oauth_gen
+                && (credentials.is_some() || rejected == Some(true))
+            {
+                Some(McpOAuthGrantWire {
+                    generation,
+                    binding: r.get(18)?,
+                    credentials,
+                    rejected: rejected.unwrap_or(false),
+                })
+            } else {
+                None
+            };
+            Ok(McpServerWire {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                name_ts: r.get(2)?,
+                description: r.get(3)?,
+                description_ts: r.get(4)?,
+                enabled: r.get(5)?,
+                enabled_ts: r.get(6)?,
+                transport: r.get(7)?,
+                allowed_tools: r.get(8)?,
+                allowed_tools_ts: r.get(9)?,
+                config_json: r.get(10)?,
+                timeout_ms: r.get(11)?,
+                timeout_ts: r.get(12)?,
+                config_ts: r.get(13)?,
+                oauth,
+                oauth_ts: r.get(14)?,
+                deleted,
+                sync_rev: r.get(16)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+pub fn merge_provider_wire(
+    conn: &Connection,
+    w: &ProviderWire,
+) -> Result<(bool, Option<ProviderId>)> {
+    id::observe_id(w.id);
+    validate_hlc(&w.name_ts)?;
+    validate_hlc(&w.base_url_ts)?;
+    validate_hlc(&w.api_key_ts)?;
+    validate_hlc(&w.archived_ts)?;
+    observe_hlc(&w.name_ts);
+    observe_hlc(&w.base_url_ts);
+    observe_hlc(&w.api_key_ts);
+    observe_hlc(&w.archived_ts);
+
+    let local = conn
+        .prepare_cached(
+            "SELECT name, name_ts, base_url, base_url_ts, api_key, api_key_ts, archived_at, archived_ts
+             FROM llm_providers WHERE id=?",
+        )?
+        .query_row([w.id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })
+        .optional()?;
+
+    let Some((
+        mut name,
+        mut name_ts,
+        mut base_url,
+        mut base_url_ts,
+        mut api_key,
+        mut api_key_ts,
+        mut archived_at,
+        mut archived_ts,
+    )) = local
+    else {
+        let rev = next_catalog_rev();
+        conn.prepare_cached(
+            "INSERT INTO llm_providers(id,name,name_ts,base_url,base_url_ts,api_key,api_key_ts,archived_at,archived_ts,sync_rev)
+             VALUES(?,?,?,?,?,?,?,?,?,?)",
+        )?
+        .execute(params![
+            w.id,
+            &w.name,
+            &w.name_ts,
+            &w.base_url,
+            &w.base_url_ts,
+            &w.api_key,
+            &w.api_key_ts,
+            w.archived_at,
+            &w.archived_ts,
+            rev
+        ])?;
+        return Ok((true, Some(w.id)));
+    };
+
+    let mut changed = false;
+    changed |= lww_take(&mut name, &mut name_ts, w.name.clone(), &w.name_ts);
+    changed |= lww_take(
+        &mut base_url,
+        &mut base_url_ts,
+        w.base_url.clone(),
+        &w.base_url_ts,
+    );
+    changed |= lww_take(&mut api_key, &mut api_key_ts, w.api_key.clone(), &w.api_key_ts);
+    changed |= lww_take(
+        &mut archived_at,
+        &mut archived_ts,
+        w.archived_at,
+        &w.archived_ts,
+    );
+    if !changed {
+        return Ok((false, None));
+    }
+    let rev = next_catalog_rev();
+    conn.prepare_cached(
+        "UPDATE llm_providers
+         SET name=?2, name_ts=?3, base_url=?4, base_url_ts=?5,
+             api_key=?6, api_key_ts=?7, archived_at=?8, archived_ts=?9, sync_rev=?10
+         WHERE id=?1",
+    )?
+    .execute(params![
+        w.id,
+        name,
+        name_ts,
+        base_url,
+        base_url_ts,
+        api_key,
+        api_key_ts,
+        archived_at,
+        archived_ts,
+        rev
+    ])?;
+    Ok((true, Some(w.id)))
+}
+
+pub fn merge_model_wire(conn: &Connection, w: &ModelWire) -> Result<(bool, Option<ModelId>)> {
+    id::observe_id(w.id);
+    id::observe_id(w.provider_id);
+    validate_hlc(&w.identity_ts)?;
+    validate_hlc(&w.context_window_ts)?;
+    validate_hlc(&w.input_modalities_ts)?;
+    validate_hlc(&w.reasoning_efforts_ts)?;
+    validate_hlc(&w.pricing_ts)?;
+    validate_hlc(&w.archived_ts)?;
+    observe_hlc(&w.identity_ts);
+    observe_hlc(&w.context_window_ts);
+    observe_hlc(&w.input_modalities_ts);
+    observe_hlc(&w.reasoning_efforts_ts);
+    observe_hlc(&w.pricing_ts);
+    observe_hlc(&w.archived_ts);
+
+    let local = conn
+        .prepare_cached(
+            "SELECT provider_id, model_key, identity_ts,
+                    context_window_tokens, context_window_ts,
+                    input_modalities, input_modalities_ts,
+                    reasoning_efforts, reasoning_efforts_ts,
+                    pricing, pricing_ts, archived_at, archived_ts
+             FROM llm_models WHERE id=?",
+        )?
+        .query_row([w.id], |r| {
+            Ok((
+                r.get::<_, ProviderId>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, Option<i64>>(11)?,
+                r.get::<_, String>(12)?,
+            ))
+        })
+        .optional()?;
+
+    let Some((
+        mut provider_id,
+        mut model_key,
+        mut identity_ts,
+        mut cw,
+        mut cw_ts,
+        mut modalities,
+        mut modalities_ts,
+        mut efforts,
+        mut efforts_ts,
+        mut pricing,
+        mut pricing_ts,
+        mut archived_at,
+        mut archived_ts,
+    )) = local
+    else {
+        let rev = next_catalog_rev();
+        conn.prepare_cached(
+            "INSERT INTO llm_models(
+                id, provider_id, model_key, identity_ts,
+                context_window_tokens, context_window_ts,
+                input_modalities, input_modalities_ts,
+                reasoning_efforts, reasoning_efforts_ts,
+                pricing, pricing_ts, archived_at, archived_ts, sync_rev
+             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )?
+        .execute(params![
+            w.id,
+            w.provider_id,
+            &w.model_key,
+            &w.identity_ts,
+            w.context_window_tokens,
+            &w.context_window_ts,
+            &w.input_modalities,
+            &w.input_modalities_ts,
+            &w.reasoning_efforts,
+            &w.reasoning_efforts_ts,
+            &w.pricing,
+            &w.pricing_ts,
+            w.archived_at,
+            &w.archived_ts,
+            rev
+        ])?;
+        return Ok((true, Some(w.id)));
+    };
+
+    let mut changed = false;
+    changed |= lww_take_pair(
+        &mut provider_id,
+        &mut model_key,
+        &mut identity_ts,
+        w.provider_id,
+        w.model_key.clone(),
+        &w.identity_ts,
+    );
+    changed |= lww_take(&mut cw, &mut cw_ts, w.context_window_tokens, &w.context_window_ts);
+    changed |= lww_take(
+        &mut modalities,
+        &mut modalities_ts,
+        w.input_modalities.clone(),
+        &w.input_modalities_ts,
+    );
+    changed |= lww_take(
+        &mut efforts,
+        &mut efforts_ts,
+        w.reasoning_efforts.clone(),
+        &w.reasoning_efforts_ts,
+    );
+    changed |= lww_take(&mut pricing, &mut pricing_ts, w.pricing.clone(), &w.pricing_ts);
+    changed |= lww_take(
+        &mut archived_at,
+        &mut archived_ts,
+        w.archived_at,
+        &w.archived_ts,
+    );
+    if !changed {
+        return Ok((false, None));
+    }
+    let rev = next_catalog_rev();
+    conn.prepare_cached(
+        "UPDATE llm_models
+         SET provider_id=?2, model_key=?3, identity_ts=?4,
+             context_window_tokens=?5, context_window_ts=?6,
+             input_modalities=?7, input_modalities_ts=?8,
+             reasoning_efforts=?9, reasoning_efforts_ts=?10,
+             pricing=?11, pricing_ts=?12, archived_at=?13, archived_ts=?14, sync_rev=?15
+         WHERE id=?1",
+    )?
+    .execute(params![
+        w.id,
+        provider_id,
+        model_key,
+        identity_ts,
+        cw,
+        cw_ts,
+        modalities,
+        modalities_ts,
+        efforts,
+        efforts_ts,
+        pricing,
+        pricing_ts,
+        archived_at,
+        archived_ts,
+        rev
+    ])?;
+    Ok((true, Some(w.id)))
+}
+
+pub fn merge_mcp_server_wire(
+    conn: &Connection,
+    w: &McpServerWire,
+) -> Result<(bool, Option<McpChange>)> {
+    id::observe_id(w.id);
+    for ts in [
+        &w.name_ts,
+        &w.description_ts,
+        &w.enabled_ts,
+        &w.allowed_tools_ts,
+        &w.timeout_ts,
+        &w.config_ts,
+        &w.oauth_ts,
+    ] {
+        validate_hlc(ts)?;
+        observe_hlc(ts);
+    }
+
+    let local = conn
+        .prepare_cached(
+            "SELECT m.name, m.name_ts, m.description, m.description_ts,
+                    m.enabled, m.enabled_ts, m.shared, m.transport,
+                    m.allowed_tools, m.allowed_tools_ts, m.config_json,
+                    m.timeout_ms, m.timeout_ts, m.config_ts, m.oauth_ts, m.deleted,
+                    o.generation, o.binding, o.credentials, o.rejected
+             FROM mcp_servers m
+             LEFT JOIN mcp_oauth o ON o.server_id = m.id
+             WHERE m.id=?1",
+        )?
+        .query_row([w.id], |r| {
+            let oauth_gen: Option<String> = r.get(16)?;
+            let oauth = oauth_gen.map(|generation| McpOAuthGrantWire {
+                generation,
+                binding: r.get(17).unwrap_or(None),
+                credentials: r.get(18).unwrap_or(None),
+                rejected: r.get::<_, Option<bool>>(19).unwrap_or(None).unwrap_or(false),
+            });
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, bool>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, String>(12)?,
+                r.get::<_, String>(13)?,
+                r.get::<_, String>(14)?,
+                r.get::<_, bool>(15)?,
+                oauth,
+            ))
+        })
+        .optional()?;
+
+    let Some((
+        mut name,
+        mut name_ts,
+        mut description,
+        mut description_ts,
+        mut enabled,
+        mut enabled_ts,
+        shared,
+        mut transport,
+        mut allowed_tools,
+        mut allowed_tools_ts,
+        mut config_json,
+        mut timeout_ms,
+        mut timeout_ts,
+        mut config_ts,
+        mut oauth_ts,
+        local_deleted,
+        local_oauth,
+    )) = local
+    else {
+        let rev = next_catalog_rev();
+        if w.deleted {
+            conn.prepare_cached(
+                "INSERT INTO mcp_servers(
+                    id, name, name_ts, description, description_ts, enabled, enabled_ts,
+                    shared, transport, allowed_tools, allowed_tools_ts, config_json,
+                    timeout_ms, timeout_ts, revision, config_ts, oauth_ts, deleted, sync_rev
+                 ) VALUES(?1,'',?2,'',?2,0,?2,1,'streamable-http',NULL,?2,'{}',1,?2,1,?2,?2,1,?3)",
+            )?
+            .execute(params![w.id, &w.name_ts, rev])?;
+            return Ok((true, Some(McpChange { id: w.id, cancel_login: true })));
+        }
+        conn.prepare_cached(
+            "INSERT INTO mcp_servers(
+                id, name, name_ts, description, description_ts, enabled, enabled_ts,
+                shared, transport, allowed_tools, allowed_tools_ts, config_json,
+                timeout_ms, timeout_ts, revision, config_ts, oauth_ts, deleted, sync_rev
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10,?11,?12,?13,1,?14,?15,0,?16)",
+        )?
+        .execute(params![
+            w.id,
+            &w.name,
+            &w.name_ts,
+            &w.description,
+            &w.description_ts,
+            w.enabled,
+            &w.enabled_ts,
+            &w.transport,
+            &w.allowed_tools,
+            &w.allowed_tools_ts,
+            &w.config_json,
+            w.timeout_ms,
+            &w.timeout_ts,
+            &w.config_ts,
+            &w.oauth_ts,
+            rev
+        ])?;
+        if w.oauth_ts >= w.config_ts
+            && let Some(ref g) = w.oauth
+        {
+            conn.prepare_cached(
+                "INSERT INTO mcp_oauth(server_id, generation, binding, pending, credentials, pending_refresh, rejected)
+                 VALUES(?1, ?2, ?3, NULL, ?4, NULL, ?5)",
+            )?
+            .execute(params![w.id, &g.generation, &g.binding, &g.credentials, g.rejected])?;
+        }
+        return Ok((true, Some(McpChange { id: w.id, cancel_login: false })));
+    };
+
+    if local_deleted {
+        return Ok((false, None));
+    }
+    if w.deleted {
+        if !shared {
+            return Ok((false, None));
+        }
+        let rev = next_catalog_rev();
+        let ts = tick_hlc(conn)?;
+        conn.prepare_cached(
+            "UPDATE mcp_servers
+             SET deleted=1, name='', name_ts=?2,
+                 description='', description_ts=?2,
+                 enabled=0, enabled_ts=?2,
+                 transport='streamable-http', config_json='{}', revision=revision+1, config_ts=?2,
+                 allowed_tools=NULL, allowed_tools_ts=?2,
+                 timeout_ms=1, timeout_ts=?2,
+                 oauth_ts=?2, sync_rev=?3
+             WHERE id=?1",
+        )?
+        .execute(params![w.id, ts, rev])?;
+        conn.prepare_cached("DELETE FROM mcp_oauth WHERE server_id=?")?
+            .execute([w.id])?;
+        return Ok((true, Some(McpChange { id: w.id, cancel_login: true })));
+    }
+    if !shared {
+        return Ok((false, None));
+    }
+
+    let mut changed = false;
+    let mut cancel_login = false;
+    changed |= lww_take(&mut name, &mut name_ts, w.name.clone(), &w.name_ts);
+    changed |= lww_take(
+        &mut description,
+        &mut description_ts,
+        w.description.clone(),
+        &w.description_ts,
+    );
+    changed |= lww_take(&mut enabled, &mut enabled_ts, w.enabled, &w.enabled_ts);
+    if !enabled && changed {
+        cancel_login = true;
+    }
+    changed |= lww_take(
+        &mut allowed_tools,
+        &mut allowed_tools_ts,
+        w.allowed_tools.clone(),
+        &w.allowed_tools_ts,
+    );
+    changed |= lww_take(&mut timeout_ms, &mut timeout_ts, w.timeout_ms, &w.timeout_ts);
+    let config_changed = lww_take_pair(
+        &mut transport,
+        &mut config_json,
+        &mut config_ts,
+        w.transport.clone(),
+        w.config_json.clone(),
+        &w.config_ts,
+    );
+    changed |= config_changed;
+    if config_changed {
+        cancel_login = true;
+    }
+
+    let incoming_grant_ts = w.oauth_ts.as_str();
+    let grant_newer = incoming_grant_ts > oauth_ts.as_str();
+    let config_invalidates_local = config_changed && oauth_ts.as_str() < config_ts.as_str();
+
+    let mut oauth_changed = false;
+    let next_grant: Option<Option<&McpOAuthGrantWire>> = if grant_newer {
+        if w.oauth.is_none() || incoming_grant_ts >= config_ts.as_str() {
+            oauth_ts = incoming_grant_ts.to_owned();
+            oauth_changed = true;
+            Some(w.oauth.as_ref())
+        } else {
+            oauth_ts = config_ts.clone();
+            oauth_changed = local_oauth.is_some();
+            Some(None)
+        }
+    } else if config_invalidates_local {
+        oauth_ts = config_ts.clone();
+        oauth_changed = local_oauth.is_some();
+        Some(None)
+    } else {
+        None
+    };
+
+    if oauth_changed {
+        changed = true;
+        cancel_login = true;
+    }
+    if !changed {
+        return Ok((false, None));
+    }
+
+    let rev = next_catalog_rev();
+    conn.prepare_cached(
+        "UPDATE mcp_servers
+         SET name=?2, name_ts=?3, description=?4, description_ts=?5,
+             enabled=?6, enabled_ts=?7, transport=?8,
+             allowed_tools=?9, allowed_tools_ts=?10,
+             config_json=?11, timeout_ms=?12, timeout_ts=?13,
+             revision=revision+1, config_ts=?14, oauth_ts=?15, sync_rev=?16
+         WHERE id=?1",
+    )?
+    .execute(params![
+        w.id,
+        name,
+        name_ts,
+        description,
+        description_ts,
+        enabled,
+        enabled_ts,
+        transport,
+        allowed_tools,
+        allowed_tools_ts,
+        config_json,
+        timeout_ms,
+        timeout_ts,
+        config_ts,
+        oauth_ts,
+        rev
+    ])?;
+
+    if let Some(grant_opt) = next_grant {
+        match grant_opt {
+            Some(g) => {
+                conn.prepare_cached(
+                    "INSERT INTO mcp_oauth(server_id, generation, binding, pending, credentials, pending_refresh, rejected)
+                     VALUES(?1, ?2, ?3, NULL, ?4, NULL, ?5)
+                     ON CONFLICT(server_id) DO UPDATE SET
+                       generation=excluded.generation,
+                       binding=excluded.binding,
+                       pending=NULL,
+                       credentials=excluded.credentials,
+                       pending_refresh=NULL,
+                       rejected=excluded.rejected",
+                )?
+                .execute(params![w.id, &g.generation, &g.binding, &g.credentials, g.rejected])?;
+            }
+            None => {
+                conn.prepare_cached("DELETE FROM mcp_oauth WHERE server_id=?")?
+                    .execute([w.id])?;
+            }
+        }
+    }
+
+    Ok((true, Some(McpChange { id: w.id, cancel_login })))
+}
+
+pub enum SessionMergeResult {
+    Unchanged,
+    Updated {
+        deleted: bool,
+        branch_switched: bool,
+        context_advanced: bool,
+    },
+}
+
+pub fn merge_session_wire(conn: &Connection, w: &SessionWire) -> Result<SessionMergeResult> {
+    id::observe_id(w.id);
+    if !w.model_id.is_empty() {
+        let _ = id::observe_id_str(&w.model_id);
+    }
+    if let Some(head) = w.active_head {
+        id::observe_id(head);
+    }
+    for ts in [&w.title_ts, &w.status_ts, &w.selection_ts, &w.active_head_ts] {
+        validate_hlc(ts)?;
+        observe_hlc(ts);
+    }
+
+    let local = conn
+        .prepare_cached(
+            "SELECT title, title_ts, created_at, updated_at,
+                    status, last_error, status_ts,
+                    model_id, reasoning_effort, selection_ts,
+                    active_head, active_head_ts, deleted
+             FROM sessions WHERE id=?",
+        )?
+        .query_row([w.id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, Option<ContextNodeId>>(10)?,
+                r.get::<_, String>(11)?,
+                r.get::<_, bool>(12)?,
+            ))
+        })
+        .optional()?;
+
+    let wire_status = match w.status.as_str() {
+        "paused" => "paused",
+        _ => "idle",
+    };
+    let wire_err = if wire_status == "paused" {
+        w.last_error.as_str()
+    } else {
+        ""
+    };
+
+    let Some((
+        mut title,
+        mut title_ts,
+        created_at,
+        mut updated_at,
+        mut status,
+        mut last_error,
+        mut status_ts,
+        mut model_id,
+        mut reasoning_effort,
+        mut selection_ts,
+        mut active_head,
+        mut active_head_ts,
+        local_deleted,
+    )) = local
+    else {
+        let rev = next_catalog_rev();
+        if w.deleted {
+            conn.prepare_cached(
+                "INSERT INTO sessions(
+                    id, title, title_ts, created_at, updated_at,
+                    status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
+                    active_head, active_head_ts, deleted, sync_rev
+                 ) VALUES(?1,'','',?2,?3,'idle','','','',NULL,'',NULL,'',1,?4)",
+            )?
+            .execute(params![w.id, w.created_at, w.updated_at, rev])?;
+            cleanup_deleted_session_data(conn, w.id)?;
+            return Ok(SessionMergeResult::Updated {
+                deleted: true,
+                branch_switched: false,
+                context_advanced: false,
+            });
+        }
+        conn.prepare_cached(
+            "INSERT INTO sessions(
+                id, title, title_ts, created_at, updated_at,
+                status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
+                active_head, active_head_ts, deleted, sync_rev
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14)",
+        )?
+        .execute(params![
+            w.id,
+            &w.title,
+            &w.title_ts,
+            w.created_at,
+            w.updated_at,
+            wire_status,
+            wire_err,
+            &w.status_ts,
+            &w.model_id,
+            &w.reasoning_effort,
+            &w.selection_ts,
+            w.active_head,
+            &w.active_head_ts,
+            rev
+        ])?;
+        let (branch_switched, context_advanced) = if w.active_head.is_some() {
+            match reconcile_active_context(conn, w.id)? {
+                ActiveContextChange::Switched | ActiveContextChange::Cleared => (true, false),
+                ActiveContextChange::Appended(_) => (false, true),
+                ActiveContextChange::Unchanged | ActiveContextChange::Incomplete => (false, false),
+            }
+        } else {
+            (false, false)
+        };
+        return Ok(SessionMergeResult::Updated {
+            deleted: false,
+            branch_switched,
+            context_advanced,
+        });
+    };
+
+    if local_deleted {
+        return Ok(SessionMergeResult::Unchanged);
+    }
+    if w.deleted {
+        let rev = next_catalog_rev();
+        let next_updated = updated_at.max(w.updated_at);
+        conn.prepare_cached(
+            "UPDATE sessions
+             SET deleted=1, title='', title_ts='', updated_at=?2,
+                 status='idle', last_error='', status_ts='',
+                 model_id='', reasoning_effort=NULL, selection_ts='',
+                 active_head=NULL, active_head_ts='', sync_rev=?3
+             WHERE id=?1",
+        )?
+        .execute(params![w.id, next_updated, rev])?;
+        cleanup_deleted_session_data(conn, w.id)?;
+        return Ok(SessionMergeResult::Updated {
+            deleted: true,
+            branch_switched: false,
+            context_advanced: false,
+        });
+    }
+
+    let mut changed = false;
+    changed |= lww_take(&mut title, &mut title_ts, w.title.clone(), &w.title_ts);
+    let next_created = if created_at == 0 || (w.created_at > 0 && w.created_at < created_at) {
+        w.created_at
+    } else {
+        created_at
+    };
+    if next_created != created_at {
+        changed = true;
+    }
+    if w.updated_at > updated_at {
+        updated_at = w.updated_at;
+        changed = true;
+    }
+    if !matches!(status.as_str(), "running" | "pausing") {
+        changed |= lww_take_pair(
+            &mut status,
+            &mut last_error,
+            &mut status_ts,
+            wire_status.to_owned(),
+            wire_err.to_owned(),
+            &w.status_ts,
+        );
+    }
+    if !w.model_id.is_empty() {
+        changed |= lww_take_pair(
+            &mut model_id,
+            &mut reasoning_effort,
+            &mut selection_ts,
+            w.model_id.clone(),
+            w.reasoning_effort.clone(),
+            &w.selection_ts,
+        );
+    }
+    let head_changed = lww_take(
+        &mut active_head,
+        &mut active_head_ts,
+        w.active_head,
+        &w.active_head_ts,
+    );
+    changed |= head_changed;
+
+    if !changed {
+        return Ok(SessionMergeResult::Unchanged);
+    }
+
+    let rev = next_catalog_rev();
+    conn.prepare_cached(
+        "UPDATE sessions
+         SET title=?2, title_ts=?3, created_at=?4, updated_at=?5,
+             status=?6, last_error=?7, status_ts=?8,
+             model_id=?9, reasoning_effort=?10, selection_ts=?11,
+             active_head=?12, active_head_ts=?13, sync_rev=?14
+         WHERE id=?1",
+    )?
+    .execute(params![
+        w.id,
+        title,
+        title_ts,
+        next_created,
+        updated_at,
+        status,
+        last_error,
+        status_ts,
+        model_id,
+        reasoning_effort,
+        selection_ts,
+        active_head,
+        active_head_ts,
+        rev
+    ])?;
+
+    let (branch_switched, context_advanced) = if head_changed {
+        match reconcile_active_context(conn, w.id)? {
+            ActiveContextChange::Switched | ActiveContextChange::Cleared => (true, false),
+            ActiveContextChange::Appended(_) => (false, true),
+            ActiveContextChange::Unchanged | ActiveContextChange::Incomplete => (false, false),
+        }
+    } else {
+        (false, false)
+    };
+
+    Ok(SessionMergeResult::Updated {
+        deleted: false,
+        branch_switched,
+        context_advanced,
+    })
+}
+
+pub fn merge_llm_call_wire(conn: &Connection, w: &LlmCallWire) -> Result<bool> {
+    id::observe_id(w.id);
+    id::observe_id(w.model_id);
+    if let Some(sid) = w.session_id {
+        id::observe_id(sid);
+    }
+    if !matches!(
+        w.status.as_str(),
+        "in_flight" | "succeeded" | "failed" | "cancelled" | "interrupted"
+    ) {
+        return Err(Error::bad("invalid llm_calls status"));
+    }
+
+    let effective_sid = match w.session_id {
+        Some(sid) => {
+            let deleted: bool = conn
+                .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
+                .query_row([sid], |r| r.get(0))?;
+            if deleted { None } else { Some(sid) }
+        }
+        None => None,
+    };
+
+    let existing: Option<(Option<SessionId>, String, i64)> = conn
+        .prepare_cached("SELECT session_id, status, origin_seq FROM llm_calls WHERE id=?")?
+        .query_row([w.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()?;
+
+    let mut changed = false;
+    match existing {
+        None => {
+            conn.prepare_cached(
+                "INSERT INTO llm_calls(
+                    id, session_id, model_id, reasoning_effort, input_end_position,
+                    started_at, finished_at, status, upstream_response_id, http_status,
+                    error_summary, raw_usage, input_uncached_tokens, cache_read_tokens,
+                    cache_write_tokens, output_tokens, pricing_snapshot, cost_nano_usd,
+                    origin_node_id, origin_seq
+                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            )?
+            .execute(params![
+                w.id,
+                effective_sid,
+                w.model_id,
+                &w.reasoning_effort,
+                w.input_end_position,
+                w.started_at,
+                w.finished_at,
+                &w.status,
+                &w.upstream_response_id,
+                w.http_status,
+                &w.error_summary,
+                &w.raw_usage,
+                w.input_uncached_tokens,
+                w.cache_read_tokens,
+                w.cache_write_tokens,
+                w.output_tokens,
+                &w.pricing_snapshot,
+                w.cost_nano_usd,
+                &w.origin_node_id,
+                w.origin_seq
+            ])?;
+            changed = true;
+        }
+        Some((cur_sid, cur_status, cur_seq)) => {
+            let cur_terminal = cur_status != "in_flight";
+            let in_terminal = w.status != "in_flight";
+            let upgrade_status = !cur_terminal && in_terminal
+                || (cur_terminal && in_terminal && w.origin_seq > cur_seq);
+            let detach_sid = cur_sid.is_some() && effective_sid.is_none();
+            if upgrade_status || detach_sid {
+                let next_sid = if cur_sid.is_none() || effective_sid.is_none() {
+                    None
+                } else {
+                    cur_sid
+                };
+                if upgrade_status {
+                    conn.prepare_cached(
+                        "UPDATE llm_calls
+                         SET session_id=?2, finished_at=?3, status=?4, upstream_response_id=?5,
+                             http_status=?6, error_summary=?7, raw_usage=?8,
+                             input_uncached_tokens=?9, cache_read_tokens=?10,
+                             cache_write_tokens=?11, output_tokens=?12,
+                             pricing_snapshot=?13, cost_nano_usd=?14, origin_seq=?15
+                         WHERE id=?1",
+                    )?
+                    .execute(params![
+                        w.id,
+                        next_sid,
+                        w.finished_at,
+                        &w.status,
+                        &w.upstream_response_id,
+                        w.http_status,
+                        &w.error_summary,
+                        &w.raw_usage,
+                        w.input_uncached_tokens,
+                        w.cache_read_tokens,
+                        w.cache_write_tokens,
+                        w.output_tokens,
+                        &w.pricing_snapshot,
+                        w.cost_nano_usd,
+                        w.origin_seq.max(cur_seq)
+                    ])?;
+                } else {
+                    conn.prepare_cached("UPDATE llm_calls SET session_id=NULL WHERE id=?")?
+                        .execute([w.id])?;
+                }
+                changed = true;
+            }
+        }
+    }
+    advance_vector(conn, CALLS_SCOPE, &w.origin_node_id, w.origin_seq)?;
+    Ok(changed)
+}
+
+pub fn apply_catalog_delta(conn: &Connection, delta: &CatalogDelta) -> Result<CatalogMergeOutcome> {
+    with_savepoint(conn, "merge_catalog_delta", || {
+        let mut out = CatalogMergeOutcome::default();
+        for p in &delta.providers {
+            let (changed, _) = merge_provider_wire(conn, p)?;
+            if changed {
+                out.changed = true;
+                out.catalog_changed = true;
+            }
+        }
+        for m in &delta.models {
+            let (changed, _) = merge_model_wire(conn, m)?;
+            if changed {
+                out.changed = true;
+                out.catalog_changed = true;
+            }
+        }
+        for s in &delta.mcp_servers {
+            let (changed, ch) = merge_mcp_server_wire(conn, s)?;
+            if changed {
+                out.changed = true;
+            }
+            if let Some(ch) = ch {
+                out.mcp_changes.push(ch);
+            }
+        }
+        for sess in &delta.sessions {
+            match merge_session_wire(conn, sess)? {
+                SessionMergeResult::Unchanged => {}
+                SessionMergeResult::Updated {
+                    deleted,
+                    branch_switched,
+                    context_advanced,
+                } => {
+                    out.changed = true;
+                    if deleted {
+                        out.deleted_sessions.insert(sess.id);
+                    } else {
+                        out.changed_sessions.insert(sess.id);
+                        if branch_switched {
+                            out.switched_sessions.insert(sess.id);
+                        } else if context_advanced {
+                            out.resync_sessions.insert(sess.id);
+                        }
+                    }
+                }
+            }
+        }
+        for call in &delta.calls {
+            if merge_llm_call_wire(conn, call)? {
+                out.changed = true;
+            }
+        }
+        for (node_id, &seq) in &delta.calls_vector {
+            advance_vector(conn, CALLS_SCOPE, node_id, seq)?;
+        }
+        Ok(out)
+    })
+}
+
+pub fn merge_attachment_refs(conn: &Connection, refs: &[AttachmentRef]) -> Result<bool> {
+    let mut has_missing = false;
+    for r in refs {
+        id::observe_id(r.id);
+        if r.byte_len <= 0 || r.byte_len > crate::media::MAX_ATTACHMENT_BYTES as i64 {
+            return Err(Error::bad("invalid attachment metadata byte_len"));
+        }
+        let inserted = conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO attachments(id, mime_type, content_hash, byte_len, data)
+                 VALUES(?1, ?2, ?3, ?4, NULL)",
+            )?
+            .execute(params![r.id, &r.mime_type, r.content_hash.as_slice(), r.byte_len])?;
+        if inserted > 0 {
+            let alias: Option<i64> = conn
+                .prepare_cached(
+                    "SELECT rowid FROM attachments
+                     WHERE content_hash=?1 AND byte_len=?2 AND data IS NOT NULL LIMIT 1",
+                )?
+                .query_row(params![r.content_hash.as_slice(), r.byte_len], |row| row.get(0))
+                .optional()?;
+            if let Some(rowid) = alias {
+                conn.prepare_cached(
+                    "UPDATE attachments SET data=(SELECT data FROM attachments WHERE rowid=?1)
+                     WHERE id=?2 AND data IS NULL",
+                )?
+                .execute(params![rowid, r.id])?;
+            } else {
+                has_missing = true;
+            }
+        }
+    }
+    Ok(has_missing)
+}
+
+pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<SessionMergeOutcome> {
+    let sid = delta.session_id;
+    id::observe_id(sid);
+    with_savepoint(conn, "merge_session_delta", || {
+        let mut out = SessionMergeOutcome::default();
+        let local_deleted: bool = conn
+            .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
+            .query_row([sid], |r| r.get(0))?;
+        if local_deleted {
+            return Ok(out);
+        }
+        if delta.deleted {
+            let exists: bool = conn
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)")?
+                .query_row([sid], |r| r.get(0))?;
+            let now = chrono::Utc::now().timestamp_millis();
+            if exists {
+                tombstone_session(conn, sid, now)?;
+            } else {
+                let rev = next_catalog_rev();
+                conn.prepare_cached(
+                    "INSERT INTO sessions(
+                        id, title, title_ts, created_at, updated_at,
+                        status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
+                        active_head, active_head_ts, deleted, sync_rev
+                     ) VALUES(?1,'','',?2,?2,'idle','','','',NULL,'',NULL,'',1,?3)",
+                )?
+                .execute(params![sid, now, rev])?;
+                cleanup_deleted_session_data(conn, sid)?;
+            }
+            out.changed = true;
+            out.deleted = true;
+            return Ok(out);
+        }
+
+        if !delta.attachments.is_empty() {
+            out.has_null_attachments |= merge_attachment_refs(conn, &delta.attachments)?;
+        }
+
+        let scope = session_scope(sid);
+        let mut content_touched = false;
+
+        for iw in &delta.invalidated_warnings {
+            id::observe_id(iw.item_id);
+            id::observe_id(iw.session_id);
+            if iw.session_id != sid {
+                return Err(Error::bad("invalidated_warning session mismatch"));
+            }
+            let ins = conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO invalidated_warnings(item_id, session_id, origin_node_id, origin_seq)
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![iw.item_id, sid, &iw.origin_node_id, iw.origin_seq])?;
+            if ins > 0 {
+                conn.prepare_cached("DELETE FROM pending_inputs WHERE session_id=?1 AND item_id=?2")?
+                    .execute(params![sid, iw.item_id])?;
+                out.changed = true;
+                content_touched = true;
+            }
+        }
+
+        for item in &delta.items {
+            id::observe_id(item.id);
+            id::observe_id(item.session_id);
+            if let Some(t) = item.target_id {
+                id::observe_id(t);
+            }
+            if let Some(c) = item.llm_call_id {
+                id::observe_id(c);
+            }
+            if let Some(cm) = item.codemode_call_item_id {
+                id::observe_id(cm);
+            }
+            if item.session_id != sid {
+                return Err(Error::bad("item session mismatch"));
+            }
+            let payload_val: Value = serde_json::from_str(&item.payload)
+                .map_err(|_| Error::bad("invalid item payload JSON"))?;
+            let ins = conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO items(
+                        id, session_id, kind, payload, target_id, llm_call_id,
+                        idempotency_key, codemode_call_item_id, origin_node_id, origin_seq
+                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                )?
+                .execute(params![
+                    item.id,
+                    sid,
+                    &item.kind,
+                    &item.payload,
+                    item.target_id,
+                    item.llm_call_id,
+                    &item.idempotency_key,
+                    item.codemode_call_item_id,
+                    &item.origin_node_id,
+                    item.origin_seq
+                ])?;
+            if ins > 0 {
+                on_item_inserted(conn, sid, item.id, &item.kind, &payload_val, item.target_id)?;
+                out.new_items.push(item.id);
+                out.changed = true;
+                content_touched = true;
+            }
+        }
+
+        for node in &delta.context_nodes {
+            id::observe_id(node.id);
+            id::observe_id(node.session_id);
+            id::observe_id(node.item_id);
+            if let Some(p) = node.parent_id {
+                id::observe_id(p);
+            }
+            if node.session_id != sid {
+                return Err(Error::bad("context_node session mismatch"));
+            }
+            let ins = conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO context_nodes(
+                        id, session_id, parent_id, depth, item_id, origin_node_id, origin_seq
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(params![
+                    node.id,
+                    sid,
+                    node.parent_id,
+                    node.depth,
+                    node.item_id,
+                    &node.origin_node_id,
+                    node.origin_seq
+                ])?;
+            if ins > 0 {
+                on_context_node_inserted(
+                    conn,
+                    sid,
+                    node.id,
+                    node.parent_id,
+                    node.depth,
+                    node.item_id,
+                    &node.origin_node_id,
+                )?;
+                out.changed = true;
+                content_touched = true;
+            }
+        }
+
+        for ts in &delta.turn_settled {
+            id::observe_id(ts.context_node_id);
+            id::observe_id(ts.session_id);
+            if ts.session_id != sid {
+                return Err(Error::bad("turn_settled session mismatch"));
+            }
+            let ins = conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO turn_settled(
+                        context_node_id, session_id, origin_node_id, origin_seq
+                     ) VALUES(?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![
+                    ts.context_node_id,
+                    sid,
+                    &ts.origin_node_id,
+                    ts.origin_seq
+                ])?;
+            if ins > 0 {
+                out.changed = true;
+            }
+        }
+
+        for (origin_node_id, &seq) in &delta.advanced_vector {
+            advance_vector(conn, &scope, origin_node_id, seq)?;
+        }
+
+        if content_touched {
+            let change = reconcile_active_context(conn, sid)?;
+            if matches!(
+                change,
+                ActiveContextChange::Switched | ActiveContextChange::Cleared
+            ) {
+                out.reset_view = true;
+            }
+        }
+        Ok(out)
+    })
+}
+
+enum CatalogRow {
+    Provider(ProviderWire),
+    Model(ModelWire),
+    Mcp(McpServerWire),
+    Session(SessionWire),
+}
+
+impl CatalogRow {
+    fn sync_rev(&self) -> i64 {
+        match self {
+            Self::Provider(r) => r.sync_rev,
+            Self::Model(r) => r.sync_rev,
+            Self::Mcp(r) => r.sync_rev,
+            Self::Session(r) => r.sync_rev,
+        }
+    }
+
+    fn approx_bytes(&self) -> usize {
+        match self {
+            Self::Provider(r) => r.name.len() + r.base_url.len() + r.api_key.as_deref().map_or(0, str::len) + 128,
+            Self::Model(r) => {
+                r.model_key.len()
+                    + r.input_modalities.len()
+                    + r.reasoning_efforts.len()
+                    + r.pricing.as_deref().map_or(0, str::len)
+                    + 192
+            }
+            Self::Mcp(r) => {
+                r.name.len()
+                    + r.description.len()
+                    + r.config_json.len()
+                    + r.allowed_tools.as_deref().map_or(0, str::len)
+                    + r.oauth.as_ref().map_or(256, |o| {
+                        o.generation.len()
+                            + o.binding.as_deref().map_or(0, str::len)
+                            + o.credentials.as_deref().map_or(0, str::len)
+                    })
+                    + 256
+            }
+            Self::Session(r) => r.title.len() + r.last_error.len() + 256,
+        }
+    }
+}
+
+pub fn read_catalog_delta(
+    conn: &Connection,
+    since_rev: i64,
+    remote_calls_vector: &BTreeMap<String, i64>,
+) -> Result<CatalogDelta> {
+    let db_epoch: String =
+        conn.query_row("SELECT db_epoch FROM local_node WHERE id=1", [], |r| r.get(0))?;
+    let head_rev = current_catalog_rev();
+    let mut rows: Vec<CatalogRow> = Vec::new();
+    let mut safe_ceiling = i64::MAX;
+
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, name, name_ts, base_url, base_url_ts, api_key, api_key_ts,
+                    archived_at, archived_ts, sync_rev
+             FROM llm_providers WHERE sync_rev > ?1
+             ORDER BY sync_rev ASC, id ASC LIMIT ?2",
+        )?;
+        let list = stmt
+            .query_map(params![since_rev, DELTA_PAGE_LIMIT as i64], |r| {
+                Ok(ProviderWire {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    name_ts: r.get(2)?,
+                    base_url: r.get(3)?,
+                    base_url_ts: r.get(4)?,
+                    api_key: r.get(5)?,
+                    api_key_ts: r.get(6)?,
+                    archived_at: r.get(7)?,
+                    archived_ts: r.get(8)?,
+                    sync_rev: r.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if list.len() == DELTA_PAGE_LIMIT
+            && let Some(last) = list.last()
+        {
+            safe_ceiling = safe_ceiling.min(last.sync_rev);
+        }
+        rows.extend(list.into_iter().map(CatalogRow::Provider));
+    }
+
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, provider_id, model_key, identity_ts,
+                    context_window_tokens, context_window_ts,
+                    input_modalities, input_modalities_ts,
+                    reasoning_efforts, reasoning_efforts_ts,
+                    pricing, pricing_ts, archived_at, archived_ts, sync_rev
+             FROM llm_models WHERE sync_rev > ?1
+             ORDER BY sync_rev ASC, id ASC LIMIT ?2",
+        )?;
+        let list = stmt
+            .query_map(params![since_rev, DELTA_PAGE_LIMIT as i64], |r| {
+                Ok(ModelWire {
+                    id: r.get(0)?,
+                    provider_id: r.get(1)?,
+                    model_key: r.get(2)?,
+                    identity_ts: r.get(3)?,
+                    context_window_tokens: r.get(4)?,
+                    context_window_ts: r.get(5)?,
+                    input_modalities: r.get(6)?,
+                    input_modalities_ts: r.get(7)?,
+                    reasoning_efforts: r.get(8)?,
+                    reasoning_efforts_ts: r.get(9)?,
+                    pricing: r.get(10)?,
+                    pricing_ts: r.get(11)?,
+                    archived_at: r.get(12)?,
+                    archived_ts: r.get(13)?,
+                    sync_rev: r.get(14)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if list.len() == DELTA_PAGE_LIMIT
+            && let Some(last) = list.last()
+        {
+            safe_ceiling = safe_ceiling.min(last.sync_rev);
+        }
+        rows.extend(list.into_iter().map(CatalogRow::Model));
+    }
+
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.id, m.name, m.name_ts, m.description, m.description_ts,
+                    m.enabled, m.enabled_ts, m.transport, m.allowed_tools, m.allowed_tools_ts,
+                    m.config_json, m.timeout_ms, m.timeout_ts, m.config_ts, m.oauth_ts,
+                    m.deleted, m.sync_rev,
+                    o.generation, o.binding, o.credentials, o.rejected
+             FROM mcp_servers m
+             LEFT JOIN mcp_oauth o ON o.server_id = m.id
+             WHERE m.shared = 1 AND m.sync_rev > ?1
+             ORDER BY m.sync_rev ASC, m.id ASC LIMIT ?2",
+        )?;
+        let list = stmt
+            .query_map(params![since_rev, DELTA_PAGE_LIMIT as i64], |r| {
+                let deleted: bool = r.get(15)?;
+                let oauth_gen: Option<String> = r.get(17)?;
+                let credentials: Option<String> = r.get(19)?;
+                let rejected: Option<bool> = r.get(20)?;
+                let oauth = if !deleted
+                    && let Some(generation) = oauth_gen
+                    && (credentials.is_some() || rejected == Some(true))
+                {
+                    Some(McpOAuthGrantWire {
+                        generation,
+                        binding: r.get(18)?,
+                        credentials,
+                        rejected: rejected.unwrap_or(false),
+                    })
+                } else {
+                    None
+                };
+                Ok(McpServerWire {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    name_ts: r.get(2)?,
+                    description: r.get(3)?,
+                    description_ts: r.get(4)?,
+                    enabled: r.get(5)?,
+                    enabled_ts: r.get(6)?,
+                    transport: r.get(7)?,
+                    allowed_tools: r.get(8)?,
+                    allowed_tools_ts: r.get(9)?,
+                    config_json: r.get(10)?,
+                    timeout_ms: r.get(11)?,
+                    timeout_ts: r.get(12)?,
+                    config_ts: r.get(13)?,
+                    oauth,
+                    oauth_ts: r.get(14)?,
+                    deleted,
+                    sync_rev: r.get(16)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if list.len() == DELTA_PAGE_LIMIT
+            && let Some(last) = list.last()
+        {
+            safe_ceiling = safe_ceiling.min(last.sync_rev);
+        }
+        rows.extend(list.into_iter().map(CatalogRow::Mcp));
+    }
+
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, title, title_ts, created_at, updated_at,
+                    CASE WHEN status IN ('running','pausing') THEN 'idle' ELSE status END,
+                    CASE WHEN status IN ('running','pausing') THEN '' ELSE last_error END,
+                    status_ts, model_id, reasoning_effort, selection_ts,
+                    active_head, active_head_ts, deleted, sync_rev
+             FROM sessions WHERE sync_rev > ?1
+             ORDER BY sync_rev ASC, id ASC LIMIT ?2",
+        )?;
+        let list = stmt
+            .query_map(params![since_rev, DELTA_PAGE_LIMIT as i64], |r| {
+                Ok(SessionWire {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    title_ts: r.get(2)?,
+                    created_at: r.get(3)?,
+                    updated_at: r.get(4)?,
+                    status: r.get(5)?,
+                    last_error: r.get(6)?,
+                    status_ts: r.get(7)?,
+                    model_id: r.get(8)?,
+                    reasoning_effort: r.get(9)?,
+                    selection_ts: r.get(10)?,
+                    active_head: r.get(11)?,
+                    active_head_ts: r.get(12)?,
+                    deleted: r.get(13)?,
+                    sync_rev: r.get(14)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if list.len() == DELTA_PAGE_LIMIT
+            && let Some(last) = list.last()
+        {
+            safe_ceiling = safe_ceiling.min(last.sync_rev);
+        }
+        rows.extend(list.into_iter().map(CatalogRow::Session));
+    }
+
+    rows.retain(|r| r.sync_rev() <= safe_ceiling);
+    rows.sort_by_key(CatalogRow::sync_rev);
+
+    let mut delta = CatalogDelta {
+        db_epoch,
+        head_rev,
+        next_rev: since_rev,
+        has_more: safe_ceiling < i64::MAX,
         ..Default::default()
     };
-    let base_bytes = head_snap_json.len() + 12; // {"session": ...}
-    let mut chunk_bytes = base_bytes;
-    let stream_id = sid.as_str();
-    let author = load_local_node(conn)?.node_id;
-    let now = chrono::Utc::now().timestamp_millis();
-    let mut seq = 0;
-    let mut final_hash = [0u8; 32];
-    clear_staging_for_stream(conn, stream_id)?;
-    let mut insert = conn.prepare_cached(
-        "INSERT INTO sync_staging_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-         VALUES(?,?,?,?,?,?,?,?,?)",
-    )?;
-    let mut stage_chunk = |chunk: &SessionDelta| -> Result<()> {
-        let op_type = if seq == 0 {
-            "session_reset_snapshot"
-        } else {
-            "session_delta"
-        };
-        seq += 1;
-        let payload = serde_json::to_string(chunk)
-            .map_err(|e| Error::internal(format!("chunk encode failed: {e}")))?;
-        let hash = compute_commit_hash(&CommitHashInput {
-            stream_id,
-            kind: StreamKind::Session,
-            epoch: new_epoch,
-            seq,
-            parent_hash: &final_hash,
-            author_node_id: &author,
-            op_type,
-            payload: &payload,
-            created_at: now,
-        });
-        insert.execute(params![
-            stream_id, new_epoch, seq, final_hash, hash, author, op_type, payload, now
-        ])?;
-        final_hash = hash;
-        Ok(())
-    };
-    // Reserve room before adding a row. An indivisible large item can use the chunked RPC path.
-    let mut make_room = |chunk: &mut SessionDelta, bytes: usize| -> Result<()> {
-        let rows = chunk.items.len() + chunk.context_items.len() + chunk.invalidated_warnings.len();
-        // Includes array field names, brackets and separators, even when adding both items and attachments.
-        let bytes = bytes.saturating_add(32);
-        if rows > 0
-            && (rows >= MAX_SESSION_CHUNK_ITEMS
-                || chunk_bytes.saturating_add(bytes) > MAX_SESSION_CHUNK_BYTES)
-        {
-            stage_chunk(chunk)?;
-            chunk.items.clear();
-            chunk.attachments.clear();
-            chunk.context_items.clear();
-            chunk.invalidated_warnings.clear();
-            chunk_bytes = base_bytes;
-        }
-        chunk_bytes = chunk_bytes.saturating_add(bytes);
-        Ok(())
-    };
 
-    // Keep the cross-chunk attachment set in SQLite. Each reference precedes its first item on replay.
-    conn.execute_batch(
-        "CREATE TEMP TABLE snapshot_attachment_ids(id TEXT PRIMARY KEY) WITHOUT ROWID",
-    )?;
-    {
-        let mut remember =
-            conn.prepare("INSERT OR IGNORE INTO temp.snapshot_attachment_ids VALUES(?)")?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id
-             FROM items WHERE session_id=? ORDER BY id",
-        )?;
-        let mut rows = stmt.query([sid])?;
-        while let Some(row) = rows.next()? {
-            let item = ItemSnapshot::from_row(row)?;
-            let mut attachments = Vec::new();
-            let mut ids = HashSet::new();
-            collect_attachment_ids_from_item(&item, &mut ids);
-            for attachment in load_attachment_refs(conn, ids)? {
-                if remember.execute([attachment.id])? != 0 {
-                    attachments.push(attachment);
-                }
-            }
-            let bytes = encoded_len(&item)?.saturating_add(encoded_len(&attachments)?);
-            make_room(&mut chunk, bytes)?;
-            chunk.attachments.extend(attachments);
-            chunk.items.push(item);
+    let mut total_bytes = 0usize;
+    let total_rows = rows.len();
+    for (idx, row) in rows.into_iter().enumerate() {
+        let row_bytes = row.approx_bytes();
+        if idx > 0 && total_bytes.saturating_add(row_bytes) > MAX_DELTA_BYTES {
+            delta.has_more = true;
+            break;
+        }
+        total_bytes += row_bytes;
+        delta.next_rev = row.sync_rev();
+        match row {
+            CatalogRow::Provider(p) => delta.providers.push(p),
+            CatalogRow::Model(m) => delta.models.push(m),
+            CatalogRow::Mcp(s) => delta.mcp_servers.push(s),
+            CatalogRow::Session(s) => delta.sessions.push(s),
         }
     }
-    conn.execute_batch("DROP TABLE temp.snapshot_attachment_ids")?;
+    if delta.providers.is_empty()
+        && delta.models.is_empty()
+        && delta.mcp_servers.is_empty()
+        && delta.sessions.is_empty()
     {
-        let mut stmt = conn.prepare_cached(
-            "SELECT position,item_id FROM context_items WHERE session_id=? ORDER BY position",
-        )?;
-        let mut rows = stmt.query([sid])?;
-        while let Some(row) = rows.next()? {
-            let ctx = ContextPos {
-                position: row.get(0)?,
-                item_id: row.get(1)?,
-            };
-            make_room(&mut chunk, encoded_len(&ctx)?)?;
-            chunk.context_items.push(ctx);
-        }
+        delta.next_rev = head_rev;
+    } else if !delta.has_more && total_rows > 0 {
+        delta.next_rev = delta.next_rev.max(head_rev);
     }
-    {
-        let mut stmt = conn.prepare_cached(
-            "SELECT i.id FROM items i WHERE i.session_id=? AND EXISTS
-             (SELECT 1 FROM invalidated_warnings w WHERE w.item_id=i.id) ORDER BY i.id",
-        )?;
-        let mut rows = stmt.query([sid])?;
-        while let Some(row) = rows.next()? {
-            let id: ItemId = row.get(0)?;
-            make_room(&mut chunk, id.as_str().len() + 2)?;
-            chunk.invalidated_warnings.push(id);
-        }
-    }
-    stage_chunk(&chunk)?; // An empty session still has its initial reset snapshot.
 
-    conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [stream_id])?;
-    conn.execute(
-        "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,reset_gen,head_snapshot,updated_at)
-         VALUES(?1,'session',?2,?3,?4,?2,?3,?4,1,1,0,0,0,?5,?6)
-         ON CONFLICT(stream_id) DO UPDATE SET
-           epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
-           synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
-           checkpoint_seq=1,watched=1,deleted=0,retired=0,
-           reset_gen=sync_streams.reset_gen+1,
-           head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
-        params![
-            stream_id,
-            new_epoch,
-            seq,
-            final_hash.as_slice(),
-            head_snap_json,
-            now
-        ],
+    // Fill remaining byte budget with llm_calls past remote_calls_vector.
+    let local_calls_vec = read_vector(conn, CALLS_SCOPE)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, session_id, model_id, reasoning_effort, input_end_position,
+                started_at, finished_at, status, upstream_response_id, http_status,
+                error_summary, raw_usage, input_uncached_tokens, cache_read_tokens,
+                cache_write_tokens, output_tokens, pricing_snapshot, cost_nano_usd,
+                origin_node_id, origin_seq
+         FROM llm_calls
+         WHERE origin_node_id = ?1 AND origin_seq > ?2
+         ORDER BY origin_seq ASC, id ASC LIMIT ?3",
     )?;
-    conn.execute(
-        "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-         SELECT stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-         FROM sync_staging_commits WHERE stream_id=?1 AND epoch=?2 ORDER BY seq",
-        params![stream_id, new_epoch],
-    )?;
-    clear_staging_for_stream(conn, stream_id)?;
-    conn.execute("DELETE FROM sync_conflicts WHERE stream_id=?", [stream_id])?;
-    Ok(())
-}
-
-pub struct ResolveLocalResult {
-    pub mcp_changes: Vec<McpChange>,
-    pub unblocked_conflicts: Vec<String>,
-    pub new_head: Option<StreamHead>,
-}
-
-pub fn resolve_conflict_local(
-    conn: &Connection,
-    stream_id: &str,
-    expected: &ConflictRecord,
-) -> Result<ResolveLocalResult> {
-    with_savepoint(conn, "resolve_local", || {
-        let c = get_conflict(conn, stream_id)?;
-        if &c != expected {
-            return Err(Error::conflict(
-                "sync conflict state changed concurrently; retry resolution",
-            ));
+    for (origin_node_id, local_max) in local_calls_vec {
+        let remote_seq = remote_calls_vector.get(&origin_node_id).copied().unwrap_or(0);
+        if local_max <= remote_seq {
+            continue;
         }
-        let new_epoch = c.local_epoch.max(c.remote_epoch) + 1;
-        let mut mcp_changes = Vec::new();
-        let now = chrono::Utc::now().timestamp_millis();
-
-        if c.reason == "name_conflict" {
-            match c.kind {
-                StreamKind::Provider => {
-                    let pid: ProviderId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid provider id"))?;
-                    let exists: bool = conn
-                        .prepare_cached("SELECT EXISTS(SELECT 1 FROM llm_providers WHERE id=?)")?
-                        .query_row([pid], |r| r.get(0))?;
-                    let snap = if exists {
-                        conn.execute(
-                            "UPDATE llm_providers SET archived_at=coalesce(archived_at, ?) WHERE id=?",
-                            params![now, pid],
-                        )?;
-                        read_provider_snapshot(conn, pid)?
-                    } else {
-                        let raw = c.remote_snapshot.as_deref().ok_or_else(|| {
-                            Error::conflict("missing remote provider snapshot to retire")
-                        })?;
-                        let mut s: ProviderSnapshot = serde_json::from_str(raw)
-                            .map_err(|_| Error::bad("invalid provider snapshot"))?;
-                        s.archived_at = s.archived_at.or(Some(now));
-                        conn.execute(
-                            "INSERT INTO llm_providers(id,name,base_url,api_key,archived_at) VALUES(?,?,?,?,?)
-                             ON CONFLICT(id) DO UPDATE SET archived_at=excluded.archived_at",
-                            params![s.id, s.name, s.base_url, s.api_key, s.archived_at],
-                        )?;
-                        read_provider_snapshot(conn, pid)?
-                    };
-                    let payload =
-                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Provider,
-                            new_epoch,
-                            op_type: "provider_upsert",
-                            payload,
-                            deleted: false,
-                            retired: false,
-                            head_snapshot: None,
-                        },
-                    )?;
-                }
-                StreamKind::Model => {
-                    let mid: ModelId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid model id"))?;
-                    let exists: bool = conn
-                        .prepare_cached("SELECT EXISTS(SELECT 1 FROM llm_models WHERE id=?)")?
-                        .query_row([mid], |r| r.get(0))?;
-                    let snap = if exists {
-                        // P1-26: update archived_at on existing model row, then re-read actual row!
-                        conn.execute(
-                            "UPDATE llm_models SET archived_at=coalesce(archived_at, ?) WHERE id=?",
-                            params![now, mid],
-                        )?;
-                        read_model_snapshot(conn, mid)?
-                    } else {
-                        let raw = c.remote_snapshot.as_deref().ok_or_else(|| {
-                            Error::conflict("missing remote model snapshot to retire")
-                        })?;
-                        let mut s: ModelSnapshot = serde_json::from_str(raw)
-                            .map_err(|_| Error::bad("invalid model snapshot"))?;
-                        s.archived_at = s.archived_at.or(Some(now));
-                        let has_prov: bool = conn
-                            .prepare_cached("SELECT EXISTS(SELECT 1 FROM llm_providers WHERE id=?)")?
-                            .query_row([s.provider_id], |r| r.get(0))?;
-                        if !has_prov {
-                            return Err(Error::conflict(
-                                "cannot resolve model name conflict before its provider exists locally",
-                            ));
-                        }
-                        conn.execute(
-                            "INSERT INTO llm_models(id,provider_id,model_key,context_window_tokens,input_modalities,reasoning_efforts,pricing,archived_at)
-                             VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET archived_at=excluded.archived_at",
-                            params![
-                                s.id,
-                                s.provider_id,
-                                s.model_key,
-                                s.context_window_tokens,
-                                s.input_modalities,
-                                s.reasoning_efforts,
-                                s.pricing,
-                                s.archived_at
-                            ],
-                        )?;
-                        read_model_snapshot(conn, mid)?
-                    };
-                    let payload =
-                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Model,
-                            new_epoch,
-                            op_type: "model_upsert",
-                            payload,
-                            deleted: false,
-                            retired: false,
-                            head_snapshot: None,
-                        },
-                    )?;
-                }
-                StreamKind::Mcp => {
-                    let mid: McpServerId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid mcp id"))?;
-                    conn.execute("DELETE FROM mcp_servers WHERE id=?", [mid])?;
-                    mcp_changes.push(McpChange {
-                        id: mid,
-                        cancel_login: true,
-                    });
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Mcp,
-                            new_epoch,
-                            op_type: "mcp_delete",
-                            payload: json!({
-                                "id": mid,
-                                "base_epoch": c.remote_epoch,
-                                "base_seq": c.remote_seq,
-                                "base_hash_hex": hex_hash(&c.remote_hash),
-                            })
-                            .to_string(),
-                            deleted: true,
-                            retired: true,
-                            head_snapshot: None,
-                        },
-                    )?;
-                }
-            _ => return Err(Error::bad("unexpected name conflict stream kind")),
-            }
-        } else {
-            // Standard fork or retired_diverged conflict -> resolve keeping local state.
-            match c.kind {
-                StreamKind::Provider => {
-                    let pid: ProviderId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid provider id"))?;
-                    let snap = read_provider_snapshot(conn, pid)?;
-                    let payload =
-                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Provider,
-                            new_epoch,
-                            op_type: "provider_upsert",
-                            payload,
-                            deleted: false,
-                            retired: false,
-                            head_snapshot: None,
-                        },
-                    )?;
-                }
-                StreamKind::Model => {
-                    let mid: ModelId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid model id"))?;
-                    let snap = read_model_snapshot(conn, mid)?;
-                    let payload =
-                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Model,
-                            new_epoch,
-                            op_type: "model_upsert",
-                            payload,
-                            deleted: false,
-                            retired: false,
-                            head_snapshot: None,
-                        },
-                    )?;
-                }
-                StreamKind::Mcp => {
-                    let mid: McpServerId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid mcp id"))?;
-                    let exists_local: Option<bool> = conn
-                        .prepare_cached("SELECT shared FROM mcp_servers WHERE id=?")?
-                        .query_row([mid], |r| r.get(0))
-                        .optional()?;
-                    if c.detaches_mcp() {
-                        // P1-09: Never resurrect a retired mcp_* ID! Detach local edits to a fresh private
-                        // McpServerId and accept retirement on the old stream ID.
-                        let (ancestor_start_seq, ancestor_hashes_hex) =
-                            collect_ancestor_hashes_hex(conn, stream_id, c.local_epoch, c.local_seq)?;
-                        if exists_local.is_some() {
-                            detach_conflicted_mcp_to_private(conn, mid)?;
-                        }
-                        mcp_changes.push(McpChange {
-                            id: mid,
-                            cancel_login: true,
-                        });
-                        replace_stream_with_epoch_snapshot(
-                            conn,
-                            EpochSnapshot {
-                                stream_id,
-                                kind: StreamKind::Mcp,
-                                new_epoch,
-                                op_type: "mcp_delete",
-                                payload: json!({
-                                    "id": mid,
-                                    "base_epoch": c.local_epoch,
-                                    "base_seq": c.local_seq,
-                                    "base_hash_hex": hex_hash(&c.local_hash),
-                                    "ancestor_start_seq": ancestor_start_seq,
-                                    "ancestor_hashes_hex": ancestor_hashes_hex,
-                                })
-                                .to_string(),
-                                deleted: true,
-                                retired: true,
-                                head_snapshot: None,
-                            },
-                        )?;
-                    } else if exists_local == Some(true) {
-                        // P1-27: promote any staged OAuth refresh credentials matching current generation.
-                        promote_staged_oauth_credentials(conn, mid)?;
-                        let snap = read_mcp_snapshot(conn, mid)?;
-                        let payload = serde_json::to_string(&snap)
-                            .map_err(|e| Error::internal(e.to_string()))?;
-                        mcp_changes.push(McpChange {
-                            id: mid,
-                            cancel_login: false,
-                        });
-                        replace_stream_with_epoch_snapshot(
-                            conn,
-                            EpochSnapshot {
-                                stream_id,
-                                kind: StreamKind::Mcp,
-                                new_epoch,
-                                op_type: "mcp_upsert",
-                                payload,
-                                deleted: false,
-                                retired: false,
-                                head_snapshot: None,
-                            },
-                        )?;
-                    } else {
-                        let (ancestor_start_seq, ancestor_hashes_hex) =
-                            collect_ancestor_hashes_hex(conn, stream_id, c.local_epoch, c.local_seq)?;
-                        mcp_changes.push(McpChange {
-                            id: mid,
-                            cancel_login: true,
-                        });
-                        replace_stream_with_epoch_snapshot(
-                            conn,
-                            EpochSnapshot {
-                                stream_id,
-                                kind: StreamKind::Mcp,
-                                new_epoch,
-                                op_type: "mcp_delete",
-                                payload: json!({
-                                    "id": mid,
-                                    "base_epoch": c.local_epoch,
-                                    "base_seq": c.local_seq,
-                                    "base_hash_hex": hex_hash(&c.local_hash),
-                                    "ancestor_start_seq": ancestor_start_seq,
-                                    "ancestor_hashes_hex": ancestor_hashes_hex,
-                                })
-                                .to_string(),
-                                deleted: true,
-                                retired: true,
-                                head_snapshot: None,
-                            },
-                        )?;
-                    }
-                }
-                StreamKind::Call => {
-                    let cid: CallId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid call id"))?;
-                    let snap = read_call_snapshot(conn, cid)?;
-                    let payload =
-                        serde_json::to_string(&snap).map_err(|e| Error::internal(e.to_string()))?;
-                    replace_stream_with_epoch_snapshot(
-                        conn,
-                        EpochSnapshot {
-                            stream_id,
-                            kind: StreamKind::Call,
-                            new_epoch,
-                            op_type: "call_upsert",
-                            payload,
-                            deleted: false,
-                            retired: false,
-                            head_snapshot: None,
-                        },
-                    )?;
-                }
-                StreamKind::Session => {
-                    let sid: SessionId =
-                        stream_id.parse().map_err(|_| Error::bad("invalid session id"))?;
-                    let exists: bool = conn
-                        .prepare_cached("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?)")?
-                        .query_row([sid], |r| r.get(0))?;
-                    if exists {
-                        // P0-01 CRITICAL: Refuse local resolution unless this node actually possesses
-                        // a complete, verified local commit chain matching the conflicted local head!
-                        let st = stream_head(conn, stream_id)?;
-                        let complete = st.as_ref().is_some_and(|l| {
-                            l.is_body_complete()
-                                && l.epoch == c.local_epoch
-                                && l.head_seq == c.local_seq
-                                && l.head_hash == c.local_hash
-                                && verify_local_prefix(
-                                    conn,
-                                    stream_id,
-                                    l.epoch,
-                                    l.checkpoint_seq,
-                                    l.head_seq,
-                                    &l.head_hash,
-                                )
-                                .unwrap_or(false)
-                        });
-                        if !complete {
-                            return Err(Error::conflict(
-                                "local node does not hold complete session history for the local branch; sync the local branch from an online holder first",
-                            ));
-                        }
-                        replace_session_with_chunked_epoch_snapshot(conn, sid, new_epoch)?;
-                    } else {
-                        let st = stream_head(conn, stream_id)?;
-                        let verified_deleted = st.as_ref().is_some_and(|l| {
-                            l.deleted
-                                && l.epoch == c.local_epoch
-                                && l.head_seq == c.local_seq
-                                && l.head_hash == c.local_hash
-                        });
-                        if !verified_deleted {
-                            return Err(Error::conflict(
-                                "local branch missing verified state for conflict resolution",
-                            ));
-                        }
-                        replace_stream_with_epoch_snapshot(
-                            conn,
-                            EpochSnapshot {
-                                stream_id,
-                                kind: StreamKind::Session,
-                                new_epoch,
-                                op_type: "session_delete",
-                                payload: json!({ "id": sid }).to_string(),
-                                deleted: true,
-                                retired: false,
-                                head_snapshot: None,
-                            },
-                        )?;
-                    }
-                }
-            }
+        if total_bytes >= MAX_DELTA_BYTES {
+            delta.has_more = true;
+            break;
         }
-        let mut unblocked = Vec::new();
-        if c.reason != "name_conflict"
-            && matches!(c.kind, StreamKind::Provider | StreamKind::Model | StreamKind::Mcp)
-        {
-            unblocked = collect_unblocked_conflicts(conn, stream_id)?;
-            unblocked.sort();
-            unblocked.dedup();
-        }
-        let new_head = stream_head_wire(conn, stream_id)?;
-        if let Some(ref nh) = new_head {
-            let resolver = load_local_node(conn)?.node_id;
-            record_resolution_receipt(
-                conn,
-                &ResolutionReceipt {
-                    stream_id: stream_id.to_owned(),
-                    kind: c.kind,
-                    chosen: "local".to_owned(),
-                    resolver_node_id: resolver,
-                    local_epoch: c.local_epoch,
-                    local_seq: c.local_seq,
-                    local_hash: c.local_hash,
-                    remote_epoch: c.remote_epoch,
-                    remote_seq: c.remote_seq,
-                    remote_hash: c.remote_hash,
-                    winner_epoch: nh.epoch,
-                    winner_seq: nh.head_seq,
-                    winner_hash: nh.head_hash,
-                    resolved_at: now,
+        let batch = stmt
+            .query_map(
+                params![&origin_node_id, remote_seq, DELTA_PAGE_LIMIT as i64],
+                |r| {
+                    Ok(LlmCallWire {
+                        id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        model_id: r.get(2)?,
+                        reasoning_effort: r.get(3)?,
+                        input_end_position: r.get(4)?,
+                        started_at: r.get(5)?,
+                        finished_at: r.get(6)?,
+                        status: r.get(7)?,
+                        upstream_response_id: r.get(8)?,
+                        http_status: r.get(9)?,
+                        error_summary: r.get(10)?,
+                        raw_usage: r.get(11)?,
+                        input_uncached_tokens: r.get(12)?,
+                        cache_read_tokens: r.get(13)?,
+                        cache_write_tokens: r.get(14)?,
+                        output_tokens: r.get(15)?,
+                        pricing_snapshot: r.get(16)?,
+                        cost_nano_usd: r.get(17)?,
+                        origin_node_id: r.get(18)?,
+                        origin_seq: r.get(19)?,
+                    })
                 },
-            )?;
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let saturated = batch.len() == DELTA_PAGE_LIMIT;
+        let mut last_seq = remote_seq;
+        let mut broke_early = false;
+        for call in batch {
+            let approx = call.raw_usage.as_deref().map_or(0, str::len)
+                + call.error_summary.as_deref().map_or(0, str::len)
+                + call.pricing_snapshot.as_deref().map_or(0, str::len)
+                + 256;
+            if total_bytes > 0 && total_bytes.saturating_add(approx) > MAX_DELTA_BYTES {
+                delta.has_more = true;
+                broke_early = true;
+                break;
+            }
+            total_bytes += approx;
+            last_seq = last_seq.max(call.origin_seq);
+            delta.calls.push(call);
         }
-        Ok(ResolveLocalResult {
-            mcp_changes,
-            unblocked_conflicts: unblocked,
-            new_head,
-        })
-    })
-    .inspect(|_| stage_stream(stream_id))
-}
-
-fn promote_staged_oauth_credentials(conn: &Connection, mid: McpServerId) -> Result<()> {
-    conn.execute(
-        "UPDATE mcp_oauth
-         SET credentials=staged_credentials, staged_credentials=NULL, pending_refresh=NULL, rejected=0
-         WHERE server_id=? AND staged_credentials IS NOT NULL",
-        [mid],
-    )?;
-    Ok(())
-}
-
-fn detach_conflicted_mcp_to_private(conn: &Connection, old_id: McpServerId) -> Result<()> {
-    promote_staged_oauth_credentials(conn, old_id)?;
-    let (name, description, enabled, transport, allowed_tools, config_json, timeout_ms): (
-        String,
-        String,
-        bool,
-        String,
-        Option<String>,
-        String,
-        i64,
-    ) = conn.query_row(
-        "SELECT name,description,enabled,transport,allowed_tools,config_json,timeout_ms
-         FROM mcp_servers WHERE id=?",
-        [old_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-    )?;
-    let oauth: Option<(String, Option<String>, Option<String>, bool)> = conn
-        .query_row(
-            "SELECT generation,binding,credentials,rejected FROM mcp_oauth
-             WHERE server_id=? AND (credentials IS NOT NULL OR rejected=1)",
-            [old_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()?;
-    let new_id = McpServerId::new()?;
-    conn.execute("DELETE FROM mcp_servers WHERE id=?", [old_id])?;
-    conn.execute(
-        "INSERT INTO mcp_servers(id,name,description,enabled,shared,transport,allowed_tools,config_json,timeout_ms,revision)
-         VALUES(?,?,?,?,0,?,?,?,?,1)",
-        params![
-            new_id,
-            name,
-            description,
-            enabled,
-            transport,
-            allowed_tools,
-            config_json,
-            timeout_ms
-        ],
-    )?;
-    if let Some((generation, binding, credentials, rejected)) = oauth {
-        conn.execute(
-            "INSERT INTO mcp_oauth(server_id,generation,binding,pending,credentials,staged_credentials,rejected)
-             VALUES(?,?,?,NULL,?,NULL,?)",
-            params![new_id, generation, binding, credentials, rejected],
-        )?;
+        if !broke_early && !saturated {
+            last_seq = local_max;
+        } else if saturated {
+            delta.has_more = true;
+        }
+        if last_seq > remote_seq {
+            delta.calls_vector.insert(origin_node_id, last_seq);
+        }
     }
-    Ok(())
+
+    Ok(delta)
 }
 
-/// Apply a verified, complete staged epoch branch onto a conflicted session WITHOUT deleting the
-/// `sync_conflicts` row, so P0-01 conflict resolution has full local branch content locally.
-pub fn commit_staged_branch_preserving_conflict(
-    conn: &Connection,
-    target_head: &StreamHead,
-    stream_id: &str,
-) -> Result<()> {
-    if target_head.stream_id != stream_id
-        || target_head.kind != StreamKind::Session
-        || target_head.deleted
-    {
-        return Err(Error::conflict("invalid target branch for conflict staging"));
+enum SessionEventRow {
+    Item(ItemWire),
+    ContextNode(ContextNodeWire),
+    TurnSettled(TurnSettledWire),
+    InvalidatedWarning(InvalidatedWarningWire),
+}
+
+impl SessionEventRow {
+    fn origin_seq(&self) -> i64 {
+        match self {
+            Self::Item(r) => r.origin_seq,
+            Self::ContextNode(r) => r.origin_seq,
+            Self::TurnSettled(r) => r.origin_seq,
+            Self::InvalidatedWarning(r) => r.origin_seq,
+        }
     }
-    let sid: SessionId = stream_id
-        .parse()
-        .map_err(|_| Error::internal("invalid session stream_id"))?;
-    with_savepoint(conn, "commit_staged_preserve_conflict", || {
-        verify_staged_chain(conn, target_head, Error::conflict)?;
 
-        clear_session_body_rows(conn, sid)?;
-        conn.execute("DELETE FROM sync_commits WHERE stream_id=?", [stream_id])?;
+    fn approx_bytes(&self) -> usize {
+        match self {
+            Self::Item(r) => r.payload.len() + 256,
+            Self::ContextNode(_) => 192,
+            Self::TurnSettled(_) => 128,
+            Self::InvalidatedWarning(_) => 128,
+        }
+    }
+}
 
-        let mut last_snapshot = None;
-        let mut last_created_at = target_head.updated_at;
-        {
-            let mut replay_stmt = conn.prepare_cached(
-                "SELECT seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-                 FROM sync_staging_commits WHERE stream_id=?1 AND epoch=?2 ORDER BY seq ASC",
-            )?;
-            let mut rows = replay_stmt.query(params![stream_id, target_head.epoch])?;
-            while let Some(r) = rows.next()? {
-                let wire = CommitWire {
-                    stream_id: stream_id.to_owned(),
-                    kind: target_head.kind,
-                    epoch: target_head.epoch,
-                    seq: r.get(0)?,
-                    parent_hash: to_hash32(r.get::<_, Vec<u8>>(1)?)?,
-                    commit_hash: to_hash32(r.get::<_, Vec<u8>>(2)?)?,
-                    author_node_id: r.get(3)?,
-                    op_type: r.get(4)?,
-                    payload: r.get(5)?,
-                    created_at: r.get(6)?,
-                };
-                last_created_at = wire.created_at;
-                match apply_one_commit(conn, &wire)? {
-                    CommitEffect::Applied {
-                        deleted,
-                        head_snapshot,
-                        ..
-                    } => {
-                        if deleted {
-                            return Err(Error::conflict(
-                                "local conflict branch unexpectedly contains terminal delete",
-                            ));
-                        }
-                        if head_snapshot.is_some() {
-                            last_snapshot = head_snapshot;
-                        }
-                    }
-                    CommitEffect::Blocked | CommitEffect::NameConflict { .. } => {
-                        return Err(Error::conflict(
-                            "cannot materialize complete local branch while dependency is missing",
-                        ));
-                    }
+fn collect_attachment_refs_from_item(payload: &str, out: &mut HashSet<AttachmentId>) {
+    let Ok(val) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+    for field in ["content", "output"] {
+        if let Some(arr) = val.get(field).and_then(Value::as_array) {
+            for part in arr {
+                if let Some(raw) = part.get("attachment_id").and_then(Value::as_str)
+                    && let Ok(aid) = raw.parse::<AttachmentId>()
+                {
+                    out.insert(aid);
                 }
             }
         }
+    }
+}
 
-        conn.execute(
-            "INSERT INTO sync_streams(stream_id,kind,epoch,head_seq,head_hash,synced_epoch,synced_seq,synced_hash,checkpoint_seq,watched,deleted,retired,reset_gen,head_snapshot,updated_at)
-             VALUES(?1,'session',?2,?3,?4,?2,?3,?4,1,1,0,0,0,?5,?6)
-             ON CONFLICT(stream_id) DO UPDATE SET
-               epoch=excluded.epoch,head_seq=excluded.head_seq,head_hash=excluded.head_hash,
-               synced_epoch=excluded.synced_epoch,synced_seq=excluded.synced_seq,synced_hash=excluded.synced_hash,
-               checkpoint_seq=1,watched=1,deleted=0,retired=0,
-               reset_gen=sync_streams.reset_gen+1,
-               head_snapshot=excluded.head_snapshot,updated_at=excluded.updated_at",
-            params![
-                stream_id,
-                target_head.epoch,
-                target_head.head_seq,
-                target_head.head_hash.as_slice(),
-                last_snapshot,
-                last_created_at
-            ],
+pub fn read_session_delta(
+    conn: &Connection,
+    sid: SessionId,
+    remote_vector: &BTreeMap<String, i64>,
+) -> Result<SessionDelta> {
+    let deleted: bool = conn
+        .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
+        .query_row([sid], |r| r.get(0))?;
+    if deleted {
+        return Ok(SessionDelta {
+            session_id: sid,
+            deleted: true,
+            has_more: false,
+            attachments: Vec::new(),
+            items: Vec::new(),
+            context_nodes: Vec::new(),
+            turn_settled: Vec::new(),
+            invalidated_warnings: Vec::new(),
+            advanced_vector: BTreeMap::new(),
+        });
+    }
+
+    let scope = session_scope(sid);
+    let local_vec = read_vector(conn, &scope)?;
+    let mut delta = SessionDelta {
+        session_id: sid,
+        deleted: false,
+        has_more: false,
+        attachments: Vec::new(),
+        items: Vec::new(),
+        context_nodes: Vec::new(),
+        turn_settled: Vec::new(),
+        invalidated_warnings: Vec::new(),
+        advanced_vector: BTreeMap::new(),
+    };
+    let mut total_bytes = 0usize;
+    let mut referenced_attachments = HashSet::new();
+
+    for (origin_node_id, local_max) in local_vec {
+        let remote_seq = remote_vector.get(&origin_node_id).copied().unwrap_or(0);
+        if local_max <= remote_seq {
+            continue;
+        }
+        if total_bytes >= MAX_DELTA_BYTES {
+            delta.has_more = true;
+            break;
+        }
+
+        let mut events: Vec<SessionEventRow> = Vec::new();
+        let mut safe_ceiling = i64::MAX;
+
+        {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, session_id, kind, payload, target_id, llm_call_id,
+                        idempotency_key, codemode_call_item_id, origin_node_id, origin_seq
+                 FROM items
+                 WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3
+                 ORDER BY origin_seq ASC, id ASC LIMIT ?4",
+            )?;
+            let list = stmt
+                .query_map(
+                    params![sid, &origin_node_id, remote_seq, DELTA_PAGE_LIMIT as i64],
+                    |r| {
+                        Ok(ItemWire {
+                            id: r.get(0)?,
+                            session_id: r.get(1)?,
+                            kind: r.get(2)?,
+                            payload: r.get(3)?,
+                            target_id: r.get(4)?,
+                            llm_call_id: r.get(5)?,
+                            idempotency_key: r.get(6)?,
+                            codemode_call_item_id: r.get(7)?,
+                            origin_node_id: r.get(8)?,
+                            origin_seq: r.get(9)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if list.len() == DELTA_PAGE_LIMIT
+                && let Some(last) = list.last()
+            {
+                safe_ceiling = safe_ceiling.min(last.origin_seq);
+            }
+            events.extend(list.into_iter().map(SessionEventRow::Item));
+        }
+
+        {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, session_id, parent_id, depth, item_id, origin_node_id, origin_seq
+                 FROM context_nodes
+                 WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3
+                 ORDER BY origin_seq ASC, id ASC LIMIT ?4",
+            )?;
+            let list = stmt
+                .query_map(
+                    params![sid, &origin_node_id, remote_seq, DELTA_PAGE_LIMIT as i64],
+                    |r| {
+                        Ok(ContextNodeWire {
+                            id: r.get(0)?,
+                            session_id: r.get(1)?,
+                            parent_id: r.get(2)?,
+                            depth: r.get(3)?,
+                            item_id: r.get(4)?,
+                            origin_node_id: r.get(5)?,
+                            origin_seq: r.get(6)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if list.len() == DELTA_PAGE_LIMIT
+                && let Some(last) = list.last()
+            {
+                safe_ceiling = safe_ceiling.min(last.origin_seq);
+            }
+            events.extend(list.into_iter().map(SessionEventRow::ContextNode));
+        }
+
+        {
+            let mut stmt = conn.prepare_cached(
+                "SELECT context_node_id, session_id, origin_node_id, origin_seq
+                 FROM turn_settled
+                 WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3
+                 ORDER BY origin_seq ASC, context_node_id ASC LIMIT ?4",
+            )?;
+            let list = stmt
+                .query_map(
+                    params![sid, &origin_node_id, remote_seq, DELTA_PAGE_LIMIT as i64],
+                    |r| {
+                        Ok(TurnSettledWire {
+                            context_node_id: r.get(0)?,
+                            session_id: r.get(1)?,
+                            origin_node_id: r.get(2)?,
+                            origin_seq: r.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if list.len() == DELTA_PAGE_LIMIT
+                && let Some(last) = list.last()
+            {
+                safe_ceiling = safe_ceiling.min(last.origin_seq);
+            }
+            events.extend(list.into_iter().map(SessionEventRow::TurnSettled));
+        }
+
+        {
+            let mut stmt = conn.prepare_cached(
+                "SELECT item_id, session_id, origin_node_id, origin_seq
+                 FROM invalidated_warnings
+                 WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3
+                 ORDER BY origin_seq ASC, item_id ASC LIMIT ?4",
+            )?;
+            let list = stmt
+                .query_map(
+                    params![sid, &origin_node_id, remote_seq, DELTA_PAGE_LIMIT as i64],
+                    |r| {
+                        Ok(InvalidatedWarningWire {
+                            item_id: r.get(0)?,
+                            session_id: r.get(1)?,
+                            origin_node_id: r.get(2)?,
+                            origin_seq: r.get(3)?,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if list.len() == DELTA_PAGE_LIMIT
+                && let Some(last) = list.last()
+            {
+                safe_ceiling = safe_ceiling.min(last.origin_seq);
+            }
+            events.extend(list.into_iter().map(SessionEventRow::InvalidatedWarning));
+        }
+
+        events.retain(|e| e.origin_seq() <= safe_ceiling);
+        events.sort_by_key(SessionEventRow::origin_seq);
+
+        let mut last_seq = remote_seq;
+        let mut broke_early = false;
+        for ev in events {
+            let approx = ev.approx_bytes();
+            if total_bytes > 0 && total_bytes.saturating_add(approx) > MAX_DELTA_BYTES {
+                delta.has_more = true;
+                broke_early = true;
+                break;
+            }
+            total_bytes += approx;
+            last_seq = last_seq.max(ev.origin_seq());
+            match ev {
+                SessionEventRow::Item(it) => {
+                    collect_attachment_refs_from_item(&it.payload, &mut referenced_attachments);
+                    delta.items.push(it);
+                }
+                SessionEventRow::ContextNode(node) => delta.context_nodes.push(node),
+                SessionEventRow::TurnSettled(ts) => delta.turn_settled.push(ts),
+                SessionEventRow::InvalidatedWarning(iw) => delta.invalidated_warnings.push(iw),
+            }
+        }
+        if !broke_early && safe_ceiling == i64::MAX {
+            last_seq = local_max;
+        } else if safe_ceiling < i64::MAX {
+            delta.has_more = true;
+        }
+        if last_seq > remote_seq {
+            delta.advanced_vector.insert(origin_node_id, last_seq);
+        }
+    }
+
+    if !referenced_attachments.is_empty() {
+        let mut att_stmt = conn.prepare_cached(
+            "SELECT id, mime_type, content_hash, byte_len FROM attachments WHERE id=?",
         )?;
-        conn.execute(
-            "INSERT INTO sync_commits(stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at)
-             SELECT stream_id,epoch,seq,parent_hash,commit_hash,author_node_id,op_type,payload,created_at
-             FROM sync_staging_commits WHERE stream_id=?1 AND epoch=?2 ORDER BY seq ASC",
-            params![stream_id, target_head.epoch],
-        )?;
-        conn.execute(
-            "DELETE FROM sync_staging_commits WHERE stream_id=?",
-            [stream_id],
-        )?;
-        Ok(())
-    })
+        for aid in referenced_attachments {
+            if let Some(att) = att_stmt
+                .query_row([aid], |r| {
+                    let blob: Vec<u8> = r.get(2)?;
+                    let content_hash: [u8; 32] = blob.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            2,
+                            "content_hash".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?;
+                    Ok(AttachmentRef {
+                        id: r.get(0)?,
+                        mime_type: r.get(1)?,
+                        content_hash,
+                        byte_len: r.get(3)?,
+                    })
+                })
+                .optional()?
+            {
+                delta.attachments.push(att);
+            }
+        }
+    }
+
+    Ok(delta)
 }

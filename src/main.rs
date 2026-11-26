@@ -139,6 +139,7 @@ Options:
   --token <TOKEN>         TCP Bearer token (default: generate and print once)
   --cluster-local         Disable public relay and DNS discovery for local-only cluster mode
   --cluster-bind <IP:PORT> Bind the iroh cluster endpoint to a specific UDP address
+  --cluster-role <ROLE>   Cluster voting role: 'voter' (default) or 'edge'
 {HELP_SOCKET_OPTIONS}  -h, --help              Print help
 "
     );
@@ -151,6 +152,7 @@ struct DaemonOptions {
     token: Option<String>,
     cluster_local: bool,
     cluster_bind: Option<SocketAddr>,
+    cluster_role: Option<cluster::identity::NodeRole>,
     #[cfg(unix)]
     unix_socket: Option<PathBuf>,
     #[cfg(unix)]
@@ -262,6 +264,7 @@ impl DaemonOptions {
         let mut token: Option<String> = None;
         let mut cluster_local = false;
         let mut cluster_bind: Option<SocketAddr> = None;
+        let mut cluster_role: Option<cluster::identity::NodeRole> = None;
         #[cfg(unix)]
         let mut unix_socket: Option<PathBuf> = None;
         #[cfg(unix)]
@@ -342,6 +345,24 @@ impl DaemonOptions {
                         format!("invalid value '{val}' for '--cluster-bind': {e}")
                     })?);
                 }
+                "--cluster-role" => {
+                    if cluster_role.is_some() {
+                        return Err(
+                            "the argument '--cluster-role <ROLE>' cannot be used multiple times"
+                                .into(),
+                        );
+                    }
+                    let val = take_str_value(inline, &mut args, "--cluster-role")?;
+                    cluster_role = Some(match val.as_str() {
+                        "voter" => cluster::identity::NodeRole::Voter,
+                        "edge" => cluster::identity::NodeRole::Edge,
+                        _ => {
+                            return Err(format!(
+                                "invalid value '{val}' for '--cluster-role': expected 'voter' or 'edge'"
+                            ));
+                        }
+                    });
+                }
                 #[cfg(unix)]
                 "--unix-socket" => {
                     if unix_socket.is_some() {
@@ -389,6 +410,7 @@ impl DaemonOptions {
             token,
             cluster_local,
             cluster_bind,
+            cluster_role,
             #[cfg(unix)]
             unix_socket,
             #[cfg(unix)]
@@ -528,6 +550,14 @@ async fn serve(
             signal.clone(),
             presence.clone(),
         )?;
+        if let Some(role) = options.cluster_role {
+            db.call(move |s| {
+                let updated = cluster::identity::set_local_role(&s.conn, role)?;
+                s.presence.set_local_role(updated.role);
+                Ok(())
+            })
+            .await?;
+        }
         let client = make_client()?;
         let stopping = CancellationToken::new();
         let workers = TaskTracker::new();

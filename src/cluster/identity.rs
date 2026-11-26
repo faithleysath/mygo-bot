@@ -1,8 +1,13 @@
-use std::{cell::RefCell, collections::HashSet, fs, net::SocketAddr, rc::Rc};
+use std::{
+    cell::RefCell, collections::HashSet, fmt, fs, net::SocketAddr, rc::Rc, str::FromStr,
+};
 
 use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine as _};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{
+    Connection, OptionalExtension, ToSql, params,
+    types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -12,6 +17,60 @@ pub const MAX_CLUSTER_PEERS: usize = 256;
 pub const MAX_PEX_PEERS: usize = 64;
 const MAX_ADDRS_PER_PEER: usize = 16;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    #[default]
+    Voter,
+    Edge,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Voter => "voter",
+            Self::Edge => "edge",
+        }
+    }
+
+    pub fn is_voter(self) -> bool {
+        matches!(self, Self::Voter)
+    }
+}
+
+impl fmt::Display for NodeRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NodeRole {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "voter" => Ok(Self::Voter),
+            "edge" => Ok(Self::Edge),
+            _ => Err(format!("invalid cluster role '{s}'; expected 'voter' or 'edge'")),
+        }
+    }
+}
+
+impl ToSql for NodeRole {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(ValueRef::Text(self.as_str().as_bytes())))
+    }
+}
+
+impl FromSql for NodeRole {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse::<Self>()
+            .map_err(|e| FromSqlError::Other(e.into()))
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalNode {
     pub secret_key: [u8; 32],
@@ -19,6 +78,8 @@ pub struct LocalNode {
     pub cluster_secret: [u8; 32],
     pub name: String,
     pub description: String,
+    pub role: NodeRole,
+    pub db_epoch: String,
     pub meta_seq: i64,
     pub membership_gen: i64,
 }
@@ -30,6 +91,8 @@ pub struct PeerInfo {
     pub description: String,
     pub os: String,
     pub arch: String,
+    #[serde(default)]
+    pub role: NodeRole,
     pub meta_seq: i64,
     pub addrs: Vec<String>,
     #[serde(default)]
@@ -120,16 +183,24 @@ pub fn ensure_local_node(conn: &Connection) -> Result<()> {
     let node_id = key.public().to_string();
     let mut cluster_secret = [0u8; 32];
     getrandom::fill(&mut cluster_secret).map_err(|_| Error::internal("entropy unavailable"))?;
+    let mut epoch_bytes = [0u8; 16];
+    getrandom::fill(&mut epoch_bytes).map_err(|_| Error::internal("entropy unavailable"))?;
+    let mut db_epoch = String::with_capacity(32);
+    for b in epoch_bytes {
+        use std::fmt::Write;
+        let _ = write!(db_epoch, "{b:02x}");
+    }
     let name = default_node_name();
     conn.execute(
-        "INSERT INTO local_node(id,secret_key,node_id,cluster_secret,name,description,meta_seq,membership_gen)
-         VALUES(1,?,?,?,?,?,1,1)",
+        "INSERT INTO local_node(id,secret_key,node_id,cluster_secret,name,description,role,db_epoch,meta_seq,membership_gen)
+         VALUES(1,?,?,?,?,?,'voter',?,1,1)",
         params![
             secret_key.as_slice(),
             node_id,
             cluster_secret.as_slice(),
             name,
-            ""
+            "",
+            db_epoch,
         ],
     )?;
     Ok(())
@@ -158,7 +229,7 @@ pub fn local_node_id(conn: &Connection) -> Result<Rc<str>> {
 
 pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
     conn.query_row(
-        "SELECT secret_key,node_id,cluster_secret,name,description,meta_seq,membership_gen
+        "SELECT secret_key,node_id,cluster_secret,name,description,role,db_epoch,meta_seq,membership_gen
          FROM local_node WHERE id=1",
         [],
         |r| {
@@ -180,8 +251,10 @@ pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
                 cluster_secret,
                 name: r.get(3)?,
                 description: r.get(4)?,
-                meta_seq: r.get(5)?,
-                membership_gen: r.get(6)?,
+                role: r.get(5)?,
+                db_epoch: r.get(6)?,
+                meta_seq: r.get(7)?,
+                membership_gen: r.get(8)?,
             })
         },
     )
@@ -192,6 +265,7 @@ pub fn update_self_meta(
     conn: &Connection,
     name: Option<String>,
     description: Option<String>,
+    role: Option<NodeRole>,
 ) -> Result<LocalNode> {
     let current = load_local_node(conn)?;
     let next_name = match name {
@@ -202,10 +276,22 @@ pub fn update_self_meta(
         Some(d) => validate_node_description(&d)?,
         None => current.description,
     };
+    let next_role = role.unwrap_or(current.role);
     conn.execute(
-        "UPDATE local_node SET name=?1, description=?2, meta_seq=meta_seq+1 WHERE id=1",
-        params![next_name, next_desc],
+        "UPDATE local_node SET name=?1, description=?2, role=?3, meta_seq=meta_seq+1 WHERE id=1",
+        params![next_name, next_desc, next_role],
     )?;
+    load_local_node(conn)
+}
+
+pub fn set_local_role(conn: &Connection, role: NodeRole) -> Result<LocalNode> {
+    let current = load_local_node(conn)?;
+    if current.role != role {
+        conn.execute(
+            "UPDATE local_node SET role=?1, meta_seq=meta_seq+1 WHERE id=1",
+            [role],
+        )?;
+    }
     load_local_node(conn)
 }
 
@@ -276,6 +362,7 @@ pub fn self_peer_info(local: &LocalNode, addr: &EndpointAddr) -> PeerInfo {
         description: local.description.clone(),
         os: current_os().to_owned(),
         arch: current_arch().to_owned(),
+        role: local.role,
         meta_seq: local.meta_seq,
         addrs: sanitize_addrs(&encode_endpoint_addrs(addr)),
         addrs_ts: now,
@@ -350,7 +437,7 @@ pub fn apply_join(
             params![new_secret.as_slice(), next_gen],
         )?;
         conn.execute("DELETE FROM cluster_peers", [])?;
-        conn.execute("DELETE FROM sync_staging_commits", [])?;
+        conn.execute("DELETE FROM peer_catalog_cursors", [])?;
         next_gen
     } else {
         local.membership_gen
@@ -406,9 +493,11 @@ pub fn upsert_peer(
     let addrs_json = serde_json::to_string(&sanitized_addrs)
         .map_err(|e| Error::internal(format!("failed to encode peer addrs: {e}")))?;
 
-    let existing: Option<(i64, String, i64)> = conn
-        .prepare_cached("SELECT meta_seq, addrs_json, addrs_ts FROM cluster_peers WHERE node_id=?")?
-        .query_row([&peer.node_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    let existing: Option<(i64, String, i64, NodeRole)> = conn
+        .prepare_cached("SELECT meta_seq, addrs_json, addrs_ts, role FROM cluster_peers WHERE node_id=?")?
+        .query_row([&peer.node_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
         .optional()?;
 
     let incoming_ts = if direct {
@@ -433,14 +522,15 @@ pub fn upsert_peer(
                 incoming_ts
             };
             conn.execute(
-                "INSERT INTO cluster_peers(node_id,name,description,os,arch,meta_seq,addrs_json,addrs_ts,last_seen_at)
-                 VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cluster_peers(node_id,name,description,os,arch,role,meta_seq,addrs_json,addrs_ts,last_seen_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)",
                 params![
                     peer.node_id,
                     peer.name,
                     peer.description,
                     peer.os,
                     peer.arch,
+                    peer.role,
                     peer.meta_seq,
                     addrs_json,
                     ts,
@@ -449,7 +539,7 @@ pub fn upsert_peer(
             )?;
             Ok(true)
         }
-        Some((old_seq, old_addrs, old_addrs_ts)) => {
+        Some((old_seq, old_addrs, old_addrs_ts, old_role)) => {
             let take_addrs = !sanitized_addrs.is_empty()
                 && (direct
                     || old_addrs == "[]"
@@ -463,8 +553,8 @@ pub fn upsert_peer(
             if peer.meta_seq > old_seq {
                 conn.execute(
                     "UPDATE cluster_peers
-                     SET name=?2, description=?3, os=?4, arch=?5, meta_seq=?6, addrs_json=?7, addrs_ts=?8,
-                         last_seen_at=CASE WHEN ?9>0 THEN max(last_seen_at, ?9) ELSE last_seen_at END
+                     SET name=?2, description=?3, os=?4, arch=?5, role=?6, meta_seq=?7, addrs_json=?8, addrs_ts=?9,
+                         last_seen_at=CASE WHEN ?10>0 THEN max(last_seen_at, ?10) ELSE last_seen_at END
                      WHERE node_id=?1",
                     params![
                         peer.node_id,
@@ -472,13 +562,14 @@ pub fn upsert_peer(
                         peer.description,
                         peer.os,
                         peer.arch,
+                        peer.role,
                         peer.meta_seq,
                         next_addrs,
                         next_ts,
                         direct_seen
                     ],
                 )?;
-                Ok(next_addrs != old_addrs)
+                Ok(next_addrs != old_addrs || peer.role != old_role)
             } else if take_addrs || direct {
                 conn.execute(
                     "UPDATE cluster_peers
@@ -497,12 +588,12 @@ pub fn upsert_peer(
 
 pub fn list_peers(conn: &Connection) -> Result<Vec<PeerInfo>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT node_id,name,description,os,arch,meta_seq,addrs_json,addrs_ts,last_seen_at
+        "SELECT node_id,name,description,os,arch,role,meta_seq,addrs_json,addrs_ts,last_seen_at
          FROM cluster_peers ORDER BY name, node_id",
     )?;
     let rows = stmt
         .query_map([], |r| {
-            let addrs_raw: String = r.get(6)?;
+            let addrs_raw: String = r.get(7)?;
             let addrs: Vec<String> = serde_json::from_str(&addrs_raw).unwrap_or_default();
             Ok(PeerInfo {
                 node_id: r.get(0)?,
@@ -510,10 +601,11 @@ pub fn list_peers(conn: &Connection) -> Result<Vec<PeerInfo>> {
                 description: r.get(2)?,
                 os: r.get(3)?,
                 arch: r.get(4)?,
-                meta_seq: r.get(5)?,
+                role: r.get(5)?,
+                meta_seq: r.get(6)?,
                 addrs,
-                addrs_ts: r.get(7)?,
-                last_seen_at: r.get(8)?,
+                addrs_ts: r.get(8)?,
+                last_seen_at: r.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -578,6 +670,7 @@ pub fn list_cluster_nodes(
             "description": local.description,
             "os": current_os(),
             "arch": current_arch(),
+            "role": local.role.as_str(),
             "online": true,
         }),
     ));
@@ -592,6 +685,7 @@ pub fn list_cluster_nodes(
                 "description": peer.description,
                 "os": peer.os,
                 "arch": peer.arch,
+                "role": peer.role.as_str(),
                 "online": online,
             }),
         ));
@@ -602,5 +696,11 @@ pub fn list_cluster_nodes(
 
 pub fn delete_peer(conn: &Connection, node_id: &str) -> Result<bool> {
     let changed = conn.execute("DELETE FROM cluster_peers WHERE node_id=?", [node_id])?;
+    if changed > 0 {
+        conn.execute(
+            "DELETE FROM peer_catalog_cursors WHERE peer_node_id=?",
+            [node_id],
+        )?;
+    }
     Ok(changed > 0)
 }

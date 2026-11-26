@@ -40,9 +40,14 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
         .and_then(|p| pricing::snapshot(p, started_at));
     let call_id = CallId::new()?;
     let origin_node_id = crate::cluster::identity::local_node_id(conn)?;
+    let origin_seq = crate::cluster::ledger::next_origin_seq(
+        conn,
+        crate::cluster::ledger::CALLS_SCOPE,
+        &origin_node_id,
+    )?;
     conn.prepare_cached(
-        "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot,origin_node_id)
-         VALUES(?,?,?,?,?,?,'in_flight',?,?)",
+        "INSERT INTO llm_calls(id,session_id,model_id,reasoning_effort,input_end_position,started_at,status,pricing_snapshot,origin_node_id,origin_seq)
+         VALUES(?,?,?,?,?,?,'in_flight',?,?,?)",
     )?
     .execute(params![
         call_id,
@@ -52,9 +57,10 @@ pub fn begin(conn: &Connection, sid: SessionId, end: i64) -> Result<Input> {
         end,
         started_at,
         snapshot,
-        origin_node_id
+        &*origin_node_id,
+        origin_seq
     ])?;
-    crate::cluster::ledger::record_call(conn, call_id)?;
+    crate::cluster::ledger::stage_catalog();
     Ok(Input {
         call_id,
         model,
@@ -82,17 +88,22 @@ impl Report {
         at: i64,
     ) -> Result<()> {
         crate::cluster::ledger::with_savepoint(conn, "finish_call", || {
-            let snapshot = conn
+            let (snapshot, origin_node_id): (Option<Value>, String) = conn
                 .prepare_cached(
-                    "SELECT pricing_snapshot FROM llm_calls WHERE id=? AND status='in_flight'",
+                    "SELECT pricing_snapshot, origin_node_id FROM llm_calls WHERE id=? AND status='in_flight'",
                 )?
-                .query_row([id], |r| r.get(0))?;
+                .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let origin_seq = crate::cluster::ledger::next_origin_seq(
+                conn,
+                crate::cluster::ledger::CALLS_SCOPE,
+                &origin_node_id,
+            )?;
             let usage = self.usage.filter(Value::is_object);
             let bill = pricing::settle(snapshot, usage.as_ref());
             conn.prepare_cached(
                 "UPDATE llm_calls SET finished_at=?, status=?, error_summary=?, upstream_response_id=?,
                  http_status=?, raw_usage=?, input_uncached_tokens=?, cache_read_tokens=?, cache_write_tokens=?,
-                 output_tokens=?, cost_nano_usd=?, pricing_snapshot=? WHERE id=? AND status='in_flight'",
+                 output_tokens=?, cost_nano_usd=?, pricing_snapshot=?, origin_seq=? WHERE id=? AND status='in_flight'",
             )?
             .execute(params![
                 at,
@@ -107,9 +118,10 @@ impl Report {
                 bill.output_tokens,
                 bill.cost_nano_usd,
                 bill.snapshot,
+                origin_seq,
                 id
             ])?;
-            crate::cluster::ledger::record_call(conn, id)?;
+            crate::cluster::ledger::stage_catalog();
             Ok(())
         })
     }

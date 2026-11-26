@@ -14,10 +14,9 @@ struct Grant {
 
 // Keep decoding and network errors outside the transaction so neither can undo logout.
 fn take(conn: &Connection, id: McpServerId, expected: Option<&str>, timeout: Duration) -> Result<Grant> {
-    crate::cluster::ledger::assert_no_conflict(conn, id.as_str())?;
     let (generation, grant) = conn.query_row(
         "SELECT generation,credentials,binding FROM mcp_servers
-         LEFT JOIN mcp_oauth ON server_id=id WHERE id=?",
+         LEFT JOIN mcp_oauth ON server_id=id WHERE id=? AND deleted=0",
         [id],
         |r| {
             Ok((
@@ -36,9 +35,7 @@ fn take(conn: &Connection, id: McpServerId, expected: Option<&str>, timeout: Dur
         ));
     }
     conn.execute("DELETE FROM mcp_oauth WHERE server_id=?", [id])?;
-    if !crate::cluster::ledger::has_conflict(conn, id.as_str())? {
-        crate::cluster::ledger::record_mcp_if_shared(conn, id)?;
-    }
+    super::storage::touch_shared_mcp_oauth(conn, id)?;
     Ok(grant)
 }
 
@@ -157,7 +154,7 @@ pub(super) async fn logout(app: &App, id: McpServerId) -> Result<()> {
         .db
         .call(move |s| {
             let (generation, ms): (Option<String>, u32) = s.conn.query_row(
-                "SELECT generation,timeout_ms FROM mcp_servers LEFT JOIN mcp_oauth ON server_id=id WHERE id=?",
+                "SELECT generation,timeout_ms FROM mcp_servers LEFT JOIN mcp_oauth ON server_id=id WHERE id=? AND deleted=0",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;

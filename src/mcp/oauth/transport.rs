@@ -34,7 +34,7 @@ impl HttpClient {
                     let sql = format!(
                         "SELECT generation,binding,json_extract(config_json,'$.url')
                      FROM mcp_oauth JOIN mcp_servers ON id=server_id
-                     WHERE id=? AND revision=? AND (enabled OR ?) AND {}",
+                     WHERE id=? AND deleted=0 AND revision=? AND (enabled OR ?) AND {}",
                         storage::AUTHORIZED_SQL
                     );
                     let (generation, raw, endpoint): (String, String, String) = s

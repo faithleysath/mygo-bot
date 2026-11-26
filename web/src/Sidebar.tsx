@@ -12,7 +12,6 @@ export interface SidebarProps {
   open: boolean;
   collapsed: boolean;
   searchOpen: boolean;
-  conflictCount: number;
   nodeNameById?: Map<string, string>;
   themePref: ThemePref;
   searchInputRef: RefObject<HTMLInputElement | null>;
@@ -32,7 +31,6 @@ export function Sidebar({
   open,
   collapsed,
   searchOpen,
-  conflictCount,
   nodeNameById,
   themePref,
   searchInputRef,
@@ -132,9 +130,6 @@ export function Sidebar({
             <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("cluster"); onClose(); }}>
               <Icon n="globe" />
               <span>{t("Cluster")}</span>
-              {conflictCount > 0 && (
-                <span class="pill pill-failed" style="margin-left:auto">{conflictCount}</span>
-              )}
             </button>
             <button type="button" class="nav-item" onClick={() => { onOpenSettingsTab("usage"); onClose(); }}>
               <Icon n="chart" />

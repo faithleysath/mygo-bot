@@ -617,26 +617,10 @@ export function createGlobalSessionSync({
   };
 }
 
-export type HistoryFetchResult =
-  | HistoryItem[]
-  | { items: HistoryItem[]; historyRev?: number | null };
-
-function normalizeHistoryResult(
-  res: HistoryFetchResult
-): { items: HistoryItem[]; historyRev: number | null } {
-  if (Array.isArray(res)) {
-    return { items: res, historyRev: null };
-  }
-  return {
-    items: res.items,
-    historyRev: typeof res.historyRev === "number" ? res.historyRev : null,
-  };
-}
-
 export interface SessionSyncOptions {
-  fetchInitial: () => Promise<HistoryFetchResult>;
-  fetchAfter: (afterId: string) => Promise<HistoryFetchResult>;
-  fetchBefore?: (beforeId: string, signal: AbortSignal) => Promise<HistoryFetchResult>;
+  fetchInitial: () => Promise<HistoryItem[]>;
+  fetchAfter: (afterId: string) => Promise<HistoryItem[]>;
+  fetchBefore?: (beforeId: string, signal: AbortSignal) => Promise<HistoryItem[]>;
   onLoadingOlder?: (loading: boolean) => void;
   onItems: (items: HistoryItem[]) => void;
   onReplaceItems?: (items: HistoryItem[]) => void;
@@ -650,9 +634,9 @@ export interface SessionSyncOptions {
 export interface SessionSync {
   loadOlder: (beforeId: string) => Promise<void>;
   start: () => void;
-  onReady: (historyRev?: number) => void;
-  onResync: (historyRev?: number) => void;
-  onReset: (historyRev?: number) => void;
+  onReady: () => void;
+  onResync: () => void;
+  onReset: () => void;
   onLiveItem: (item: HistoryItem) => void;
   dispose: () => void;
   getState: () => { initialLoaded: boolean; syncedThroughId: string; gapOpen: boolean };
@@ -679,7 +663,6 @@ export function createSessionSync({
   let runAgain = false;
   let replaceNext = false;
   let resetGen = 0;
-  let knownHistoryRev: number | null = null;
   let olderRequest: AbortController | null = null;
 
   const cancelOlder = (): void => {
@@ -717,21 +700,8 @@ export function createSessionSync({
     let shouldScheduleRetry = false;
     try {
       if (!initialLoaded) {
-        const { items: hist, historyRev: respRev } = normalizeHistoryResult(await fetchInitial());
+        const hist = await fetchInitial();
         if (disposed || myGen !== resetGen) return;
-        if (respRev !== null && knownHistoryRev !== null && respRev !== knownHistoryRev) {
-          knownHistoryRev = Math.max(knownHistoryRev, respRev);
-          resetGen += 1;
-          initialLoaded = false;
-          syncedThroughId = "";
-          gapOpen = true;
-          replaceNext = true;
-          runAgain = true;
-          return;
-        }
-        if (respRev !== null) {
-          knownHistoryRev = respRev;
-        }
         if (replaceNext && onReplaceItems) {
           onReplaceItems(hist);
         } else {
@@ -747,17 +717,8 @@ export function createSessionSync({
         if (!runAgain) triggerSidecars();
       } else {
         while (!disposed) {
-          const { items: page, historyRev: pageRev } = normalizeHistoryResult(
-            await fetchAfter(syncedThroughId)
-          );
+          const page = await fetchAfter(syncedThroughId);
           if (disposed || myGen !== resetGen) return;
-          if (pageRev !== null && knownHistoryRev !== null && pageRev !== knownHistoryRev) {
-            onReset(pageRev);
-            return;
-          }
-          if (pageRev !== null) {
-            knownHistoryRev = pageRev;
-          }
           if (page.length) {
             onItems(page);
             const last = page[page.length - 1].id;
@@ -800,35 +761,21 @@ export function createSessionSync({
     void runSync();
   };
 
-  const syncWithRev = (historyRev?: number): void => {
+  const syncAfterGap = (): void => {
     if (disposed) return;
-    if (typeof historyRev === "number") {
-      if (knownHistoryRev !== null && historyRev !== knownHistoryRev) {
-        onReset(historyRev);
-        return;
-      }
-      if (knownHistoryRev === null && (initialLoaded || inFlight)) {
-        onReset(historyRev);
-        return;
-      }
-      knownHistoryRev = historyRev;
-    }
     gapOpen = true;
     retryDelay = 1000;
     clearRetry();
     void runSync();
   };
 
-  const onReady = (historyRev?: number): void => syncWithRev(historyRev);
+  const onReady = (): void => syncAfterGap();
 
-  const onResync = (historyRev?: number): void => syncWithRev(historyRev);
+  const onResync = (): void => syncAfterGap();
 
-  const onReset = (historyRev?: number): void => {
+  const onReset = (): void => {
     if (disposed) return;
     cancelOlder();
-    if (typeof historyRev === "number") {
-      knownHistoryRev = historyRev;
-    }
     resetGen += 1;
     initialLoaded = false;
     syncedThroughId = "";
@@ -849,18 +796,13 @@ export function createSessionSync({
     olderRequest = request;
     onLoadingOlder?.(true);
     try {
-      const page = normalizeHistoryResult(await fetchBefore(beforeId, request.signal));
+      const page = await fetchBefore(beforeId, request.signal);
       if (request.signal.aborted) return;
-      if (page.historyRev !== knownHistoryRev) {
-        onReset(page.historyRev === null ? undefined : Math.max(knownHistoryRev ?? 0, page.historyRev));
-        return;
-      }
-      onItems(page.items);
-      onHasMore(page.items.length === 50);
+      onItems(page);
+      onHasMore(page.length === 50);
     } catch (e) {
       if (!request.signal.aborted) {
         onError?.(errorMessage(e));
-        // An interrupted body can mean the server replaced history between batches.
         onResync();
       }
     } finally {

@@ -197,7 +197,7 @@ pub(crate) fn guard_grant_copy(
     let row: Option<(String, bool)> = conn
         .prepare_cached(
             "SELECT generation,pending_refresh IS NOT NULL FROM mcp_oauth
-             JOIN mcp_servers ON id=server_id WHERE server_id=? AND shared=1",
+             JOIN mcp_servers ON id=server_id WHERE server_id=? AND shared=1 AND deleted=0",
         )?
         .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
@@ -271,7 +271,7 @@ async fn status(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<J
             let sql = format!(
                 "SELECT json_type(config_json,'$.oauth') IS 'object', {},
              json_extract(pending,'$.created_at')+?2>unixepoch()
-             FROM mcp_servers LEFT JOIN mcp_oauth ON id=server_id WHERE id=?1",
+             FROM mcp_servers LEFT JOIN mcp_oauth ON id=server_id WHERE id=?1 AND deleted=0",
                 storage::AUTHORIZED_SQL
             );
             let status = s.conn.query_row(&sql, params![id, LOGIN_TTL], |row| {
@@ -341,27 +341,8 @@ async fn logout(State(app): State<App>, Path(id): Path<McpServerId>) -> Result<S
 
 pub(crate) struct CoordinatorRefreshOutcome {
     pub status: crate::cluster::sync::OAuthRefreshStatus,
-    pub head: Option<crate::cluster::ledger::StreamHead>,
-    pub commits: Vec<crate::cluster::ledger::CommitWire>,
-    pub has_more: bool,
+    pub server: Option<crate::cluster::ledger::McpServerWire>,
     pub error: Option<String>,
-}
-
-fn to_wire_head(st: crate::cluster::ledger::LocalStreamState) -> crate::cluster::ledger::StreamHead {
-    let body_complete = st.is_body_complete();
-    crate::cluster::ledger::StreamHead {
-        stream_id: st.stream_id,
-        kind: st.kind,
-        epoch: st.epoch,
-        head_seq: st.head_seq,
-        head_hash: st.head_hash,
-        body_complete,
-        checkpoint_seq: st.checkpoint_seq,
-        deleted: st.deleted,
-        retired: st.retired,
-        head_snapshot: st.head_snapshot,
-        updated_at: st.updated_at,
-    }
 }
 
 pub(crate) async fn refresh_shared_as_coordinator(
@@ -369,9 +350,6 @@ pub(crate) async fn refresh_shared_as_coordinator(
     _client: &reqwest::Client,
     id: McpServerId,
     generation: &str,
-    expected_epoch: i64,
-    expected_seq: i64,
-    expected_hash: Option<[u8; 32]>,
     rejected_token_hash: Option<[u8; 32]>,
 ) -> Result<CoordinatorRefreshOutcome> {
     use crate::cluster::{ledger, sync::OAuthRefreshStatus};
@@ -396,59 +374,15 @@ pub(crate) async fn refresh_shared_as_coordinator(
 
     let pre = db
         .call(move |s| {
-            let local_st = ledger::stream_head(&s.conn, id.as_str())?;
-            if ledger::has_conflict(&s.conn, id.as_str())? {
-                return Ok(Precheck::Early(CoordinatorRefreshOutcome {
-                    status: OAuthRefreshStatus::Conflicted,
-                    head: local_st.map(to_wire_head),
-                    commits: Vec::new(),
-                    has_more: false,
-                    error: Some("MCP stream conflicted on coordinator".into()),
-                }));
-            }
-            if let Some(st) = &local_st
-                && expected_epoch > 0
-            {
-                if st.epoch < expected_epoch || (st.epoch == expected_epoch && st.head_seq < expected_seq)
-                {
-                    return Ok(Precheck::Early(CoordinatorRefreshOutcome {
-                        status: OAuthRefreshStatus::UpToDate,
-                        head: None,
-                        commits: Vec::new(),
-                        has_more: false,
-                        error: None,
-                    }));
-                }
-                if st.epoch == expected_epoch && expected_seq > 0 {
-                    let local_at = ledger::commit_hash_at(
-                        &s.conn,
-                        id.as_str(),
-                        expected_epoch,
-                        expected_seq,
-                    )?;
-                    if local_at.is_some() && local_at != expected_hash {
-                        return Ok(Precheck::Early(CoordinatorRefreshOutcome {
-                            status: OAuthRefreshStatus::Conflicted,
-                            head: local_st.map(to_wire_head),
-                            commits: Vec::new(),
-                            has_more: false,
-                            error: Some(
-                                "divergent MCP OAuth history detected; resolve conflict".into(),
-                            ),
-                        }));
-                    }
-                }
-            }
-
             let row: Option<(i64, String, String, Option<String>, bool, bool, bool)> = s
                 .conn
                 .query_row(
                     &format!(
                         "SELECT m.revision, o.binding, json_extract(m.config_json,'$.url'),
-                                coalesce(o.staged_credentials,o.credentials), o.rejected,
+                                o.credentials, o.rejected,
                                 ({}), o.pending_refresh IS NOT NULL
                          FROM mcp_servers m JOIN mcp_oauth o ON o.server_id=m.id
-                         WHERE m.id=?1 AND m.shared=1 AND o.generation=?2",
+                         WHERE m.id=?1 AND m.shared=1 AND m.deleted=0 AND o.generation=?2",
                         storage::AUTHORIZED_SQL
                     ),
                     params![id, gen_owned],
@@ -460,9 +394,7 @@ pub(crate) async fn refresh_shared_as_coordinator(
             else {
                 return Ok(Precheck::Early(CoordinatorRefreshOutcome {
                     status: OAuthRefreshStatus::ReauthRequired,
-                    head: local_st.map(to_wire_head),
-                    commits: Vec::new(),
-                    has_more: false,
+                    server: ledger::load_mcp_wire(&s.conn, id)?,
                     error: Some("MCP OAuth login changed or missing".into()),
                 }));
             };
@@ -472,9 +404,7 @@ pub(crate) async fn refresh_shared_as_coordinator(
             let Some(raw_creds) = raw_creds else {
                 return Ok(Precheck::Early(CoordinatorRefreshOutcome {
                     status: OAuthRefreshStatus::ReauthRequired,
-                    head: local_st.map(to_wire_head),
-                    commits: Vec::new(),
-                    has_more: false,
+                    server: ledger::load_mcp_wire(&s.conn, id)?,
                     error: Some("MCP OAuth credentials missing".into()),
                 }));
             };
@@ -492,9 +422,7 @@ pub(crate) async fn refresh_shared_as_coordinator(
             if !authorized && !matching_rejected {
                 return Ok(Precheck::Early(CoordinatorRefreshOutcome {
                     status: OAuthRefreshStatus::ReauthRequired,
-                    head: local_st.map(to_wire_head),
-                    commits: Vec::new(),
-                    has_more: false,
+                    server: ledger::load_mcp_wire(&s.conn, id)?,
                     error: Some("MCP OAuth re-authentication required".into()),
                 }));
             }
@@ -510,14 +438,7 @@ pub(crate) async fn refresh_shared_as_coordinator(
         .await?;
 
     let status = match pre {
-        Precheck::Early(mut out) => {
-            if out.head.is_some() {
-                let (commits, has_more) = read_refresh_tail(db, id, expected_epoch, expected_seq).await?;
-                out.commits = commits;
-                out.has_more = has_more;
-            }
-            return Ok(out);
-        }
+        Precheck::Early(out) => return Ok(out),
         Precheck::Proceed {
             revision,
             binding,
@@ -550,68 +471,10 @@ pub(crate) async fn refresh_shared_as_coordinator(
         }
     };
 
-    let (head, commits, has_more) = db
-        .call(move |s| {
-            let Some(st) = ledger::stream_head(&s.conn, id.as_str())? else {
-                return Ok((None, Vec::new(), false));
-            };
-            if st.epoch != expected_epoch {
-                return Ok((Some(to_wire_head(st)), Vec::new(), true));
-            }
-            let start_after = if expected_seq >= 0 && expected_seq <= st.head_seq {
-                expected_seq
-            } else {
-                0
-            };
-            let (commits, has_more) = ledger::read_commits_range(
-                &s.conn,
-                &st.stream_id,
-                st.epoch,
-                start_after,
-                None,
-                256,
-                4 * 1024 * 1024,
-            )?;
-            Ok((Some(to_wire_head(st)), commits, has_more))
-        })
-        .await?;
-
+    let server = db.call(move |s| ledger::load_mcp_wire(&s.conn, id)).await?;
     Ok(CoordinatorRefreshOutcome {
         status,
-        head,
-        commits,
-        has_more,
+        server,
         error: None,
     })
-}
-
-async fn read_refresh_tail(
-    db: &Db,
-    id: McpServerId,
-    expected_epoch: i64,
-    expected_seq: i64,
-) -> Result<(Vec<crate::cluster::ledger::CommitWire>, bool)> {
-    db.call(move |s| {
-        let Some(st) = crate::cluster::ledger::stream_head(&s.conn, id.as_str())? else {
-            return Ok((Vec::new(), false));
-        };
-        if st.epoch != expected_epoch {
-            return Ok((Vec::new(), true));
-        }
-        let start_after = if expected_seq >= 0 && expected_seq <= st.head_seq {
-            expected_seq
-        } else {
-            0
-        };
-        crate::cluster::ledger::read_commits_range(
-            &s.conn,
-            &st.stream_id,
-            st.epoch,
-            start_after,
-            None,
-            256,
-            4 * 1024 * 1024,
-        )
-    })
-    .await
 }

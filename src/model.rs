@@ -209,7 +209,7 @@ impl App {
         input: Input,
         out: &mut Output,
         hard: &CancellationToken,
-        (run_epoch, run_gen): (i64, u64),
+        run_gen: u64,
     ) -> std::result::Result<(), Failure> {
         let body = body(self.db.clone(), sid, &input).await?;
         let mut request = self
@@ -357,7 +357,7 @@ impl App {
                         out.final_output_index = Some(idx);
                         return Ok(());
                     }
-                    self.accept(sid, input.call_id, item, out, hard, (run_epoch, run_gen))
+                    self.accept(sid, input.call_id, item, out, hard, run_gen)
                         .await?;
                     self.streams.finish_item(sid, input.call_id, idx);
                 }
@@ -375,7 +375,7 @@ impl App {
         item: Value,
         out: &mut Output,
         hard: &CancellationToken,
-        (run_epoch, run_gen): (i64, u64),
+        run_gen: u64,
     ) -> Result<()> {
         let kind = item["type"]
             .as_str()
@@ -398,7 +398,7 @@ impl App {
                     move |conn| {
                         let sql =
                             "SELECT payload FROM items WHERE session_id=? AND kind='function_call'
-                           AND json_extract(payload,'$.call_id')=?";
+                           AND json_extract(payload,'$.call_id')=? LIMIT 1";
                         let existing: Option<Value> = conn
                             .query_row(sql, (sid, call_key), |r| r.get(0))
                             .optional()?;
@@ -412,23 +412,13 @@ impl App {
                             }
                             return Ok(None);
                         }
-                        let saved = store::add_item(
+                        let id = store::add_item(
                             conn,
                             sid,
                             "function_call",
                             &item,
                             None,
                             Some(llm_call_id),
-                        )?;
-                        let id = saved.id;
-                        crate::cluster::ledger::record_session_delta_at_epoch(
-                            conn,
-                            sid,
-                            "session_delta",
-                            vec![saved],
-                            Vec::new(),
-                            Vec::new(),
-                            Some(run_epoch),
                         )?;
                         Ok(Some(id))
                     },
@@ -476,16 +466,7 @@ impl App {
             .write_for_run(
                 sid,
                 run_gen,
-                move |conn| {
-                    store::add_context_item(
-                        conn,
-                        sid,
-                        &kind,
-                        &item,
-                        llm_call_id,
-                        Some(run_epoch),
-                    )
-                },
+                move |conn| store::add_context_item(conn, sid, &kind, &item, llm_call_id),
                 move |s, id| {
                     s.item_saved(sid, id)?;
                     Ok(())

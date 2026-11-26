@@ -21,9 +21,9 @@ import type {
   McpToolPolicy,
   McpTransport,
   ModelInfo,
+  NodeRole,
   ProviderInfo,
   SessionInfo,
-  SyncConflictInfo,
   ThemePref,
 } from "./types.ts";
 
@@ -970,15 +970,14 @@ function UsageTab({
 function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
   const { locale, t } = useI18n();
   const [status, setStatus] = useState<ClusterStatus | null>(null);
-  const [conflicts, setConflicts] = useState<SyncConflictInfo[]>([]);
   const [selfName, setSelfName] = useState("");
   const [selfDesc, setSelfDesc] = useState("");
+  const [selfRole, setSelfRole] = useState<NodeRole>("voter");
   const [inviteCode, setInviteCode] = useState("");
   const [joinInvite, setJoinInvite] = useState("");
   const [pendingForceInvite, setPendingForceInvite] = useState("");
   const [busySync, setBusySync] = useState(false);
   const [busyJoin, setBusyJoin] = useState(false);
-  const [resolvingId, setResolvingId] = useState<string | null>(null);
   const [confirmPeerId, setConfirmPeerId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [err, setErr] = useState("");
@@ -990,14 +989,11 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
   }, [confirmPeerId]);
 
   const load = async () => {
-    const [st, confs] = await Promise.all([
-      apiFetch<ClusterStatus>("/cluster"),
-      apiFetch<SyncConflictInfo[]>("/cluster/conflicts"),
-    ]);
+    const st = await apiFetch<ClusterStatus>("/cluster");
     setStatus(st);
     setSelfName(st.self.name);
     setSelfDesc(st.self.description);
-    setConflicts(confs);
+    setSelfRole(st.self.role);
   };
 
   useEffect(() => {
@@ -1011,7 +1007,7 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     try {
       await apiFetch("/cluster/self", {
         method: "PATCH",
-        body: { name: selfName, description: selfDesc },
+        body: { name: selfName, description: selfDesc, role: selfRole },
       });
       await load();
       onClusterChanged();
@@ -1027,7 +1023,7 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     try {
       const res = await apiFetch<ClusterSyncSummary>("/cluster/sync", { method: "POST", body: {} });
       setNotice(
-        `${t("Synced:")} ${res.peers_queried} ${t("peers queried")}, ${res.streams_updated} ${t("streams updated")}, ${res.conflicts} ${t("conflicts")}`
+        `${t("Synced:")} ${res.peers_queried} ${t("peers queried")}, ${res.catalog_rows_updated} ${t("catalog updated")}, ${res.sessions_updated} ${t("sessions updated")}`
       );
       await load();
       onClusterChanged();
@@ -1079,24 +1075,6 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     await joinWithInvite(inv, false);
   };
 
-  const resolveConflict = async (streamId: string, resolution: "local" | "cluster") => {
-    setErr("");
-    setNotice("");
-    setResolvingId(streamId);
-    try {
-      await apiFetch(`/cluster/conflicts/${encodeURIComponent(streamId)}/resolve`, {
-        method: "POST",
-        body: { resolution },
-      });
-      await load();
-      onClusterChanged();
-    } catch (ex) {
-      setErr(errorMessage(ex));
-    } finally {
-      setResolvingId(null);
-    }
-  };
-
   const removePeer = async (nodeId: string) => {
     setErr("");
     try {
@@ -1132,6 +1110,7 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
               <span class="muted">{t("Node ID")}:</span>
               <code class="md-inline-code mono truncate" style="max-width:440px">{status.self.node_id}</code>
               <CopyBtn text={status.self.node_id} />
+              <span class="pill">{status.self.role === "edge" ? t("Edge") : t("Voter")}</span>
               <span class="pill mono">{status.self.os}/{status.self.arch}</span>
             </div>
             <form class="form-box" onSubmit={saveSelf}>
@@ -1144,6 +1123,26 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
                   <span>{t("Description")}</span>
                   <input value={selfDesc} onInput={(e) => setSelfDesc(e.currentTarget.value)} />
                 </label>
+              </div>
+              <div class="field">
+                <span>{t("Role")}</span>
+                <div class="segmented">
+                  {(
+                    [
+                      ["voter", t("Voter")],
+                      ["edge", t("Edge")],
+                    ] as const
+                  ).map(([val, label]) => (
+                    <button
+                      key={val}
+                      type="button"
+                      class={`seg-btn ${selfRole === val ? "active" : ""}`}
+                      onClick={() => setSelfRole(val)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
               </div>
               <div class="row gap-1">
                 <button type="submit" class="btn-primary btn-xs">{t("Save")}</button>
@@ -1224,6 +1223,7 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
                     <span class={`pill ${p.online ? "pill-succeeded" : ""}`}>
                       {p.online ? t("online") : t("offline")}
                     </span>
+                    <span class="pill">{p.role === "edge" ? t("Edge") : t("Voter")}</span>
                     <span class="pill mono">{p.os}/{p.arch}</span>
                   </div>
                   <div class="row gap-1 muted small">
@@ -1247,75 +1247,6 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
                 >
                   {confirming ? t("Confirm?") : t("Remove")}
                 </button>
-              </div>
-            );
-          })}
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <div class="row gap-1">
-            <h4>{t("Sync Conflicts")}</h4>
-            {conflicts.length > 0 && <span class="pill pill-failed">{conflicts.length}</span>}
-          </div>
-        </div>
-        <div class="item-list">
-          {conflicts.length === 0 && (
-            <div class="empty-hint small">{t("No sync conflicts.")}</div>
-          )}
-          {conflicts.map((c) => {
-            const busy = resolvingId === c.stream_id;
-            return (
-              <div key={c.stream_id} class="form-box">
-                <div class="row gap-1" style="justify-content:space-between;flex-wrap:wrap">
-                  <div class="row gap-1" style="flex-wrap:wrap">
-                    <span class="pill">{c.kind}</span>
-                    <strong class="mono small">{c.stream_id}</strong>
-                    <span class="pill pill-failed">{c.reason}</span>
-                  </div>
-                  <span class="muted small">{formatRelTimeLoc(c.detected_at, locale)}</span>
-                </div>
-                <div class="small mono muted">
-                  {t("Local")}: epoch={c.local_epoch} seq={c.local_seq} ({c.local_hash_hex.slice(0, 10)}) ·{" "}
-                  {t("Cluster")}: epoch={c.remote_epoch} seq={c.remote_seq} ({c.remote_hash_hex.slice(0, 10)}) via{" "}
-                  {c.remote_node_id.slice(0, 12)}…
-                </div>
-                {(c.related_local_id || c.remote_summary) && (
-                  <div class="small muted">
-                    {c.related_local_id && (
-                      <span>
-                        {t("Local ID")}: <code class="md-inline-code mono">{c.related_local_id}</code>{" "}
-                      </span>
-                    )}
-                    {c.remote_summary && (
-                      <span class="mono">
-                        {Object.entries(c.remote_summary)
-                          .slice(0, 6)
-                          .map(([k, v]) => `${k}=${String(v)}`)
-                          .join(" · ")}
-                      </span>
-                    )}
-                  </div>
-                )}
-                <div class="row gap-1">
-                  <button
-                    type="button"
-                    class="btn-primary btn-xs"
-                    disabled={busy}
-                    onClick={() => void resolveConflict(c.stream_id, "local")}
-                  >
-                    {busy ? t("Resolving…") : t("Keep Local (Force Push)")}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn-danger btn-xs"
-                    disabled={busy}
-                    onClick={() => void resolveConflict(c.stream_id, "cluster")}
-                  >
-                    {busy ? t("Resolving…") : t("Use Cluster (Overwrite)")}
-                  </button>
-                </div>
               </div>
             );
           })}

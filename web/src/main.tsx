@@ -4,7 +4,6 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   ApiError,
   apiFetch,
-  apiFetchWithHeaders,
   connectSse,
   consumeHashToken,
   errorMessage,
@@ -154,6 +153,7 @@ function TokenGate({ onSuccess }: { onSuccess: () => void }) {
 function TopBar({
   session,
   runnerNodeName,
+  nodeNameById,
   sseStatus,
   sidebarCollapsed,
   activeTab,
@@ -165,6 +165,7 @@ function TopBar({
 }: {
   session: SessionInfo | null;
   runnerNodeName: string | null;
+  nodeNameById?: Map<string, string>;
   sseStatus: SseStatus;
   sidebarCollapsed: boolean;
   activeTab: MainTab;
@@ -172,7 +173,10 @@ function TopBar({
   onSelectTab: (tab: MainTab) => void;
   onOpenSidebar: () => void;
   onOpenSettings: () => void;
-  onPatchSession: (sid: string, patch: Partial<Pick<SessionInfo, "title">>) => void;
+  onPatchSession: (
+    sid: string,
+    patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort" | "active_head">>
+  ) => void;
 }) {
   const { locale, t } = useI18n();
   const [title, setTitle] = useState(session?.title || "");
@@ -181,6 +185,8 @@ function TopBar({
   }, [session?.id, session?.title]);
 
   if (!session) return null;
+
+  const branches = session.branches ?? [];
 
   const commitTitle = () => {
     const next = title.trim();
@@ -220,6 +226,31 @@ function TopBar({
           </span>
           {runnerNodeName && (
             <span class="pill" title={t("Running on")}>@{runnerNodeName}</span>
+          )}
+          {branches.length > 1 && (
+            <select
+              class="composer-select"
+              style="width:auto;max-width:220px"
+              title={t("Branch")}
+              aria-label={t("Branch")}
+              disabled={session.status === "running" || session.status === "pausing"}
+              value={session.active_head ?? ""}
+              onChange={(e) => {
+                const nextHead = e.currentTarget.value;
+                if (nextHead && nextHead !== session.active_head) {
+                  onPatchSession(session.id, { active_head: nextHead });
+                }
+              }}
+            >
+              {branches.map((b, idx) => {
+                const nodeLabel = nodeNameById?.get(b.origin_node_id) || b.origin_node_id.slice(0, 8);
+                return (
+                  <option key={b.head_id} value={b.head_id}>
+                    {`#${idx + 1} · ${b.depth} · ${nodeLabel} (${b.head_id.slice(0, 10)})`}
+                  </option>
+                );
+              })}
+            </select>
           )}
           {sseStatus === "reconnecting" && (
             <span class="pill pill-paused">{t("reconnecting")}</span>
@@ -304,7 +335,6 @@ function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<MainTab>("chat");
   const [clusterStatus, setClusterStatus] = useState<ClusterStatus | null>(null);
-  const conflictCount = clusterStatus?.conflict_count ?? 0;
   const [runNodeBySid, setRunNodeBySid] = useState<Record<string, string>>({});
   const runNodeBySidRef = useRef<Record<string, string>>({});
   runNodeBySidRef.current = runNodeBySid;
@@ -542,8 +572,6 @@ function App() {
           void loadCatalog().catch(() => {});
         } else if (name === "mcp.updated") {
           setMcpRefreshNonce((n) => n + 1);
-        } else if (name === "sync.conflict") {
-          void refreshClusterBadge();
         }
       },
     });
@@ -693,16 +721,8 @@ function App() {
     const isCallClosed = (callId: string) =>
       closedCalls.has(callId) || (clearedThroughCallId !== "" && callId <= clearedThroughCallId);
 
-    const parseHistoryRev = (headers: Headers): number | null => {
-      const raw = headers.get("x-history-rev");
-      if (raw == null || raw === "") return null;
-      const n = Number(raw);
-      return Number.isSafeInteger(n) && n >= 0 ? n : null;
-    };
-    const fetchHistoryPage = async (url: string, signal?: AbortSignal) => {
-      const { data, headers } = await apiFetchWithHeaders<HistoryItem[]>(url, { signal });
-      return { items: data, historyRev: parseHistoryRev(headers) };
-    };
+    const fetchHistoryPage = (url: string, signal?: AbortSignal) =>
+      apiFetch<HistoryItem[]>(url, { signal });
     const sessionSync = createSessionSync({
       fetchInitial: () => fetchHistoryPage(`/sessions/${sid}/history?tail=true&limit=50`),
       fetchAfter: (afterId) =>
@@ -745,12 +765,12 @@ function App() {
       onEvent: (name, data) => {
         if (activeIdRef.current !== sid || sessionEpochRef.current !== epoch) return;
         if (name === "ready") {
-          const sess = data as SessionInfo & { history_rev?: number };
+          const sess = data as SessionInfo;
           globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === sess.id ? sess : s)));
           setDraft(null);
           setRetryNotice(null);
-          sessionSync.onReady(sess.history_rev);
+          sessionSync.onReady();
         } else if (name === "stream.snapshot") {
           const snap = data as ActiveDraft;
           if (!isCallClosed(snap.llm_call_id)) {
@@ -840,7 +860,6 @@ function App() {
           globalSyncRef.current?.touchSession(sid);
           setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
         } else if (name === "session.reset") {
-          const ev = data as { history_rev?: number } | null;
           closedCalls.clear();
           closedItems.clear();
           clearedThroughCallId = "";
@@ -855,9 +874,8 @@ function App() {
               }
             })
             .catch(() => {});
-          sessionSync.onReset(ev?.history_rev);
+          sessionSync.onReset();
         } else if (name === "resync") {
-          const ev = data as { history_rev?: number } | null;
           setRetryNotice(null);
           globalSyncRef.current?.touchSession(sid);
           apiFetch<SessionInfo>(`/sessions/${sid}`)
@@ -868,7 +886,7 @@ function App() {
               }
             })
             .catch(() => {});
-          sessionSync.onResync(ev?.history_rev);
+          sessionSync.onResync();
         }
       },
     });
@@ -989,7 +1007,7 @@ function App() {
 
   const patchSession = async (
     sid: string,
-    patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort">>
+    patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort" | "active_head">>
   ) => {
     setBannerErr("");
     const baseVersion = globalSyncRef.current?.getSessionVersion(sid) ?? 0;
@@ -1007,6 +1025,9 @@ function App() {
       }
       if (globalSyncRef.current) globalSyncRef.current.onLocalPatch(updated, baseVersion);
       else setSessions((prev) => applyLocalPatch(prev, updated));
+      if (patch.active_head !== undefined && sid === activeIdRef.current) {
+        sessionSyncRef.current?.onReset();
+      }
     } catch (e) {
       setBannerErr(errorMessage(e));
     }
@@ -1207,7 +1228,6 @@ function App() {
             open={sidebarOpen}
             collapsed={sidebarCollapsed}
             searchOpen={searchOpen}
-            conflictCount={conflictCount}
             nodeNameById={nodeNameById}
             themePref={themePref}
             searchInputRef={searchInputRef}
@@ -1231,6 +1251,7 @@ function App() {
                       ? nodeNameById.get(activeSession.runner_node_id) || activeSession.runner_node_id
                       : null
                   }
+                  nodeNameById={nodeNameById}
                   sseStatus={sseStatus}
                   sidebarCollapsed={sidebarCollapsed}
                   activeTab={activeTab}

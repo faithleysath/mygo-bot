@@ -12,10 +12,9 @@ use crate::{
     cluster::{
         SyncSignal,
         identity::{
-            current_arch, current_os, delete_peer, encode_endpoint_addrs, encode_invite,
+            NodeRole, current_arch, current_os, delete_peer, encode_endpoint_addrs, encode_invite,
             list_peers, load_local_node, update_self_meta,
         },
-        ledger::{ConflictInfo, list_conflicts},
         sync::SyncSummary,
     },
     id::SessionId,
@@ -29,11 +28,6 @@ pub fn routes() -> Router<App> {
         .route("/cluster/join", post(join))
         .route("/cluster/peers/{node_id}", delete(remove_peer))
         .route("/cluster/sync", post(sync_now))
-        .route("/cluster/conflicts", get(conflicts))
-        .route(
-            "/cluster/conflicts/{stream_id}/resolve",
-            post(resolve_conflict),
-        )
 }
 
 #[derive(Serialize)]
@@ -41,6 +35,7 @@ struct SelfNodeStatus {
     node_id: String,
     name: String,
     description: String,
+    role: NodeRole,
     os: &'static str,
     arch: &'static str,
     meta_seq: i64,
@@ -53,6 +48,7 @@ struct ClusterPeerView {
     node_id: String,
     name: String,
     description: String,
+    role: NodeRole,
     os: String,
     arch: String,
     meta_seq: i64,
@@ -66,7 +62,6 @@ struct ClusterStatus {
     #[serde(rename = "self")]
     self_node: SelfNodeStatus,
     peers: Vec<ClusterPeerView>,
-    conflict_count: usize,
 }
 
 async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
@@ -74,23 +69,19 @@ async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
     let online_set: std::collections::HashSet<String> =
         app.cluster.net.online_peer_ids().into_iter().collect();
     let local_only = app.cluster.net.is_local_only();
-    let (local, peers, conflict_count) = app
+    let (local, peers) = app
         .db
         .call(|s| {
             let local = load_local_node(&s.conn)?;
             let peers = list_peers(&s.conn)?;
-            let conflict_count = usize::try_from(
-                s.conn
-                    .query_row("SELECT count(*) FROM sync_conflicts", [], |r| r.get::<_, i64>(0))?,
-            )
-            .unwrap_or(0);
-            Ok((local, peers, conflict_count))
+            Ok((local, peers))
         })
         .await?;
     let self_node = SelfNodeStatus {
         node_id: local.node_id,
         name: local.name,
         description: local.description,
+        role: local.role,
         os: current_os(),
         arch: current_arch(),
         meta_seq: local.meta_seq,
@@ -105,6 +96,7 @@ async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
                 node_id: p.node_id,
                 name: p.name,
                 description: p.description,
+                role: p.role,
                 os: p.os,
                 arch: p.arch,
                 meta_seq: p.meta_seq,
@@ -114,11 +106,7 @@ async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
             }
         })
         .collect();
-    Ok(Json(ClusterStatus {
-        self_node,
-        peers,
-        conflict_count,
-    }))
+    Ok(Json(ClusterStatus { self_node, peers }))
 }
 
 #[derive(Deserialize)]
@@ -126,22 +114,24 @@ async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
 struct PatchSelf {
     name: Option<String>,
     description: Option<String>,
+    role: Option<NodeRole>,
 }
 
 async fn patch_self(
     State(app): State<App>,
     Json(body): Json<PatchSelf>,
 ) -> Result<Json<SelfNodeStatus>> {
-    if body.name.is_none() && body.description.is_none() {
-        return Err(Error::bad("expected name or description"));
+    if body.name.is_none() && body.description.is_none() && body.role.is_none() {
+        return Err(Error::bad("expected name, description, or role"));
     }
     let addrs = encode_endpoint_addrs(&app.cluster.net.endpoint_addr());
     let local_only = app.cluster.net.is_local_only();
     let local = app
         .db
         .write(
-            move |conn| update_self_meta(conn, body.name, body.description),
+            move |conn| update_self_meta(conn, body.name, body.description, body.role),
             |s, updated| {
+                s.presence.set_local_role(updated.role);
                 s.sync_signal(SyncSignal::SelfMetaChanged);
                 Ok(updated)
             },
@@ -151,6 +141,7 @@ async fn patch_self(
         node_id: local.node_id,
         name: local.name,
         description: local.description,
+        role: local.role,
         os: current_os(),
         arch: current_arch(),
         meta_seq: local.meta_seq,
@@ -192,6 +183,7 @@ async fn join(State(app): State<App>, Json(body): Json<JoinBody>) -> Result<Json
             "node_id": peer.node_id,
             "name": peer.name,
             "description": peer.description,
+            "role": peer.role,
             "os": peer.os,
             "arch": peer.arch,
         }
@@ -209,16 +201,17 @@ async fn remove_peer(
         .write(
             move |conn| {
                 let removed = delete_peer(conn, &target)?;
-                let count = if removed {
-                    crate::cluster::identity::list_peers(conn)?.len()
+                let peers = if removed {
+                    crate::cluster::identity::list_peers(conn)?
                 } else {
-                    0
+                    Vec::new()
                 };
-                Ok((removed, count))
+                Ok((removed, peers))
             },
-            move |_, (removed, count)| {
+            move |_, (removed, peers)| {
                 if removed {
-                    presence.set_known_peer_count(count);
+                    presence.set_peer_roles(&peers);
+                    presence.set_known_peer_count(peers.len());
                 }
                 Ok(removed)
             },
@@ -244,26 +237,4 @@ async fn sync_now(
     let sid = body.and_then(|b| b.0.session_id);
     let summary = app.cluster.sync.sync_now(sid).await?;
     Ok(Json(summary))
-}
-
-async fn conflicts(State(app): State<App>) -> Result<Json<Vec<ConflictInfo>>> {
-    app.db.call(|s| Ok(Json(list_conflicts(&s.conn)?))).await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResolveBody {
-    resolution: String,
-}
-
-async fn resolve_conflict(
-    State(app): State<App>,
-    Path(stream_id): Path<String>,
-    Json(body): Json<ResolveBody>,
-) -> Result<StatusCode> {
-    app.cluster
-        .sync
-        .resolve_conflict(&stream_id, &body.resolution)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
 }

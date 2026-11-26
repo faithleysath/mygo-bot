@@ -4,6 +4,15 @@ export type MainTab = "chat" | "trace" | "context";
 export type SseStatus = "open" | "reconnecting";
 export type SessionStatus = "idle" | "running" | "pausing" | "paused";
 
+export type NodeRole = "voter" | "edge";
+
+export interface BranchHead {
+  head_id: string;
+  depth: number;
+  last_item_id: string;
+  origin_node_id: string;
+}
+
 export interface SessionInfo {
   id: string;
   title: string;
@@ -14,6 +23,8 @@ export interface SessionInfo {
   last_error: string;
   model_id: string;
   runner_node_id: string | null;
+  active_head?: string | null;
+  branches?: BranchHead[];
 }
 
 export interface SessionStatusEvent {
@@ -32,6 +43,7 @@ export interface SelfNodeStatus {
   node_id: string;
   name: string;
   description: string;
+  role: NodeRole;
   os: string;
   arch: string;
   meta_seq: number;
@@ -43,6 +55,7 @@ export interface ClusterPeerView {
   node_id: string;
   name: string;
   description: string;
+  role: NodeRole;
   os: string;
   arch: string;
   meta_seq: number;
@@ -54,29 +67,12 @@ export interface ClusterPeerView {
 export interface ClusterStatus {
   self: SelfNodeStatus;
   peers: ClusterPeerView[];
-  conflict_count: number;
 }
 
 export interface ClusterSyncSummary {
   peers_queried: number;
-  streams_updated: number;
-  conflicts: number;
-}
-
-export interface SyncConflictInfo {
-  stream_id: string;
-  kind: "provider" | "model" | "mcp" | "call" | "session";
-  local_epoch: number;
-  local_seq: number;
-  local_hash_hex: string;
-  remote_epoch: number;
-  remote_seq: number;
-  remote_hash_hex: string;
-  remote_node_id: string;
-  reason: string;
-  related_local_id: string | null;
-  remote_summary: Record<string, unknown> | null;
-  detected_at: number;
+  catalog_rows_updated: number;
+  sessions_updated: number;
 }
 
 export interface ProviderInfo {
