@@ -20,7 +20,7 @@
 | **`codemode_task_status`** | 模型工具 | 查单个任务的实时透视快照或已完工摘要 | 必填 `id`（严格格式 `cm_<26位小写 Crockford Base32 后缀>`，共 29 字符） |
 | **`codemode_task_renew`** | 模型工具 | 把活任务剩余租期从现在起重置为指定秒数 | 必填 `id` 和 `duration_seconds`（**1 到 86400 秒**） |
 | **`codemode_task_kill`** | 模型工具 | 停掉任务及其受管进程组，最多原地等 **3 秒**遗言 | 必填 `id` |
-| `GET /sessions/{sid}/tasks` | HTTP API | 供 WebUI 任务栏每 2 秒拉取本会话活跃任务全量快照（若由远端 Runner 占有则自动经 `mygo/exec/2` 转发过去拉取） | 绕过“无变化去重”，总是返回最新完整文本尾部 |
+| `GET /sessions/{sid}/tasks` | HTTP API | 供 WebUI 任务栏每 2 秒拉取本会话活跃任务全量快照（若由远端 Runner 占有则自动经 `mygo/exec/1` 转发过去拉取） | 绕过“无变化去重”，总是返回最新完整文本尾部 |
 | `DELETE /sessions/{sid}/tasks/{tid}` | HTTP API | 人工从页面点 Stop 掐断指定任务（同样按当前占有权透明转发至任务所在节点） | 等同触发停止（超时标 `expired`，否则 `killed`），返回 `stopping` |
 
 每个脚本开跑时，都会从它那笔 `function_call` 在 `items` 表里的 TypeID 主键 `origin`（形如 `itm_<26位后缀>`）直接换前缀命名，任务编号就是 **`cm_<26位后缀>`**。为了护住机器内存和 JS 线程池，系统锁死了两道并发配额：**全进程最多同时跑 256 个虚拟机任务，单个会话最多 32 个**——不仅记账员的 `s.tasks` 算这个数，连后面 `codemode_wait` 临时拉起来的 `trigger_code` 探针也会占一个 `VmSlot`（直到工人线程把进程组完全清场释放才摘名额）。
