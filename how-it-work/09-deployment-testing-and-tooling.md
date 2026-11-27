@@ -1,4 +1,4 @@
-# 08 · 部署运维、压测验证、瘦身发布与评测体系
+# 09 · 部署运维、压测验证、瘦身发布与评测体系
 
 把程序的核心机制写完只是完成了一半，另一半决定了它能不能稳稳落地跑在生产机器上、能不能放心大改而不算糊涂账、以及跟同类前沿 Agent 放在同一道考题里到底几斤几两。这一篇把 MyGo-Bot 从启动命令、原生服务托管、极限瘦身构建，到 26 场景并发压测与 59 题横向评测一次讲透。
 
@@ -107,4 +107,4 @@ mise run stress --scenarios hot-enqueue,duplicate-run,idempotency,long-context,f
 
 ---
 
-**上一篇**：[07 · 实时流、HTTP API、内置文档与 WebUI](07-realtime-api-and-webui.md) · **返回目录**：[总览](README.md)
+**上一篇**：[08 · 私有集群：无冲突同步与多数派执行控制](08-cluster-sync-and-execution.md) · **返回目录**：[总览](README.md)

@@ -27,7 +27,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 
 注意：`v1` 刻意把这两条索引建成**非唯一部分索引**（这样就算两台设备离线并发创建重名目录，跨节点 CRDT 合流时也不会被 SQL `UNIQUE` 报错卡死）；而在正常本地新建、修改或恢复的写事务入口里，应用层会顺着这两条索引严格拦截同活跃名称碰撞并返回 `409 Conflict`。意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会被应用层冲突检查拦住。
 
-判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会打上逐字段 HLC 时间戳并递增持久化在高水位 `local_node.catalog_rev` 上的行级 `sync_rev`，在私有集群内经 `CatalogSync` 即时自动同步。其中 [`merge_provider_wire`](../src/cluster/ledger.rs#L1304) 特意把供应商的 `base_url` 与 `api_key` 绑在同一枚原子 HLC 时间戳 **`endpoint_ts`**（`lww_take_pair`）上一并取新——省掉这枚绑定、拆成两个时间戳，A 改地址而 B 换密钥后合流就会把新密钥错发去老地址。
+判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会打上逐字段 HLC 时间戳并递增持久化在高水位 `local_node.catalog_rev` 上的行级 `sync_rev`，在私有集群内经 `CatalogSync` 即时自动同步。其中 [src/cluster/ledger.rs](../src/cluster/ledger.rs) 的 `merge_provider_wire` 特意把供应商的 `base_url` 与 `api_key` 绑在同一枚原子 HLC 时间戳 **`endpoint_ts`**（`lww_take_pair`）上一并取新——省掉这枚绑定、拆成两个时间戳，A 改地址而 B 换密钥后合流就会把新密钥错发去老地址。
 
 ### 护账与护会话的四道铁门
 
