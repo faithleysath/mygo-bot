@@ -976,7 +976,9 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
   const [pendingForceInvite, setPendingForceInvite] = useState("");
   const [busySync, setBusySync] = useState(false);
   const [busyJoin, setBusyJoin] = useState(false);
+  const [busyLeave, setBusyLeave] = useState(false);
   const [confirmPeerId, setConfirmPeerId] = useState<string | null>(null);
+  const [confirmLeave, setConfirmLeave] = useState(false);
   const [notice, setNotice] = useState("");
   const [err, setErr] = useState("");
 
@@ -985,6 +987,12 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     const tmr = setTimeout(() => setConfirmPeerId(null), 3000);
     return () => clearTimeout(tmr);
   }, [confirmPeerId]);
+
+  useEffect(() => {
+    if (!confirmLeave) return;
+    const tmr = setTimeout(() => setConfirmLeave(false), 3000);
+    return () => clearTimeout(tmr);
+  }, [confirmLeave]);
 
   const load = async () => {
     const st = await apiFetch<ClusterStatus>("/cluster");
@@ -1083,6 +1091,27 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     }
   };
 
+  const leaveCluster = async () => {
+    setErr("");
+    setNotice("");
+    setBusyLeave(true);
+    try {
+      const st = await apiFetch<ClusterStatus>("/cluster/leave", { method: "POST" });
+      setStatus(st);
+      setSelfName(st.self.name);
+      setSelfDesc(st.self.description);
+      setInviteCode("");
+      setPendingForceInvite("");
+      setConfirmLeave(false);
+      setNotice(t("Cluster secret rotated and peers cleared."));
+      onClusterChanged();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setBusyLeave(false);
+    }
+  };
+
   return (
     <div class="tab-stack">
       {err && <div class="err-inline">{err}</div>}
@@ -1131,9 +1160,31 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
       <section class="panel">
         <div class="panel-head">
           <h4>{t("Peers & Join")}</h4>
-          <button type="button" class="btn-ghost btn-xs" onClick={generateInvite}>
-            {t("Generate Invite")}
-          </button>
+          <div class="row gap-1">
+            <button type="button" class="btn-ghost btn-xs" onClick={generateInvite}>
+              {t("Generate Invite")}
+            </button>
+            <button
+              type="button"
+              class="btn-danger btn-xs"
+              disabled={busyLeave}
+              onClick={() => {
+                if (confirmLeave) {
+                  void leaveCluster();
+                } else {
+                  setConfirmLeave(true);
+                }
+              }}
+            >
+              {busyLeave
+                ? t("Rotating…")
+                : confirmLeave
+                  ? t("Confirm?")
+                  : (status?.peers.length || 0) > 0
+                    ? t("Leave Cluster")
+                    : t("Rotate Secret")}
+            </button>
+          </div>
         </div>
         {inviteCode && (
           <div class="form-box">

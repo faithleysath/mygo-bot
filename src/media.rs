@@ -159,6 +159,7 @@ async fn upload(State(app): State<App>, headers: HeaderMap, body: Body) -> Resul
         return Err(Error::bad("expected a complete, nonempty attachment"));
     }
     let hash = hash.finalize();
+    let created_at = chrono::Utc::now().timestamp_millis();
     let saved = app
         .db
         .write(
@@ -170,6 +171,7 @@ async fn upload(State(app): State<App>, headers: HeaderMap, body: Body) -> Resul
                     mime.as_ref(),
                     hash.as_bytes().as_slice(),
                     bytes as i64,
+                    created_at,
                     ZeroBlob(bytes as u64),
                 ))?;
                 let mut blob =
@@ -192,7 +194,73 @@ async fn upload(State(app): State<App>, headers: HeaderMap, body: Body) -> Resul
 }
 
 const INSERT_ATTACHMENT: &str =
-    "INSERT INTO attachments(id,mime_type,content_hash,byte_len,data) VALUES(?,?,?,?,?)";
+    "INSERT INTO attachments(id,mime_type,content_hash,byte_len,created_at,data) VALUES(?,?,?,?,?,?)";
+
+pub(crate) const ATTACHMENT_GC_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
+const ATTACHMENT_GC_BATCH: usize = 64;
+const ATTACHMENT_GC_MAX_BATCHES_PER_SWEEP: usize = 16;
+const ATTACHMENT_GC_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const ATTACHMENT_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+pub fn gc_orphan_attachments(conn: &Connection, cutoff_ms: i64, limit: usize) -> Result<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let deleted = conn
+        .prepare_cached(
+            "DELETE FROM attachments
+             WHERE id IN (
+                 SELECT a.id FROM attachments a
+                 WHERE a.created_at <= ?1
+                   AND NOT EXISTS (SELECT 1 FROM item_attachments ia WHERE ia.attachment_id = a.id)
+                 ORDER BY a.created_at, a.id
+                 LIMIT ?2
+             )",
+        )?
+        .execute(rusqlite::params![cutoff_ms, limit_i64])?;
+    Ok(deleted)
+}
+
+pub async fn reap_orphan_attachments(db: Db, stopping: tokio_util::sync::CancellationToken) {
+    tokio::select! {
+        biased;
+        _ = stopping.cancelled() => return,
+        _ = tokio::time::sleep(ATTACHMENT_GC_INITIAL_DELAY) => {}
+    }
+    loop {
+        if stopping.is_cancelled() {
+            return;
+        }
+        let cutoff_ms = chrono::Utc::now().timestamp_millis() - ATTACHMENT_GC_GRACE_MS;
+        for _ in 0..ATTACHMENT_GC_MAX_BATCHES_PER_SWEEP {
+            if stopping.is_cancelled() {
+                return;
+            }
+            let res = db
+                .write(
+                    move |conn| gc_orphan_attachments(conn, cutoff_ms, ATTACHMENT_GC_BATCH),
+                    |_, deleted| Ok(deleted),
+                )
+                .await;
+            match res {
+                Ok(deleted) if deleted >= ATTACHMENT_GC_BATCH => {
+                    tokio::task::yield_now().await;
+                }
+                Ok(_) => break,
+                Err(err) => {
+                    tracing::warn!(error = %err, "orphan attachment GC sweep failed");
+                    break;
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = stopping.cancelled() => return,
+            _ = tokio::time::sleep(ATTACHMENT_GC_INTERVAL) => {}
+        }
+    }
+}
 
 pub fn attachment_mime(value: &str) -> Result<mime::Mime> {
     value
@@ -211,12 +279,14 @@ pub fn save_attachment(conn: &Connection, mime: &mime::Mime, data: &[u8]) -> Res
     }
     let hash = blake3::hash(data);
     let byte_len = i64::try_from(data.len()).map_err(|_| Error::bad("attachment too large"))?;
+    let created_at = chrono::Utc::now().timestamp_millis();
     let id = AttachmentId::new()?;
     conn.prepare_cached(INSERT_ATTACHMENT)?.execute((
         id,
         mime.as_ref(),
         hash.as_bytes().as_slice(),
         byte_len,
+        created_at,
         data,
     ))?;
     Ok(id)

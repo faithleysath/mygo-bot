@@ -579,6 +579,10 @@ async fn serve(
     let (app, _cap_server, _exec_server) = app;
     app.workers
         .spawn(mcp::reap_idle(app.db.clone(), app.stopping.clone()));
+    app.workers.spawn(media::reap_orphan_attachments(
+        app.db.clone(),
+        app.stopping.clone(),
+    ));
     let routes = api::routes(app.clone());
     let web = webui::routes();
     let docs = listen.ip().is_loopback().then(docs::routes);

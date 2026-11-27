@@ -25,6 +25,7 @@ pub fn routes() -> Router<App> {
         .route("/cluster/self", patch(patch_self))
         .route("/cluster/invite", post(invite))
         .route("/cluster/join", post(join))
+        .route("/cluster/leave", post(leave))
         .route("/cluster/peers/{node_id}", delete(remove_peer))
         .route("/cluster/sync", post(sync_now))
 }
@@ -174,6 +175,26 @@ async fn join(State(app): State<App>, Json(body): Json<JoinBody>) -> Result<Json
             "arch": peer.arch,
         }
     })))
+}
+
+async fn leave(State(app): State<App>) -> Result<Json<ClusterStatus>> {
+    let local = app.cluster.leave_cluster().await?;
+    let addrs = encode_endpoint_addrs(&app.cluster.net.endpoint_addr());
+    let local_only = app.cluster.net.is_local_only();
+    let self_node = SelfNodeStatus {
+        node_id: local.node_id,
+        name: local.name,
+        description: local.description,
+        os: current_os(),
+        arch: current_arch(),
+        meta_seq: local.meta_seq,
+        addrs,
+        local_only,
+    };
+    Ok(Json(ClusterStatus {
+        self_node,
+        peers: Vec::new(),
+    }))
 }
 
 async fn remove_peer(

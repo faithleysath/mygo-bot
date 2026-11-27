@@ -142,10 +142,20 @@ CREATE TABLE attachments (
     mime_type TEXT NOT NULL,
     content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
     byte_len INTEGER NOT NULL CHECK (byte_len > 0),
+    created_at INTEGER NOT NULL DEFAULT 0,
     data BLOB
 );
 CREATE INDEX attachments_by_hash ON attachments(content_hash) WHERE data IS NOT NULL;
 CREATE INDEX attachments_missing ON attachments(id) WHERE data IS NULL;
+CREATE INDEX attachments_by_created ON attachments(created_at, id);
+
+CREATE TABLE item_attachments (
+    session_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL,
+    PRIMARY KEY (attachment_id, session_id, item_id)
+) WITHOUT ROWID;
+CREATE INDEX item_attachments_by_session ON item_attachments(session_id);
 
 CREATE TABLE items (
     id TEXT PRIMARY KEY,

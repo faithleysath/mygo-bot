@@ -20,11 +20,12 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     Error, Result,
     cluster::{
+        ClusterSignal,
         cap::CapServer,
         exec::{ExecPlane, ExecServer},
         identity::{
-            LocalNode, PeerInfo, decode_endpoint_addr, list_peers, load_local_node, self_peer_info,
-            upsert_peer_if_gen,
+            LocalNode, PeerInfo, decode_endpoint_addr, encode_endpoint_addrs, list_peers,
+            load_local_node, sanitize_addrs, self_peer_info, upsert_peer_if_gen,
         },
         sync::SyncEngine,
     },
@@ -164,6 +165,7 @@ pub struct ClusterNet {
     connected_peers: Mutex<PeerConnectState>,
     connect_notify: Notify,
     dial_wake: Notify,
+    signal: Arc<ClusterSignal>,
     stopping: CancellationToken,
     tasks: TaskTracker,
     global_rpc_sem: Arc<Semaphore>,
@@ -425,6 +427,7 @@ impl ClusterNet {
         db: Db,
         local: LocalNode,
         config: crate::cluster::ClusterConfig,
+        signal: Arc<ClusterSignal>,
         stopping: CancellationToken,
     ) -> Arc<Self> {
         let gen_cancel = stopping.child_token();
@@ -454,6 +457,7 @@ impl ClusterNet {
             connected_peers: Mutex::default(),
             connect_notify: Notify::new(),
             dial_wake: Notify::new(),
+            signal,
             stopping,
             tasks: TaskTracker::new(),
             global_rpc_sem: Arc::new(Semaphore::new(MAX_GLOBAL_INFLIGHT_RPC)),
@@ -515,8 +519,61 @@ impl ClusterNet {
         if starting_loops.is_some() {
             self.tasks.spawn(self.clone().accept_loop(endpoint.clone()));
             self.tasks.spawn(self.clone().dial_loop(endpoint.clone()));
+            self.tasks
+                .spawn(self.clone().addr_watch_loop(endpoint.clone()));
         }
         Ok(endpoint)
+    }
+
+    async fn addr_watch_loop(self: Arc<Self>, endpoint: Endpoint) {
+        use iroh::Watcher as _;
+        fn norm_addrs(addr: &EndpointAddr) -> Vec<String> {
+            let mut addrs = sanitize_addrs(&encode_endpoint_addrs(addr));
+            addrs.sort();
+            addrs
+        }
+        let mut watcher = endpoint.watch_addr();
+        let mut last_addrs = norm_addrs(&watcher.get());
+        loop {
+            let next_addr = tokio::select! {
+                biased;
+                _ = self.stopping.cancelled() => return,
+                _ = endpoint.closed() => return,
+                res = watcher.updated() => match res {
+                    Ok(addr) => addr,
+                    Err(_) => return,
+                },
+            };
+            let mut latest = norm_addrs(&next_addr);
+            if latest == last_addrs || latest.is_empty() {
+                continue;
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = self.stopping.cancelled() => return,
+                    _ = endpoint.closed() => return,
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    res = watcher.updated() => match res {
+                        Ok(addr) => {
+                            let cand = norm_addrs(&addr);
+                            if !cand.is_empty() {
+                                latest = cand;
+                            }
+                        }
+                        Err(_) => return,
+                    },
+                }
+            }
+            if latest != last_addrs && !latest.is_empty() {
+                last_addrs = latest;
+                self.wake_dialer();
+                if !self.online_peer_ids().is_empty() {
+                    self.signal.notify_self_meta();
+                }
+            }
+        }
     }
 
     fn endpoint(&self) -> Option<&Endpoint> {

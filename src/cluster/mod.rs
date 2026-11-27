@@ -142,6 +142,7 @@ impl Cluster {
             start.db.clone(),
             local,
             start.config,
+            start.signal.clone(),
             start.stopping.clone(),
         );
         let sync = sync::SyncEngine::new(
@@ -232,6 +233,33 @@ impl Cluster {
             })
             .await
             .map_err(|e| Error::internal(format!("join task aborted: {e}")))?
+    }
+
+    pub async fn leave_cluster(&self) -> Result<identity::LocalNode> {
+        let db = self.db.clone();
+        let net = self.net.clone();
+        let sync = self.sync.clone();
+        let join_gate = self.join_gate.clone();
+        let presence = self.presence.clone();
+        self.workers
+            .spawn(async move {
+                let _guard = join_gate.lock().await;
+                let (new_gen, new_secret, updated) = db
+                    .write(
+                        identity::apply_leave,
+                        move |_, res| {
+                            presence.clear_all_remote();
+                            presence.set_known_peer_count(0);
+                            Ok(res)
+                        },
+                    )
+                    .await?;
+                net.switch_membership(new_gen, new_secret);
+                sync.on_membership_switched();
+                Ok(updated)
+            })
+            .await
+            .map_err(|e| Error::internal(format!("leave task aborted: {e}")))?
     }
 
     pub async fn ensure_session_watched(&self, sid: SessionId) -> Result<()> {

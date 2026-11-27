@@ -363,6 +363,10 @@ pub fn apply_join(
         )?;
         conn.execute("DELETE FROM cluster_peers", [])?;
         conn.execute("DELETE FROM peer_catalog_cursors", [])?;
+        conn.execute(
+            "UPDATE mcp_oauth SET pending_refresh=NULL WHERE pending_refresh IS NOT NULL",
+            [],
+        )?;
         next_gen
     } else {
         local.membership_gen
@@ -370,6 +374,25 @@ pub fn apply_join(
     let now = chrono::Utc::now().timestamp_millis();
     upsert_peer(conn, &local.node_id, &peer, now, true)?;
     Ok((secret_changed, next_gen, new_secret, peer))
+}
+
+pub fn apply_leave(conn: &Connection) -> Result<(i64, [u8; 32], LocalNode)> {
+    let local = load_local_node(conn)?;
+    let mut new_secret = [0u8; 32];
+    getrandom::fill(&mut new_secret).map_err(|_| Error::internal("entropy unavailable"))?;
+    let next_gen = local.membership_gen + 1;
+    conn.execute(
+        "UPDATE local_node SET cluster_secret=?1, membership_gen=?2 WHERE id=1",
+        params![new_secret.as_slice(), next_gen],
+    )?;
+    conn.execute("DELETE FROM cluster_peers", [])?;
+    conn.execute("DELETE FROM peer_catalog_cursors", [])?;
+    conn.execute(
+        "UPDATE mcp_oauth SET pending_refresh=NULL WHERE pending_refresh IS NOT NULL",
+        [],
+    )?;
+    let updated = load_local_node(conn)?;
+    Ok((next_gen, new_secret, updated))
 }
 
 pub fn assert_membership_gen(conn: &Connection, expected_gen: i64) -> Result<()> {
@@ -612,11 +635,47 @@ pub fn list_cluster_nodes(
     Ok(nodes.into_iter().map(|(_, _, v)| v).collect())
 }
 
+pub fn sample_peers_for_pex(mut peers: Vec<PeerInfo>, limit: usize) -> Vec<PeerInfo> {
+    if limit == 0 {
+        peers.clear();
+        return peers;
+    }
+    if peers.len() <= limit {
+        return peers;
+    }
+    peers.sort_by(|a, b| {
+        b.last_seen_at
+            .cmp(&a.last_seen_at)
+            .then_with(|| b.addrs_ts.cmp(&a.addrs_ts))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    let recent = limit / 2;
+    let rest = &mut peers[recent..];
+    let need = limit - recent;
+    let mut rand_buf = [0u8; 8];
+    for i in 0..need {
+        let span = rest.len() - i;
+        let offset = if getrandom::fill(&mut rand_buf).is_ok() {
+            (u64::from_le_bytes(rand_buf) as usize) % span
+        } else {
+            0
+        };
+        rest.swap(i, i + offset);
+    }
+    peers.truncate(limit);
+    peers
+}
+
 pub fn delete_peer(conn: &Connection, node_id: &str) -> Result<bool> {
     let changed = conn.execute("DELETE FROM cluster_peers WHERE node_id=?", [node_id])?;
     if changed > 0 {
         conn.execute(
             "DELETE FROM peer_catalog_cursors WHERE peer_node_id=?",
+            [node_id],
+        )?;
+        conn.execute(
+            "UPDATE mcp_oauth SET pending_refresh=NULL
+             WHERE json_extract(pending_refresh,'$.coordinator')=?1",
             [node_id],
         )?;
     }

@@ -22,7 +22,7 @@ use crate::{
         ClusterSignal,
         identity::{
             MAX_PEX_PEERS, PeerInfo, assert_membership_gen, list_peers, load_local_node,
-            self_peer_info, upsert_peer_if_gen,
+            sample_peers_for_pex, self_peer_info, upsert_peer_if_gen,
         },
         ledger::{
             self, CALLS_SCOPE, CatalogDelta, McpServerWire, SessionDelta, apply_catalog_delta,
@@ -103,6 +103,8 @@ enum RpcReq {
         caller_server: Option<McpServerWire>,
         #[serde(default)]
         rejected_token_hash: Option<[u8; 32]>,
+        #[serde(default)]
+        hops_left: u8,
     },
 }
 
@@ -734,9 +736,9 @@ impl SyncEngine {
                             )?;
                         }
                         let my_info = self_peer_info(&local, &addr);
-                        let mut my_peers = list_peers(&s.conn)?;
-                        s.presence.set_known_peer_count(my_peers.len());
-                        my_peers.truncate(MAX_PEX_PEERS);
+                        let peers = list_peers(&s.conn)?;
+                        s.presence.set_known_peer_count(peers.len());
+                        let my_peers = sample_peers_for_pex(peers, MAX_PEX_PEERS);
                         Ok((my_info, my_peers, changed))
                     })
                     .await?;
@@ -922,6 +924,7 @@ impl SyncEngine {
                 generation,
                 caller_server,
                 rejected_token_hash,
+                hops_left,
             } => {
                 let lock = self.mcp_locks.lock_for(server_id);
                 let _guard = lock.lock().await;
@@ -942,6 +945,90 @@ impl SyncEngine {
                         .await?;
                     if changed {
                         self.signal.notify_changes(true, Vec::new());
+                    }
+                }
+                if hops_left > 0 {
+                    let remote_holders = self.query_mcp_participants(server_id).await;
+                    let next_coord = remote_holders
+                        .into_iter()
+                        .filter(|p| p.as_str() < self.net.local_node_id())
+                        .min();
+                    if let Some(next_coord) = next_coord {
+                        let local_wire = self
+                            .db
+                            .call(move |s| {
+                                assert_membership_gen(&s.conn, conn_gen)?;
+                                load_mcp_wire(&s.conn, server_id)
+                            })
+                            .await?;
+                        match self
+                            .rpc(
+                                &next_coord,
+                                &RpcReq::OAuthRefresh {
+                                    server_id,
+                                    generation: generation.clone(),
+                                    caller_server: local_wire,
+                                    rejected_token_hash,
+                                    hops_left: hops_left - 1,
+                                },
+                                RPC_TIMEOUT_OAUTH,
+                            )
+                            .await
+                        {
+                            Ok((
+                                RpcResp::OAuthRefreshResult {
+                                    status,
+                                    server,
+                                    error,
+                                },
+                                _,
+                            )) => {
+                                if let Some(ref w) = server {
+                                    let w_clone = w.clone();
+                                    let changed = self
+                                        .db
+                                        .call(move |s| {
+                                            assert_membership_gen(&s.conn, conn_gen)?;
+                                            let (changed, ch) =
+                                                merge_mcp_server_wire(&s.conn, &w_clone)?;
+                                            if let Some(ch) = ch {
+                                                s.mcp.apply_sync_change(ch);
+                                            }
+                                            if changed {
+                                                s.publish_global(
+                                                    "mcp.updated",
+                                                    json!({ "id": server_id }),
+                                                );
+                                            }
+                                            Ok(changed)
+                                        })
+                                        .await?;
+                                    if changed
+                                        || status == OAuthRefreshStatus::Refreshed
+                                        || status == OAuthRefreshStatus::ReauthRequired
+                                    {
+                                        self.signal.notify_changes(true, Vec::new());
+                                    }
+                                }
+                                return Ok((
+                                    RpcResp::OAuthRefreshResult {
+                                        status,
+                                        server,
+                                        error,
+                                    },
+                                    None,
+                                ));
+                            }
+                            Ok(_) | Err(_) => {
+                                return Ok((
+                                    RpcResp::Error {
+                                        message: "upstream OAuth refresh coordinator unreachable"
+                                            .into(),
+                                    },
+                                    None,
+                                ));
+                            }
+                        }
                     }
                 }
                 let res = crate::mcp::oauth::refresh_shared_as_coordinator(
@@ -997,8 +1084,7 @@ impl SyncEngine {
                 if local.membership_gen != mgen {
                     return Err(Error::conflict("membership changed"));
                 }
-                let mut my_peers = list_peers(&s.conn)?;
-                my_peers.truncate(MAX_PEX_PEERS);
+                let my_peers = sample_peers_for_pex(list_peers(&s.conn)?, MAX_PEX_PEERS);
                 Ok((self_peer_info(&local, &addr), my_peers))
             })
             .await?;
@@ -1714,6 +1800,65 @@ impl SyncEngine {
             .await
     }
 
+    pub async fn sync_session_from_peers_best_effort(
+        &self,
+        sid: SessionId,
+        peers: &[String],
+    ) -> Result<bool> {
+        if self.is_session_deleted_local(sid).await? {
+            return Ok(true);
+        }
+        let mgen = self.net.membership_gen();
+        if !peers.is_empty() {
+            let results: Vec<Result<()>> = stream::iter(peers.iter().cloned())
+                .map(|peer_id| async move {
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    if let Err(err) = self.pull_catalog_from_peer(&peer_id, mgen).await {
+                        if self.net.membership_gen() != mgen {
+                            return Err(Error::conflict("membership generation changed"));
+                        }
+                        tracing::debug!(%sid, %peer_id, error = %err, "relay catalog pull skipped peer");
+                        return Ok(());
+                    }
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    if let Err(err) = self.pull_session_from_peer(sid, &peer_id, mgen).await {
+                        if self.net.membership_gen() != mgen {
+                            return Err(Error::conflict("membership generation changed"));
+                        }
+                        tracing::debug!(%sid, %peer_id, error = %err, "relay session pull skipped peer");
+                    }
+                    Ok(())
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            for res in results {
+                res?;
+            }
+        }
+        self.db
+            .call(move |s| {
+                let row: Option<bool> = s
+                    .conn
+                    .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                    .query_row([sid], |r| r.get(0))
+                    .optional()?;
+                match row {
+                    Some(true) => Ok(true),
+                    Some(false) => {
+                        mark_session_watched(&s.conn, sid)?;
+                        Ok(false)
+                    }
+                    None => Ok(false),
+                }
+            })
+            .await
+    }
+
     pub async fn sync_now(&self, session_id: Option<SessionId>) -> Result<SyncSummary> {
         let _gate = self.sync_now_gate.lock().await;
         let Some(sid) = session_id else {
@@ -2191,7 +2336,9 @@ impl SyncEngine {
             .and_then(|raw| serde_json::from_str::<PendingRefreshState>(raw).ok())
             .filter(|pr| pr.fp == current_fp);
 
-        let delegation = if let Some(pr) = active_pending {
+        let mut pending_raw_for_cas = pending_raw;
+        let mut reused_delegation: Option<PendingRefreshState> = None;
+        if let Some(pr) = active_pending {
             let coord = self
                 .net
                 .is_peer_online(&pr.coordinator)
@@ -2209,13 +2356,46 @@ impl SyncEngine {
             match recheck {
                 ReconciledOAuth::Unchanged => {
                     let remote_holders = self.query_mcp_participants(server_id).await;
-                    if !remote_holders.iter().any(|p| p == &pr.coordinator) {
-                        return Ok(RefreshCoordination::PendingConfirmation);
+                    if remote_holders.iter().any(|p| p == &pr.coordinator) {
+                        reused_delegation = Some(pr);
+                    } else {
+                        let cleared = self
+                            .db
+                            .write(
+                                {
+                                    let gen_q = gen_owned.clone();
+                                    let pr = pr.clone();
+                                    move |conn| {
+                                        assert_membership_gen(conn, mgen)?;
+                                        let now_secs = chrono::Utc::now().timestamp();
+                                        if pr.is_stale_or_orphaned(conn, now_secs)? {
+                                            pr.clear_if_current(conn, server_id, &gen_q)?;
+                                            Ok(true)
+                                        } else {
+                                            Ok(false)
+                                        }
+                                    }
+                                },
+                                |_, cleared| Ok(cleared),
+                            )
+                            .await?;
+                        if !cleared {
+                            return Ok(RefreshCoordination::PendingConfirmation);
+                        }
+                        tracing::warn!(
+                            %server_id,
+                            coordinator = %pr.coordinator,
+                            "cleared stale or orphaned OAuth pending_refresh"
+                        );
+                        pending_raw_for_cas = None;
                     }
-                    pr
                 }
                 other => return Ok(other.into_coordination()),
             }
+        }
+
+        let delegation = if let Some(pr) = reused_delegation {
+            pr
         } else {
             let mut participants = self.query_mcp_participants(server_id).await;
             participants.push(self.net.local_node_id().to_owned());
@@ -2228,6 +2408,7 @@ impl SyncEngine {
             let pending = PendingRefreshState {
                 coordinator: chosen,
                 fp: current_fp,
+                created_at: chrono::Utc::now().timestamp(),
             };
             let pending_json =
                 serde_json::to_string(&pending).map_err(|e| Error::internal(e.to_string()))?;
@@ -2267,7 +2448,7 @@ impl SyncEngine {
                             let changed = conn.execute(
                                 "UPDATE mcp_oauth SET pending_refresh=?1
                                  WHERE server_id=?2 AND generation=?3 AND pending_refresh IS ?4",
-                                params![pending_json, server_id, gen_q, pending_raw],
+                                params![pending_json, server_id, gen_q, pending_raw_for_cas],
                             )?;
                             if changed == 0 {
                                 return Ok(Err(RefreshCoordination::PendingConfirmation));
@@ -2301,6 +2482,7 @@ impl SyncEngine {
                     generation: gen_owned.clone(),
                     caller_server,
                     rejected_token_hash,
+                    hops_left: 2,
                 },
                 RPC_TIMEOUT_OAUTH,
             )

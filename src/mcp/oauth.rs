@@ -27,14 +27,32 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 const LOGIN_TTL: u32 = 600;
+pub(crate) const PENDING_REFRESH_STALE_SECS: i64 = 300;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct PendingRefreshState {
     pub coordinator: String,
     pub fp: String,
+    #[serde(default)]
+    pub created_at: i64,
 }
 
 impl PendingRefreshState {
+    pub(crate) fn is_stale_or_orphaned(
+        &self,
+        conn: &rusqlite::Connection,
+        now_secs: i64,
+    ) -> Result<bool> {
+        let peer_known: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM cluster_peers WHERE node_id=?1)")?
+            .query_row([&self.coordinator], |r| r.get(0))?;
+        if !peer_known {
+            return Ok(true);
+        }
+        Ok(self.created_at <= 0
+            || now_secs.saturating_sub(self.created_at) >= PENDING_REFRESH_STALE_SECS)
+    }
+
     pub(crate) fn clear_if_current(
         &self,
         conn: &rusqlite::Connection,
@@ -194,18 +212,32 @@ pub(crate) fn guard_grant_copy(
     mcp: &mut super::Connections,
     id: McpServerId,
 ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
-    let row: Option<(String, bool)> = conn
+    let row: Option<(String, Option<String>)> = conn
         .prepare_cached(
-            "SELECT generation,pending_refresh IS NOT NULL FROM mcp_oauth
+            "SELECT generation,pending_refresh FROM mcp_oauth
              JOIN mcp_servers ON id=server_id WHERE server_id=? AND shared=1 AND deleted=0",
         )?
         .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    let Some((generation, pending)) = row else {
+    let Some((generation, pending_raw)) = row else {
         return Ok(None);
     };
-    if pending {
-        return Err(Error::conflict("OAuth refresh is awaiting confirmation; retry detaching later"));
+    if let Some(raw) = pending_raw {
+        let now_secs = chrono::Utc::now().timestamp();
+        let clear = match serde_json::from_str::<PendingRefreshState>(&raw) {
+            Ok(pr) => pr.is_stale_or_orphaned(conn, now_secs)?,
+            Err(_) => true,
+        };
+        if clear {
+            conn.execute(
+                "UPDATE mcp_oauth SET pending_refresh=NULL WHERE server_id=?1 AND generation=?2",
+                params![id, generation],
+            )?;
+        } else {
+            return Err(Error::conflict(
+                "OAuth refresh is awaiting confirmation; retry detaching later",
+            ));
+        }
     }
     mcp.refresh_gate(&generation)
         .try_lock_owned()

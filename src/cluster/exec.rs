@@ -27,7 +27,7 @@ use crate::{
     },
     codemode,
     events::{NextSessionNotice, SessionEventStream},
-    id::{ContextNodeId, ItemId, McpServerId, SessionId},
+    id::{AttachmentId, ContextNodeId, ItemId, McpServerId, SessionId},
     media,
     store::{self, Db, Session, SessionStatus, session},
 };
@@ -46,6 +46,8 @@ const MAX_PEER_REMOTE_SSE_SUBS: usize = 32;
 const EXEC_REQ_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_SHORT_TIMEOUT: Duration = Duration::from_secs(10);
 const EXEC_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const EXEC_PROBE_HOP_MARGIN_MS: u32 = 350;
+const EXEC_PROBE_MIN_BUDGET_MS: u32 = 400;
 const EXEC_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const CLAIM_TTL: Duration = Duration::from_secs(5);
 
@@ -751,6 +753,19 @@ enum ExecReq {
         visited: Vec<String>,
         #[serde(default)]
         hops_left: u8,
+        #[serde(default)]
+        budget_ms: u32,
+    },
+    RelaySessionSync {
+        session_id: SessionId,
+        #[serde(default)]
+        target_head_ts: String,
+        #[serde(default)]
+        target_vector: BTreeMap<String, i64>,
+        #[serde(default)]
+        visited: Vec<String>,
+        #[serde(default)]
+        hops_left: u8,
     },
     ReleaseClaim {
         session_id: SessionId,
@@ -824,6 +839,9 @@ enum ExecResp {
         session_active_head_ts: String,
         #[serde(default)]
         session_vector: BTreeMap<String, i64>,
+    },
+    RelaySynced {
+        deleted: bool,
     },
     Session {
         session: Value,
@@ -1430,6 +1448,7 @@ impl ExecPlane {
             claim: None,
             visited: extend_visited(&[], &local_id, &online),
             hops_left: MAX_CHECK_HOPS,
+            budget_ms: EXEC_PROBE_TIMEOUT.as_millis() as u32,
         };
         let replies = futures_util::future::join_all(online.into_iter().map(|peer_id| {
             let req_ref = &req;
@@ -1469,6 +1488,20 @@ impl ExecPlane {
             }
         }
         if !deleted_peers.is_empty() {
+            let relay_req = ExecReq::RelaySessionSync {
+                session_id: sid,
+                target_head_ts: String::new(),
+                target_vector: BTreeMap::new(),
+                visited: extend_visited(&[], &local_id, &deleted_peers),
+                hops_left: MAX_CHECK_HOPS,
+            };
+            futures_util::future::join_all(deleted_peers.iter().map(|peer_id| {
+                let req_ref = &relay_req;
+                async move {
+                    let _ = self.exec_rpc(peer_id, req_ref, EXEC_OP_TIMEOUT).await;
+                }
+            }))
+            .await;
             let _ = self.sync.sync_session_strict(sid, &deleted_peers).await;
             return Err(rusqlite::Error::QueryReturnedNoRows.into());
         }
@@ -1570,11 +1603,12 @@ impl ExecPlane {
 
         // Fast local path when this node already occupies the session (e.g., background tasks).
         if self.presence.local_owner(sid).is_some() {
-            self.validate_local_gate_preconditions(
+            self.validate_pre_probe_preconditions(
                 sid,
                 GatePurpose::Run {
                     require_model_caps: true,
                 },
+                true,
             )
             .await?;
             self.sync.ensure_session_attachments(sid).await?;
@@ -1652,10 +1686,11 @@ impl ExecPlane {
         Ok(session)
     }
 
-    async fn validate_local_gate_preconditions(
+    async fn validate_pre_probe_preconditions(
         &self,
         sid: SessionId,
         purpose: GatePurpose,
+        require_branch_complete: bool,
     ) -> Result<(String, String, BTreeMap<String, i64>)> {
         let presence = self.presence.clone();
         self.db
@@ -1686,7 +1721,7 @@ impl ExecPlane {
                                 return Err(Error::conflict("session is pausing"));
                             }
                         }
-                        if !session_branch_complete(&s.conn, sid)? {
+                        if require_branch_complete && !session_branch_complete(&s.conn, sid)? {
                             return Err(Error::conflict(
                                 "session branch history is incomplete locally; sync before running",
                             ));
@@ -1699,6 +1734,23 @@ impl ExecPlane {
                     .query_row([sid], |r| r.get(0))?;
                 let vector = read_vector(&s.conn, &session_scope(sid))?;
                 Ok((s.local_node_id.clone(), head_ts, vector))
+            })
+            .await
+    }
+
+    async fn validate_post_probe_run_ready(&self, sid: SessionId) -> Result<Vec<AttachmentId>> {
+        self.db
+            .call(move |s| {
+                let current = session(&s.conn, sid)?;
+                if current.status == SessionStatus::Pausing {
+                    return Err(Error::conflict("session is pausing"));
+                }
+                if !session_branch_complete(&s.conn, sid)? {
+                    return Err(Error::conflict(
+                        "session branch history is incomplete locally; sync before running",
+                    ));
+                }
+                crate::media::missing_session_context_attachments(&s.conn, sid)
             })
             .await
     }
@@ -1726,12 +1778,14 @@ impl ExecPlane {
             if online.is_empty() {
                 if known_pre > 0 {
                     // Isolated partition: allow local start/delete without remote consensus.
-                    self.validate_local_gate_preconditions(sid, purpose).await?;
+                    self.validate_pre_probe_preconditions(sid, purpose, true)
+                        .await?;
                     if require_model_caps {
                         self.sync.ensure_session_attachments(sid).await?;
                     }
                 } else {
-                    self.validate_local_gate_preconditions(sid, purpose).await?;
+                    self.validate_pre_probe_preconditions(sid, purpose, true)
+                        .await?;
                 }
                 if self.net.online_peer_ids().is_empty() {
                     return Ok(ConnectedGate {
@@ -1777,19 +1831,13 @@ impl ExecPlane {
                 return Err(err);
             }
             let (local_id, local_head_ts, local_vector) =
-                match self.validate_local_gate_preconditions(sid, purpose).await {
+                match self.validate_pre_probe_preconditions(sid, purpose, false).await {
                     Ok(v) => v,
                     Err(err) => {
                         claim_guard.release_now().await;
                         return Err(err);
                     }
                 };
-            if require_model_caps
-                && let Err(err) = self.sync.ensure_session_attachments(sid).await
-            {
-                claim_guard.release_now().await;
-                return Err(err);
-            }
 
             let online = self.net.online_peer_ids();
             if online.is_empty() {
@@ -1811,6 +1859,7 @@ impl ExecPlane {
                 claim: Some(claim),
                 visited: extend_visited(&[], &local_id, &online),
                 hops_left: MAX_CHECK_HOPS,
+                budget_ms: EXEC_PROBE_TIMEOUT.as_millis() as u32,
             };
             let replies = futures_util::future::join_all(online.iter().cloned().map(|peer_id| {
                 let req_ref = &req;
@@ -1835,8 +1884,11 @@ impl ExecPlane {
 
             let mut deleted_peers = Vec::new();
             let mut ahead_peers = Vec::new();
+            let mut ahead_head_ts = local_head_ts.clone();
+            let mut ahead_vector = local_vector.clone();
             let mut retry_by_claim: Option<String> = None;
             let mut hard_occupied: Option<String> = None;
+            let mut online_probe_errors = Vec::new();
 
             for (peer_id, reply) in replies {
                 match reply {
@@ -1860,6 +1912,10 @@ impl ExecPlane {
                             &local_head_ts,
                             &local_vector,
                         ) {
+                            if session_active_head_ts.as_str() > ahead_head_ts.as_str() {
+                                ahead_head_ts = session_active_head_ts.clone();
+                            }
+                            merge_session_vector(&mut ahead_vector, &session_vector);
                             ahead_peers.push(peer_id.clone());
                         }
                         if occupied {
@@ -1875,13 +1931,32 @@ impl ExecPlane {
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        tracing::debug!(%sid, %peer_id, error = %err, "peer unreachable during connected-component occupancy check");
+                        if self.net.is_peer_online(&peer_id) {
+                            tracing::warn!(%sid, %peer_id, error = %err, "online peer probe failed during connected-component occupancy check");
+                            online_probe_errors.push(peer_id);
+                        } else {
+                            tracing::debug!(%sid, %peer_id, error = %err, "peer unreachable during connected-component occupancy check");
+                        }
                     }
                 }
             }
 
             if !deleted_peers.is_empty() {
                 claim_guard.release_now().await;
+                let relay_req = ExecReq::RelaySessionSync {
+                    session_id: sid,
+                    target_head_ts: String::new(),
+                    target_vector: BTreeMap::new(),
+                    visited: extend_visited(&[], &local_id, &deleted_peers),
+                    hops_left: MAX_CHECK_HOPS,
+                };
+                futures_util::future::join_all(deleted_peers.iter().map(|peer_id| {
+                    let req_ref = &relay_req;
+                    async move {
+                        let _ = self.exec_rpc(peer_id, req_ref, EXEC_OP_TIMEOUT).await;
+                    }
+                }))
+                .await;
                 let _ = self.sync.sync_session_strict(sid, &deleted_peers).await;
                 return Err(rusqlite::Error::QueryReturnedNoRows.into());
             }
@@ -1895,7 +1970,34 @@ impl ExecPlane {
             }
             if !ahead_peers.is_empty() {
                 claim_guard.release_now().await;
-                let _ = self.sync.sync_session_strict(sid, &ahead_peers).await;
+                let relay_req = ExecReq::RelaySessionSync {
+                    session_id: sid,
+                    target_head_ts: ahead_head_ts,
+                    target_vector: ahead_vector,
+                    visited: extend_visited(&[], &local_id, &ahead_peers),
+                    hops_left: MAX_CHECK_HOPS,
+                };
+                let relay_replies =
+                    futures_util::future::join_all(ahead_peers.iter().map(|peer_id| {
+                        let req_ref = &relay_req;
+                        async move { self.exec_rpc(peer_id, req_ref, EXEC_OP_TIMEOUT).await }
+                    }))
+                    .await;
+                if relay_replies
+                    .into_iter()
+                    .any(|r| matches!(r, Ok(ExecResp::RelaySynced { deleted: true })))
+                {
+                    let _ = self.sync.sync_session_strict(sid, &ahead_peers).await;
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                }
+                match self.sync.sync_session_strict(sid, &ahead_peers).await {
+                    Ok(()) => {}
+                    Err(err) if err.0 == axum::http::StatusCode::NOT_FOUND => return Err(err),
+                    Err(err) if attempt + 1 >= max_attempts => return Err(err),
+                    Err(err) => {
+                        tracing::debug!(%sid, error = %err, "strict sync from ahead peers failed; retrying gate");
+                    }
+                }
                 if attempt + 1 < max_attempts {
                     sleep_jitter(false).await;
                     continue;
@@ -1914,6 +2016,37 @@ impl ExecPlane {
                     continue;
                 }
                 return Err(Error::conflict("concurrent cluster start detected; retry"));
+            }
+            if !online_probe_errors.is_empty() {
+                drop(claim_guard);
+                if attempt + 1 < max_attempts {
+                    sleep_jitter(false).await;
+                    continue;
+                }
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "timed out verifying session occupancy with online cluster peers; retry".into(),
+                ));
+            }
+
+            if matches!(purpose, GatePurpose::Run { .. }) {
+                let missing_atts = match self.validate_post_probe_run_ready(sid).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        claim_guard.release_now().await;
+                        return Err(err);
+                    }
+                };
+                if require_model_caps && !missing_atts.is_empty() {
+                    claim_guard.release_now().await;
+                    self.sync.ensure_session_attachments(sid).await?;
+                    if attempt + 1 < max_attempts {
+                        continue;
+                    }
+                    return Err(Error::conflict(
+                        "attachments fetched; retry starting session",
+                    ));
+                }
             }
 
             match self.presence.promote_local_claim_to_committing(sid, &claim_id) {
@@ -2267,6 +2400,14 @@ async fn sleep_jitter(prefer_early: bool) {
     tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
+fn merge_session_vector(dst: &mut BTreeMap<String, i64>, src: &BTreeMap<String, i64>) {
+    for (node, &seq) in src {
+        dst.entry(node.clone())
+            .and_modify(|cur| *cur = (*cur).max(seq))
+            .or_insert(seq);
+    }
+}
+
 fn peer_ahead_of_local(
     peer_deleted: bool,
     peer_head_ts: &str,
@@ -2538,9 +2679,36 @@ impl ExecServer {
                 claim,
                 visited,
                 hops_left,
+                budget_ms,
             } => {
                 let resp = self
-                    .handle_check_occupancy(&from_peer, session_id, claim, visited, hops_left)
+                    .handle_check_occupancy(
+                        &from_peer,
+                        session_id,
+                        claim,
+                        visited,
+                        hops_left,
+                        budget_ms,
+                    )
+                    .await;
+                Self::send_reply(&mut send, &resp).await;
+            }
+            ExecReq::RelaySessionSync {
+                session_id,
+                target_head_ts,
+                target_vector,
+                visited,
+                hops_left,
+            } => {
+                let resp = self
+                    .handle_relay_session_sync(
+                        &from_peer,
+                        session_id,
+                        target_head_ts,
+                        target_vector,
+                        visited,
+                        hops_left,
+                    )
                     .await;
                 Self::send_reply(&mut send, &resp).await;
             }
@@ -2750,6 +2918,110 @@ impl ExecServer {
         .await;
     }
 
+    async fn handle_relay_session_sync(
+        &self,
+        from_peer: &str,
+        sid: SessionId,
+        target_head_ts: String,
+        target_vector: BTreeMap<String, i64>,
+        mut visited: Vec<String>,
+        hops_left: u8,
+    ) -> ExecResp {
+        let state = self
+            .app
+            .db
+            .call(move |s| {
+                let row: Option<(bool, String)> = s
+                    .conn
+                    .prepare_cached("SELECT deleted, active_head_ts FROM sessions WHERE id=?")?
+                    .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                match row {
+                    Some((true, _)) => Ok((true, true, String::new(), BTreeMap::new(), false)),
+                    Some((false, head_ts)) => {
+                        let vector = read_vector(&s.conn, &session_scope(sid))?;
+                        let complete = session_branch_complete(&s.conn, sid)?;
+                        Ok((false, true, head_ts, vector, complete))
+                    }
+                    None => Ok((false, false, String::new(), BTreeMap::new(), false)),
+                }
+            })
+            .await;
+        let (deleted, exists, local_head_ts, local_vector, branch_complete) = match state {
+            Ok(v) => v,
+            Err(e) => return Self::to_wire_err(e),
+        };
+        if deleted {
+            return ExecResp::RelaySynced { deleted: true };
+        }
+        if exists
+            && branch_complete
+            && (!target_head_ts.is_empty() || !target_vector.is_empty())
+            && !peer_ahead_of_local(
+                false,
+                &target_head_ts,
+                &target_vector,
+                &local_head_ts,
+                &local_vector,
+            )
+        {
+            let _ = self.app.cluster.ensure_session_watched(sid).await;
+            return ExecResp::RelaySynced { deleted: false };
+        }
+
+        let hops = hops_left.min(MAX_CHECK_HOPS);
+        if hops == 0 {
+            return ExecResp::RelaySynced { deleted: false };
+        }
+        visited.truncate(MAX_GOSSIP_ENTRIES);
+        let local_id = self.app.exec.presence().local_node_id();
+        let visited_set: HashSet<&str> = visited.iter().map(String::as_str).collect();
+        let downstream: Vec<String> = self
+            .app
+            .cluster
+            .net
+            .online_peer_ids()
+            .into_iter()
+            .filter(|p| p != from_peer && p != &local_id && !visited_set.contains(p.as_str()))
+            .collect();
+        if downstream.is_empty() {
+            return ExecResp::RelaySynced { deleted: false };
+        }
+
+        let next_visited = extend_visited(&visited, &local_id, &downstream);
+        let fwd_req = ExecReq::RelaySessionSync {
+            session_id: sid,
+            target_head_ts,
+            target_vector,
+            visited: next_visited,
+            hops_left: hops - 1,
+        };
+        let _fwd_replies =
+            futures_util::future::join_all(downstream.iter().map(|peer_id| {
+                let req_ref = &fwd_req;
+                async move {
+                    self.app
+                        .exec
+                        .exec_rpc(peer_id, req_ref, EXEC_OP_TIMEOUT)
+                        .await
+                }
+            }))
+            .await;
+
+        match self
+            .app
+            .cluster
+            .sync
+            .sync_session_from_peers_best_effort(sid, &downstream)
+            .await
+        {
+            Ok(now_deleted) => ExecResp::RelaySynced {
+                deleted: now_deleted,
+            },
+            Err(e) => Self::to_wire_err(e),
+        }
+    }
+
     async fn handle_check_occupancy(
         &self,
         from_peer: &str,
@@ -2757,7 +3029,14 @@ impl ExecServer {
         claim: Option<RunClaim>,
         mut visited: Vec<String>,
         hops_left: u8,
+        budget_ms: u32,
     ) -> ExecResp {
+        let probe_start = Instant::now();
+        let effective_budget_ms = if budget_ms == 0 {
+            EXEC_PROBE_TIMEOUT.as_millis() as u32
+        } else {
+            budget_ms.min(EXEC_PROBE_TIMEOUT.as_millis() as u32)
+        };
         if let Some(ref c) = claim
             && c.node_id.parse::<EndpointId>().is_err()
         {
@@ -2887,6 +3166,9 @@ impl ExecServer {
             };
         }
 
+        let mut merged_head_ts = session_active_head_ts.clone();
+        let mut merged_vector = session_vector.clone();
+
         // Forward across online downstream peers in the connected component.
         let visited_set: HashSet<String> = visited.iter().cloned().collect();
         let downstream: Vec<String> = if hops > 0 {
@@ -2908,12 +3190,27 @@ impl ExecServer {
 
         let mut confirmed_idle: HashSet<String> = HashSet::new();
         if !downstream.is_empty() {
+            let elapsed_ms = probe_start
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u32::MAX)) as u32;
+            let child_budget_ms = effective_budget_ms
+                .saturating_sub(elapsed_ms)
+                .saturating_sub(EXEC_PROBE_HOP_MARGIN_MS);
+            if child_budget_ms < EXEC_PROBE_MIN_BUDGET_MS {
+                return ExecResp::Error {
+                    status: 504,
+                    message: "occupancy probe budget exhausted".into(),
+                };
+            }
+            let child_timeout = Duration::from_millis(u64::from(child_budget_ms));
             let next_visited = extend_visited(&visited, &local_id, &downstream);
             let fwd_req = ExecReq::CheckOccupancy {
                 session_id: sid,
                 claim: claim.clone(),
                 visited: next_visited,
                 hops_left: hops - 1,
+                budget_ms: child_budget_ms,
             };
             let fwd_replies =
                 futures_util::future::join_all(downstream.into_iter().map(|peer_id| {
@@ -2923,50 +3220,58 @@ impl ExecServer {
                             peer_id.clone(),
                             self.app
                                 .exec
-                                .exec_rpc(&peer_id, req_ref, EXEC_PROBE_TIMEOUT)
+                                .exec_rpc(&peer_id, req_ref, child_timeout)
                                 .await,
                         )
                     }
                 }))
                 .await;
 
-            let mut deleted_peers = Vec::new();
-            let mut ahead_peers = Vec::new();
+            let mut has_deleted = false;
             let mut fwd_occupied: Option<(String, Option<SessionStatus>, usize, bool)> = None;
+            let mut online_err: Option<String> = None;
 
             for (peer_id, reply) in fwd_replies {
-                if let Ok(ExecResp::Occupancy {
-                    occupied,
-                    runner_node_id,
-                    status,
-                    active_tasks,
-                    occupied_by_claim,
-                    session_deleted: d_del,
-                    session_active_head_ts: d_ts,
-                    session_vector: d_vec,
-                    ..
-                }) = reply
-                {
-                    if d_del {
-                        deleted_peers.push(peer_id);
-                        continue;
-                    }
-                    if peer_ahead_of_local(false, &d_ts, &d_vec, &session_active_head_ts, &session_vector) {
-                        ahead_peers.push(peer_id.clone());
-                    }
-                    if occupied {
-                        let holder = runner_node_id.unwrap_or(peer_id);
-                        if holder != claim_owner && fwd_occupied.is_none() {
-                            fwd_occupied = Some((holder, status, active_tasks, occupied_by_claim));
+                match reply {
+                    Ok(ExecResp::Occupancy {
+                        occupied,
+                        runner_node_id,
+                        status,
+                        active_tasks,
+                        occupied_by_claim,
+                        session_deleted: d_del,
+                        session_active_head_ts: d_ts,
+                        session_vector: d_vec,
+                        ..
+                    }) => {
+                        if d_del {
+                            has_deleted = true;
+                            break;
                         }
-                    } else {
-                        confirmed_idle.insert(peer_id);
+                        if d_ts.as_str() > merged_head_ts.as_str() {
+                            merged_head_ts = d_ts;
+                        }
+                        merge_session_vector(&mut merged_vector, &d_vec);
+                        if occupied {
+                            let holder = runner_node_id.unwrap_or(peer_id);
+                            if holder != claim_owner && fwd_occupied.is_none() {
+                                fwd_occupied =
+                                    Some((holder, status, active_tasks, occupied_by_claim));
+                            }
+                        } else {
+                            confirmed_idle.insert(peer_id);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        if self.app.cluster.net.is_peer_online(&peer_id) && online_err.is_none() {
+                            online_err = Some(peer_id);
+                        }
                     }
                 }
             }
 
-            if !deleted_peers.is_empty() {
-                let _ = self.app.cluster.sync.sync_session_strict(sid, &deleted_peers).await;
+            if has_deleted {
                 return ExecResp::Occupancy {
                     occupied: false,
                     runner_node_id: None,
@@ -2989,13 +3294,16 @@ impl ExecServer {
                     occupied_by_claim: by_claim,
                     session_deleted: false,
                     session_active_head,
-                    session_active_head_ts,
-                    session_vector,
+                    session_active_head_ts: merged_head_ts,
+                    session_vector: merged_vector,
                 };
             }
 
-            if !ahead_peers.is_empty() {
-                let _ = self.app.cluster.sync.sync_session_strict(sid, &ahead_peers).await;
+            if let Some(peer_id) = online_err {
+                return ExecResp::Error {
+                    status: 504,
+                    message: format!("occupancy check timed out via peer {peer_id}"),
+                };
             }
         }
 
@@ -3015,8 +3323,8 @@ impl ExecServer {
                 occupied_by_claim: false,
                 session_deleted: false,
                 session_active_head,
-                session_active_head_ts,
-                session_vector,
+                session_active_head_ts: merged_head_ts,
+                session_vector: merged_vector,
             };
         }
 
@@ -3058,6 +3366,13 @@ impl ExecServer {
                     });
                 }
                 let vec_now = read_vector(&s.conn, &session_scope(sid))?;
+                let final_head_ts = if merged_head_ts.as_str() > ts_now.as_str() {
+                    merged_head_ts
+                } else {
+                    ts_now
+                };
+                let mut final_vec = vec_now;
+                merge_session_vector(&mut final_vec, &merged_vector);
 
                 if local_occupied_now {
                     let st = local_occ
@@ -3071,8 +3386,8 @@ impl ExecServer {
                         occupied_by_claim: false,
                         session_deleted: false,
                         session_active_head: head_now,
-                        session_active_head_ts: ts_now,
-                        session_vector: vec_now,
+                        session_active_head_ts: final_head_ts,
+                        session_vector: final_vec,
                     });
                 }
 
@@ -3087,8 +3402,8 @@ impl ExecServer {
                             occupied_by_claim: by_claim,
                             session_deleted: false,
                             session_active_head: head_now,
-                            session_active_head_ts: ts_now,
-                            session_vector: vec_now,
+                            session_active_head_ts: final_head_ts,
+                            session_vector: final_vec,
                         });
                     }
                 } else if let Some((holder, by_claim)) =
@@ -3102,8 +3417,8 @@ impl ExecServer {
                         occupied_by_claim: by_claim,
                         session_deleted: false,
                         session_active_head: head_now,
-                        session_active_head_ts: ts_now,
-                        session_vector: vec_now,
+                        session_active_head_ts: final_head_ts,
+                        session_vector: final_vec,
                     });
                 }
 
@@ -3115,8 +3430,8 @@ impl ExecServer {
                     occupied_by_claim: false,
                     session_deleted: false,
                     session_active_head: head_now,
-                    session_active_head_ts: ts_now,
-                    session_vector: vec_now,
+                    session_active_head_ts: final_head_ts,
+                    session_vector: final_vec,
                 })
             })
             .await;

@@ -984,6 +984,18 @@ pub fn on_item_inserted(
     payload: &Value,
     target_id: Option<ItemId>,
 ) -> Result<()> {
+    let mut att_refs = HashSet::new();
+    collect_attachment_ids_from_value(payload, &mut att_refs);
+    if !att_refs.is_empty() {
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO item_attachments(session_id, item_id, attachment_id)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(attachment_id, session_id, item_id) DO NOTHING",
+        )?;
+        for aid in att_refs {
+            stmt.execute(params![sid, id, aid])?;
+        }
+    }
     match kind {
         "user_message" => {
             let key: Option<String> = conn
@@ -1235,6 +1247,8 @@ fn cleanup_deleted_session_data(conn: &Connection, sid: SessionId) -> Result<()>
     conn.prepare_cached("DELETE FROM context_nodes WHERE session_id=?")?
         .execute([sid])?;
     conn.prepare_cached("DELETE FROM items WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM item_attachments WHERE session_id=?")?
         .execute([sid])?;
     conn.prepare_cached("DELETE FROM watched_sessions WHERE session_id=?")?
         .execute([sid])?;
@@ -2493,6 +2507,7 @@ pub fn apply_catalog_delta(conn: &Connection, delta: &CatalogDelta) -> Result<Ca
 
 pub fn merge_attachment_refs(conn: &Connection, refs: &[AttachmentRef]) -> Result<bool> {
     let mut has_missing = false;
+    let now = chrono::Utc::now().timestamp_millis();
     for r in refs {
         id::observe_id(r.id);
         if r.byte_len <= 0 || r.byte_len > crate::media::MAX_ATTACHMENT_BYTES as i64 {
@@ -2500,11 +2515,11 @@ pub fn merge_attachment_refs(conn: &Connection, refs: &[AttachmentRef]) -> Resul
         }
         let inserted = conn
             .prepare_cached(
-                "INSERT INTO attachments(id, mime_type, content_hash, byte_len, data)
-                 VALUES(?1, ?2, ?3, ?4, NULL)
+                "INSERT INTO attachments(id, mime_type, content_hash, byte_len, created_at, data)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL)
                  ON CONFLICT(id) DO NOTHING",
             )?
-            .execute(params![r.id, &r.mime_type, r.content_hash.as_slice(), r.byte_len])?;
+            .execute(params![r.id, &r.mime_type, r.content_hash.as_slice(), r.byte_len, now])?;
         if inserted > 0 {
             let alias: Option<i64> = conn
                 .prepare_cached(
@@ -3238,11 +3253,8 @@ struct SessionEventMeta {
     key: SessionEventKey,
 }
 
-fn collect_attachment_refs_from_item(payload: &str, out: &mut HashSet<AttachmentId>) {
-    let Ok(val) = serde_json::from_str::<Value>(payload) else {
-        return;
-    };
-    for field in ["content", "output"] {
+fn collect_attachment_ids_from_value(val: &Value, out: &mut HashSet<AttachmentId>) {
+    for field in ["content", "output", "summary"] {
         if let Some(arr) = val.get(field).and_then(Value::as_array) {
             for part in arr {
                 if let Some(raw) = part.get("attachment_id").and_then(Value::as_str)
@@ -3253,6 +3265,13 @@ fn collect_attachment_refs_from_item(payload: &str, out: &mut HashSet<Attachment
             }
         }
     }
+}
+
+fn collect_attachment_refs_from_item(payload: &str, out: &mut HashSet<AttachmentId>) {
+    let Ok(val) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+    collect_attachment_ids_from_value(&val, out);
 }
 
 pub fn read_session_delta(
