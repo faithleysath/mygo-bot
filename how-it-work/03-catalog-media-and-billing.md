@@ -25,7 +25,7 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 - `llm_providers_active_name ON llm_providers(name) WHERE archived_at IS NULL`
 - `llm_models_active_key ON llm_models(provider_id, model_key) WHERE archived_at IS NULL`
 
-注意：`v10` 刻意把这两条索引建成**非唯一部分索引**（这样就算两台设备离线并发创建重名目录，跨节点 CRDT 合流时也不会被 SQL `UNIQUE` 报错卡死）；而在正常本地新建、修改或恢复的写事务入口里，应用层会顺着这两条索引严格拦截同活跃名称碰撞并返回 `409 Conflict`。意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会被应用层冲突检查拦住。
+注意：`v11` 刻意把这两条索引建成**非唯一部分索引**（这样就算两台设备离线并发创建重名目录，跨节点 CRDT 合流时也不会被 SQL `UNIQUE` 报错卡死）；而在正常本地新建、修改或恢复的写事务入口里，应用层会顺着这两条索引严格拦截同活跃名称碰撞并返回 `409 Conflict`。意思是：**只要旧条目归档了，你就可以立刻用一模一样的名字或 `model_key` 新建一条全新配置**；只有当你试图恢复一条“跟当前活条目重名”的旧记录时，才会被应用层冲突检查拦住。
 
 判断一个模型“能不能用”也不用业务代码四处拼条件，全库统一查 **`model_catalog` 视图**——只有模型自己没归档 **且** 它所属的供应商也没归档（`m.archived_at IS NULL AND p.archived_at IS NULL`），`available` 才为 `1`。同时 `llm_providers` 与 `llm_models` 的所有增改和归档/恢复都会打上逐字段 HLC 时间戳并递增持久化在高水位 `local_node.catalog_rev` 上的行级 `sync_rev`，在私有集群内经 `CatalogSync` 即时自动同步。其中 [`merge_provider_wire`](../src/cluster/ledger.rs#L1304) 特意把供应商的 `base_url` 与 `api_key` 绑在同一枚原子 HLC 时间戳 **`endpoint_ts`**（`lww_take_pair`）上一并取新——省掉这枚绑定、拆成两个时间戳，A 改地址而 B 换密钥后合流就会把新密钥错发去老地址。
 
@@ -87,7 +87,7 @@ PriceBook（强制 timezone = "UTC"）
 
 这里有一个很谨慎的细节：**节假日判断不猜未知年份**。如果命中的时段勾了 `exclude_holidays: true`，但调用当年的年份压根没填进日历的 `covered_years` 里，`is_holiday` 直接返回 `None`，宁可跳过生成快照让这单 `cost_nano_usd` 留空，也绝不胡乱按“非节假日”打折或原价记账。
 
-等这趟 HTTP 请求结束（无论成功、失败、被取消还是被重启动断），`Report::finish` 会填好 `finished_at`、`status`、`upstream_response_id`、`http_status`、`error_summary`、`raw_usage`，再用当时冻好的 `pricing_snapshot` 匹配这次实际产生的输入总 token 数所在阶梯（把下标写回快照的 `matched_tier_index`），算出最终费用。
+等这趟 HTTP 请求结束（无论成功、失败、被取消还是被重启动断），`Report::finish` 会填好 `finished_at`、`status`、`upstream_response_id`、`http_status`、`error_summary`、`raw_usage`，再用当时冻好的 `pricing_snapshot` 匹配这次实际产生的输入总 token 数所在阶梯（把下标写回快照的 `matched_tier_index`），算出最终费用。为了防止上游吐出异常超长字段撑爆数据库或阻塞 `CatalogSync` 分页，[src/calls.rs](../src/calls.rs)、`Store::status_checked` 与 `ledger` 同步路径统一守死存储上限：`upstream_response_id` 超过 **`MAX_STORED_RESPONSE_ID_BYTES`（1024 字节）**直接置空丢弃，`raw_usage` 超过 **64 KiB** 置空，而调用的 `error_summary` 与会话的 `last_error`/`local_error` 一律经 `truncate_utf8` 在 **8192 字节**内按 UTF-8 字符边界安全截断。
 
 ### 零浮点 `cost_nano_usd` 与双口径缓存结算
 
