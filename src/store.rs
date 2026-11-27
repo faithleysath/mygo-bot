@@ -122,7 +122,7 @@ impl Db {
             crate::cluster::identity::ensure_local_node(&tx)?;
         } else {
             let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if version != 11 {
+            if version != 1 {
                 return Err(Error::internal(
                     "incompatible database schema; select a new database directory",
                 ));
