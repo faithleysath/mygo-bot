@@ -205,8 +205,7 @@ impl Cluster {
                         "node already belongs to another cluster; pass force=true to switch clusters",
                     ));
                 }
-                net.ensure_endpoint().await?;
-                let _ = net.probe_join(&secret, &peer).await?;
+                let (epoch, voters) = net.request_admission(&secret, &peer).await?;
                 let (secret_changed, new_gen, new_secret, peer, _) = db
                     .write(
                         move |conn| {
@@ -214,19 +213,21 @@ impl Cluster {
                             let want_voter = prev_local.role.is_voter();
                             let (changed, next_gen, secret, peer) =
                                 identity::apply_join(conn, secret, peer, force)?;
+                            let (local, _) = identity::adopt_voter_config(conn, epoch, &voters)?;
                             let peers = identity::list_peers(conn)?;
-                            let after_local = identity::load_local_node(conn)?;
-                            Ok((changed, next_gen, secret, peer, (peers, after_local.voter_epoch), want_voter))
+                            Ok((changed, next_gen, secret, peer, peers, local, want_voter))
                         },
-                        move |_, (changed, next_gen, secret, peer, (peers, voter_epoch), want_voter)| {
+                        move |_, (changed, next_gen, secret, peer, peers, local, want_voter)| {
                             let count = peers.len();
                             if changed {
-                                presence.set_want_voter_admission(want_voter);
-                                presence.set_voter_config(0, &[], 0, &[], "");
+                                presence.set_want_voter_admission(want_voter && !local.role.is_voter());
                                 presence.clear_all_remote();
-                            } else if voter_epoch == 0 && want_voter {
-                                presence.set_want_voter_admission(true);
                             }
+                            presence.set_local_role(local.role);
+                            presence.set_voter_config(
+                                local.voter_epoch, &local.voter_set, local.pending_voter_epoch,
+                                &local.pending_voter_set, &local.pending_proposal_id,
+                            );
                             presence.set_peer_roles(&peers);
                             presence.set_known_peer_count(count);
                             Ok((changed, next_gen, secret, peer, count))

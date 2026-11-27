@@ -31,10 +31,10 @@ use crate::{
     store::Db,
 };
 
-pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/1";
+pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/2";
 pub const CAP_ALPN: &[u8] = b"mygo/cap/1";
-pub const EXEC_ALPN: &[u8] = b"mygo/exec/1";
-pub const JOIN_PROBE_ALPN: &[u8] = b"mygo/join-probe/1";
+pub const EXEC_ALPN: &[u8] = b"mygo/exec/2";
+const JOIN_ALPN: &[u8] = b"mygo/join/1";
 const MAX_CAP_CONNS_PER_PEER: usize = 4;
 const MAX_EXEC_CONNS_PER_PEER: usize = 2;
 const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
@@ -68,7 +68,7 @@ enum AuthMsg {
         mac: [u8; 32],
     },
     Ok,
-    JoinProbe {
+    Admission {
         ok: bool,
         voter_epoch: u64,
         #[serde(default)]
@@ -392,7 +392,7 @@ impl ClusterNet {
             CLUSTER_ALPN.to_vec(),
             CAP_ALPN.to_vec(),
             EXEC_ALPN.to_vec(),
-            JOIN_PROBE_ALPN.to_vec(),
+            JOIN_ALPN.to_vec(),
         ]);
         if let Some(addr) = self.config.bind_addr {
             builder = builder
@@ -747,7 +747,7 @@ impl ClusterNet {
         Ok(())
     }
 
-    pub(super) async fn probe_join(
+    pub(super) async fn request_admission(
         self: &Arc<Self>,
         secret: &[u8; 32],
         peer: &PeerInfo,
@@ -756,7 +756,7 @@ impl ClusterNet {
         let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs)?;
         let conn = match tokio::time::timeout(
             DIAL_TIMEOUT,
-            endpoint.connect(addr, JOIN_PROBE_ALPN),
+            endpoint.connect(addr, JOIN_ALPN),
         )
         .await
         {
@@ -789,7 +789,7 @@ impl ClusterNet {
             ),
         )
         .await;
-        let (_remote_peer, _send, mut recv) = match auth {
+        let (_peer, _send, mut recv) = match auth {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 conn.close(1u32.into(), b"auth failed");
@@ -803,25 +803,25 @@ impl ClusterNet {
                 conn.close(1u32.into(), b"auth timeout");
                 return Err(Error(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "cluster invite probe timed out".into(),
+                    "cluster admission timed out".into(),
                 ));
             }
         };
         let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_auth(&mut recv)).await;
-        conn.close(0u32.into(), b"probe done");
+        conn.close(0u32.into(), b"admission complete");
         match reply {
-            Ok(Ok(AuthMsg::JoinProbe {
+            Ok(Ok(AuthMsg::Admission {
                 ok: true,
                 voter_epoch,
                 voter_set,
                 ..
             })) if voter_epoch > 0 && !voter_set.is_empty() => Ok((voter_epoch, voter_set)),
-            Ok(Ok(AuthMsg::JoinProbe { reason, .. })) => Err(Error::conflict(
+            Ok(Ok(AuthMsg::Admission { reason, .. })) => Err(Error::conflict(
                 reason.unwrap_or_else(|| "invite peer cannot accept cluster joins".into()),
             )),
             Ok(Ok(_)) => Err(Error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "unexpected cluster join probe response".into(),
+                "unexpected admission response".into(),
             )),
             Ok(Err(e)) => Err(if e.0 == axum::http::StatusCode::BAD_REQUEST {
                 Error::conflict(e.1)
@@ -830,15 +830,15 @@ impl ClusterNet {
             }),
             Err(_) => Err(Error(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "cluster join probe timed out".into(),
+                "cluster admission timed out".into(),
             )),
         }
     }
 
     async fn handle_incoming_conn(self: Arc<Self>, conn: Connection) {
         let alpn = conn.alpn();
-        if alpn == JOIN_PROBE_ALPN {
-            self.handle_join_probe_inbound(conn).await;
+        if alpn == JOIN_ALPN {
+            self.admit_joining_peer(conn).await;
             return;
         }
         let (srv_label, cli_label, aux) = if alpn == CLUSTER_ALPN {
@@ -1026,7 +1026,7 @@ impl ClusterNet {
         Ok((remote_peer, send, recv))
     }
 
-    async fn handle_join_probe_inbound(self: Arc<Self>, conn: Connection) {
+    async fn admit_joining_peer(self: Arc<Self>, conn: Connection) {
         let (mgen, cluster_secret, gen_cancel) = self.auth_context();
         let res = tokio::select! {
             _ = gen_cancel.cancelled() => {
@@ -1054,42 +1054,55 @@ impl ClusterNet {
             conn.close(1u32.into(), b"self connection");
             return;
         }
-        let local = match self.db.call(|s| load_local_node(&s.conn)).await {
-            Ok(local) => local,
-            Err(_) => {
-                conn.close(1u32.into(), b"probe failed");
-                return;
-            }
-        };
-        if self.membership_gen() != mgen
-            || gen_cancel.is_cancelled()
-            || local.membership_gen != mgen
-        {
-            conn.close(2u32.into(), b"cluster changed");
-            return;
-        }
-        let msg = if local.voter_epoch > 0 && !local.voter_set.is_empty() {
-            AuthMsg::JoinProbe {
+        // Register before acknowledging. set_local_role checks this same peer table
+        // inside its write, so demoting the last standalone voter is ordered with admission.
+        let admission = self
+            .db
+            .write(
+                move |conn| {
+                    let local = load_local_node(conn)?;
+                    if local.membership_gen != mgen
+                        || local.voter_epoch == 0
+                        || local.voter_set.is_empty()
+                    {
+                        return Err(Error::conflict(
+                            "invite source has no current voter configuration",
+                        ));
+                    }
+                    let now = chrono::Utc::now().timestamp_millis();
+                    upsert_peer_if_gen(conn, &local.node_id, &remote_peer, now, true, mgen)?;
+                    let peers = list_peers(conn)?;
+                    if !peers.iter().any(|p| p.node_id == remote_peer.node_id) {
+                        return Err(Error::bad("invalid joining peer"));
+                    }
+                    Ok((local.voter_epoch, local.voter_set, peers))
+                },
+                |s, (epoch, voters, peers)| {
+                    s.presence.set_peer_roles(&peers);
+                    s.presence.set_known_peer_count(peers.len());
+                    Ok((epoch, voters))
+                },
+            )
+            .await;
+        let msg = match admission {
+            Ok((voter_epoch, voter_set)) => AuthMsg::Admission {
                 ok: true,
-                voter_epoch: local.voter_epoch,
-                voter_set: local.voter_set,
+                voter_epoch,
+                voter_set,
                 reason: None,
-            }
-        } else {
-            AuthMsg::JoinProbe {
+            },
+            Err(_) => AuthMsg::Admission {
                 ok: false,
-                voter_epoch: local.voter_epoch,
+                voter_epoch: 0,
                 voter_set: Vec::new(),
-                reason: Some(
-                    "invite source has no committed cluster voter and cannot accept joins".into(),
-                ),
-            }
+                reason: Some("invite source could not admit this peer".into()),
+            },
         };
         if write_auth(&mut send, &msg).await.is_ok() {
             let _ = send.finish();
             let _ = tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
         }
-        conn.close(0u32.into(), b"probe done");
+        conn.close(0u32.into(), b"admission complete");
     }
 
     fn aux_maps(&self, kind: AuxKind) -> (&AuxConnMap, &AuxLockMap) {

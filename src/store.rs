@@ -39,7 +39,7 @@ type ApplyWrite = Box<dyn FnOnce(Result<&Connection>, bool) -> (bool, Acknowledg
 struct Write {
     start_session: Option<SessionId>,
     expected_run_gen: Option<(SessionId, u64)>,
-    retry_tx: Option<oneshot::Sender<Write>>,
+    retry_tx: Option<oneshot::Sender<(Write, watch::Receiver<bool>)>>,
     apply: ApplyWrite,
 }
 
@@ -73,7 +73,6 @@ pub enum Enqueued {
 #[derive(Clone)]
 pub struct Db {
     tx: mpsc::Sender<Command>,
-    presence: Arc<PresenceState>,
 }
 
 pub struct Store {
@@ -219,7 +218,6 @@ impl Db {
         clear_staged();
         let (sender, mut receiver) = mpsc::channel::<Command>(64);
         let runtime = tokio::runtime::Handle::current();
-        let db_presence = presence.clone();
         thread::Builder::new()
             .name("sqlite".into())
             .spawn(move || {
@@ -276,10 +274,7 @@ impl Db {
                     }
                 }
             })?;
-        Ok(Self {
-            tx: sender,
-            presence: db_presence,
-        })
+        Ok(Self { tx: sender })
     }
 
     pub async fn call<T: Send + 'static>(
@@ -382,7 +377,6 @@ impl Db {
                 )
             }),
         };
-        let mut retries = 0usize;
         loop {
             let (ret_tx, ret_rx) = oneshot::channel();
             write.retry_tx = Some(ret_tx);
@@ -390,7 +384,7 @@ impl Db {
                 .send(Command::Write(write))
                 .await
                 .map_err(|_| Error::internal("database worker stopped"))?;
-            let returned = tokio::select! {
+            let (returned, mut decision) = tokio::select! {
                 res = &mut reply_rx => {
                     return res.map_err(|_| Error::internal("database worker stopped"))?;
                 }
@@ -403,27 +397,10 @@ impl Db {
                     }
                 },
             };
-            retries += 1;
-            if retries >= 8 {
+            if decision.wait_for(|granted| *granted).await.is_err() {
                 return Err(Error::conflict("session execution lease lost"));
             }
-            match self
-                .presence
-                .wait_local_lease_ready(sid, None, std::time::Duration::from_secs(10))
-                .await
-            {
-                crate::cluster::exec::LocalLeaseStatus::Valid => {
-                    write = returned;
-                }
-                crate::cluster::exec::LocalLeaseStatus::Upgrading => {
-                    return Err(Error::conflict(
-                        "session execution lease temporarily upgrading",
-                    ));
-                }
-                crate::cluster::exec::LocalLeaseStatus::Invalid => {
-                    return Err(Error::conflict("session execution lease lost"));
-                }
-            }
+            write = returned;
         }
     }
 
@@ -601,9 +578,9 @@ impl Store {
                     };
                     match lease_status {
                         crate::cluster::exec::LocalLeaseStatus::Valid => {}
-                        crate::cluster::exec::LocalLeaseStatus::Upgrading => {
+                        crate::cluster::exec::LocalLeaseStatus::Upgrading(decision) => {
                             if let Some(retry_tx) = write.retry_tx.take() {
-                                let _ = retry_tx.send(write);
+                                let _ = retry_tx.send((write, decision));
                                 continue;
                             }
                             let (_, reply) = (write.apply)(

@@ -122,6 +122,7 @@ pub async fn execute(
         .map_err(|e| HostError::from(e.to_string()))?
         .map_err(|(code, msg)| HostError::coded(code, msg))?;
 
+    host.wait_for_execution().await?;
     match resolved {
         ResolvedNode::Local { name, .. } => execute_local_cap(host, &name, op, args, data).await,
         ResolvedNode::Remote(peer) => {
@@ -159,6 +160,7 @@ async fn execute_orchestration(
                     Ok(Reply::value(value))
                 }
                 "upload.open" | "stream.next" | "stream.write" | "stream.finish" => {
+                    host.wait_for_execution().await?;
                     host.streams.execute(op, &args["id"], data).await
                 }
                 "sleep" => {

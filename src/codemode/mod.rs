@@ -236,6 +236,29 @@ impl Host {
             streams: Arc::default(),
         }
     }
+    async fn wait_for_execution(&self) -> std::result::Result<(), HostError> {
+        loop {
+            let deadline = *self.deadline.borrow();
+            if self.cancel.is_cancelled() || Instant::now() >= deadline {
+                return Err("task stopped or expired".into());
+            }
+            let ready = self
+                .app
+                .exec
+                .presence()
+                .wait_local_lease_ready(self.sid, Some(&self.cancel));
+            match tokio::time::timeout_at(deadline, ready).await {
+                Ok(true)
+                    if !self.cancel.is_cancelled() && Instant::now() < *self.deadline.borrow() =>
+                {
+                    return Ok(());
+                }
+                Ok(_) => return Err("task stopped or execution lease lost".into()),
+                Err(_) => continue, // A renewal may have extended the task deadline.
+            }
+        }
+    }
+
     pub async fn io(
         &self,
         op: String,
@@ -258,10 +281,8 @@ impl Host {
         let sid = self.sid;
         let origin = self.origin;
         let app = self.app.clone();
-        let mut retries = 0usize;
         loop {
             let worker = app.clone();
-            let allow_upgrade = retries < 4;
             match self
                 .app
                 .db
@@ -277,7 +298,7 @@ impl Host {
                         return Err(Error::conflict("session superseded or conflicted"));
                     }
                     if !s.is_local_lease_valid(sid) {
-                        if allow_upgrade && s.is_local_lease_upgrading(sid) {
+                        if s.is_local_lease_upgrading(sid) {
                             return Ok(EmitStep::RetryUpgrade(blocks));
                         }
                         return Err(Error::conflict("session superseded or conflicted"));
@@ -309,13 +330,7 @@ impl Host {
                 Ok(EmitStep::Done(id)) => return Ok(id),
                 Ok(EmitStep::RetryUpgrade(b)) => {
                     blocks = b;
-                    retries += 1;
-                    let _ = self
-                        .app
-                        .exec
-                        .presence()
-                        .wait_local_lease_ready(sid, None, Duration::from_secs(10))
-                        .await;
+                    self.wait_for_execution().await.map_err(|e| e.message().to_owned())?;
                 }
                 Err(e) => return Err(e.to_string()),
             }
@@ -1024,24 +1039,17 @@ async fn supervise(
         },
     };
     let outcome = Arc::new(outcome);
-    let mut upgrade_waits = 0u8;
     loop {
         let worker = app.clone();
         let result = outcome.clone();
-        let allow_defer = upgrade_waits < 4;
         match app
             .db
-            .call(move |s| complete(s, &worker, id, &result, allow_defer))
+            .call(move |s| complete(s, &worker, id, &result))
             .await
         {
             Ok(None) => break,
             Ok(Some(sid)) => {
-                upgrade_waits += 1;
-                let _ = app
-                    .exec
-                    .presence()
-                    .wait_local_lease_ready(sid, None, Duration::from_secs(10))
-                    .await;
+                app.exec.presence().wait_local_lease_ready(sid, None).await;
             }
             Err(e) => {
                 tracing::error!(%id, error=%e, "task result transaction failed");
@@ -1090,14 +1098,13 @@ fn complete(
     app: &App,
     id: ItemId,
     result: &Outcome,
-    allow_upgrade_defer: bool,
 ) -> Result<Option<SessionId>> {
     let (sid, cur_gen) = {
         let task = &s.tasks[&id];
         (task.origin.sid, s.reset_gen(task.origin.sid))
     };
     let superseded = task_superseded(&s.conn, cur_gen, &s.tasks[&id])?;
-    if !superseded && allow_upgrade_defer && s.is_local_lease_upgrading(sid) {
+    if !superseded && s.is_local_lease_upgrading(sid) {
         return Ok(Some(sid));
     }
     if superseded || !s.is_local_lease_valid(sid) {

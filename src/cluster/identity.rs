@@ -538,41 +538,6 @@ pub fn commit_voter_config(
     Ok((load_local_node(conn)?, role_changed))
 }
 
-pub fn abort_voter_config(
-    conn: &Connection,
-    next_epoch: u64,
-    proposal_id: &str,
-    fence_ballot: Option<&str>,
-) -> Result<LocalNode> {
-    if proposal_id.is_empty() {
-        return Err(Error::bad("invalid voter proposal_id"));
-    }
-    if let Some(ballot) = fence_ballot {
-        crate::cluster::ledger::validate_hlc(ballot)?;
-        crate::cluster::ledger::observe_hlc(ballot);
-    }
-    let next_i64 = i64::try_from(next_epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
-    if let Some(ballot) = fence_ballot {
-        conn.execute(
-            "UPDATE local_node
-             SET voter_ballot=CASE WHEN ?3 > voter_ballot THEN ?3 ELSE voter_ballot END,
-                 pending_voter_epoch=CASE WHEN pending_voter_epoch=?1 AND pending_proposal_id=?2 THEN 0 ELSE pending_voter_epoch END,
-                 pending_voter_set_json=CASE WHEN pending_voter_epoch=?1 AND pending_proposal_id=?2 THEN '[]' ELSE pending_voter_set_json END,
-                 pending_proposal_id=CASE WHEN pending_voter_epoch=?1 AND pending_proposal_id=?2 THEN '' ELSE pending_proposal_id END
-             WHERE id=1",
-            params![next_i64, proposal_id, ballot],
-        )?;
-    } else {
-        conn.execute(
-            "UPDATE local_node
-             SET pending_voter_epoch=0, pending_voter_set_json='[]', pending_proposal_id=''
-             WHERE id=1 AND pending_voter_epoch=?1 AND pending_proposal_id=?2",
-            params![next_i64, proposal_id],
-        )?;
-    }
-    load_local_node(conn)
-}
-
 pub fn adopt_voter_config(
     conn: &Connection,
     epoch: u64,
