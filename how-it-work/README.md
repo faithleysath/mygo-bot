@@ -32,7 +32,7 @@ flowchart TB
         Agent -->|"POST /responses（流式 SSE）"| Upstream["上游大模型（OpenAI Responses API）"]
     end
 
-    ApiLayer <-->|"集群控制 / 节点角色 / 远端执行与 SSE 中继"| Cluster["iroh QUIC 私有集群（按需绑定：mygo/cluster/2 同步、mygo/cap/1 能力转发、mygo/exec/2 租约与 SSE 中继、mygo/join/1 串行入群准入）"]
+    ApiLayer <-->|"集群控制 / 节点角色 / 远端执行与 SSE 中继"| Cluster["iroh QUIC 私有集群（按需绑定：mygo/cluster/1 同步、mygo/cap/1 能力转发、mygo/exec/1 租约与 SSE 中继、mygo/join/1 串行入群准入）"]
     Cluster <-->|"NotifyDirty / CatalogSync & SessionSync 与 256 KiB 分块"| Sqlite
 
     Agent -->|"6 个 codemode* 工具"| Pool["JS 工人线程池（默认 min(核数, 4)）"]
@@ -57,7 +57,7 @@ flowchart TB
 | 篇目 | 文档 | 它解决什么问题 | 核心机制与涉及模块 |
 | :--- | :--- | :--- | :--- |
 | 第 1 篇 | [核心抽象与 Agent 循环](01-agent-loop.md) | 对话怎么存、怎么推着走、怎么安全停和崩后收残局 | `items`、`context_nodes` DAG 与 `active_context` 投影、投信与点火分离、`step`、`steer`、`pending_inputs` 与 `turn_settled`、`Voter`/`Edge` 多数派执行租约与 `voter_epoch` 两阶段联合多数派成员变更、`GateMode`/`RunAuth` 门控与断联复核、`status`/`local_status` 持久化与本机叠加态分离、叶节点分支切换、软/硬暂停、重试、优雅退出、按 `input_head` 分支归属的崩溃恢复 |
-| 第 2 篇 | [底层底座：单记账员、合批落盘、流式读写与防重](02-storage-and-concurrency.md) | 只有一个记账员，为什么多人并发投信、翻账、删会话不堵不乱；多节点间怎么无冲突同步 | 单线程运行时 + 独占 `sqlite` 线程、容量 64 通道、32 笔顺手拼车与 `savepoint`、入群前活跃任务 `409` 守门与二态写租约核验、不可变主键快照分页 + `X-History-View` 视图连续性、`Idempotency-Key` 跨节点规范等价类收敛、`call_id` 与 `v11` 去跨表外键/去全局唯一约束的应用层防重、单机按需绑定 `iroh` QUIC 与 `JOIN_ALPN` 串行入群准入、HLC 逐字段 LWW + 持久化 `local_node.catalog_rev` 水位、两阶段有界差量读取与超大 `ItemWire` 256 KiB 分块同步、按 Peer 细粒度并发锁、`ON CONFLICT` 精准去重、单调墓碑与无冲突合流 |
+| 第 2 篇 | [底层底座：单记账员、合批落盘、流式读写与防重](02-storage-and-concurrency.md) | 只有一个记账员，为什么多人并发投信、翻账、删会话不堵不乱；多节点间怎么无冲突同步 | 单线程运行时 + 独占 `sqlite` 线程、容量 64 通道、32 笔顺手拼车与 `savepoint`、入群前活跃任务 `409` 守门与二态写租约核验、不可变主键快照分页 + `X-History-View` 视图连续性、`Idempotency-Key` 跨节点规范等价类收敛、`call_id` 与 `v1` 去跨表外键/去全局唯一约束的应用层防重、单机按需绑定 `iroh` QUIC 与 `JOIN_ALPN` 串行入群准入、HLC 逐字段 LWW + 持久化 `local_node.catalog_rev` 水位、两阶段有界差量读取与超大 `ItemWire` 256 KiB 分块同步、按 Peer 细粒度并发锁、`ON CONFLICT` 精准去重、单调墓碑与无冲突合流 |
 | 第 3 篇 | [模型目录、多模态附件与精确计费](03-catalog-media-and-billing.md) | 怎么管多家模型、按需同步大文件媒体、不差一厘钱地算账 | 供应商/模型目录与软归档、供应商 `endpoint_ts` 原子合并、四道校验铁门、会话显式选模、50 MiB 内容寻址与全链路有界流式附件（上传配额、256 KiB 多节点分块拉取、`blob_open` 实时 Base64 展开与 `pinned_head` 分支校验）、`active_context` 增量历史校验前缀缓存、`llm_calls`（含 `input_head` 钉分支）、`PriceBook` 快照与 `cost_nano_usd` 零浮点结算 |
 | 第 4 篇 | [Codemode 上篇：最小完备原语、独立车间与宿主能力](04-codemode-sandbox.md) | 怎么让模型写 JS 安全干重活，既不冻住主线程也不留孤儿进程 | JS 工人池与 QuickJS 隔离、`cluster.node(target)` 云化节点句柄、`TextDecoder`/`TextEncoder`、跨节点流句柄与背压、`fs` 防设备文件、`http`、`proc.exec` 进程笼、`node.mygo.request` 内网接口、输出合流与 `savepoint` 落盘 |
 | 第 5 篇 | [Codemode 下篇：前后台分流、原地等信、实时透视与租期恢复](05-codemode-lifecycle.md) | 脚本跑久了怎么办、没跑完怎么不轮询等信、怎么查进度和防死循环 | 90 秒后台欠条、`codemode_event` 与 `wake`、门外双信箱分叉、`codemode_wait` 唤醒弦与 `trigger_code` 探针、`LiveState` 指纹去重、2 小时租期与 `invalidated_warnings`、3 秒等遗言 |
@@ -79,7 +79,7 @@ flowchart TB
 | **顺手拼车与 `savepoint`** | 记账员把通道口排队的最多 32 笔兼容写单拢进一次刷盘，每人套独立反悔点互不连坐 | [第 2 篇](02-storage-and-concurrency.md) |
 | **半格律合并（HLC LWW + 因果向量）** | 所有跨节点同步合并满足交换律、结合律与幂等律——目录按字段级 HLC 时间戳 `*_ts` 取新并借持久化 `local_node.catalog_rev`（表行 `sync_rev`）游标增量拉取，会话正文与调用账单按 `(origin_node_id, origin_seq)` 因果向量差量补齐，彻底消灭同步冲突与人工裁决 | [第 2 篇](02-storage-and-concurrency.md) |
 | **Watch 懒同步与单调墓碑** | 会话目录默认全集群同步，明细正文（`items`、`context_nodes`、`turn_settled`、`invalidated_warnings`）仅对记进 `watched_sessions` 的会话持续追更；删除写下只增不减的 `0 -> 1` `deleted` 墓碑，防离线节点重连时把删掉的资源重新复活 | [第 2 篇](02-storage-and-concurrency.md) |
-| **控制面 / 执行面** | 集群里任意节点都可作为入口接 HTTP 控制与中继 SSE（控制面），真正跑大模型与后台脚本的节点通过 `mygo/exec/2` 独立承接（执行面） | [第 1 篇](01-agent-loop.md) |
+| **控制面 / 执行面** | 集群里任意节点都可作为入口接 HTTP 控制与中继 SSE（控制面），真正跑大模型与后台脚本的节点通过 `mygo/exec/1` 独立承接（执行面） | [第 1 篇](01-agent-loop.md) |
 | **多数派执行租约（`Voter` / `Edge`）** | 全集群区分投票节点 `Voter` 与边缘节点 `Edge`：由 `voter_epoch` 两阶段联合多数派（新旧选民双多数）护航成员变更，开跑前与删会话时通过 `Occupancy` 进度栅栏先向全体在线同伴探占有并按需强同步最新进度，10 秒租约（每 3 秒续租）只数当前选民集 `Voter` 多数派，失多数派 9 秒内本地熔断仅记本机 `local_status` 停机 | [第 1 篇](01-agent-loop.md) |
 | **价格快照与 `cost_nano_usd`** | 开跑时把当前生效的时段阶梯价冻在 `llm_calls` 里，收尾用纯整数按十亿分之一美元精确结算 | [第 3 篇](03-catalog-media-and-billing.md) |
 | **受管命令（进程笼）** | `proc.exec` 和 MCP `stdio` 把子进程关进 Unix 进程组或 Windows `JobObject`，退出/超时时连根清场 | [第 4 篇](04-codemode-sandbox.md) |
