@@ -54,6 +54,86 @@ const MAX_GOSSIP_ENTRIES: usize = MAX_CLUSTER_PEERS + 1;
 const MAX_PRESENCE_SESSIONS_PER_NODE: usize = 256;
 const MAX_CHECK_HOPS: u8 = 4;
 
+fn extend_visited(existing: &[String], local_id: &str, targets: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity((existing.len() + 1 + targets.len()).min(MAX_GOSSIP_ENTRIES));
+    let mut seen: HashSet<&str> = HashSet::new();
+    for id in existing
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(local_id))
+        .chain(targets.iter().map(String::as_str))
+    {
+        if out.len() >= MAX_GOSSIP_ENTRIES {
+            break;
+        }
+        if !id.is_empty() && seen.insert(id) {
+            out.push(id.to_owned());
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PeerPresenceSyncState {
+    acked_seq: u64,
+    acked_hash: Option<[u8; 32]>,
+    in_flight: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresenceSendDecision {
+    Skip,
+    Send,
+}
+
+fn presence_entries_hash(entries: &[NodePresence]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let _ = serde_json::to_writer(&mut hasher, entries);
+    *hasher.finalize().as_bytes()
+}
+
+fn begin_presence_send_in_map(
+    map: &mut HashMap<String, PeerPresenceSyncState>,
+    peer_id: &str,
+    seq: u64,
+    entries_hash: [u8; 32],
+    allow_skip: bool,
+) -> PresenceSendDecision {
+    let entry = map.entry(peer_id.to_owned()).or_default();
+    if allow_skip && entry.in_flight == 0 && entry.acked_hash == Some(entries_hash) {
+        entry.acked_seq = entry.acked_seq.max(seq);
+        return PresenceSendDecision::Skip;
+    }
+    if entry.acked_hash != Some(entries_hash) {
+        // Sending a different snapshot makes the remote's view uncertain until acked.
+        entry.acked_hash = None;
+    }
+    entry.in_flight += 1;
+    PresenceSendDecision::Send
+}
+
+fn finish_presence_send_in_map(
+    map: &mut HashMap<String, PeerPresenceSyncState>,
+    peer_id: &str,
+    seq: u64,
+    entries_hash: [u8; 32],
+    succeeded: bool,
+    peer_online: bool,
+) {
+    if !peer_online {
+        map.remove(peer_id);
+        return;
+    }
+    let Some(entry) = map.get_mut(peer_id) else {
+        return;
+    };
+    entry.in_flight = entry.in_flight.saturating_sub(1);
+    if succeeded && seq >= entry.acked_seq {
+        entry.acked_seq = seq;
+        entry.acked_hash = Some(entries_hash);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionOccupancy {
     pub session_id: SessionId,
@@ -849,13 +929,38 @@ pub struct ExecPlane {
     start_locks: Mutex<HashMap<SessionId, Weak<AsyncMutex<()>>>>,
     peer_sync_wake: Arc<Notify>,
     pending_peer_sync: Mutex<HashSet<String>>,
-    acked_presence: Mutex<HashMap<String, u64>>,
+    acked_presence: Mutex<HashMap<String, PeerPresenceSyncState>>,
     self_weak: OnceLock<Weak<ExecPlane>>,
 }
 
 pub(crate) fn is_membership_changed_err(err: &Error) -> bool {
     err.0 == axum::http::StatusCode::CONFLICT
         && err.1 == "cluster membership changed while starting session"
+}
+
+struct PresenceInFlightGuard<'a, 'b> {
+    plane: &'a ExecPlane,
+    peer_id: &'b str,
+    seq: u64,
+    hash: [u8; 32],
+    armed: bool,
+}
+
+impl<'a, 'b> PresenceInFlightGuard<'a, 'b> {
+    fn complete(mut self, succeeded: bool) {
+        self.armed = false;
+        self.plane
+            .finish_presence_send(self.peer_id, self.seq, self.hash, succeeded);
+    }
+}
+
+impl Drop for PresenceInFlightGuard<'_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.plane
+                .finish_presence_send(self.peer_id, self.seq, self.hash, false);
+        }
+    }
 }
 
 impl ExecPlane {
@@ -936,12 +1041,56 @@ impl ExecPlane {
         self.publish_presence_changes(changed);
     }
 
-    fn mark_presence_acked(&self, peer_id: &str, seq: u64) {
+    fn begin_presence_send<'a, 'b>(
+        &'a self,
+        peer_id: &'b str,
+        seq: u64,
+        entries_hash: [u8; 32],
+        allow_skip: bool,
+    ) -> Option<PresenceInFlightGuard<'a, 'b>> {
         let mut acked = self.acked_presence.lock().unwrap();
-        acked
-            .entry(peer_id.to_owned())
-            .and_modify(|s| *s = (*s).max(seq))
-            .or_insert(seq);
+        match begin_presence_send_in_map(&mut acked, peer_id, seq, entries_hash, allow_skip) {
+            PresenceSendDecision::Skip => None,
+            PresenceSendDecision::Send => Some(PresenceInFlightGuard {
+                plane: self,
+                peer_id,
+                seq,
+                hash: entries_hash,
+                armed: true,
+            }),
+        }
+    }
+
+    fn finish_presence_send(
+        &self,
+        peer_id: &str,
+        seq: u64,
+        entries_hash: [u8; 32],
+        succeeded: bool,
+    ) {
+        let online = self.net.is_peer_online(peer_id);
+        let mut acked = self.acked_presence.lock().unwrap();
+        finish_presence_send_in_map(&mut acked, peer_id, seq, entries_hash, succeeded, online);
+    }
+
+    async fn try_send_presence(
+        &self,
+        peer_id: &str,
+        timeout: Duration,
+    ) -> Option<std::result::Result<(), ()>> {
+        let (sender_instance_id, sender_gossip_seq, entries) =
+            self.presence.snapshot_for_peer(peer_id);
+        let entries_hash = presence_entries_hash(&entries);
+        let guard = self.begin_presence_send(peer_id, sender_gossip_seq, entries_hash, true)?;
+        let req = ExecReq::PresenceSync {
+            sender_instance_id,
+            sender_gossip_seq,
+            entries,
+            want_reply: false,
+        };
+        let ok = self.exec_rpc(peer_id, &req, timeout).await.is_ok();
+        guard.complete(ok);
+        Some(if ok { Ok(()) } else { Err(()) })
     }
 
     fn publish_presence_changes(&self, changed: Vec<SessionId>) {
@@ -1005,7 +1154,7 @@ impl ExecPlane {
                 let acked = self.acked_presence.lock().unwrap();
                 online
                     .into_iter()
-                    .filter(|p| acked.get(p).copied().unwrap_or(0) < seq)
+                    .filter(|p| acked.get(p).map_or(0, |st| st.acked_seq) < seq)
                     .collect()
             };
 
@@ -1022,34 +1171,27 @@ impl ExecPlane {
             }
 
             if !due.is_empty() {
-                let results = futures_util::future::join_all(due.into_iter().map(|peer_id| {
-                    let (sender_instance_id, sender_gossip_seq, entries) =
-                        self.presence.snapshot_for_peer(&peer_id);
-                    let req = ExecReq::PresenceSync {
-                        sender_instance_id,
-                        sender_gossip_seq,
-                        entries,
-                        want_reply: false,
-                    };
-                    async move {
-                        let res = self.exec_rpc(&peer_id, &req, EXEC_SHORT_TIMEOUT).await;
-                        (peer_id, sender_gossip_seq, res)
-                    }
+                let results = futures_util::future::join_all(due.into_iter().map(|peer_id| async move {
+                    let res = self.try_send_presence(&peer_id, EXEC_SHORT_TIMEOUT).await;
+                    (peer_id, res)
                 }))
                 .await;
                 let retry_base = Instant::now();
-                for (peer_id, sent_seq, res) in results {
-                    if res.is_ok() {
-                        self.mark_presence_acked(&peer_id, sent_seq);
-                        backoff.remove(&peer_id);
-                    } else if self.net.is_peer_online(&peer_id) {
-                        let next_delay = backoff
-                            .get(&peer_id)
-                            .map(|(_, prev)| (*prev * 2).min(Duration::from_millis(3200)))
-                            .unwrap_or_else(|| Duration::from_millis(200));
-                        let next_at = retry_base + next_delay;
-                        backoff.insert(peer_id, (next_at, next_delay));
-                        earliest = Some(earliest.map_or(next_at, |e| e.min(next_at)));
+                for (peer_id, outcome) in results {
+                    match outcome {
+                        None | Some(Ok(())) => {
+                            backoff.remove(&peer_id);
+                        }
+                        Some(Err(())) if self.net.is_peer_online(&peer_id) => {
+                            let next_delay = backoff
+                                .get(&peer_id)
+                                .map(|(_, prev)| (*prev * 2).min(Duration::from_millis(3200)))
+                                .unwrap_or_else(|| Duration::from_millis(200));
+                            let next_at = retry_base + next_delay;
+                            backoff.insert(peer_id, (next_at, next_delay));
+                            earliest = Some(earliest.map_or(next_at, |e| e.min(next_at)));
+                        }
+                        Some(Err(())) => {}
                     }
                 }
             }
@@ -1089,26 +1231,12 @@ impl ExecPlane {
         if targets.is_empty() {
             return;
         }
-        let results = futures_util::future::join_all(targets.into_iter().map(|peer_id| {
-            let (sender_instance_id, sender_gossip_seq, entries) =
-                self.presence.snapshot_for_peer(&peer_id);
-            let req = ExecReq::PresenceSync {
-                sender_instance_id,
-                sender_gossip_seq,
-                entries,
-                want_reply: false,
-            };
-            async move {
-                let res = self.exec_rpc(&peer_id, &req, EXEC_PROBE_TIMEOUT).await;
-                (peer_id, sender_gossip_seq, res)
-            }
-        }))
+        futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|peer_id| self.try_send_presence(peer_id, EXEC_PROBE_TIMEOUT)),
+        )
         .await;
-        for (peer_id, sent_seq, res) in results {
-            if res.is_ok() {
-                self.mark_presence_acked(&peer_id, sent_seq);
-            }
-        }
     }
 
     async fn peer_presence_sync_loop(&self) {
@@ -1134,20 +1262,29 @@ impl ExecPlane {
                 }
                 let (sender_instance_id, sender_gossip_seq, entries) =
                     self.presence.snapshot_for_peer(&peer_id);
+                let entries_hash = presence_entries_hash(&entries);
+                let Some(guard) =
+                    self.begin_presence_send(&peer_id, sender_gossip_seq, entries_hash, false)
+                else {
+                    return;
+                };
                 let req = ExecReq::PresenceSync {
                     sender_instance_id,
                     sender_gossip_seq,
                     entries,
                     want_reply: true,
                 };
-                if let Ok(ExecResp::Presence {
-                    sender_instance_id: r_inst,
-                    sender_gossip_seq: r_seq,
-                    entries: r_entries,
-                }) = self.exec_rpc(&peer_id, &req, EXEC_SHORT_TIMEOUT).await
-                {
-                    self.mark_presence_acked(&peer_id, sender_gossip_seq);
-                    self.apply_remote_presence(&peer_id, r_inst, r_seq, r_entries);
+                match self.exec_rpc(&peer_id, &req, EXEC_SHORT_TIMEOUT).await {
+                    Ok(ExecResp::Presence {
+                        sender_instance_id: r_inst,
+                        sender_gossip_seq: r_seq,
+                        entries: r_entries,
+                    }) => {
+                        guard.complete(true);
+                        self.apply_remote_presence(&peer_id, r_inst, r_seq, r_entries);
+                    }
+                    Ok(_) => guard.complete(true),
+                    Err(_) => guard.complete(false),
                 }
             }))
             .await;
@@ -1291,7 +1428,7 @@ impl ExecPlane {
         let req = ExecReq::CheckOccupancy {
             session_id: sid,
             claim: None,
-            visited: vec![local_id.clone()],
+            visited: extend_visited(&[], &local_id, &online),
             hops_left: MAX_CHECK_HOPS,
         };
         let replies = futures_util::future::join_all(online.into_iter().map(|peer_id| {
@@ -1672,7 +1809,7 @@ impl ExecPlane {
             let req = ExecReq::CheckOccupancy {
                 session_id: sid,
                 claim: Some(claim),
-                visited: vec![local_id.clone()],
+                visited: extend_visited(&[], &local_id, &online),
                 hops_left: MAX_CHECK_HOPS,
             };
             let replies = futures_util::future::join_all(online.iter().cloned().map(|peer_id| {
@@ -2197,9 +2334,10 @@ impl ClaimReleaseGuard {
             return;
         };
         let holder = std::mem::take(&mut self.holder_node_id);
+        let visited = extend_visited(&[], &holder, &peers);
         let req = ExecReq::ReleaseClaim {
             session_id: self.sid,
-            visited: vec![holder.clone()],
+            visited,
             holder_node_id: holder,
             claim_id: std::mem::take(&mut self.claim_id),
             hops_left: MAX_CHECK_HOPS,
@@ -2232,10 +2370,11 @@ impl Drop for ClaimReleaseGuard {
         let holder = std::mem::take(&mut self.holder_node_id);
         let claim_id = std::mem::take(&mut self.claim_id);
         let workers = plane.workers.clone();
+        let visited = extend_visited(&[], &holder, &peers);
         workers.spawn(async move {
             let req = ExecReq::ReleaseClaim {
                 session_id: sid,
-                visited: vec![holder.clone()],
+                visited,
                 holder_node_id: holder,
                 claim_id,
                 hops_left: MAX_CHECK_HOPS,
@@ -2594,14 +2733,12 @@ impl ExecServer {
         if downstream.is_empty() {
             return;
         }
-        if !visited.contains(&local_id) {
-            visited.push(local_id);
-        }
+        let next_visited = extend_visited(&visited, &local_id, &downstream);
         let req = ExecReq::ReleaseClaim {
             session_id: sid,
             holder_node_id,
             claim_id,
-            visited,
+            visited: next_visited,
             hops_left: hops - 1,
         };
         futures_util::future::join_all(downstream.into_iter().map(|peer_id| {
@@ -2771,10 +2908,7 @@ impl ExecServer {
 
         let mut confirmed_idle: HashSet<String> = HashSet::new();
         if !downstream.is_empty() {
-            let mut next_visited = visited.clone();
-            if !next_visited.contains(&local_id) && next_visited.len() < MAX_GOSSIP_ENTRIES {
-                next_visited.push(local_id.clone());
-            }
+            let next_visited = extend_visited(&visited, &local_id, &downstream);
             let fwd_req = ExecReq::CheckOccupancy {
                 session_id: sid,
                 claim: claim.clone(),
