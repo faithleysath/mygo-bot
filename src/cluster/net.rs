@@ -31,9 +31,9 @@ use crate::{
     store::Db,
 };
 
-pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/2";
+pub const CLUSTER_ALPN: &[u8] = b"mygo/cluster/1";
 pub const CAP_ALPN: &[u8] = b"mygo/cap/1";
-pub const EXEC_ALPN: &[u8] = b"mygo/exec/2";
+pub const EXEC_ALPN: &[u8] = b"mygo/exec/1";
 const JOIN_ALPN: &[u8] = b"mygo/join/1";
 const MAX_CAP_CONNS_PER_PEER: usize = 4;
 const MAX_EXEC_CONNS_PER_PEER: usize = 2;
