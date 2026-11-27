@@ -17,12 +17,15 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+pub const RECONNECT_PAUSE_REASON: &str = "reconnected to cluster; pausing offline run";
+
 #[derive(Clone, Default)]
 pub struct Control {
     pub soft: CancellationToken,
     pub hard: CancellationToken,
     pub run_gen: u64,
     pub lease: Option<Arc<ActiveLease>>,
+    pub forced_offline: bool,
 }
 
 impl Control {
@@ -61,9 +64,7 @@ pub async fn start(
     };
     if req.node.is_none() && app.exec.presence().known_peer_count() == 0 {
         match app.start_local_checked(sid, RunAuth::Standalone).await {
-            Err(err)
-                if err.0 == axum::http::StatusCode::CONFLICT
-                    && err.1 == "cluster membership changed while starting session" => {}
+            Err(err) if crate::cluster::exec::is_membership_changed_err(&err) => {}
             other => return other.map(Json),
         }
     }
@@ -81,10 +82,7 @@ impl App {
                 app.exec.start_wake_run(&app, sid).await
             } else {
                 match app.start_worker_inner(sid, true, RunAuth::Standalone).await {
-                    Err(err)
-                        if err.0 == axum::http::StatusCode::CONFLICT
-                            && err.1 == "cluster membership changed while starting session" =>
-                    {
+                    Err(err) if crate::cluster::exec::is_membership_changed_err(&err) => {
                         app.exec.start_wake_run(&app, sid).await
                     }
                     other => other,
@@ -101,7 +99,8 @@ impl App {
                     .call(move |s| {
                         s.pending_wakes.remove(&sid);
                         s.refresh_local_presence(sid);
-                        let can_sync_pause = s.presence.known_peer_count() == 0
+                        let can_sync_pause = (s.presence.known_peer_count() == 0
+                            && !s.presence.is_joining())
                             || (s.is_local_lease_valid(sid)
                                 && !matches!(
                                     e.0,
@@ -175,6 +174,10 @@ impl App {
     ) -> Result<Session> {
         use crate::cluster::exec::RunAuth;
 
+        if self.exec.presence().is_joining() {
+            return Err(Error::conflict("cluster join in progress; retry"));
+        }
+        let forced_offline = matches!(auth, RunAuth::ForcedOffline);
         let lease = match &auth {
             RunAuth::Quorum(l) => Some(l.clone()),
             RunAuth::Standalone | RunAuth::ForcedOffline => None,
@@ -288,6 +291,7 @@ impl App {
                                 hard: CancellationToken::new(),
                                 run_gen,
                                 lease,
+                                forced_offline,
                             };
                             s.active.insert(sid, control.clone());
                             s.refresh_local_presence_with(
@@ -347,7 +351,7 @@ impl App {
     }
 }
 
-fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
+pub(crate) fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
     if let Some(ctrl) = s.active.remove(&sid) {
         ctrl.soft.cancel();
         ctrl.hard.cancel();
@@ -364,6 +368,27 @@ fn fence_local_run(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
     let reason = reason_bounded.as_str();
     let now = chrono::Utc::now().timestamp_millis();
     // A fenced runner can only record its pause locally.
+    let update = s.conn.execute(
+        "UPDATE sessions SET local_status='paused',local_error=?2,updated_at=max(updated_at,?3) WHERE id=?1",
+        (sid, reason, now),
+    );
+    s.refresh_local_presence(sid);
+    update?;
+    s.notify_status(sid, "paused", reason, now);
+    Ok(())
+}
+
+fn pause_forced_offline_local(s: &mut Store, sid: SessionId, reason: &str) -> Result<()> {
+    let reason_bounded =
+        crate::calls::truncate_utf8(reason, crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES);
+    let reason = reason_bounded.as_str();
+    if reason == RECONNECT_PAUSE_REASON {
+        crate::codemode::stop_session(s, sid);
+        s.pending_wakes.remove(&sid);
+    } else if s.presence.known_peer_count() > 0 && crate::codemode::has_session_tasks(s, sid) {
+        s.presence.notify_reconcile();
+    }
+    let now = chrono::Utc::now().timestamp_millis();
     let update = s.conn.execute(
         "UPDATE sessions SET local_status='paused',local_error=?2,updated_at=max(updated_at,?3) WHERE id=?1",
         (sid, reason, now),
@@ -502,7 +527,6 @@ impl App {
     async fn run(self, sid: SessionId, control: Control, channel: broadcast::Sender<Notice>) {
         let outcome = self.run_loop(sid, &control, &channel).await;
         if let Err(problem) = outcome {
-            self.exec.presence().wait_local_lease_ready(sid, None).await;
             let settled = self
                 .db
                 .call(move |s| {
@@ -513,6 +537,14 @@ impl App {
                         return fence_local_run(s, sid, "execution lease lost");
                     }
                     s.active.remove(&sid);
+                    if control.forced_offline {
+                        let reason = match (session(&s.conn, sid), control.soft.is_cancelled()) {
+                            (Ok(info), true) if !info.last_error.is_empty() => info.last_error,
+                            _ => problem.1,
+                        };
+                        let reason = if reason.is_empty() { "paused" } else { &reason };
+                        return pause_forced_offline_local(s, sid, reason);
+                    }
                     // Keep the lease until the terminal write has committed or failed.
                     let result = pause_failed_run(s, sid, &control, problem);
                     s.refresh_local_presence(sid);
@@ -535,9 +567,7 @@ impl App {
         let mut attempt = 0u64;
         let run_gen = control.run_gen;
         loop {
-            if !control.lease_valid()
-                || !self.exec.presence().wait_local_lease_ready(sid, Some(&control.hard)).await
-            {
+            if !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid) {
                 return Err(Error::conflict("execution lease lost"));
             }
             enum BeginOutcome {
@@ -670,7 +700,7 @@ impl App {
             // A call may have reached the store just as the stream was cancelled, before spawn.
             if (interrupted || (output.tools && streamed.is_err()))
                 && control.lease_valid()
-                && self.exec.presence().wait_local_lease_ready(sid, None).await
+                && self.exec.presence().is_local_lease_valid(sid)
             {
                 self.db
                     .call(move |s| {
@@ -704,9 +734,7 @@ impl App {
             if interrupted {
                 return Err(Error::conflict("paused"));
             }
-            if !control.lease_valid()
-                || !self.exec.presence().wait_local_lease_ready(sid, Some(&control.hard)).await
-            {
+            if !control.lease_valid() || !self.exec.presence().is_local_lease_valid(sid) {
                 return Err(Error::conflict("execution lease lost"));
             }
             match streamed {
@@ -737,6 +765,7 @@ impl App {
             let tools = output.tools;
             let final_output_index = output.final_output_index;
             let soft = control.soft.clone();
+            let forced_offline = control.forced_offline;
             let stopped = self
                 .db
                 .write_for_run(
@@ -789,7 +818,16 @@ impl App {
                             "idle"
                         };
                         let now = chrono::Utc::now().timestamp_millis();
-                        if matches!(state, "idle" | "paused") {
+                        if state == "paused" && forced_offline {
+                            conn.prepare_cached(
+                                "UPDATE sessions
+                                 SET local_status='paused',
+                                     local_error=coalesce(nullif(local_error,''), 'paused'),
+                                     updated_at=max(updated_at,?2)
+                                 WHERE id=?1",
+                            )?
+                            .execute((sid, now))?;
+                        } else if matches!(state, "idle" | "paused") {
                             let status_ts = crate::cluster::ledger::tick_hlc(conn)?;
                             let rev = crate::cluster::ledger::next_catalog_rev(conn)?;
                             conn.prepare_cached(
@@ -820,6 +858,19 @@ impl App {
                         if state != "running" {
                             if s.active.get(&sid).is_some_and(|c| c.run_gen == run_gen) {
                                 s.active.remove(&sid);
+                            }
+                            if forced_offline {
+                                if state == "paused"
+                                    && session(&s.conn, sid)
+                                        .is_ok_and(|info| info.last_error == RECONNECT_PAUSE_REASON)
+                                {
+                                    crate::codemode::stop_session(s, sid);
+                                    s.pending_wakes.remove(&sid);
+                                } else if s.presence.known_peer_count() > 0
+                                    && crate::codemode::has_session_tasks(s, sid)
+                                {
+                                    s.presence.notify_reconcile();
+                                }
                             }
                             s.refresh_local_presence(sid);
                             if state == "idle" {

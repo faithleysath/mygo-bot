@@ -754,14 +754,7 @@ impl SyncEngine {
                         let (local, _) = adopt_voter_config(&s.conn, voter_epoch, &voter_set)?;
                         let my_info = self_peer_info(&local, &addr);
                         let mut my_peers = list_peers(&s.conn)?;
-                        s.presence.set_local_role(local.role);
-                        s.presence.set_voter_config(
-                            local.voter_epoch,
-                            &local.voter_set,
-                            local.pending_voter_epoch,
-                            &local.pending_voter_set,
-                            &local.pending_proposal_id,
-                        );
+                        s.presence.sync_local_node(&local);
                         s.presence.set_peer_roles(&my_peers);
                         s.presence.set_known_peer_count(my_peers.len());
                         my_peers.truncate(MAX_PEX_PEERS);
@@ -1078,14 +1071,7 @@ impl SyncEngine {
                     }
                     let (local, _) = adopt_voter_config(&s.conn, voter_epoch, &voter_set)?;
                     let all = list_peers(&s.conn)?;
-                    s.presence.set_local_role(local.role);
-                    s.presence.set_voter_config(
-                        local.voter_epoch,
-                        &local.voter_set,
-                        local.pending_voter_epoch,
-                        &local.pending_voter_set,
-                        &local.pending_proposal_id,
-                    );
+                    s.presence.sync_local_node(&local);
                     s.presence.set_peer_roles(&all);
                     s.presence.set_known_peer_count(all.len());
                     Ok(changed)
@@ -1478,6 +1464,112 @@ impl SyncEngine {
         Ok((any_changed, caught_up))
     }
 
+    async fn is_session_deleted_local(&self, sid: SessionId) -> Result<bool> {
+        self.db
+            .call(move |s| {
+                s.conn
+                    .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
+                    .query_row([sid], |r| r.get::<_, bool>(0))
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    async fn pull_catalog_peers(
+        &self,
+        peers: &[String],
+        mgen: i64,
+    ) -> (usize, usize, Option<Error>) {
+        let mut ok_count = 0usize;
+        let mut rows_updated = 0usize;
+        let mut first_err: Option<Error> = None;
+        let mut futs = stream::iter(peers.iter().cloned())
+            .map(|peer_id| async move {
+                if self.net.membership_gen() != mgen {
+                    return Err(Error::conflict("membership generation changed"));
+                }
+                self.pull_catalog_from_peer(&peer_id, mgen).await.map_err(|err| {
+                    Error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("catalog sync with peer {peer_id} failed: {}", err.1),
+                    )
+                })
+            })
+            .buffer_unordered(4);
+        while let Some(res) = futs.next().await {
+            match res {
+                Ok((_, rows, true)) => {
+                    ok_count += 1;
+                    rows_updated += rows;
+                }
+                Ok((_, rows, false)) => {
+                    rows_updated += rows;
+                    if first_err.is_none() {
+                        first_err = Some(Error(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "catalog sync truncated before catching up".into(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        (ok_count, rows_updated, first_err)
+    }
+
+    async fn pull_session_peers(
+        &self,
+        sid: SessionId,
+        peers: &[String],
+        mgen: i64,
+    ) -> (usize, bool, Option<Error>) {
+        let mut ok_count = 0usize;
+        let mut any_changed = false;
+        let mut first_err: Option<Error> = None;
+        let mut futs = stream::iter(peers.iter().cloned())
+            .map(|peer_id| async move {
+                if self.net.membership_gen() != mgen {
+                    return Err(Error::conflict("membership generation changed"));
+                }
+                self.pull_session_from_peer(sid, &peer_id, mgen)
+                    .await
+                    .map_err(|err| {
+                        Error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("session sync with peer {peer_id} failed: {}", err.1),
+                        )
+                    })
+            })
+            .buffer_unordered(4);
+        while let Some(res) = futs.next().await {
+            match res {
+                Ok((changed, true)) => {
+                    ok_count += 1;
+                    any_changed |= changed;
+                }
+                Ok((changed, false)) => {
+                    any_changed |= changed;
+                    if first_err.is_none() {
+                        first_err = Some(Error(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "session sync truncated before catching up".into(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        (ok_count, any_changed, first_err)
+    }
+
     pub async fn sync_with_peers(
         &self,
         specific_peer: Option<&str>,
@@ -1497,20 +1589,7 @@ impl SyncEngine {
             });
         }
 
-        let mut catalog_rows_updated = 0usize;
-        let mut catalog_futs = stream::iter(peers.iter().cloned())
-            .map(|peer_id| async move {
-                if self.net.membership_gen() != mgen {
-                    return Ok((false, 0, false));
-                }
-                self.pull_catalog_from_peer(&peer_id, mgen).await
-            })
-            .buffer_unordered(4);
-        while let Some(res) = catalog_futs.next().await {
-            if let Ok((_, rows, _)) = res {
-                catalog_rows_updated += rows;
-            }
-        }
+        let (_, catalog_rows_updated, _) = self.pull_catalog_peers(&peers, mgen).await;
 
         let sessions: Vec<SessionId> = match target_session {
             Some(sid) => vec![sid],
@@ -1526,21 +1605,8 @@ impl SyncEngine {
             if self.net.membership_gen() != mgen {
                 break;
             }
-            let mut updated_this = false;
-            let mut sess_futs = stream::iter(peers.iter().cloned())
-                .map(|peer_id| async move {
-                    if self.net.membership_gen() != mgen {
-                        return Ok((false, false));
-                    }
-                    self.pull_session_from_peer(sid, &peer_id, mgen).await
-                })
-                .buffer_unordered(4);
-            while let Some(res) = sess_futs.next().await {
-                if let Ok((true, _)) = res {
-                    updated_this = true;
-                }
-            }
-            if updated_this {
+            let (_, updated, _) = self.pull_session_peers(sid, &peers, mgen).await;
+            if updated {
                 sessions_updated += 1;
             }
         }
@@ -1553,16 +1619,7 @@ impl SyncEngine {
     }
 
     pub async fn sync_session_strict(&self, sid: SessionId, peers: &[String]) -> Result<()> {
-        let deleted_local = self
-            .db
-            .call(move |s| {
-                s.conn
-                    .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
-                    .query_row([sid], |r| r.get::<_, bool>(0))
-                    .map_err(Into::into)
-            })
-            .await?;
-        if deleted_local {
+        if self.is_session_deleted_local(sid).await? {
             return Err(rusqlite::Error::QueryReturnedNoRows.into());
         }
         let mgen = self.net.membership_gen();
@@ -1647,61 +1704,17 @@ impl SyncEngine {
         let Some(sid) = session_id else {
             return self.sync_with_peers(None, None).await;
         };
-        let deleted_local = self
-            .db
-            .call(move |s| {
-                s.conn
-                    .prepare_cached("SELECT coalesce((SELECT deleted FROM sessions WHERE id=?), 0)")?
-                    .query_row([sid], |r| r.get::<_, bool>(0))
-                    .map_err(Into::into)
-            })
-            .await?;
-        if deleted_local {
+        if self.is_session_deleted_local(sid).await? {
             return Err(rusqlite::Error::QueryReturnedNoRows.into());
         }
 
         let mgen = self.net.membership_gen();
         let peers = self.net.online_peer_ids();
-        let mut catalog_rows_updated = 0usize;
-        let mut catalog_ok = 0usize;
-        let mut first_cat_err: Option<Error> = None;
-        if !peers.is_empty() {
-            let mut cat_futs = stream::iter(peers.iter().cloned())
-                .map(|peer_id| async move {
-                    if self.net.membership_gen() != mgen {
-                        return Err(Error::conflict("membership generation changed"));
-                    }
-                    self.pull_catalog_from_peer(&peer_id, mgen).await.map_err(|err| {
-                        Error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("catalog sync with peer {peer_id} failed: {}", err.1),
-                        )
-                    })
-                })
-                .buffer_unordered(4);
-            while let Some(res) = cat_futs.next().await {
-                match res {
-                    Ok((_, rows, true)) => {
-                        catalog_ok += 1;
-                        catalog_rows_updated += rows;
-                    }
-                    Ok((_, rows, false)) => {
-                        catalog_rows_updated += rows;
-                        if first_cat_err.is_none() {
-                            first_cat_err = Some(Error(
-                                StatusCode::GATEWAY_TIMEOUT,
-                                "catalog sync truncated before catching up".into(),
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        if first_cat_err.is_none() {
-                            first_cat_err = Some(e);
-                        }
-                    }
-                }
-            }
-        }
+        let (catalog_ok, catalog_rows_updated, first_cat_err) = if peers.is_empty() {
+            (0, 0, None)
+        } else {
+            self.pull_catalog_peers(&peers, mgen).await
+        };
 
         let state_after_cat: Option<bool> = self
             .db
@@ -1736,45 +1749,9 @@ impl SyncEngine {
 
         let mut session_updated = false;
         if !peers.is_empty() {
-            let mut session_ok = 0usize;
-            let mut first_sess_err: Option<Error> = None;
-            let mut sess_futs = stream::iter(peers.iter().cloned())
-                .map(|peer_id| async move {
-                    if self.net.membership_gen() != mgen {
-                        return Err(Error::conflict("membership generation changed"));
-                    }
-                    self.pull_session_from_peer(sid, &peer_id, mgen)
-                        .await
-                        .map_err(|err| {
-                            Error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                format!("session sync with peer {peer_id} failed: {}", err.1),
-                            )
-                        })
-                })
-                .buffer_unordered(4);
-            while let Some(res) = sess_futs.next().await {
-                match res {
-                    Ok((changed, true)) => {
-                        session_ok += 1;
-                        session_updated |= changed;
-                    }
-                    Ok((changed, false)) => {
-                        session_updated |= changed;
-                        if first_sess_err.is_none() {
-                            first_sess_err = Some(Error(
-                                StatusCode::GATEWAY_TIMEOUT,
-                                "session sync truncated before catching up".into(),
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        if first_sess_err.is_none() {
-                            first_sess_err = Some(e);
-                        }
-                    }
-                }
-            }
+            let (session_ok, changed, first_sess_err) =
+                self.pull_session_peers(sid, &peers, mgen).await;
+            session_updated = changed;
             if session_ok == 0 {
                 return Err(first_sess_err.unwrap_or_else(|| {
                     Error(
@@ -2088,6 +2065,47 @@ impl SyncEngine {
             Unchanged,
         }
 
+        impl ReconciledOAuth {
+            fn into_coordination(self) -> RefreshCoordination {
+                match self {
+                    Self::GoneOrReauth => RefreshCoordination::Delegated {
+                        reauth_required: true,
+                    },
+                    Self::Rotated => RefreshCoordination::Delegated {
+                        reauth_required: false,
+                    },
+                    Self::Unchanged => RefreshCoordination::PendingConfirmation,
+                }
+            }
+        }
+
+        async fn sync_and_evaluate_oauth(
+            sync: &SyncEngine,
+            mgen: i64,
+            server_id: McpServerId,
+            generation: String,
+            pending: PendingRefreshState,
+            priority_peer: Option<&str>,
+            clear_if_same_and_valid: bool,
+        ) -> Result<ReconciledOAuth> {
+            if let Some(peer) = priority_peer {
+                let _ = sync.sync_with_peers(Some(peer), None).await;
+            }
+            let _ = sync.sync_with_peers(None, None).await;
+            sync.db
+                .call(move |s| {
+                    evaluate_oauth_after_sync(
+                        &s.conn,
+                        mgen,
+                        server_id,
+                        &generation,
+                        &pending,
+                        clear_if_same_and_valid,
+                    )
+                })
+                .await
+        }
+
         fn evaluate_oauth_after_sync(
             conn: &rusqlite::Connection,
             mgen: i64,
@@ -2164,40 +2182,29 @@ impl SyncEngine {
             .filter(|pr| pr.fp == current_fp);
 
         let delegation = if let Some(pr) = active_pending {
-            if self.net.is_peer_online(&pr.coordinator) {
-                let _ = self.sync_with_peers(Some(&pr.coordinator), None).await;
-            }
-            let _ = self.sync_with_peers(None, None).await;
-            let remote_holders = self.query_mcp_participants(server_id).await;
-            let recheck = self
-                .db
-                .call({
-                    let gen_q = gen_owned.clone();
-                    let pending = pr.clone();
-                    move |s| {
-                        evaluate_oauth_after_sync(
-                            &s.conn, mgen, server_id, &gen_q, &pending, false,
-                        )
-                    }
-                })
-                .await?;
+            let coord = self
+                .net
+                .is_peer_online(&pr.coordinator)
+                .then_some(pr.coordinator.as_str());
+            let recheck = sync_and_evaluate_oauth(
+                self,
+                mgen,
+                server_id,
+                gen_owned.clone(),
+                pr.clone(),
+                coord,
+                false,
+            )
+            .await?;
             match recheck {
-                ReconciledOAuth::GoneOrReauth => {
-                    return Ok(RefreshCoordination::Delegated {
-                        reauth_required: true,
-                    });
-                }
-                ReconciledOAuth::Rotated => {
-                    return Ok(RefreshCoordination::Delegated {
-                        reauth_required: false,
-                    });
-                }
                 ReconciledOAuth::Unchanged => {
+                    let remote_holders = self.query_mcp_participants(server_id).await;
                     if !remote_holders.iter().any(|p| p == &pr.coordinator) {
                         return Ok(RefreshCoordination::PendingConfirmation);
                     }
                     pr
                 }
+                other => return Ok(other.into_coordination()),
             }
         } else {
             let mut participants = self.query_mcp_participants(server_id).await;
@@ -2339,41 +2346,20 @@ impl SyncEngine {
                         )
                     })
                     .await?;
-                match post {
-                    ReconciledOAuth::GoneOrReauth => Ok(RefreshCoordination::Delegated {
-                        reauth_required: true,
-                    }),
-                    ReconciledOAuth::Rotated => Ok(RefreshCoordination::Delegated {
-                        reauth_required: false,
-                    }),
-                    ReconciledOAuth::Unchanged => Ok(RefreshCoordination::PendingConfirmation),
-                }
+                Ok(post.into_coordination())
             }
             _ => {
-                let _ = self.sync_with_peers(Some(coordinator), None).await;
-                let _ = self.sync_with_peers(None, None).await;
-                let post = self
-                    .db
-                    .call(move |s| {
-                        evaluate_oauth_after_sync(
-                            &s.conn,
-                            mgen,
-                            server_id,
-                            &gen_owned,
-                            &delegation,
-                            false,
-                        )
-                    })
-                    .await?;
-                match post {
-                    ReconciledOAuth::GoneOrReauth => Ok(RefreshCoordination::Delegated {
-                        reauth_required: true,
-                    }),
-                    ReconciledOAuth::Rotated => Ok(RefreshCoordination::Delegated {
-                        reauth_required: false,
-                    }),
-                    ReconciledOAuth::Unchanged => Ok(RefreshCoordination::PendingConfirmation),
-                }
+                let post = sync_and_evaluate_oauth(
+                    self,
+                    mgen,
+                    server_id,
+                    gen_owned,
+                    delegation.clone(),
+                    Some(coordinator),
+                    false,
+                )
+                .await?;
+                Ok(post.into_coordination())
             }
         }
     }

@@ -236,29 +236,6 @@ impl Host {
             streams: Arc::default(),
         }
     }
-    async fn wait_for_execution(&self) -> std::result::Result<(), HostError> {
-        loop {
-            let deadline = *self.deadline.borrow();
-            if self.cancel.is_cancelled() || Instant::now() >= deadline {
-                return Err("task stopped or expired".into());
-            }
-            let ready = self
-                .app
-                .exec
-                .presence()
-                .wait_local_lease_ready(self.sid, Some(&self.cancel));
-            match tokio::time::timeout_at(deadline, ready).await {
-                Ok(true)
-                    if !self.cancel.is_cancelled() && Instant::now() < *self.deadline.borrow() =>
-                {
-                    return Ok(());
-                }
-                Ok(_) => return Err("task stopped or execution lease lost".into()),
-                Err(_) => continue, // A renewal may have extended the task deadline.
-            }
-        }
-    }
-
     pub async fn io(
         &self,
         op: String,
@@ -270,71 +247,52 @@ impl Host {
         }
         io::execute(self, &op, args, data).await
     }
-    pub async fn emit(&self, mut blocks: Blocks) -> std::result::Result<ItemId, String> {
+    pub async fn emit(&self, blocks: Blocks) -> std::result::Result<ItemId, String> {
         if self.trigger {
             return Err("emitEvent is not available in trigger_code; return from trigger_code to finish waiting".into());
         }
-        enum EmitStep {
-            Done(ItemId),
-            RetryUpgrade(Blocks),
-        }
         let sid = self.sid;
         let origin = self.origin;
-        let app = self.app.clone();
-        loop {
-            let worker = app.clone();
-            match self
-                .app
-                .db
-                .call(move |s| {
-                    let task = s
-                        .tasks
-                        .get(&origin)
-                        .ok_or_else(|| Error::conflict("task no longer active"))?;
-                    if task.reason.is_some() || task.expired() || task.cancel.is_cancelled() {
-                        return Err(Error::conflict("task stopped or expired"));
-                    }
-                    if task_superseded(&s.conn, s.reset_gen(sid), task)? {
-                        return Err(Error::conflict("session superseded or conflicted"));
-                    }
-                    if !s.is_local_lease_valid(sid) {
-                        if s.is_local_lease_upgrading(sid) {
-                            return Ok(EmitStep::RetryUpgrade(blocks));
-                        }
-                        return Err(Error::conflict("session superseded or conflicted"));
-                    }
-                    if blocks.parts.is_empty() {
-                        return Err(Error::bad("empty event"));
-                    }
-                    let now = Instant::now();
-                    // Burst of eight events; regain one token every second.
-                    let tokens =
-                        (task.tokens + now.duration_since(task.refilled).as_secs_f64()).min(8.0);
-                    if tokens < 1.0 || ledger::pending_messages(&s.conn, sid)? >= 128 {
-                        return Err(Error::conflict(
-                            "backpressure: event rate or session queue limit reached",
-                        ));
-                    }
-                    let tx = s.conn.transaction()?;
-                    let content = ledger::materialize(&tx, sid, &blocks)?;
-                    let id = ledger::event(&tx, sid, origin, "message", &content, true)?;
-                    tx.commit()?;
-                    let task = s.tasks.get_mut(&origin).expect("task checked above");
-                    task.tokens = tokens - 1.0;
-                    task.refilled = now;
-                    event_saved(s, &worker, sid, id, true);
-                    Ok(EmitStep::Done(id))
-                })
-                .await
-            {
-                Ok(EmitStep::Done(id)) => return Ok(id),
-                Ok(EmitStep::RetryUpgrade(b)) => {
-                    blocks = b;
-                    self.wait_for_execution().await.map_err(|e| e.message().to_owned())?;
+        let worker = self.app.clone();
+        self.app
+            .db
+            .call(move |s| {
+                let task = s
+                    .tasks
+                    .get(&origin)
+                    .ok_or_else(|| Error::conflict("task no longer active"))?;
+                if task.reason.is_some() || task.expired() || task.cancel.is_cancelled() {
+                    return Err(Error::conflict("task stopped or expired"));
                 }
-                Err(e) => return Err(e.to_string()),
-            }
-        }
+                if task_superseded(&s.conn, s.reset_gen(sid), task)?
+                    || !s.is_local_lease_valid(sid)
+                {
+                    return Err(Error::conflict("session superseded or conflicted"));
+                }
+                if blocks.parts.is_empty() {
+                    return Err(Error::bad("empty event"));
+                }
+                let now = Instant::now();
+                // Burst of eight events; regain one token every second.
+                let tokens =
+                    (task.tokens + now.duration_since(task.refilled).as_secs_f64()).min(8.0);
+                if tokens < 1.0 || ledger::pending_messages(&s.conn, sid)? >= 128 {
+                    return Err(Error::conflict(
+                        "backpressure: event rate or session queue limit reached",
+                    ));
+                }
+                let tx = s.conn.transaction()?;
+                let content = ledger::materialize(&tx, sid, &blocks)?;
+                let id = ledger::event(&tx, sid, origin, "message", &content, true)?;
+                tx.commit()?;
+                let task = s.tasks.get_mut(&origin).expect("task checked above");
+                task.tokens = tokens - 1.0;
+                task.refilled = now;
+                event_saved(s, &worker, sid, id, true);
+                Ok(id)
+            })
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -949,9 +907,6 @@ fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
         return Ok(None);
     }
     if !s.is_local_lease_valid(sid) {
-        if s.is_local_lease_upgrading(sid) {
-            return Ok(Some(Instant::now() + Duration::from_millis(50)));
-        }
         s.tasks.get_mut(&id).unwrap().stop("superseded");
         return Ok(None);
     }
@@ -1047,10 +1002,7 @@ async fn supervise(
             .call(move |s| complete(s, &worker, id, &result))
             .await
         {
-            Ok(None) => break,
-            Ok(Some(sid)) => {
-                app.exec.presence().wait_local_lease_ready(sid, None).await;
-            }
+            Ok(()) => break,
             Err(e) => {
                 tracing::error!(%id, error=%e, "task result transaction failed");
                 if app.stopping.is_cancelled() {
@@ -1098,15 +1050,12 @@ fn complete(
     app: &App,
     id: ItemId,
     result: &Outcome,
-) -> Result<Option<SessionId>> {
+) -> Result<()> {
     let (sid, cur_gen) = {
         let task = &s.tasks[&id];
         (task.origin.sid, s.reset_gen(task.origin.sid))
     };
     let superseded = task_superseded(&s.conn, cur_gen, &s.tasks[&id])?;
-    if !superseded && s.is_local_lease_upgrading(sid) {
-        return Ok(Some(sid));
-    }
     if superseded || !s.is_local_lease_valid(sid) {
         let mut task = remove_task(s, id);
         s.refresh_local_presence(sid);
@@ -1122,7 +1071,7 @@ fn complete(
         if let Some(k) = task.kill {
             let _ = k.committed.send(());
         }
-        return Ok(None);
+        return Ok(());
     }
     let task = &s.tasks[&id];
     let tx = s.conn.transaction()?;
@@ -1196,5 +1145,5 @@ fn complete(
     {
         s.notify_status(sid, info.status.as_str(), &info.last_error, info.updated_at);
     }
-    Ok(None)
+    Ok(())
 }

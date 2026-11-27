@@ -553,14 +553,7 @@ async fn serve(
         if let Some(role) = options.cluster_role {
             db.call(move |s| {
                 let updated = cluster::identity::set_local_role(&s.conn, role)?;
-                s.presence.set_local_role(updated.role);
-                s.presence.set_voter_config(
-                    updated.voter_epoch,
-                    &updated.voter_set,
-                    updated.pending_voter_epoch,
-                    &updated.pending_voter_set,
-                    &updated.pending_proposal_id,
-                );
+                s.presence.sync_local_node(&updated);
                 Ok(())
             })
             .await?;

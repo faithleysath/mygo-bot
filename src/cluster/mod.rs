@@ -188,23 +188,28 @@ impl Cluster {
         self.workers
             .spawn(async move {
                 let _guard = join_gate.lock().await;
+                let _joining = presence.begin_join();
                 let precheck_secret = secret;
-                let precheck_conflict = db
-                    .call(move |s| {
-                        let local = identity::load_local_node(&s.conn)?;
-                        let has_peers: bool = s.conn.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM cluster_peers)",
-                            [],
-                            |r| r.get(0),
-                        )?;
-                        Ok(has_peers && local.cluster_secret != precheck_secret && !force)
-                    })
-                    .await?;
-                if precheck_conflict {
-                    return Err(Error::conflict(
-                        "node already belongs to another cluster; pass force=true to switch clusters",
-                    ));
-                }
+                db.call(move |s| {
+                    if !s.active.is_empty() || !s.pending_wakes.is_empty() || !s.tasks.is_empty() {
+                        return Err(Error::conflict(
+                            "cannot join cluster while sessions or background tasks are active; pause or stop them first",
+                        ));
+                    }
+                    let local = identity::load_local_node(&s.conn)?;
+                    let has_peers: bool = s.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM cluster_peers)",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if has_peers && local.cluster_secret != precheck_secret && !force {
+                        return Err(Error::conflict(
+                            "node already belongs to another cluster; pass force=true to switch clusters",
+                        ));
+                    }
+                    Ok(())
+                })
+                .await?;
                 let (epoch, voters) = net.request_admission(&secret, &peer).await?;
                 let (secret_changed, new_gen, new_secret, peer, _) = db
                     .write(
@@ -223,11 +228,7 @@ impl Cluster {
                                 presence.set_want_voter_admission(want_voter && !local.role.is_voter());
                                 presence.clear_all_remote();
                             }
-                            presence.set_local_role(local.role);
-                            presence.set_voter_config(
-                                local.voter_epoch, &local.voter_set, local.pending_voter_epoch,
-                                &local.pending_voter_set, &local.pending_proposal_id,
-                            );
+                            presence.sync_local_node(&local);
                             presence.set_peer_roles(&peers);
                             presence.set_known_peer_count(count);
                             Ok((changed, next_gen, secret, peer, count))

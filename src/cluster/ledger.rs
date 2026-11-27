@@ -1295,64 +1295,65 @@ pub fn tombstone_shared_mcp(conn: &Connection, id: McpServerId) -> Result<bool> 
     Ok(true)
 }
 
-pub fn load_mcp_wire(conn: &Connection, id: McpServerId) -> Result<Option<McpServerWire>> {
-    let row: Option<McpServerWire> = conn
-        .prepare_cached(
-            "SELECT m.id, m.name, m.name_ts, m.description, m.description_ts,
-                    m.enabled, m.enabled_ts, m.transport, m.allowed_tools, m.allowed_tools_ts,
-                    m.config_json, m.timeout_ms, m.timeout_ts, m.headers_epoch_ts, m.headers_ts,
-                    m.auth_config_ts, m.oauth_epoch_ts, m.oauth_ts, m.deleted, m.sync_rev,
-                    o.generation, o.auth_config_ts, o.auth_fingerprint, o.binding, o.credentials, o.rejected
-             FROM mcp_servers m
-             LEFT JOIN mcp_oauth o ON o.server_id = m.id
-             WHERE m.id=?1 AND m.shared=1",
-        )?
-        .query_row([id], |r| {
-            let deleted: bool = r.get(18)?;
-            let oauth_gen: Option<String> = r.get(20)?;
-            let credentials: Option<String> = r.get(24)?;
-            let rejected: Option<bool> = r.get(25)?;
-            let oauth = if !deleted
-                && let Some(generation) = oauth_gen
-                && (credentials.is_some() || rejected == Some(true))
-            {
-                Some(McpOAuthGrantWire {
-                    generation,
-                    auth_config_ts: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
-                    auth_fingerprint: r.get::<_, Option<String>>(22)?.unwrap_or_default(),
-                    binding: r.get(23)?,
-                    credentials,
-                    rejected: rejected.unwrap_or(false),
-                })
-            } else {
-                None
-            };
-            Ok(McpServerWire {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                name_ts: r.get(2)?,
-                description: r.get(3)?,
-                description_ts: r.get(4)?,
-                enabled: r.get(5)?,
-                enabled_ts: r.get(6)?,
-                transport: r.get(7)?,
-                allowed_tools: r.get(8)?,
-                allowed_tools_ts: r.get(9)?,
-                config_json: r.get(10)?,
-                timeout_ms: r.get(11)?,
-                timeout_ts: r.get(12)?,
-                headers_epoch_ts: r.get(13)?,
-                headers_ts: r.get(14)?,
-                auth_config_ts: r.get(15)?,
-                oauth_epoch_ts: r.get(16)?,
-                oauth,
-                oauth_ts: r.get(17)?,
-                deleted,
-                sync_rev: r.get(19)?,
-            })
+const MCP_WIRE_COLUMNS: &str = "m.id, m.name, m.name_ts, m.description, m.description_ts,
+                m.enabled, m.enabled_ts, m.transport, m.allowed_tools, m.allowed_tools_ts,
+                m.config_json, m.timeout_ms, m.timeout_ts, m.headers_epoch_ts, m.headers_ts,
+                m.auth_config_ts, m.oauth_epoch_ts, m.oauth_ts, m.deleted, m.sync_rev,
+                o.generation, o.auth_config_ts, o.auth_fingerprint, o.binding, o.credentials, o.rejected";
+
+fn mcp_wire_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerWire> {
+    let deleted: bool = r.get(18)?;
+    let oauth_gen: Option<String> = r.get(20)?;
+    let credentials: Option<String> = r.get(24)?;
+    let rejected: Option<bool> = r.get(25)?;
+    let oauth = if !deleted
+        && let Some(generation) = oauth_gen
+        && (credentials.is_some() || rejected == Some(true))
+    {
+        Some(McpOAuthGrantWire {
+            generation,
+            auth_config_ts: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
+            auth_fingerprint: r.get::<_, Option<String>>(22)?.unwrap_or_default(),
+            binding: r.get(23)?,
+            credentials,
+            rejected: rejected.unwrap_or(false),
         })
-        .optional()?;
-    Ok(row)
+    } else {
+        None
+    };
+    Ok(McpServerWire {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        name_ts: r.get(2)?,
+        description: r.get(3)?,
+        description_ts: r.get(4)?,
+        enabled: r.get(5)?,
+        enabled_ts: r.get(6)?,
+        transport: r.get(7)?,
+        allowed_tools: r.get(8)?,
+        allowed_tools_ts: r.get(9)?,
+        config_json: r.get(10)?,
+        timeout_ms: r.get(11)?,
+        timeout_ts: r.get(12)?,
+        headers_epoch_ts: r.get(13)?,
+        headers_ts: r.get(14)?,
+        auth_config_ts: r.get(15)?,
+        oauth_epoch_ts: r.get(16)?,
+        oauth,
+        oauth_ts: r.get(17)?,
+        deleted,
+        sync_rev: r.get(19)?,
+    })
+}
+
+pub fn load_mcp_wire(conn: &Connection, id: McpServerId) -> Result<Option<McpServerWire>> {
+    let sql = format!(
+        "SELECT {MCP_WIRE_COLUMNS} FROM mcp_servers m LEFT JOIN mcp_oauth o ON o.server_id = m.id WHERE m.id=?1 AND m.shared=1"
+    );
+    Ok(conn
+        .prepare_cached(&sql)?
+        .query_row([id], mcp_wire_from_row)
+        .optional()?)
 }
 
 pub fn merge_provider_wire(
@@ -1360,12 +1361,10 @@ pub fn merge_provider_wire(
     w: &ProviderWire,
 ) -> Result<(bool, Option<ProviderId>)> {
     id::observe_id(w.id);
-    validate_hlc(&w.name_ts)?;
-    validate_hlc(&w.endpoint_ts)?;
-    validate_hlc(&w.archived_ts)?;
-    observe_hlc(&w.name_ts);
-    observe_hlc(&w.endpoint_ts);
-    observe_hlc(&w.archived_ts);
+    for ts in [&w.name_ts, &w.endpoint_ts, &w.archived_ts] {
+        validate_hlc(ts)?;
+        observe_hlc(ts);
+    }
 
     let local = conn
         .prepare_cached(
@@ -1385,71 +1384,60 @@ pub fn merge_provider_wire(
         })
         .optional()?;
 
-    let Some((
-        mut name,
-        mut name_ts,
-        mut base_url,
-        mut api_key,
-        mut endpoint_ts,
-        mut archived_at,
-        mut archived_ts,
-    )) = local
-    else {
-        let rev = next_catalog_rev(conn)?;
-        conn.prepare_cached(
-            "INSERT INTO llm_providers(id,name,name_ts,base_url,api_key,endpoint_ts,archived_at,archived_ts,sync_rev)
-             VALUES(?,?,?,?,?,?,?,?,?)",
-        )?
-        .execute(params![
-            w.id,
-            &w.name,
-            &w.name_ts,
-            &w.base_url,
-            &w.api_key,
-            &w.endpoint_ts,
+    let (name, name_ts, base_url, api_key, endpoint_ts, archived_at, archived_ts) = match local {
+        None => (
+            w.name.clone(),
+            w.name_ts.clone(),
+            w.base_url.clone(),
+            w.api_key.clone(),
+            w.endpoint_ts.clone(),
             w.archived_at,
-            &w.archived_ts,
-            rev
-        ])?;
-        return Ok((true, Some(w.id)));
+            w.archived_ts.clone(),
+        ),
+        Some((
+            mut name,
+            mut name_ts,
+            mut base_url,
+            mut api_key,
+            mut endpoint_ts,
+            mut archived_at,
+            mut archived_ts,
+        )) => {
+            let mut changed = false;
+            changed |= lww_take(&mut name, &mut name_ts, w.name.clone(), &w.name_ts);
+            changed |= lww_take_pair(
+                &mut base_url,
+                &mut api_key,
+                &mut endpoint_ts,
+                w.base_url.clone(),
+                w.api_key.clone(),
+                &w.endpoint_ts,
+            );
+            changed |= lww_take(
+                &mut archived_at,
+                &mut archived_ts,
+                w.archived_at,
+                &w.archived_ts,
+            );
+            if !changed {
+                return Ok((false, None));
+            }
+            (name, name_ts, base_url, api_key, endpoint_ts, archived_at, archived_ts)
+        }
     };
 
-    let mut changed = false;
-    changed |= lww_take(&mut name, &mut name_ts, w.name.clone(), &w.name_ts);
-    changed |= lww_take_pair(
-        &mut base_url,
-        &mut api_key,
-        &mut endpoint_ts,
-        w.base_url.clone(),
-        w.api_key.clone(),
-        &w.endpoint_ts,
-    );
-    changed |= lww_take(
-        &mut archived_at,
-        &mut archived_ts,
-        w.archived_at,
-        &w.archived_ts,
-    );
-    if !changed {
-        return Ok((false, None));
-    }
     let rev = next_catalog_rev(conn)?;
     conn.prepare_cached(
-        "UPDATE llm_providers
-         SET name=?2, name_ts=?3, base_url=?4, api_key=?5, endpoint_ts=?6,
-             archived_at=?7, archived_ts=?8, sync_rev=?9
-         WHERE id=?1",
+        "INSERT INTO llm_providers(id,name,name_ts,base_url,api_key,endpoint_ts,archived_at,archived_ts,sync_rev)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(id) DO UPDATE SET
+           name=excluded.name, name_ts=excluded.name_ts,
+           base_url=excluded.base_url, api_key=excluded.api_key, endpoint_ts=excluded.endpoint_ts,
+           archived_at=excluded.archived_at, archived_ts=excluded.archived_ts,
+           sync_rev=excluded.sync_rev",
     )?
     .execute(params![
-        w.id,
-        name,
-        name_ts,
-        base_url,
-        api_key,
-        endpoint_ts,
-        archived_at,
-        archived_ts,
-        rev
+        w.id, name, name_ts, base_url, api_key, endpoint_ts, archived_at, archived_ts, rev
     ])?;
     Ok((true, Some(w.id)))
 }
@@ -1457,18 +1445,17 @@ pub fn merge_provider_wire(
 pub fn merge_model_wire(conn: &Connection, w: &ModelWire) -> Result<(bool, Option<ModelId>)> {
     id::observe_id(w.id);
     id::observe_id(w.provider_id);
-    validate_hlc(&w.identity_ts)?;
-    validate_hlc(&w.context_window_ts)?;
-    validate_hlc(&w.input_modalities_ts)?;
-    validate_hlc(&w.reasoning_efforts_ts)?;
-    validate_hlc(&w.pricing_ts)?;
-    validate_hlc(&w.archived_ts)?;
-    observe_hlc(&w.identity_ts);
-    observe_hlc(&w.context_window_ts);
-    observe_hlc(&w.input_modalities_ts);
-    observe_hlc(&w.reasoning_efforts_ts);
-    observe_hlc(&w.pricing_ts);
-    observe_hlc(&w.archived_ts);
+    for ts in [
+        &w.identity_ts,
+        &w.context_window_ts,
+        &w.input_modalities_ts,
+        &w.reasoning_efforts_ts,
+        &w.pricing_ts,
+        &w.archived_ts,
+    ] {
+        validate_hlc(ts)?;
+        observe_hlc(ts);
+    }
 
     let local = conn
         .prepare_cached(
@@ -1498,93 +1485,118 @@ pub fn merge_model_wire(conn: &Connection, w: &ModelWire) -> Result<(bool, Optio
         })
         .optional()?;
 
-    let Some((
-        mut provider_id,
-        mut model_key,
-        mut identity_ts,
-        mut cw,
-        mut cw_ts,
-        mut modalities,
-        mut modalities_ts,
-        mut efforts,
-        mut efforts_ts,
-        mut pricing,
-        mut pricing_ts,
-        mut archived_at,
-        mut archived_ts,
-    )) = local
-    else {
-        let rev = next_catalog_rev(conn)?;
-        conn.prepare_cached(
-            "INSERT INTO llm_models(
-                id, provider_id, model_key, identity_ts,
-                context_window_tokens, context_window_ts,
-                input_modalities, input_modalities_ts,
-                reasoning_efforts, reasoning_efforts_ts,
-                pricing, pricing_ts, archived_at, archived_ts, sync_rev
-             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        )?
-        .execute(params![
-            w.id,
+    let (
+        provider_id,
+        model_key,
+        identity_ts,
+        cw,
+        cw_ts,
+        modalities,
+        modalities_ts,
+        efforts,
+        efforts_ts,
+        pricing,
+        pricing_ts,
+        archived_at,
+        archived_ts,
+    ) = match local {
+        None => (
             w.provider_id,
-            &w.model_key,
-            &w.identity_ts,
+            w.model_key.clone(),
+            w.identity_ts.clone(),
             w.context_window_tokens,
-            &w.context_window_ts,
-            &w.input_modalities,
-            &w.input_modalities_ts,
-            &w.reasoning_efforts,
-            &w.reasoning_efforts_ts,
-            &w.pricing,
-            &w.pricing_ts,
+            w.context_window_ts.clone(),
+            w.input_modalities.clone(),
+            w.input_modalities_ts.clone(),
+            w.reasoning_efforts.clone(),
+            w.reasoning_efforts_ts.clone(),
+            w.pricing.clone(),
+            w.pricing_ts.clone(),
             w.archived_at,
-            &w.archived_ts,
-            rev
-        ])?;
-        return Ok((true, Some(w.id)));
+            w.archived_ts.clone(),
+        ),
+        Some((
+            mut provider_id,
+            mut model_key,
+            mut identity_ts,
+            mut cw,
+            mut cw_ts,
+            mut modalities,
+            mut modalities_ts,
+            mut efforts,
+            mut efforts_ts,
+            mut pricing,
+            mut pricing_ts,
+            mut archived_at,
+            mut archived_ts,
+        )) => {
+            let mut changed = false;
+            changed |= lww_take_pair(
+                &mut provider_id,
+                &mut model_key,
+                &mut identity_ts,
+                w.provider_id,
+                w.model_key.clone(),
+                &w.identity_ts,
+            );
+            changed |= lww_take(&mut cw, &mut cw_ts, w.context_window_tokens, &w.context_window_ts);
+            changed |= lww_take(
+                &mut modalities,
+                &mut modalities_ts,
+                w.input_modalities.clone(),
+                &w.input_modalities_ts,
+            );
+            changed |= lww_take(
+                &mut efforts,
+                &mut efforts_ts,
+                w.reasoning_efforts.clone(),
+                &w.reasoning_efforts_ts,
+            );
+            changed |= lww_take(&mut pricing, &mut pricing_ts, w.pricing.clone(), &w.pricing_ts);
+            changed |= lww_take(
+                &mut archived_at,
+                &mut archived_ts,
+                w.archived_at,
+                &w.archived_ts,
+            );
+            if !changed {
+                return Ok((false, None));
+            }
+            (
+                provider_id,
+                model_key,
+                identity_ts,
+                cw,
+                cw_ts,
+                modalities,
+                modalities_ts,
+                efforts,
+                efforts_ts,
+                pricing,
+                pricing_ts,
+                archived_at,
+                archived_ts,
+            )
+        }
     };
 
-    let mut changed = false;
-    changed |= lww_take_pair(
-        &mut provider_id,
-        &mut model_key,
-        &mut identity_ts,
-        w.provider_id,
-        w.model_key.clone(),
-        &w.identity_ts,
-    );
-    changed |= lww_take(&mut cw, &mut cw_ts, w.context_window_tokens, &w.context_window_ts);
-    changed |= lww_take(
-        &mut modalities,
-        &mut modalities_ts,
-        w.input_modalities.clone(),
-        &w.input_modalities_ts,
-    );
-    changed |= lww_take(
-        &mut efforts,
-        &mut efforts_ts,
-        w.reasoning_efforts.clone(),
-        &w.reasoning_efforts_ts,
-    );
-    changed |= lww_take(&mut pricing, &mut pricing_ts, w.pricing.clone(), &w.pricing_ts);
-    changed |= lww_take(
-        &mut archived_at,
-        &mut archived_ts,
-        w.archived_at,
-        &w.archived_ts,
-    );
-    if !changed {
-        return Ok((false, None));
-    }
     let rev = next_catalog_rev(conn)?;
     conn.prepare_cached(
-        "UPDATE llm_models
-         SET provider_id=?2, model_key=?3, identity_ts=?4,
-             context_window_tokens=?5, context_window_ts=?6,
-             input_modalities=?7, input_modalities_ts=?8,
-             reasoning_efforts=?9, reasoning_efforts_ts=?10,
-             pricing=?11, pricing_ts=?12, archived_at=?13, archived_ts=?14, sync_rev=?15
-         WHERE id=?1",
+        "INSERT INTO llm_models(
+            id, provider_id, model_key, identity_ts,
+            context_window_tokens, context_window_ts,
+            input_modalities, input_modalities_ts,
+            reasoning_efforts, reasoning_efforts_ts,
+            pricing, pricing_ts, archived_at, archived_ts, sync_rev
+         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+            provider_id=excluded.provider_id, model_key=excluded.model_key, identity_ts=excluded.identity_ts,
+            context_window_tokens=excluded.context_window_tokens, context_window_ts=excluded.context_window_ts,
+            input_modalities=excluded.input_modalities, input_modalities_ts=excluded.input_modalities_ts,
+            reasoning_efforts=excluded.reasoning_efforts, reasoning_efforts_ts=excluded.reasoning_efforts_ts,
+            pricing=excluded.pricing, pricing_ts=excluded.pricing_ts,
+            archived_at=excluded.archived_at, archived_ts=excluded.archived_ts,
+            sync_rev=excluded.sync_rev",
     )?
     .execute(params![
         w.id,
@@ -1604,6 +1616,40 @@ pub fn merge_model_wire(conn: &Connection, w: &ModelWire) -> Result<(bool, Optio
         rev
     ])?;
     Ok((true, Some(w.id)))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EpochLwwAction {
+    KeepLocal,
+    TakeIncoming,
+    Reset,
+}
+
+fn resolve_epoch_lww(
+    local_eligible: bool,
+    incoming_eligible: bool,
+    local_ts: &str,
+    incoming_ts: &str,
+    local_needs_reset: bool,
+) -> EpochLwwAction {
+    match (local_eligible, incoming_eligible) {
+        (true, true) => {
+            if incoming_ts > local_ts {
+                EpochLwwAction::TakeIncoming
+            } else {
+                EpochLwwAction::KeepLocal
+            }
+        }
+        (true, false) => EpochLwwAction::KeepLocal,
+        (false, true) => EpochLwwAction::TakeIncoming,
+        (false, false) => {
+            if local_needs_reset {
+                EpochLwwAction::Reset
+            } else {
+                EpochLwwAction::KeepLocal
+            }
+        }
+    }
 }
 
 pub fn merge_mcp_server_wire(
@@ -1632,7 +1678,30 @@ pub fn merge_mcp_server_wire(
     }
 
     with_savepoint(conn, "merge_mcp_server", || {
-        let local = conn
+        struct LocalMcp {
+            name: String,
+            name_ts: String,
+            description: String,
+            description_ts: String,
+            enabled: bool,
+            enabled_ts: String,
+            shared: bool,
+            transport: String,
+            allowed_tools: Option<String>,
+            allowed_tools_ts: String,
+            config_json: String,
+            timeout_ms: i64,
+            timeout_ts: String,
+            headers_epoch_ts: String,
+            headers_ts: String,
+            auth_config_ts: String,
+            oauth_epoch_ts: String,
+            oauth_ts: String,
+            deleted: bool,
+            oauth: Option<McpOAuthGrantWire>,
+        }
+
+        let existing = conn
             .prepare_cached(
                 "SELECT m.name, m.name_ts, m.description, m.description_ts,
                         m.enabled, m.enabled_ts, m.shared, m.transport,
@@ -1654,177 +1723,53 @@ pub fn merge_mcp_server_wire(
                     credentials: r.get(23).unwrap_or(None),
                     rejected: r.get::<_, Option<bool>>(24).unwrap_or(None).unwrap_or(false),
                 });
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, bool>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, bool>(6)?,
-                    r.get::<_, String>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, String>(9)?,
-                    r.get::<_, String>(10)?,
-                    r.get::<_, i64>(11)?,
-                    r.get::<_, String>(12)?,
-                    r.get::<_, String>(13)?,
-                    r.get::<_, String>(14)?,
-                    r.get::<_, String>(15)?,
-                    r.get::<_, String>(16)?,
-                    r.get::<_, String>(17)?,
-                    r.get::<_, bool>(18)?,
+                Ok(LocalMcp {
+                    name: r.get(0)?,
+                    name_ts: r.get(1)?,
+                    description: r.get(2)?,
+                    description_ts: r.get(3)?,
+                    enabled: r.get(4)?,
+                    enabled_ts: r.get(5)?,
+                    shared: r.get(6)?,
+                    transport: r.get(7)?,
+                    allowed_tools: r.get(8)?,
+                    allowed_tools_ts: r.get(9)?,
+                    config_json: r.get(10)?,
+                    timeout_ms: r.get(11)?,
+                    timeout_ts: r.get(12)?,
+                    headers_epoch_ts: r.get(13)?,
+                    headers_ts: r.get(14)?,
+                    auth_config_ts: r.get(15)?,
+                    oauth_epoch_ts: r.get(16)?,
+                    oauth_ts: r.get(17)?,
+                    deleted: r.get(18)?,
                     oauth,
-                ))
+                })
             })
             .optional()?;
 
-        let Some((
-            mut name,
-            mut name_ts,
-            mut description,
-            mut description_ts,
-            mut enabled,
-            mut enabled_ts,
-            shared,
-            mut transport,
-            mut allowed_tools,
-            mut allowed_tools_ts,
-            mut config_json,
-            mut timeout_ms,
-            mut timeout_ts,
-            mut headers_epoch_ts,
-            mut headers_ts,
-            mut auth_config_ts,
-            mut oauth_epoch_ts,
-            mut oauth_ts,
-            local_deleted,
-            local_oauth,
-        )) = local
-        else {
+        if existing.as_ref().is_some_and(|r| r.deleted) {
+            return Ok((false, None));
+        }
+        if existing.as_ref().is_some_and(|r| !r.shared) {
+            return Ok((false, None));
+        }
+        if w.deleted {
             let rev = next_catalog_rev(conn)?;
-            if w.deleted {
-                conn.prepare_cached(
-                    "INSERT INTO mcp_servers(
-                        id, name, name_ts, description, description_ts, enabled, enabled_ts,
-                        shared, transport, allowed_tools, allowed_tools_ts, config_json,
-                        timeout_ms, timeout_ts, revision, headers_epoch_ts, headers_ts,
-                        auth_config_ts, oauth_epoch_ts, oauth_ts, deleted, sync_rev
-                     ) VALUES(?1,'','','','',0,'',1,'streamable-http',NULL,'','{}',1,'',1,'','','','','',1,?2)",
-                )?
-                .execute(params![w.id, rev])?;
-                return Ok((
-                    true,
-                    Some(McpChange {
-                        id: w.id,
-                        cancel_login: true,
-                        evict_pool: true,
-                    }),
-                ));
-            }
-            let (w_core, w_headers) = split_mcp_config(&w.transport, &w.config_json);
-            let hdr_eligible = w.transport != "stdio" && w.headers_epoch_ts == w.auth_config_ts;
-            let (init_hdr_epoch, init_hdr_ts, init_headers) = if hdr_eligible {
-                (
-                    w.headers_epoch_ts.as_str(),
-                    w.headers_ts.as_str(),
-                    w_headers,
-                )
-            } else {
-                (
-                    w.auth_config_ts.as_str(),
-                    w.auth_config_ts.as_str(),
-                    serde_json::Map::new(),
-                )
-            };
-            let init_cfg = compose_mcp_config(&w.transport, w_core, init_headers);
-            let fp = auth_config_fingerprint(&w.transport, &init_cfg);
-            let incoming_eligible = w.oauth_epoch_ts == w.auth_config_ts
-                && w.oauth.as_ref().is_none_or(|g| {
-                    g.auth_config_ts == w.auth_config_ts && g.auth_fingerprint == fp
-                });
-            let (init_epoch, init_oauth_ts, insert_grant) = if incoming_eligible {
-                (
-                    w.oauth_epoch_ts.as_str(),
-                    w.oauth_ts.as_str(),
-                    w.oauth.as_ref(),
-                )
-            } else {
-                (w.auth_config_ts.as_str(), w.auth_config_ts.as_str(), None)
-            };
             conn.prepare_cached(
                 "INSERT INTO mcp_servers(
                     id, name, name_ts, description, description_ts, enabled, enabled_ts,
                     shared, transport, allowed_tools, allowed_tools_ts, config_json,
                     timeout_ms, timeout_ts, revision, headers_epoch_ts, headers_ts,
                     auth_config_ts, oauth_epoch_ts, oauth_ts, deleted, sync_rev
-                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,?17,?18,0,?19)",
-            )?
-            .execute(params![
-                w.id,
-                &w.name,
-                &w.name_ts,
-                &w.description,
-                &w.description_ts,
-                w.enabled,
-                &w.enabled_ts,
-                &w.transport,
-                &w.allowed_tools,
-                &w.allowed_tools_ts,
-                &init_cfg,
-                w.timeout_ms,
-                &w.timeout_ts,
-                init_hdr_epoch,
-                init_hdr_ts,
-                &w.auth_config_ts,
-                init_epoch,
-                init_oauth_ts,
-                rev
-            ])?;
-            if let Some(g) = insert_grant {
-                conn.prepare_cached(
-                    "INSERT INTO mcp_oauth(server_id, generation, auth_config_ts, auth_fingerprint, binding, pending, credentials, pending_refresh, rejected)
-                     VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7)",
-                )?
-                .execute(params![
-                    w.id,
-                    &g.generation,
-                    &g.auth_config_ts,
-                    &g.auth_fingerprint,
-                    &g.binding,
-                    &g.credentials,
-                    g.rejected
-                ])?;
-            }
-            return Ok((
-                true,
-                Some(McpChange {
-                    id: w.id,
-                    cancel_login: false,
-                    evict_pool: true,
-                }),
-            ));
-        };
-
-        if local_deleted {
-            return Ok((false, None));
-        }
-        if w.deleted {
-            if !shared {
-                return Ok((false, None));
-            }
-            let rev = next_catalog_rev(conn)?;
-            conn.prepare_cached(
-                "UPDATE mcp_servers
-                 SET deleted=1, name='', name_ts='',
-                     description='', description_ts='',
-                     enabled=0, enabled_ts='',
-                     transport='streamable-http', config_json='{}', revision=revision+1,
-                     headers_epoch_ts='', headers_ts='', auth_config_ts='', oauth_epoch_ts='',
-                     allowed_tools=NULL, allowed_tools_ts='',
-                     timeout_ms=1, timeout_ts='',
-                     oauth_ts='', sync_rev=?2
-                 WHERE id=?1",
+                 ) VALUES(?1,'','','','',0,'',1,'streamable-http',NULL,'','{}',1,'',1,'','','','','',1,?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    deleted=1, name='', name_ts='', description='', description_ts='',
+                    enabled=0, enabled_ts='', transport='streamable-http', config_json='{}',
+                    revision=mcp_servers.revision+1, headers_epoch_ts='', headers_ts='',
+                    auth_config_ts='', oauth_epoch_ts='', allowed_tools=NULL,
+                    allowed_tools_ts='', timeout_ms=1, timeout_ts='', oauth_ts='',
+                    sync_rev=excluded.sync_rev",
             )?
             .execute(params![w.id, rev])?;
             conn.prepare_cached("DELETE FROM mcp_oauth WHERE server_id=?")?
@@ -1838,210 +1783,253 @@ pub fn merge_mcp_server_wire(
                 }),
             ));
         }
-        if !shared {
-            return Ok((false, None));
-        }
 
-        let name_changed = lww_take(&mut name, &mut name_ts, w.name.clone(), &w.name_ts);
-        let desc_changed = lww_take(
-            &mut description,
-            &mut description_ts,
-            w.description.clone(),
-            &w.description_ts,
-        );
-        let enabled_changed = lww_take(&mut enabled, &mut enabled_ts, w.enabled, &w.enabled_ts);
-        let allowed_tools_changed = lww_take(
-            &mut allowed_tools,
-            &mut allowed_tools_ts,
-            w.allowed_tools.clone(),
-            &w.allowed_tools_ts,
-        );
-        let timeout_changed = lww_take(&mut timeout_ms, &mut timeout_ts, w.timeout_ms, &w.timeout_ts);
-
-        let (mut core_map, mut headers_map) = split_mcp_config(&transport, &config_json);
+        let is_new = existing.is_none();
         let (w_core, w_headers) = split_mcp_config(&w.transport, &w.config_json);
-        let mut auth_changed = false;
-        let mut auth_meta_changed = false;
-        if w.auth_config_ts > auth_config_ts {
-            if transport != w.transport || core_map != w_core {
-                auth_changed = true;
+        let mut cur = existing.unwrap_or_else(|| LocalMcp {
+            name: w.name.clone(),
+            name_ts: w.name_ts.clone(),
+            description: w.description.clone(),
+            description_ts: w.description_ts.clone(),
+            enabled: w.enabled,
+            enabled_ts: w.enabled_ts.clone(),
+            shared: true,
+            transport: w.transport.clone(),
+            allowed_tools: w.allowed_tools.clone(),
+            allowed_tools_ts: w.allowed_tools_ts.clone(),
+            config_json: String::new(),
+            timeout_ms: w.timeout_ms,
+            timeout_ts: w.timeout_ts.clone(),
+            headers_epoch_ts: String::new(),
+            headers_ts: String::new(),
+            auth_config_ts: w.auth_config_ts.clone(),
+            oauth_epoch_ts: String::new(),
+            oauth_ts: String::new(),
+            deleted: false,
+            oauth: None,
+        });
+        let (
+            core_map,
+            mut headers_map,
+            scalar_changed,
+            enabled_changed,
+            allowed_tools_changed,
+            timeout_changed,
+            auth_changed,
+        ) = if is_new {
+            (w_core, serde_json::Map::new(), true, false, false, false, false)
+        } else {
+            let name_changed = lww_take(&mut cur.name, &mut cur.name_ts, w.name.clone(), &w.name_ts);
+            let desc_changed = lww_take(
+                &mut cur.description,
+                &mut cur.description_ts,
+                w.description.clone(),
+                &w.description_ts,
+            );
+            let enabled_changed =
+                lww_take(&mut cur.enabled, &mut cur.enabled_ts, w.enabled, &w.enabled_ts);
+            let allowed_tools_changed = lww_take(
+                &mut cur.allowed_tools,
+                &mut cur.allowed_tools_ts,
+                w.allowed_tools.clone(),
+                &w.allowed_tools_ts,
+            );
+            let timeout_changed =
+                lww_take(&mut cur.timeout_ms, &mut cur.timeout_ts, w.timeout_ms, &w.timeout_ts);
+            let (mut core_map, headers_map) = split_mcp_config(&cur.transport, &cur.config_json);
+            let mut auth_changed = false;
+            let mut auth_meta_changed = false;
+            if w.auth_config_ts > cur.auth_config_ts {
+                if cur.transport != w.transport || core_map != w_core {
+                    auth_changed = true;
+                }
+                cur.transport = w.transport.clone();
+                core_map = w_core;
+                cur.auth_config_ts = w.auth_config_ts.clone();
+                auth_meta_changed = true;
             }
-            transport = w.transport.clone();
-            core_map = w_core;
-            auth_config_ts = w.auth_config_ts.clone();
-            auth_meta_changed = true;
-        }
+            let scalar_changed = name_changed
+                || desc_changed
+                || enabled_changed
+                || allowed_tools_changed
+                || timeout_changed
+                || auth_meta_changed;
+            (
+                core_map,
+                headers_map,
+                scalar_changed,
+                enabled_changed,
+                allowed_tools_changed,
+                timeout_changed,
+                auth_changed,
+            )
+        };
 
-        let local_hdr_eligible = transport != "stdio" && headers_epoch_ts == auth_config_ts;
-        let incoming_hdr_eligible =
-            transport != "stdio" && w.transport == transport && w.headers_epoch_ts == auth_config_ts;
+        let local_hdr_eligible =
+            !is_new && cur.transport != "stdio" && cur.headers_epoch_ts == cur.auth_config_ts;
+        let incoming_hdr_eligible = cur.transport != "stdio"
+            && w.transport == cur.transport
+            && w.headers_epoch_ts == cur.auth_config_ts;
+        let hdr_needs_reset = is_new
+            || !headers_map.is_empty()
+            || cur.headers_epoch_ts != cur.auth_config_ts
+            || cur.headers_ts != cur.auth_config_ts;
         let mut headers_changed = false;
         let mut headers_meta_changed = false;
-        match (local_hdr_eligible, incoming_hdr_eligible) {
-            (true, true) => {
-                if w.headers_ts > headers_ts {
-                    if headers_map != w_headers {
-                        headers_changed = true;
-                    }
-                    headers_map = w_headers;
-                    headers_ts = w.headers_ts.clone();
-                    headers_meta_changed = true;
-                }
-            }
-            (true, false) => {}
-            (false, true) => {
+        match resolve_epoch_lww(
+            local_hdr_eligible,
+            incoming_hdr_eligible,
+            &cur.headers_ts,
+            &w.headers_ts,
+            hdr_needs_reset,
+        ) {
+            EpochLwwAction::KeepLocal => {}
+            EpochLwwAction::TakeIncoming => {
                 if headers_map != w_headers {
                     headers_changed = true;
                 }
                 headers_map = w_headers;
-                headers_epoch_ts = auth_config_ts.clone();
-                headers_ts = w.headers_ts.clone();
+                cur.headers_epoch_ts = cur.auth_config_ts.clone();
+                cur.headers_ts = w.headers_ts.clone();
                 headers_meta_changed = true;
             }
-            (false, false) => {
-                if !headers_map.is_empty()
-                    || headers_epoch_ts != auth_config_ts
-                    || headers_ts != auth_config_ts
-                {
-                    if !headers_map.is_empty() {
-                        headers_changed = true;
-                    }
-                    headers_map = serde_json::Map::new();
-                    headers_epoch_ts = auth_config_ts.clone();
-                    headers_ts = auth_config_ts.clone();
-                    headers_meta_changed = true;
+            EpochLwwAction::Reset => {
+                if !headers_map.is_empty() {
+                    headers_changed = true;
                 }
+                headers_map.clear();
+                cur.headers_epoch_ts = cur.auth_config_ts.clone();
+                cur.headers_ts = cur.auth_config_ts.clone();
+                headers_meta_changed = true;
             }
         }
-        config_json = compose_mcp_config(&transport, core_map, headers_map);
+        cur.config_json = compose_mcp_config(&cur.transport, core_map, headers_map);
 
-        let winning_fp = auth_config_fingerprint(&transport, &config_json);
-        let local_eligible = oauth_epoch_ts == auth_config_ts
-            && local_oauth.as_ref().is_none_or(|g| {
-                g.auth_config_ts == auth_config_ts && g.auth_fingerprint == winning_fp
+        let winning_fp = auth_config_fingerprint(&cur.transport, &cur.config_json);
+        let local_oauth_eligible = !is_new
+            && cur.oauth_epoch_ts == cur.auth_config_ts
+            && cur.oauth.as_ref().is_none_or(|g| {
+                g.auth_config_ts == cur.auth_config_ts && g.auth_fingerprint == winning_fp
             });
-        let incoming_eligible = w.oauth_epoch_ts == auth_config_ts
+        let incoming_oauth_eligible = w.oauth_epoch_ts == cur.auth_config_ts
             && w.oauth.as_ref().is_none_or(|g| {
-                g.auth_config_ts == auth_config_ts && g.auth_fingerprint == winning_fp
+                g.auth_config_ts == cur.auth_config_ts && g.auth_fingerprint == winning_fp
             });
+        let oauth_needs_reset = is_new
+            || cur.oauth.is_some()
+            || cur.oauth_epoch_ts != cur.auth_config_ts
+            || cur.oauth_ts != cur.auth_config_ts;
 
         let mut oauth_changed = false;
         let mut oauth_binding_changed = false;
-        let next_grant: Option<Option<&McpOAuthGrantWire>> =
-            match (local_eligible, incoming_eligible) {
-                (true, true) => {
-                    if w.oauth_ts > oauth_ts {
-                        oauth_ts = w.oauth_ts.clone();
-                        oauth_epoch_ts = auth_config_ts.clone();
-                        let same_binding = match (&local_oauth, &w.oauth) {
-                            (None, None) => true,
-                            (Some(l), Some(r)) => {
-                                l.generation == r.generation
-                                    && l.binding == r.binding
-                                    && l.auth_config_ts == r.auth_config_ts
-                                    && l.auth_fingerprint == r.auth_fingerprint
-                            }
-                            _ => false,
-                        };
-                        let same_cred = match (&local_oauth, &w.oauth) {
-                            (None, None) => true,
-                            (Some(l), Some(r)) => {
-                                same_binding
-                                    && l.credentials == r.credentials
-                                    && l.rejected == r.rejected
-                            }
-                            _ => false,
-                        };
-                        if !same_cred {
-                            oauth_changed = true;
-                            oauth_binding_changed = !same_binding;
-                            Some(w.oauth.as_ref())
-                        } else {
-                            // Still persist newer oauth_ts so retries/peers converge cleanly.
-                            oauth_changed = true;
-                            None
+        let next_grant: Option<Option<&McpOAuthGrantWire>> = match resolve_epoch_lww(
+            local_oauth_eligible,
+            incoming_oauth_eligible,
+            &cur.oauth_ts,
+            &w.oauth_ts,
+            oauth_needs_reset,
+        ) {
+            EpochLwwAction::KeepLocal => None,
+            EpochLwwAction::TakeIncoming => {
+                cur.oauth_ts = w.oauth_ts.clone();
+                cur.oauth_epoch_ts = cur.auth_config_ts.clone();
+                oauth_changed = true;
+                if local_oauth_eligible {
+                    let same_binding = match (&cur.oauth, &w.oauth) {
+                        (None, None) => true,
+                        (Some(l), Some(r)) => {
+                            l.generation == r.generation
+                                && l.binding == r.binding
+                                && l.auth_config_ts == r.auth_config_ts
+                                && l.auth_fingerprint == r.auth_fingerprint
                         }
-                    } else {
+                        _ => false,
+                    };
+                    let same_cred = match (&cur.oauth, &w.oauth) {
+                        (None, None) => true,
+                        (Some(l), Some(r)) => {
+                            same_binding && l.credentials == r.credentials && l.rejected == r.rejected
+                        }
+                        _ => false,
+                    };
+                    if same_cred {
+                        // Persist newer oauth_ts so retries/peers converge cleanly.
                         None
+                    } else {
+                        oauth_binding_changed = !same_binding;
+                        Some(w.oauth.as_ref())
                     }
-                }
-                (true, false) => None,
-                (false, true) => {
-                    oauth_ts = w.oauth_ts.clone();
-                    oauth_epoch_ts = auth_config_ts.clone();
-                    oauth_changed = true;
-                    oauth_binding_changed = true;
+                } else {
+                    oauth_binding_changed = !is_new;
                     Some(w.oauth.as_ref())
                 }
-                (false, false) => {
-                    if local_oauth.is_some()
-                        || oauth_epoch_ts != auth_config_ts
-                        || oauth_ts != auth_config_ts
-                    {
-                        oauth_ts = auth_config_ts.clone();
-                        oauth_epoch_ts = auth_config_ts.clone();
-                        oauth_changed = true;
-                        oauth_binding_changed = local_oauth.is_some();
-                        Some(None)
-                    } else {
-                        None
-                    }
-                }
-            };
+            }
+            EpochLwwAction::Reset => {
+                cur.oauth_ts = cur.auth_config_ts.clone();
+                cur.oauth_epoch_ts = cur.auth_config_ts.clone();
+                oauth_changed = true;
+                oauth_binding_changed = !is_new && cur.oauth.is_some();
+                if is_new { None } else { Some(None) }
+            }
+        };
 
-        let non_oauth_changed = name_changed
-            || desc_changed
-            || enabled_changed
-            || allowed_tools_changed
-            || timeout_changed
-            || auth_changed
-            || auth_meta_changed
-            || headers_meta_changed;
-        if !non_oauth_changed && !oauth_changed {
+        if !is_new && !scalar_changed && !headers_meta_changed && !oauth_changed {
             return Ok((false, None));
         }
 
-        let evict_pool = enabled_changed
+        let evict_pool = is_new
+            || enabled_changed
             || allowed_tools_changed
             || timeout_changed
             || auth_changed
             || headers_changed
             || oauth_binding_changed;
-        let cancel_login =
-            (enabled_changed && !enabled) || auth_changed || oauth_binding_changed;
+        let cancel_login = !is_new
+            && ((enabled_changed && !cur.enabled) || auth_changed || oauth_binding_changed);
 
         let rev = next_catalog_rev(conn)?;
         let rev_bump = i64::from(evict_pool);
         conn.prepare_cached(
-            "UPDATE mcp_servers
-             SET name=?2, name_ts=?3, description=?4, description_ts=?5,
-                 enabled=?6, enabled_ts=?7, transport=?8,
-                 allowed_tools=?9, allowed_tools_ts=?10,
-                 config_json=?11, timeout_ms=?12, timeout_ts=?13,
-                 revision=revision+?14, headers_epoch_ts=?15, headers_ts=?16,
-                 auth_config_ts=?17, oauth_epoch_ts=?18, oauth_ts=?19, sync_rev=?20
-             WHERE id=?1",
+            "INSERT INTO mcp_servers(
+                id, name, name_ts, description, description_ts, enabled, enabled_ts,
+                shared, transport, allowed_tools, allowed_tools_ts, config_json,
+                timeout_ms, timeout_ts, revision, headers_epoch_ts, headers_ts,
+                auth_config_ts, oauth_epoch_ts, oauth_ts, deleted, sync_rev
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10,?11,?12,?13,1,?14,?15,?16,?17,?18,0,?20)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, name_ts=excluded.name_ts,
+                description=excluded.description, description_ts=excluded.description_ts,
+                enabled=excluded.enabled, enabled_ts=excluded.enabled_ts,
+                transport=excluded.transport,
+                allowed_tools=excluded.allowed_tools, allowed_tools_ts=excluded.allowed_tools_ts,
+                config_json=excluded.config_json,
+                timeout_ms=excluded.timeout_ms, timeout_ts=excluded.timeout_ts,
+                revision=mcp_servers.revision+?19,
+                headers_epoch_ts=excluded.headers_epoch_ts, headers_ts=excluded.headers_ts,
+                auth_config_ts=excluded.auth_config_ts,
+                oauth_epoch_ts=excluded.oauth_epoch_ts, oauth_ts=excluded.oauth_ts,
+                sync_rev=excluded.sync_rev",
         )?
         .execute(params![
             w.id,
-            name,
-            name_ts,
-            description,
-            description_ts,
-            enabled,
-            enabled_ts,
-            transport,
-            allowed_tools,
-            allowed_tools_ts,
-            config_json,
-            timeout_ms,
-            timeout_ts,
+            cur.name,
+            cur.name_ts,
+            cur.description,
+            cur.description_ts,
+            cur.enabled,
+            cur.enabled_ts,
+            cur.transport,
+            cur.allowed_tools,
+            cur.allowed_tools_ts,
+            cur.config_json,
+            cur.timeout_ms,
+            cur.timeout_ts,
+            cur.headers_epoch_ts,
+            cur.headers_ts,
+            cur.auth_config_ts,
+            cur.oauth_epoch_ts,
+            cur.oauth_ts,
             rev_bump,
-            headers_epoch_ts,
-            headers_ts,
-            auth_config_ts,
-            oauth_epoch_ts,
-            oauth_ts,
             rev
         ])?;
 
@@ -2096,6 +2084,14 @@ pub enum SessionMergeResult {
     },
 }
 
+fn reconcile_context_flags(conn: &Connection, sid: SessionId) -> Result<(bool, bool)> {
+    match reconcile_active_context(conn, sid)? {
+        ActiveContextChange::Switched | ActiveContextChange::Cleared => Ok((true, false)),
+        ActiveContextChange::Appended(_) => Ok((false, true)),
+        ActiveContextChange::Unchanged | ActiveContextChange::Incomplete => Ok((false, false)),
+    }
+}
+
 pub fn merge_session_wire(conn: &Connection, w: &SessionWire) -> Result<SessionMergeResult> {
     id::observe_id(w.id);
     if !w.model_id.is_empty() {
@@ -2136,105 +2132,23 @@ pub fn merge_session_wire(conn: &Connection, w: &SessionWire) -> Result<SessionM
         })
         .optional()?;
 
-    let wire_status = match w.status.as_str() {
-        "paused" => "paused",
-        _ => "idle",
-    };
-    let bounded_wire_err = crate::calls::truncate_utf8(
-        w.last_error.as_str(),
-        crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES,
-    );
-    let wire_err = if wire_status == "paused" {
-        bounded_wire_err.as_str()
-    } else {
-        ""
-    };
-
-    let Some((
-        mut title,
-        mut title_ts,
-        created_at,
-        mut updated_at,
-        mut status,
-        mut last_error,
-        mut status_ts,
-        mut model_id,
-        mut reasoning_effort,
-        mut selection_ts,
-        mut active_head,
-        mut active_head_ts,
-        local_deleted,
-    )) = local
-    else {
-        let rev = next_catalog_rev(conn)?;
-        if w.deleted {
-            conn.prepare_cached(
-                "INSERT INTO sessions(
-                    id, title, title_ts, created_at, updated_at,
-                    status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
-                    active_head, active_head_ts, deleted, sync_rev
-                 ) VALUES(?1,'','',0,0,'idle','','','',NULL,'',NULL,'',1,?2)",
-            )?
-            .execute(params![w.id, rev])?;
-            cleanup_deleted_session_data(conn, w.id)?;
-            return Ok(SessionMergeResult::Updated {
-                deleted: true,
-                branch_switched: false,
-                context_advanced: false,
-            });
-        }
-        conn.prepare_cached(
-            "INSERT INTO sessions(
-                id, title, title_ts, created_at, updated_at,
-                status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
-                active_head, active_head_ts, deleted, sync_rev
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14)",
-        )?
-        .execute(params![
-            w.id,
-            &w.title,
-            &w.title_ts,
-            w.created_at,
-            w.updated_at,
-            wire_status,
-            wire_err,
-            &w.status_ts,
-            &w.model_id,
-            &w.reasoning_effort,
-            &w.selection_ts,
-            w.active_head,
-            &w.active_head_ts,
-            rev
-        ])?;
-        let (branch_switched, context_advanced) = if w.active_head.is_some() {
-            match reconcile_active_context(conn, w.id)? {
-                ActiveContextChange::Switched | ActiveContextChange::Cleared => (true, false),
-                ActiveContextChange::Appended(_) => (false, true),
-                ActiveContextChange::Unchanged | ActiveContextChange::Incomplete => (false, false),
-            }
-        } else {
-            (false, false)
-        };
-        return Ok(SessionMergeResult::Updated {
-            deleted: false,
-            branch_switched,
-            context_advanced,
-        });
-    };
-
-    if local_deleted {
+    if local.as_ref().is_some_and(|r| r.12) {
         return Ok(SessionMergeResult::Unchanged);
     }
     if w.deleted {
         let rev = next_catalog_rev(conn)?;
         conn.prepare_cached(
-            "UPDATE sessions
-             SET deleted=1, title='', title_ts='', created_at=0, updated_at=0,
-                 status='idle', last_error='', status_ts='',
-                 local_status=NULL, local_error='',
-                 model_id='', reasoning_effort=NULL, selection_ts='',
-                 active_head=NULL, active_head_ts='', sync_rev=?2
-             WHERE id=?1",
+            "INSERT INTO sessions(
+                id, title, title_ts, created_at, updated_at,
+                status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
+                active_head, active_head_ts, deleted, sync_rev
+             ) VALUES(?1,'','',0,0,'idle','','','',NULL,'',NULL,'',1,?2)
+             ON CONFLICT(id) DO UPDATE SET
+                deleted=1, title='', title_ts='', created_at=0, updated_at=0,
+                status='idle', last_error='', status_ts='',
+                local_status=NULL, local_error='',
+                model_id='', reasoning_effort=NULL, selection_ts='',
+                active_head=NULL, active_head_ts='', sync_rev=excluded.sync_rev",
         )?
         .execute(params![w.id, rev])?;
         cleanup_deleted_session_data(conn, w.id)?;
@@ -2245,64 +2159,141 @@ pub fn merge_session_wire(conn: &Connection, w: &SessionWire) -> Result<SessionM
         });
     }
 
-    let mut changed = false;
-    changed |= lww_take(&mut title, &mut title_ts, w.title.clone(), &w.title_ts);
-    let next_created = if created_at == 0 || (w.created_at > 0 && w.created_at < created_at) {
-        w.created_at
-    } else {
-        created_at
-    };
-    if next_created != created_at {
-        changed = true;
-    }
-    if w.updated_at > updated_at {
-        updated_at = w.updated_at;
-        changed = true;
-    }
-    changed |= lww_take_pair(
-        &mut status,
-        &mut last_error,
-        &mut status_ts,
-        wire_status.to_owned(),
-        wire_err.to_owned(),
-        &w.status_ts,
+    let wire_status = if w.status == "paused" { "paused" } else { "idle" };
+    let bounded_wire_err = crate::calls::truncate_utf8(
+        w.last_error.as_str(),
+        crate::calls::MAX_STORED_ERROR_SUMMARY_BYTES,
     );
-    if !w.model_id.is_empty() {
-        changed |= lww_take_pair(
-            &mut model_id,
-            &mut reasoning_effort,
-            &mut selection_ts,
+    let wire_err = if wire_status == "paused" {
+        bounded_wire_err.as_str()
+    } else {
+        ""
+    };
+
+    let (
+        title,
+        title_ts,
+        created_at,
+        updated_at,
+        status,
+        last_error,
+        status_ts,
+        model_id,
+        reasoning_effort,
+        selection_ts,
+        active_head,
+        active_head_ts,
+        check_context,
+    ) = match local {
+        None => (
+            w.title.clone(),
+            w.title_ts.clone(),
+            w.created_at,
+            w.updated_at,
+            wire_status.to_owned(),
+            wire_err.to_owned(),
+            w.status_ts.clone(),
             w.model_id.clone(),
             w.reasoning_effort.clone(),
-            &w.selection_ts,
-        );
-    }
-    let head_changed = lww_take(
-        &mut active_head,
-        &mut active_head_ts,
-        w.active_head,
-        &w.active_head_ts,
-    );
-    changed |= head_changed;
-
-    if !changed {
-        return Ok(SessionMergeResult::Unchanged);
-    }
+            w.selection_ts.clone(),
+            w.active_head,
+            w.active_head_ts.clone(),
+            w.active_head.is_some(),
+        ),
+        Some((
+            mut title,
+            mut title_ts,
+            created_at,
+            mut updated_at,
+            mut status,
+            mut last_error,
+            mut status_ts,
+            mut model_id,
+            mut reasoning_effort,
+            mut selection_ts,
+            mut active_head,
+            mut active_head_ts,
+            _,
+        )) => {
+            let mut changed = lww_take(&mut title, &mut title_ts, w.title.clone(), &w.title_ts);
+            let next_created = if created_at == 0 || (w.created_at > 0 && w.created_at < created_at) {
+                w.created_at
+            } else {
+                created_at
+            };
+            if next_created != created_at {
+                changed = true;
+            }
+            if w.updated_at > updated_at {
+                updated_at = w.updated_at;
+                changed = true;
+            }
+            changed |= lww_take_pair(
+                &mut status,
+                &mut last_error,
+                &mut status_ts,
+                wire_status.to_owned(),
+                wire_err.to_owned(),
+                &w.status_ts,
+            );
+            if !w.model_id.is_empty() {
+                changed |= lww_take_pair(
+                    &mut model_id,
+                    &mut reasoning_effort,
+                    &mut selection_ts,
+                    w.model_id.clone(),
+                    w.reasoning_effort.clone(),
+                    &w.selection_ts,
+                );
+            }
+            let head_changed = lww_take(
+                &mut active_head,
+                &mut active_head_ts,
+                w.active_head,
+                &w.active_head_ts,
+            );
+            if !(changed || head_changed) {
+                return Ok(SessionMergeResult::Unchanged);
+            }
+            (
+                title,
+                title_ts,
+                next_created,
+                updated_at,
+                status,
+                last_error,
+                status_ts,
+                model_id,
+                reasoning_effort,
+                selection_ts,
+                active_head,
+                active_head_ts,
+                head_changed,
+            )
+        }
+    };
 
     let rev = next_catalog_rev(conn)?;
     conn.prepare_cached(
-        "UPDATE sessions
-         SET title=?2, title_ts=?3, created_at=?4, updated_at=?5,
-             status=?6, last_error=?7, status_ts=?8,
-             model_id=?9, reasoning_effort=?10, selection_ts=?11,
-             active_head=?12, active_head_ts=?13, sync_rev=?14
-         WHERE id=?1",
+        "INSERT INTO sessions(
+            id, title, title_ts, created_at, updated_at,
+            status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
+            active_head, active_head_ts, deleted, sync_rev
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14)
+         ON CONFLICT(id) DO UPDATE SET
+            title=excluded.title, title_ts=excluded.title_ts,
+            created_at=excluded.created_at, updated_at=excluded.updated_at,
+            status=excluded.status, last_error=excluded.last_error, status_ts=excluded.status_ts,
+            model_id=excluded.model_id, reasoning_effort=excluded.reasoning_effort,
+            selection_ts=excluded.selection_ts,
+            active_head=excluded.active_head, active_head_ts=excluded.active_head_ts,
+            sync_rev=excluded.sync_rev",
     )?
     .execute(params![
         w.id,
         title,
         title_ts,
-        next_created,
+        created_at,
         updated_at,
         status,
         last_error,
@@ -2315,12 +2306,8 @@ pub fn merge_session_wire(conn: &Connection, w: &SessionWire) -> Result<SessionM
         rev
     ])?;
 
-    let (branch_switched, context_advanced) = if head_changed {
-        match reconcile_active_context(conn, w.id)? {
-            ActiveContextChange::Switched | ActiveContextChange::Cleared => (true, false),
-            ActiveContextChange::Appended(_) => (false, true),
-            ActiveContextChange::Unchanged | ActiveContextChange::Incomplete => (false, false),
-        }
+    let (branch_switched, context_advanced) = if check_context {
+        reconcile_context_flags(conn, w.id)?
     } else {
         (false, false)
     };
@@ -2870,6 +2857,20 @@ struct CatalogMeta {
     key: CatalogKey,
 }
 
+fn collect_bounded_metas<T>(
+    rows: Vec<T>,
+    seq_of: impl Fn(&T) -> i64,
+    out: &mut Vec<T>,
+    safe_ceiling: &mut i64,
+) {
+    if rows.len() == DELTA_PAGE_LIMIT
+        && let Some(last) = rows.last()
+    {
+        *safe_ceiling = (*safe_ceiling).min(seq_of(last));
+    }
+    out.extend(rows);
+}
+
 pub fn read_catalog_delta(
     conn: &Connection,
     since_rev: i64,
@@ -2899,12 +2900,7 @@ pub fn read_catalog_delta(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if list.len() == DELTA_PAGE_LIMIT
-            && let Some(last) = list.last()
-        {
-            safe_ceiling = safe_ceiling.min(last.sync_rev);
-        }
-        metas.extend(list);
+        collect_bounded_metas(list, |m| m.sync_rev, &mut metas, &mut safe_ceiling);
     }
 
     {
@@ -2926,12 +2922,7 @@ pub fn read_catalog_delta(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if list.len() == DELTA_PAGE_LIMIT
-            && let Some(last) = list.last()
-        {
-            safe_ceiling = safe_ceiling.min(last.sync_rev);
-        }
-        metas.extend(list);
+        collect_bounded_metas(list, |m| m.sync_rev, &mut metas, &mut safe_ceiling);
     }
 
     {
@@ -2957,12 +2948,7 @@ pub fn read_catalog_delta(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if list.len() == DELTA_PAGE_LIMIT
-            && let Some(last) = list.last()
-        {
-            safe_ceiling = safe_ceiling.min(last.sync_rev);
-        }
-        metas.extend(list);
+        collect_bounded_metas(list, |m| m.sync_rev, &mut metas, &mut safe_ceiling);
     }
 
     {
@@ -2991,12 +2977,7 @@ pub fn read_catalog_delta(
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if list.len() == DELTA_PAGE_LIMIT
-            && let Some(last) = list.last()
-        {
-            safe_ceiling = safe_ceiling.min(last.sync_rev);
-        }
-        metas.extend(list);
+        collect_bounded_metas(list, |m| m.sync_rev, &mut metas, &mut safe_ceiling);
     }
 
     metas.retain(|r| r.sync_rev <= safe_ceiling);
@@ -3035,16 +3016,10 @@ pub fn read_catalog_delta(
                 pricing, pricing_ts, archived_at, archived_ts, sync_rev
          FROM llm_models WHERE id=?1",
     )?;
-    let mut mcp_stmt = conn.prepare_cached(
-        "SELECT m.id, m.name, m.name_ts, m.description, m.description_ts,
-                m.enabled, m.enabled_ts, m.transport, m.allowed_tools, m.allowed_tools_ts,
-                m.config_json, m.timeout_ms, m.timeout_ts, m.headers_epoch_ts, m.headers_ts,
-                m.auth_config_ts, m.oauth_epoch_ts, m.oauth_ts, m.deleted, m.sync_rev,
-                o.generation, o.auth_config_ts, o.auth_fingerprint, o.binding, o.credentials, o.rejected
-         FROM mcp_servers m
-         LEFT JOIN mcp_oauth o ON o.server_id = m.id
-         WHERE m.id=?1",
-    )?;
+    let mcp_sql = format!(
+        "SELECT {MCP_WIRE_COLUMNS} FROM mcp_servers m LEFT JOIN mcp_oauth o ON o.server_id = m.id WHERE m.id=?1"
+    );
+    let mut mcp_stmt = conn.prepare_cached(&mcp_sql)?;
     let mut sess_stmt = conn.prepare_cached(
         "SELECT id, title, title_ts, created_at, updated_at,
                 status, last_error, status_ts, model_id, reasoning_effort, selection_ts,
@@ -3101,53 +3076,7 @@ pub fn read_catalog_delta(
                 }
             }
             CatalogKey::Mcp(id) => {
-                if let Some(s) = mcp_stmt
-                    .query_row([id], |r| {
-                        let deleted: bool = r.get(18)?;
-                        let oauth_gen: Option<String> = r.get(20)?;
-                        let credentials: Option<String> = r.get(24)?;
-                        let rejected: Option<bool> = r.get(25)?;
-                        let oauth = if !deleted
-                            && let Some(generation) = oauth_gen
-                            && (credentials.is_some() || rejected == Some(true))
-                        {
-                            Some(McpOAuthGrantWire {
-                                generation,
-                                auth_config_ts: r.get::<_, Option<String>>(21)?.unwrap_or_default(),
-                                auth_fingerprint: r.get::<_, Option<String>>(22)?.unwrap_or_default(),
-                                binding: r.get(23)?,
-                                credentials,
-                                rejected: rejected.unwrap_or(false),
-                            })
-                        } else {
-                            None
-                        };
-                        Ok(McpServerWire {
-                            id: r.get(0)?,
-                            name: r.get(1)?,
-                            name_ts: r.get(2)?,
-                            description: r.get(3)?,
-                            description_ts: r.get(4)?,
-                            enabled: r.get(5)?,
-                            enabled_ts: r.get(6)?,
-                            transport: r.get(7)?,
-                            allowed_tools: r.get(8)?,
-                            allowed_tools_ts: r.get(9)?,
-                            config_json: r.get(10)?,
-                            timeout_ms: r.get(11)?,
-                            timeout_ts: r.get(12)?,
-                            headers_epoch_ts: r.get(13)?,
-                            headers_ts: r.get(14)?,
-                            auth_config_ts: r.get(15)?,
-                            oauth_epoch_ts: r.get(16)?,
-                            oauth,
-                            oauth_ts: r.get(17)?,
-                            deleted,
-                            sync_rev: r.get(19)?,
-                        })
-                    })
-                    .optional()?
-                {
+                if let Some(s) = mcp_stmt.query_row([id], mcp_wire_from_row).optional()? {
                     delta.mcp_servers.push(s);
                 }
             }
@@ -3458,12 +3387,7 @@ pub fn read_session_delta(
                     },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if list.len() == DELTA_PAGE_LIMIT
-                && let Some(last) = list.last()
-            {
-                safe_ceiling = safe_ceiling.min(last.origin_seq);
-            }
-            events.extend(list);
+            collect_bounded_metas(list, |e| e.origin_seq, &mut events, &mut safe_ceiling);
         }
 
         {
@@ -3480,12 +3404,7 @@ pub fn read_session_delta(
                     },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if list.len() == DELTA_PAGE_LIMIT
-                && let Some(last) = list.last()
-            {
-                safe_ceiling = safe_ceiling.min(last.origin_seq);
-            }
-            events.extend(list);
+            collect_bounded_metas(list, |e| e.origin_seq, &mut events, &mut safe_ceiling);
         }
 
         {
@@ -3502,12 +3421,7 @@ pub fn read_session_delta(
                     },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if list.len() == DELTA_PAGE_LIMIT
-                && let Some(last) = list.last()
-            {
-                safe_ceiling = safe_ceiling.min(last.origin_seq);
-            }
-            events.extend(list);
+            collect_bounded_metas(list, |e| e.origin_seq, &mut events, &mut safe_ceiling);
         }
 
         {
@@ -3524,12 +3438,7 @@ pub fn read_session_delta(
                     },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if list.len() == DELTA_PAGE_LIMIT
-                && let Some(last) = list.last()
-            {
-                safe_ceiling = safe_ceiling.min(last.origin_seq);
-            }
-            events.extend(list);
+            collect_bounded_metas(list, |e| e.origin_seq, &mut events, &mut safe_ceiling);
         }
 
         events.retain(|e| e.origin_seq <= safe_ceiling);

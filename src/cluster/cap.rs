@@ -12,13 +12,19 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Semaphore, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     App,
-    cluster::{identity::PeerInfo, net::ClusterNet},
+    cluster::{
+        identity::PeerInfo,
+        net::{
+            ClusterNet, FrameReadErr as ReadFrameErr, PermittedBytes, read_json_frame,
+            write_json_frame,
+        },
+    },
     codemode::{
         CommandGuard, CommandPreview, Host, HostError, McpGuard, RemoteCommandProgress, Reply,
         Stream, StreamResource, files,
@@ -48,56 +54,12 @@ fn client_byte_budget() -> Arc<Semaphore> {
         .clone()
 }
 
-enum ReadFrameErr {
-    Protocol(String),
-    Transport(String),
-}
-
-struct PermittedBytes {
-    bytes: Vec<u8>,
-    _permit: Option<OwnedSemaphorePermit>,
-}
-
-impl PermittedBytes {
-    fn into_parts(self) -> (Vec<u8>, Option<OwnedSemaphorePermit>) {
-        (self.bytes, self._permit)
-    }
-
-    fn into_vec(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
-impl std::ops::Deref for PermittedBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
 async fn write_cap_frame(
     send: &mut SendStream,
     header: &impl Serialize,
     body: Option<&[u8]>,
 ) -> std::result::Result<(), String> {
-    let hdr_bytes = serde_json::to_vec(header).map_err(|e| format!("cap encode failed: {e}"))?;
-    let h_len = u32::try_from(hdr_bytes.len()).map_err(|_| "cap header too large".to_owned())?;
-    let b_slice = body.unwrap_or(&[]);
-    let b_len = u32::try_from(b_slice.len()).map_err(|_| "cap body too large".to_owned())?;
-    let mut prefix = Vec::with_capacity(8 + hdr_bytes.len());
-    prefix.extend_from_slice(&h_len.to_be_bytes());
-    prefix.extend_from_slice(&hdr_bytes);
-    prefix.extend_from_slice(&b_len.to_be_bytes());
-    send.write_all(&prefix)
-        .await
-        .map_err(|e| format!("cap stream write failed: {e}"))?;
-    if !b_slice.is_empty() {
-        send.write_all(b_slice)
-            .await
-            .map_err(|e| format!("cap stream body write failed: {e}"))?;
-    }
-    Ok(())
+    write_json_frame(send, header, body, "cap").await
 }
 
 async fn read_cap_frame<T: DeserializeOwned>(
@@ -106,67 +68,7 @@ async fn read_cap_frame<T: DeserializeOwned>(
     max_body: usize,
     byte_budget: &Arc<Semaphore>,
 ) -> std::result::Result<(T, PermittedBytes), ReadFrameErr> {
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| ReadFrameErr::Transport(format!("cap read header length failed: {e}")))?;
-    let h_len = u32::from_be_bytes(len_buf) as usize;
-    if h_len > max_header {
-        return Err(ReadFrameErr::Protocol(
-            "capability frame header exceeds limit".into(),
-        ));
-    }
-    let h_permits = u32::try_from(h_len.div_ceil(CAP_BYTE_UNIT).max(1))
-        .map_err(|_| ReadFrameErr::Protocol("capability header permit overflow".into()))?;
-    let _hdr_permit: OwnedSemaphorePermit = byte_budget
-        .clone()
-        .acquire_many_owned(h_permits)
-        .await
-        .map_err(|_| ReadFrameErr::Transport("capability byte budget closed".into()))?;
-    let mut header = vec![0u8; h_len];
-    recv.read_exact(&mut header)
-        .await
-        .map_err(|e| ReadFrameErr::Transport(format!("cap read header failed: {e}")))?;
-    let parsed: T = serde_json::from_slice(&header)
-        .map_err(|e| ReadFrameErr::Protocol(format!("invalid capability frame header: {e}")))?;
-    drop(header);
-    drop(_hdr_permit);
-
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| ReadFrameErr::Transport(format!("cap read body length failed: {e}")))?;
-    let b_len = u32::from_be_bytes(len_buf) as usize;
-    if b_len > max_body {
-        return Err(ReadFrameErr::Protocol(
-            "capability frame body exceeds limit".into(),
-        ));
-    }
-    let _body_permit = if b_len > 0 {
-        let b_permits = u32::try_from(b_len.div_ceil(CAP_BYTE_UNIT))
-            .map_err(|_| ReadFrameErr::Protocol("capability body permit overflow".into()))?;
-        Some(
-            byte_budget
-                .clone()
-                .acquire_many_owned(b_permits)
-                .await
-                .map_err(|_| ReadFrameErr::Transport("capability byte budget closed".into()))?,
-        )
-    } else {
-        None
-    };
-    let mut body = vec![0u8; b_len];
-    if b_len > 0 {
-        recv.read_exact(&mut body)
-            .await
-            .map_err(|e| ReadFrameErr::Transport(format!("cap read body failed: {e}")))?;
-    }
-    Ok((
-        parsed,
-        PermittedBytes {
-            bytes: body,
-            _permit: _body_permit,
-        },
-    ))
+    read_json_frame(recv, max_header, max_body, byte_budget, CAP_BYTE_UNIT, "capability").await
 }
 
 async fn read_next_server_msg(

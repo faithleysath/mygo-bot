@@ -39,7 +39,6 @@ type ApplyWrite = Box<dyn FnOnce(Result<&Connection>, bool) -> (bool, Acknowledg
 struct Write {
     start_session: Option<SessionId>,
     expected_run_gen: Option<(SessionId, u64)>,
-    retry_tx: Option<oneshot::Sender<(Write, watch::Receiver<bool>)>>,
     apply: ApplyWrite,
 }
 
@@ -140,14 +139,7 @@ impl Db {
         let local = crate::cluster::identity::load_local_node(&tx)?;
         let local_node_id = local.node_id.clone();
         presence.set_local_node_id(local_node_id.clone());
-        presence.set_local_role(local.role);
-        presence.set_voter_config(
-            local.voter_epoch,
-            &local.voter_set,
-            local.pending_voter_epoch,
-            &local.pending_voter_set,
-            &local.pending_proposal_id,
-        );
+        presence.sync_local_node(&local);
         let peers = crate::cluster::identity::list_peers(&tx)?;
         let peer_count = peers.len();
         if local.voter_epoch == 0 && peer_count > 0 && local.role.is_voter() {
@@ -358,50 +350,13 @@ impl Db {
         apply: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
         publish: impl FnOnce(&mut Store, T) -> Result<R> + Send + 'static,
     ) -> Result<R> {
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        let mut write = Write {
-            start_session: None,
-            expected_run_gen: Some((sid, expected_run_gen)),
-            retry_tx: None,
-            apply: Box::new(move |conn, _| {
-                let result = conn.and_then(apply);
-                (
-                    result.is_ok(),
-                    Box::new(move |store, committed| {
-                        let result = match committed {
-                            Ok(()) => result.and_then(|value| publish(store, value)),
-                            Err(error) => Err(error.clone()),
-                        };
-                        let _ = reply_tx.send(result);
-                    }),
-                )
-            }),
-        };
-        loop {
-            let (ret_tx, ret_rx) = oneshot::channel();
-            write.retry_tx = Some(ret_tx);
-            self.tx
-                .send(Command::Write(write))
-                .await
-                .map_err(|_| Error::internal("database worker stopped"))?;
-            let (returned, mut decision) = tokio::select! {
-                res = &mut reply_rx => {
-                    return res.map_err(|_| Error::internal("database worker stopped"))?;
-                }
-                ret = ret_rx => match ret {
-                    Ok(returned) => returned,
-                    Err(_) => {
-                        return reply_rx
-                            .await
-                            .map_err(|_| Error::internal("database worker stopped"))?;
-                    }
-                },
-            };
-            if decision.wait_for(|granted| *granted).await.is_err() {
-                return Err(Error::conflict("session execution lease lost"));
-            }
-            write = returned;
-        }
+        self.grouped_write(
+            None,
+            Some((sid, expected_run_gen)),
+            move |conn, _| apply(conn),
+            publish,
+        )
+        .await
     }
 
     pub async fn start_write<T: 'static, R: Send + 'static>(
@@ -424,7 +379,6 @@ impl Db {
             Command::Write(Write {
                 start_session,
                 expected_run_gen,
-                retry_tx: None,
                 apply: Box::new(move |conn, active| {
                     let result = conn.and_then(|conn| apply(conn, active));
                     (
@@ -564,44 +518,26 @@ impl Store {
                     "shutting down".into(),
                 ));
             }
+            if starting && self.presence.is_joining() {
+                return Err(Error::conflict("cluster join in progress; retry"));
+            }
             let active_map = &self.active;
             let mut tx = self.conn.transaction()?;
-            for mut write in pending.by_ref() {
+            for write in pending.by_ref() {
                 if let Some((sid, expected_gen)) = write.expected_run_gen {
-                    let lease_status = if active_map
+                    let valid = active_map
                         .get(&sid)
-                        .is_none_or(|run| run.run_gen != expected_gen)
-                    {
-                        crate::cluster::exec::LocalLeaseStatus::Invalid
-                    } else {
-                        self.presence.local_lease_status(sid)
-                    };
-                    match lease_status {
-                        crate::cluster::exec::LocalLeaseStatus::Valid => {}
-                        crate::cluster::exec::LocalLeaseStatus::Upgrading(decision) => {
-                            if let Some(retry_tx) = write.retry_tx.take() {
-                                let _ = retry_tx.send((write, decision));
-                                continue;
-                            }
-                            let (_, reply) = (write.apply)(
-                                Err(Error::conflict(
-                                    "session execution lease temporarily upgrading",
-                                )),
-                                false,
-                            );
-                            replies.push(reply);
-                            continue;
-                        }
-                        crate::cluster::exec::LocalLeaseStatus::Invalid => {
-                            let (_, reply) = (write.apply)(
-                                Err(Error::conflict(
-                                    "session superseded by cluster replacement or expired execution lease",
-                                )),
-                                false,
-                            );
-                            replies.push(reply);
-                            continue;
-                        }
+                        .is_some_and(|run| run.run_gen == expected_gen)
+                        && self.presence.is_local_lease_valid(sid);
+                    if !valid {
+                        let (_, reply) = (write.apply)(
+                            Err(Error::conflict(
+                                "session superseded by cluster replacement or expired execution lease",
+                            )),
+                            false,
+                        );
+                        replies.push(reply);
+                        continue;
                     }
                 }
                 // A failed multi-statement operation must not leave part of its reply in the DB.
@@ -749,10 +685,6 @@ impl Store {
 
     pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
         self.presence.is_local_lease_valid(sid)
-    }
-
-    pub fn is_local_lease_upgrading(&self, sid: SessionId) -> bool {
-        self.presence.is_local_lease_upgrading(sid)
     }
 
     pub fn effective_runner_node_id(&self, sid: SessionId) -> Option<Cow<'_, str>> {

@@ -220,9 +220,131 @@ pub async fn write_frame_timed(
     Ok(())
 }
 
+pub enum FrameReadErr {
+    Protocol(String),
+    Transport(String),
+}
+
+pub struct PermittedBytes {
+    bytes: Vec<u8>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PermittedBytes {
+    pub fn into_parts(self) -> (Vec<u8>, Option<OwnedSemaphorePermit>) {
+        (self.bytes, self._permit)
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::ops::Deref for PermittedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 pub struct FramePermits {
     _hdr: OwnedSemaphorePermit,
     _body: Option<OwnedSemaphorePermit>,
+}
+
+pub async fn write_json_frame(
+    send: &mut SendStream,
+    header: &impl Serialize,
+    body: Option<&[u8]>,
+    label: &str,
+) -> std::result::Result<(), String> {
+    let hdr_bytes = serde_json::to_vec(header).map_err(|e| format!("{label} encode failed: {e}"))?;
+    let h_len = u32::try_from(hdr_bytes.len()).map_err(|_| format!("{label} header too large"))?;
+    let b_slice = body.unwrap_or(&[]);
+    let b_len = u32::try_from(b_slice.len()).map_err(|_| format!("{label} body too large"))?;
+    let mut prefix = Vec::with_capacity(8 + hdr_bytes.len());
+    prefix.extend_from_slice(&h_len.to_be_bytes());
+    prefix.extend_from_slice(&hdr_bytes);
+    prefix.extend_from_slice(&b_len.to_be_bytes());
+    send.write_all(&prefix)
+        .await
+        .map_err(|e| format!("{label} stream write failed: {e}"))?;
+    if !b_slice.is_empty() {
+        send.write_all(b_slice)
+            .await
+            .map_err(|e| format!("{label} stream body write failed: {e}"))?;
+    }
+    Ok(())
+}
+
+async fn read_frame_section(
+    recv: &mut RecvStream,
+    max_len: usize,
+    byte_budget: &Arc<Semaphore>,
+    byte_unit: usize,
+    min_one_permit: bool,
+    label: &str,
+    part: &str,
+) -> std::result::Result<(Vec<u8>, Option<OwnedSemaphorePermit>), FrameReadErr> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .map_err(|e| FrameReadErr::Transport(format!("{label} read {part} length failed: {e}")))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > max_len {
+        return Err(FrameReadErr::Protocol(format!(
+            "{label} frame {part} exceeds limit"
+        )));
+    }
+    if len == 0 && !min_one_permit {
+        return Ok((Vec::new(), None));
+    }
+    let count = len.div_ceil(byte_unit);
+    let permits = u32::try_from(if min_one_permit { count.max(1) } else { count })
+        .map_err(|_| FrameReadErr::Protocol(format!("{label} {part} permit overflow")))?;
+    let permit = byte_budget
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .map_err(|_| FrameReadErr::Transport(format!("{label} byte budget closed")))?;
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        recv.read_exact(&mut buf)
+            .await
+            .map_err(|e| FrameReadErr::Transport(format!("{label} read {part} failed: {e}")))?;
+    }
+    Ok((buf, Some(permit)))
+}
+
+pub async fn read_json_frame<T: serde::de::DeserializeOwned>(
+    recv: &mut RecvStream,
+    max_header: usize,
+    max_body: usize,
+    byte_budget: &Arc<Semaphore>,
+    byte_unit: usize,
+    label: &str,
+) -> std::result::Result<(T, PermittedBytes), FrameReadErr> {
+    let (header, hdr_permit) = read_frame_section(
+        recv, max_header, byte_budget, byte_unit, true, label, "header",
+    )
+    .await?;
+    let parsed: T = serde_json::from_slice(&header)
+        .map_err(|e| FrameReadErr::Protocol(format!("invalid {label} frame header: {e}")))?;
+    drop(header);
+    drop(hdr_permit);
+
+    let (body, body_permit) = read_frame_section(
+        recv, max_body, byte_budget, byte_unit, false, label, "body",
+    )
+    .await?;
+    Ok((
+        parsed,
+        PermittedBytes {
+            bytes: body,
+            _permit: body_permit,
+        },
+    ))
 }
 
 pub async fn read_frame_bounded(
@@ -233,57 +355,27 @@ pub async fn read_frame_bounded(
     deadline: Duration,
 ) -> Result<(Vec<u8>, Vec<u8>, FramePermits)> {
     tokio::time::timeout(deadline, async {
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| Error::internal(format!("cluster read header length failed: {e}")))?;
-        let h_len = u32::from_be_bytes(len_buf) as usize;
-        if h_len > max_header {
-            return Err(Error::bad("cluster frame header exceeds limit"));
-        }
-        let h_permits = u32::try_from(h_len.div_ceil(RPC_BYTE_UNIT).max(1))
-            .map_err(|_| Error::bad("frame header permit overflow"))?;
-        let hdr_permit = byte_budget
-            .clone()
-            .acquire_many_owned(h_permits)
-            .await
-            .map_err(|_| Error::internal("rpc byte budget closed"))?;
-        let mut header = vec![0u8; h_len];
-        recv.read_exact(&mut header)
-            .await
-            .map_err(|e| Error::internal(format!("cluster read header failed: {e}")))?;
-
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| Error::internal(format!("cluster read body length failed: {e}")))?;
-        let b_len = u32::from_be_bytes(len_buf) as usize;
-        if b_len > max_body {
-            return Err(Error::bad("cluster frame body exceeds limit"));
-        }
-        let body_permit = if b_len > 0 {
-            let b_permits = u32::try_from(b_len.div_ceil(RPC_BYTE_UNIT))
-                .map_err(|_| Error::bad("frame body permit overflow"))?;
-            Some(
-                byte_budget
-                    .clone()
-                    .acquire_many_owned(b_permits)
-                    .await
-                    .map_err(|_| Error::internal("rpc byte budget closed"))?,
-            )
-        } else {
-            None
-        };
-        let mut body = vec![0u8; b_len];
-        if b_len > 0 {
-            recv.read_exact(&mut body)
-                .await
-                .map_err(|e| Error::internal(format!("cluster read body failed: {e}")))?;
-        }
+        let (header, hdr_permit) = read_frame_section(
+            recv, max_header, byte_budget, RPC_BYTE_UNIT, true, "cluster", "header",
+        )
+        .await
+        .map_err(|e| match e {
+            FrameReadErr::Protocol(m) => Error::bad(m),
+            FrameReadErr::Transport(m) => Error::internal(m),
+        })?;
+        let (body, body_permit) = read_frame_section(
+            recv, max_body, byte_budget, RPC_BYTE_UNIT, false, "cluster", "body",
+        )
+        .await
+        .map_err(|e| match e {
+            FrameReadErr::Protocol(m) => Error::bad(m),
+            FrameReadErr::Transport(m) => Error::internal(m),
+        })?;
         Ok((
             header,
             body,
             FramePermits {
-                _hdr: hdr_permit,
+                _hdr: hdr_permit.expect("header allocates >= 1 permit"),
                 _body: body_permit,
             },
         ))
@@ -1054,35 +1146,44 @@ impl ClusterNet {
             conn.close(1u32.into(), b"self connection");
             return;
         }
-        // Register before acknowledging. set_local_role checks this same peer table
-        // inside its write, so demoting the last standalone voter is ordered with admission.
+        // Register before acknowledging. Reject standalone 0-peer inviters with active runs/tasks
+        // so single-node sessions never become stranded without a quorum lease.
         let admission = self
             .db
-            .write(
-                move |conn| {
-                    let local = load_local_node(conn)?;
-                    if local.membership_gen != mgen
-                        || local.voter_epoch == 0
-                        || local.voter_set.is_empty()
-                    {
-                        return Err(Error::conflict(
-                            "invite source has no current voter configuration",
-                        ));
-                    }
-                    let now = chrono::Utc::now().timestamp_millis();
-                    upsert_peer_if_gen(conn, &local.node_id, &remote_peer, now, true, mgen)?;
-                    let peers = list_peers(conn)?;
-                    if !peers.iter().any(|p| p.node_id == remote_peer.node_id) {
-                        return Err(Error::bad("invalid joining peer"));
-                    }
-                    Ok((local.voter_epoch, local.voter_set, peers))
-                },
-                |s, (epoch, voters, peers)| {
-                    s.presence.set_peer_roles(&peers);
-                    s.presence.set_known_peer_count(peers.len());
-                    Ok((epoch, voters))
-                },
-            )
+            .call(move |s| {
+                let tx = s.conn.transaction()?;
+                let local = load_local_node(&tx)?;
+                if local.membership_gen != mgen
+                    || local.voter_epoch == 0
+                    || local.voter_set.is_empty()
+                {
+                    return Err(Error::conflict(
+                        "invite source has no current voter configuration",
+                    ));
+                }
+                let existing_empty: bool = !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cluster_peers)",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )?;
+                if existing_empty
+                    && (!s.active.is_empty() || !s.pending_wakes.is_empty() || !s.tasks.is_empty())
+                {
+                    return Err(Error::conflict(
+                        "invite source has active standalone sessions or background tasks; pause or stop them before joining",
+                    ));
+                }
+                let now = chrono::Utc::now().timestamp_millis();
+                upsert_peer_if_gen(&tx, &local.node_id, &remote_peer, now, true, mgen)?;
+                let peers = list_peers(&tx)?;
+                if !peers.iter().any(|p| p.node_id == remote_peer.node_id) {
+                    return Err(Error::bad("invalid joining peer"));
+                }
+                tx.commit()?;
+                s.presence.set_peer_roles(&peers);
+                s.presence.set_known_peer_count(peers.len());
+                Ok((local.voter_epoch, local.voter_set))
+            })
             .await;
         let msg = match admission {
             Ok((voter_epoch, voter_set)) => AuthMsg::Admission {
@@ -1091,11 +1192,15 @@ impl ClusterNet {
                 voter_set,
                 reason: None,
             },
-            Err(_) => AuthMsg::Admission {
+            Err(err) => AuthMsg::Admission {
                 ok: false,
                 voter_epoch: 0,
                 voter_set: Vec::new(),
-                reason: Some("invite source could not admit this peer".into()),
+                reason: Some(if err.0 == axum::http::StatusCode::CONFLICT {
+                    err.1
+                } else {
+                    "invite source could not admit this peer".into()
+                }),
             },
         };
         if write_auth(&mut send, &msg).await.is_ok() {
