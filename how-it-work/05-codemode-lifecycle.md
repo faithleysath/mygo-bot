@@ -143,7 +143,6 @@
    - **第一摊**：把全库所有本机产出、门外未读的 `lease_warning` 全塞进 `invalidated_warnings` 作废——因为本机重启后没有哪个租期还活着；
    - **第二摊**：顺着 `codemode_receipts` 索引找出所有本机打过后台欠条（`codemode_call_item_id IS NOT NULL`）却还没等来 `completed` 事件的任务，挨个补写一笔 `"Daemon restarted; result unknown."`（`status: "interrupted"`）的 `completed` 事件，并把对应会话标成 `paused`——跟普通工具一样，绝不擅自重跑可能已产生的副作用；
    - **第三摊**：万一崩溃刚好卡在“后台事件刚写库提交，但 `app.wake` 还没来得及把 `idle` 会话拉起来”的那一微秒，就把这些门外压着未读 `codemode_event` 却仍停在 `idle` 的会话也统一标成 `paused`（`"daemon restarted with pending codemode events"`），等你下次点 `/run` 接手，绝不让事件沉底装死。
-5. **`UpgradingOffline` 租约过渡期等待**：当单机并入集群、后台正试图把现有活动会话从 `Standalone`/`ForcedOffline` 升级成 `Quorum` 租约（挂着 `LocalLeaseStatus::Upgrading(watch::Receiver<bool>)`）时，脚本宿主打底了一道统一的异步门控 **`Host::wait_for_execution`**——它监听协调者唯一的 `watch::Receiver<bool>` 判决信道，同时受任务截止时间 `deadline`（若中途经 `codemode_task_renew` 续命延后则自动续等新截止线）和取消令牌 `cancel` 约束：不仅 `src/codemode/io.rs` 里**所有带副作用的外部原语调用与流式读写（`execute` 及 `upload.open`/`stream.*`）**在发往本地或远端节点前都先过这道等待门禁，连 **`Host::emit`** 写事件与 **`supervise`/`complete()`** 结账落盘看见 `is_local_lease_upgrading` 也会退出短事务等 `wait_for_execution` / `wait_local_lease_ready` 落锤，`tick()` 也暂且延后 **50 毫秒**重查，绝不因为升级一瞬未拿齐投票租约就报错丢任务，也绝不放任升级尚未获批的脚本继续往外发 I/O。只有确认分支被切换/删会话（`task_superseded`）或升级失败退成 `Invalid` 才止步摘牌。
 
 ---
 
