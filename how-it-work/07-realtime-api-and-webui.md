@@ -41,10 +41,10 @@
 
 ## HTTP API 全景、三条路由面与内置 OpenAPI 文档
 
-整套系统共暴露 **34 条路径、49 个操作**，完整 OpenAPI `3.1.0` 契约与 **56 个 Schema**（单行压缩 JSON 约 **85.8 KiB / 87,844 字节**）编译期嵌在 [src/openapi.json](../src/openapi.json) 里：
+整套系统共暴露 **34 条路径、49 个操作**，完整 OpenAPI `3.1.0` 契约与 **55 个 Schema**（单行压缩 JSON 约 **84.0 KiB / 86,030 字节**）编译期嵌在 [src/openapi.json](../src/openapi.json) 里：
 - 会话模型涵盖 `runner_node_id`、`active_head`、`branches`（`BranchHead[]`）；支持 `/history` 与 `/context` 的 `?view=` 校验与 `X-History-View`（失配返 `409`）；
-- `PUT /sessions/{sid}/run` 支持可选请求体 `{ "node", "force_offline" }`（离线或失多数派默认返 `503`）；
-- `POST /cluster/join` 在邀请作废、**任意一端存在活跃会话或后台任务**、或换群未传 `force` 时返 **`409 Conflict`**（不可达返 `503`）；`PATCH /cluster/self`、`DELETE /cluster/peers/{node_id}` 在联合多数派不可用时返 `503`；`POST /cluster/sync` 支持 `404` / `503` / `504`。
+- `PUT /sessions/{sid}/run` 支持可选请求体 `{ "node" }`（指定目标直连节点但对方离线时返 `503`；若群内已有节点占用则返 `409`；完全断网时本机可直接开跑）；
+- `POST /cluster/join` 在邀请作废或换群未传 `force` 时返 **`409 Conflict`**（不可达返 `503`，允许带活跃会话入群）；`DELETE /cluster/peers/{node_id}` 直接清理离线或在线同伴并断开连接；`POST /cluster/sync` 支持 `404` / `503` / `504`。
 
 | 模块 | 路由一览 | 核心职责 |
 | :--- | :--- | :--- |
@@ -55,7 +55,7 @@
 | **媒体附件**（2） | `POST /attachments`，`GET /attachments/{id}` | 上传不超过 50 MiB 多模态原文件（限流返 `429`）与跨节点分块流式下载 |
 | **调用与计费**（3） | `GET /calls`，`GET /calls/summary`，`GET /calls/{id}` | 查询每轮上游调用明细、token、最新上下文长度与 `cost_nano_usd` 费用 |
 | **MCP 与 OAuth**（10） | `GET/POST /mcp/servers`，`GET/PATCH/DELETE /mcp/servers/{id}`，`POST .../test`<br>`GET/DELETE .../oauth`，`POST .../oauth/login`，`POST .../oauth/callback` | 注册传输与 `shared` 开关、并发 4 体检探测、启动/手动/撤销 OAuth 2.1 |
-| **集群与同步**（6） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync` | 查集群、改节点元信息与 `voter`/`edge` 角色（`503`）、经 `mygo/join/1` 准入加入（`409`/`503`）、移出同伴与触发同步 |
+| **集群与同步**（6） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync` | 查集群、改节点名称/描述、经 `mygo/join/1` 准入加入（`409`/`503`）、随时移出同伴与触发同步 |
 
 ### 三条不同的路由出口（[src/main.rs](../src/main.rs)、[src/api.rs](../src/api.rs)）
 
@@ -76,7 +76,7 @@
 ### 1. 构建、压缩与强 ETag 嵌入（`web/build.mjs` & `src/webui.rs`）
 
 执行 `bun run build` 先跑 `tsc --noEmit` 全量类型检查，随后输出三份静态资源编译期通过 `include_bytes!` 焊进二进制：
-- `bun` 打包 + `gzip -9` → **`src/webui/app.js.gz`（约 45.4 KiB / 46,538 字节）**；
+- `bun` 打包 + `gzip -9` → **`src/webui/app.js.gz`（约 45.3 KiB / 46,382 字节）**；
 - 状态机压缩 CSS + gzip → **`src/webui/app.css.gz`（约 6.6 KiB / 6,736 字节）**；
 - 内联无闪屏主题探测脚本 → **`src/webui/index.html`（898 字节）**。
 
@@ -105,8 +105,8 @@
   - 多节点时右下角出现**执行节点选择器**（可指定在线节点跑下一轮）；
   - 运行中支持 **`Pause`**（软暂停） / **`Stop`**（硬暂停）、上方折叠任务栏每 2 秒拉取后台终端尾部并支持 `Kill`；
   - 顶栏集成 `Chat` / `Trace` / `Context` 三视图、多分支 **`Branch` 切换下拉框**、`@runner` 徽标、标题编辑、模型/推理档位切换以及调用/缓存命中率/费用/上下文占比环。
-- **设置弹窗（`Settings.tsx`）**：`Models`（供应商与模型管理，含密钥编辑与价目 JSON）、`MCP`（含 `shared` 全集群同步开关与告警、OAuth 弹窗登录与跨机手动粘贴 `Submit Callback`）、`Cluster`（本机改名、在线切换 `Voter`/`Edge`、生成邀请码/加入或带确认 `Force Switch Cluster` 换群、一键同步与成员管理）、`Usage` 与 `General`（深浅主题、`/docs`、登出）。
+- **设置弹窗（`Settings.tsx`）**：`Models`（供应商与模型管理，含密钥编辑与价目 JSON）、`MCP`（含 `shared` 全集群同步开关与告警、OAuth 弹窗登录与跨机手动粘贴 `Submit Callback`）、`Cluster`（本机改名与描述、生成邀请码/加入或带确认 `Force Switch Cluster` 换群、一键同步与成员管理）、`Usage` 与 `General`（深浅主题、`/docs`、登出）。
 
 ---
 
-**上一篇**：[06 · 外部工具扩展：MCP 协议、双传输与 OAuth 2.1](06-mcp-and-oauth.md) · **返回目录**：[总览](README.md) · **下一篇**：[08 · 私有集群：无冲突同步与多数派执行控制](08-cluster-sync-and-execution.md)
+**上一篇**：[06 · 外部工具扩展：MCP 协议、双传输与 OAuth 2.1](06-mcp-and-oauth.md) · **返回目录**：[总览](README.md) · **下一篇**：[08 · 私有集群：无冲突同步与连通图 Gossip 协作](08-cluster-sync-and-execution.md)

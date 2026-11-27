@@ -55,10 +55,10 @@ MyGo-Bot 把会话引擎拆得非常干净：**先把账目和排队分开，再
 
 **在 MyGo-Bot 里，“投信”和“点火”是两件事。** 会话停在 `idle` 或 `paused` 时，调 `POST /sessions/{sid}/messages` 只是把信投进门外信箱（`items` + `pending_inputs`）；必须再调一次 `PUT /sessions/{sid}/run` 才真正点火开工。
 
-多节点下怎么决定谁来跑、怎么防撞车？规则可以压成三句话（完整抢牌协议、Paxos 选民变更与重连对账专章见 [第 8 篇](08-cluster-sync-and-execution.md)）：
-- **纯单机（`known_peer_count == 0`）**：零锁零 RPC，直接以 `Standalone` 模式开跑。
-- **多节点集群**：开跑前可选 `{ "node": "..." }` 指定由哪台在线节点执行；执行机必须先走 [src/cluster/exec.rs](../src/cluster/exec.rs) 的 `acquire_session_lease` 强同步账本与附件、探测全群占有与进度栅栏、并向 `Voter` 多数派领一块 10 秒可续租的 `Quorum` 工作牌（凑不够多数派默认返 `503`，仅显式传 `force_offline: true` 允许无租约离线强跑）。
-- **控制指令自动找人**：只要会话正被远端 Runner 占着，发信、撤回、改标题、暂停、查停任务会自动单跳转发给那台 Runner 处理；删会话也共用同一套 `Voter` 多数派门控（`acquire_delete_gate`）。
+多节点下怎么决定谁来跑、怎么防撞车？规则可以压成三句话（完整 Gossip 扩散与多跳互斥协议见 [第 8 篇](08-cluster-sync-and-execution.md)）：
+- **纯单机或无在线同伴（孤岛模式）**：纯单机（`known_peer_count == 0` 且无在线邻居）走零锁零 RPC 快路径直接开跑；即便已入群但此刻完全断网成孤岛，仍直接验完本地分支与附件后自由开跑（不报 `503`，重连后由 DAG 自动保留并合流分支）。
+- **连通群内并发防护**：开跑前可选 `{ "node": "..." }` 指定哪台直连在线节点执行；当存在在线同伴时，走 [src/cluster/exec.rs](../src/cluster/exec.rs) 的 `acquire_connected_gate` 先通过 `sync_session_best_effort` 拉齐可达节点更新与缺失附件，再沿着连通图发最多 4 跳的 `CheckOccupancy` 探测占有（含路径向量 Gossip 已感知的节点）和最新进度，配合 5 秒内存短声明 `RunClaim` 按 `node_id` 决胜并发抢跑，无人占着即可点火，不锁死心跳也不要求全群多数派在线。
+- **控制指令找人与安全删会话**：只要会话正被直连在线的远端 Runner 占着，发信、撤回、改标题、暂停与查停任务会自动单跳转发过去处理；`DELETE /sessions/{sid}` 共用同一套连通图门禁 `acquire_delete_gate` 确认可达节点无人占用、无人领先后再写墓碑。
 
 一旦点火成功（本机进入 `running`），Worker 会一轮接一轮跑下去，直到活干完为止。每一趟的具体动作如下：
 
@@ -100,7 +100,7 @@ MyGo-Bot 把会话引擎拆得非常干净：**先把账目和排队分开，再
 - **共享持久态（`sessions.status` + `last_error` + `status_ts`）**：只存 `'idle'` 或 `'paused'` 两个稳态，带 HLC 时间戳全群同步；
 - **仅本机叠加态（`sessions.local_status` + `local_error`）**：可为 `NULL`、`'running'`、`'pausing'` 或 `'paused'`，**永远不上网**。
 
-读取会话视图时 SQL 优先叠上本机状态：正常停稳写回共享 `idle`/`paused` 时把 `local_status` 清回 `NULL`；而断网失租熔断（[src/agent.rs](../src/agent.rs) `fence_session_local`）或重连软停离线任务时只允许写 `local_status`，绝不污染其他节点已经跑出的新状态。非执行节点则把内存占有表 `PresenceState` 实时叠到 `runner_node_id` 上。
+读取会话视图时 SQL 优先叠上本机状态：正常停稳写回共享 `idle`/`paused` 时把 `local_status` 清回 `NULL`，避免高频推进状态触发全群同步刷屏，也让崩溃未清的运行态止步于本机而不污染他机。非执行节点则把路径向量 Gossip 同步过来的内存占有表 `PresenceState` 实时叠到 `runner_node_id` 上。
 
 ```mermaid
 stateDiagram-v2
@@ -122,7 +122,7 @@ stateDiagram-v2
     pausing --> paused: "进程崩溃重启（标 daemon restarted）"
 ```
 
-配合上面的状态机，活动会话在内存里挂着控制句柄 `Control { soft, hard, run_gen, lease, forced_offline }`（其中 `run_gen` 每次拉起 Worker 递增，挡住慢一拍的旧输出越界写库；而整支历史切分支或删会话另由 `session_reset_gen` 驱逐旧后台任务）。“暂停”只看一个问题：**当前这一步 `step` 还让不让做完？**
+配合上面的状态机，活动会话在内存里挂着极轻的控制句柄 `Control { soft, hard, run_gen }`（其中 `run_gen` 每次拉起 Worker 递增，挡住慢一拍的旧输出越界写库；而整支历史切分支或删会话另由 `session_reset_gen` 驱逐旧后台任务）。“暂停”只看一个问题：**当前这一步 `step` 还让不让做完？**
 
 - **软暂停（`DELETE /sessions/{sid}/run` 或 `?mode=soft`）**：先把本机叠加态落为 `local_status = 'pausing'`（写库失败就回滚，绝不半途误取消），再拉响 `soft`。模型流和已派工具照常收完尾，到这一步结束看见 `soft` 已取消才停进 `paused`（重复点软暂停幂等跳过，会话原本静止时直接落成持久 `paused`）。
 - **硬暂停（`?mode=hard`）**：同时拉响 `soft`、`hard` 并立刻按 `killed` 拉闸本会话所有后台 `codemode` 任务（见 [第 5 篇](05-codemode-lifecycle.md)）。模型流被当场掐断，边界认 **`item` 而不是 `step`**：
@@ -130,7 +130,7 @@ stateDiagram-v2
   - 已派出去正在退出的工具等收完，赶上落盘的结果留着；
   - 已经记了 `function_call` 却没拿回结果的调用，由 `publish_tools(..., recovering=true)` 按调用顺序归进上下文，并诚实补上一句 **`"Execution interrupted; result unknown."`**。
 
-在集群里，只要手里还握着有效 `Quorum` 租约，停稳后会写回共享 `status` 并清掉 `local_status`，等所有后台收尾完再放牌；如果写库前已经失租或被 `fence_session_local` 熔断，就只记本机 `local_status = 'paused'`。另有一个小细节：会话停在 `paused` 时若后来把门外错信撤回导致账已平，点一次 `/run` 会自动帮你清掉 `last_error` 归回 `idle`；停在 `pausing` 时再点 `/run` 会直接返 `409 Conflict`。
+正常停稳或报错停下后会把结果写回共享 `status` 并清掉 `local_status`，随后借助 `PresenceState` 通知同伴释放该会话的占有标记。另有一个小细节：会话停在 `paused` 时若后来把门外错信撤回导致账已平，点一次 `/run` 会自动帮你清掉 `last_error` 归回 `idle`；停在 `pausing` 时再点 `/run` 会直接返 `409 Conflict`。
 
 ---
 
@@ -150,7 +150,7 @@ stateDiagram-v2
 ### 3. 崩溃恢复与 Schema `v1` 守门（[src/store.rs](../src/store.rs)）
 
 硬暂停还来得及自己结账，`SIGKILL` 或断电则根本没给机会。进程重启打开 `Db::open` 时，只信 WAL 最后一笔已提交事务，在一个启动事务里做三件事：
-1. **验库与对齐单调水位**：核对 `PRAGMA user_version == 1`（Schema `v1` 不写迁移脚本，不匹配直接报错拒绝启动）；接着对齐 `id::seed_from_db`、带 `MAX_HLC_WALL_MS` 守卫的 [`seed_hlc_from_db`](../src/cluster/ledger.rs) 和持久化在 `local_node.catalog_rev` 里的目录水位（[`next_catalog_rev`](../src/cluster/ledger.rs)），加载身份、`voter_epoch`/`voter_set`、同伴与 `session_leases`。
+1. **验库与对齐单调水位**：核对 `PRAGMA user_version == 1`（Schema `v1` 不写迁移脚本，不匹配直接报错拒绝启动）；接着对齐 `id::seed_from_db`、带 `MAX_HLC_WALL_MS` 守卫的 [`seed_hlc_from_db`](../src/cluster/ledger.rs) 和持久化在 `local_node.catalog_rev` 里的目录水位（[`next_catalog_rev`](../src/cluster/ledger.rs)），加载本机身份与已登记同伴数量。
 2. **原地按来源恢复本机残局**：只按 `origin_node_id == local_node_id` 过滤，把本机仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`）；把停在 `local_status IN ('running', 'pausing')` 的会话收成持久 `'paused'` 并清掉叠加态；并就地跑一遍 `codemode::ledger::recover` 处理本机中断任务与作废提醒。绝不误伤群里别的机器还在跑的会话。
 3. **等人工重开才按 `input_head` 补工具残局**：重启时**绝不自动重跑未回结果的普通工具**（因为没落盘结果不等于没执行过副作用）。空缺先留着，等你下次手动点 `/run` 时，由 [`publish_tools`](../src/store.rs) 严格核对 `llm_calls.input_head` 分支归属后只补齐属于当前分支的未果调用（`"Execution interrupted; result unknown."`——绝不把另一条分叉上死掉的工具错拉过来），然后再查 `needs_model` 与 `pending_inputs` 决定接着跑还是回 `idle`。
 

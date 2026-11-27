@@ -31,7 +31,7 @@ MyGo-Bot 死守一条**最小完备原语原则**：不给模型发一大堆杂�
 
 ## 全套云化节点原语、跨节点流句柄与进程笼子
 
-在全局层，车间只提供 `cluster.nodes()`（返回按 `(name, id)` 排序的 `[{ id, name, description, os, arch, role, online }]`，其中 `role` 为 `'voter'` 或 `'edge'`，**刻意不暴露哪个节点是当前脚本执行者**）和 `const node = cluster.node(target)`（按精确 `id` 或唯一 `name` 取出目标节点句柄，报错带 `ENODENOTFOUND` / `ENODEAMBIGUOUS` / `ENODEUNREACH`）。
+在全局层，车间只提供 `cluster.nodes()`（返回按 `(name, id)` 排序的 `[{ id, name, description, os, arch, online }]`，**刻意不暴露哪个节点是当前脚本执行者**）和 `const node = cluster.node(target)`（按精确 `id` 或唯一 `name` 取出目标节点句柄，报错带 `ENODENOTFOUND` / `ENODEAMBIGUOUS` / `ENODEUNREACH`）。
 
 每次调用 `node.fs.*`、`node.proc.exec`、`node.http.request`、`node.mcp.*` 或 `node.mygo.request` 时，请求统一步入 `src/codemode/io.rs`：
 - **本地零开销直调**：目标解析到本机 `node_id` 时直接走本机执行路径；

@@ -55,9 +55,8 @@
 
 记账规则把写单分成“普通写（包括 `Db::write` 和运行期 `Db::write_for_run`）”与“启动运行写（`start_session`）”两类（[src/store.rs](../src/store.rs)）：
 - **同会话两次点火绝不混批**：若把同一个 `sid` 的两次 `/run` 塞进同一外层事务，第一笔还没 `publish` 进内存 `s.active`，第二笔进事务就会误以为还没人跑从而起出重复 Worker！所以同会话点火必须拆批（不同会话的点火照常拼车；优雅退出 `self.closing == true` 时统一拒开返 `503`）。
-- **两态租约 + 运行世代拦截过期旧 Worker**：每次开跑递增 `Store.session_run_gen` 钉在 `Control` 上，Worker 的每笔落库全走 `Db::write_for_run` 带上 `expected_run_gen`。记账员在 `commit_batch` 核对：
-  - 若 `starting && presence.is_joining()`（本机正在入群握手中），直接返 **`409 Conflict`** 拦下新点火；
-  - 若运行世代已被顶掉或执行租约 `is_local_lease_valid(sid)` 已失效，同样当场拒写返 **`409 Conflict`**（再无半空挂起退回）；
+- **运行世代拦截过期旧 Worker**：每次开跑递增 `Store.session_run_gen` 钉在 `Control` 上，Worker 的每笔落库全走 `Db::write_for_run` 带上 `expected_run_gen`。记账员在 `commit_batch` 严格核对：
+  - 若运行世代已被新 Worker 或分支切换/删除动作顶掉，当场拒写返 **`409 Conflict`**；
   - 错误摘要统一用 `truncate_utf8(..., MAX_STORED_ERROR_SUMMARY_BYTES)` 钳在 **8192 字节**内，绝不切断多字节 UTF-8 字符。
 - **分叉/删除重置世代 `session_reset_gen`**：仅在切换 `active_head` 或删除会话时递增，供后台 `codemode` 任务在 `task_superseded` 里核对。正常重开新回合不会递增它，免得误吞跨回合后台完工信。
 
@@ -94,7 +93,7 @@
 - **查排队信件 `GET /sessions/{sid}/messages`**：按同一套 `idempotency_key` 规范等价类规则聚合（每键只展示最小 `id`），结合是否曾进入任何分支 `context_nodes` 或挂上 `withdrawal` 实时算出 `queued` / `included` / `withdrawn` 状态，支持过滤和游标分页。
 - **撤回消息 `DELETE /sessions/{sid}/messages/{mid}`**：若正被远端 Runner 占有会先单跳转发；本机事务按等价类核对还没进过任何上下文即可写撤回单（已进上下文返 `409 Conflict`；已撤回过直接幂等返回 `204 No Content`）。
 - **彻底删除会话 `DELETE /sessions/{sid}`**：
-  1. 若存在集群同伴，先 `ensure_session_watched` 拉齐正文，再经 [src/cluster/exec.rs](../src/cluster/exec.rs) 的 `acquire_delete_gate` 过多数派删除门控（他机已删返 `404`、有人占用返 `409`、失多数派返 `503`），拿着 9 秒本地隔离租约 `DeleteGateGuard` 进最终事务再次验活；
+  1. 若存在集群同伴，先 `ensure_session_watched` 拉齐正文，再经 [src/cluster/exec.rs](../src/cluster/exec.rs) 的 `acquire_delete_gate` 沿着当前连通图多跳排查占位（他机已删返 `404`、连通图内有人占用返 `409`、发现更新进度则先拉齐再复核），拿着临时声明护栏 `DeleteGateGuard` 进最终事务再次验活后释放；
   2. 将 `sessions` 行推向单调不可逆的 **`deleted = 1` 规范墓碑**（标题、时间、状态、配置与 `active_head` 等全部洗净归零并递增 `sync_rev`），随后清空会话正文与本地派生表，绝不让离线同伴连回来把旧会话复活；
   3. **保留花费账单**：把关联 `llm_calls.session_id` 设为 `NULL` 后继续留存；
   4. **摘掉内存残余**：立即清除该会话的 MCP 连接、SSE 槽位、唤醒弦并广播 `session.deleted`。
@@ -105,7 +104,7 @@
 
 看到这里你会发现，单机这一层几乎所有看似“怪异”的决定——**去掉跨表外键和全局唯一索引、拆出永不上网的 `local_status`、把 `deleted=1` 洗成全零对称墓碑、严格在 `COMMIT` 后才推脏标记**——全都是在为分布式合流铺平地基。
 
-至于把多台 MyGo-Bot 连成一个私人小群后，数据如何按半格律 CRDT 自动合流、执行面又怎么靠 `Voter` 多数派租约和联合 Paxos 防止撞车，我们放到专门的 **[第 8 篇 · 私有集群：无冲突同步与多数派执行控制](08-cluster-sync-and-execution.md)** 里一次讲透。
+至于把多台 MyGo-Bot 连成一个私人小群后，数据如何按半格律 CRDT 自动合流、执行面又怎么靠路径向量 Gossip 占有与多跳探测防撞车，我们放到专门的 **[第 8 篇 · 私有集群：无冲突同步与连通图 Gossip 协作](08-cluster-sync-and-execution.md)** 里一次讲透。
 
 ---
 

@@ -31,8 +31,7 @@
 - **私有集群参数（默认全部可省略）**：
   - 单机默认**按需延迟绑定** QUIC 端点——平时不开额外 UDP 端口，直到在 WebUI / API 生成邀请码或加入集群才启动；
   - `--cluster-local`：禁用公共中继与 DNS 发现，仅走局域网或本机直连；
-  - `--cluster-bind <IP:PORT>`：显式固定 `iroh` QUIC 集群 UDP 端口；
-  - `--cluster-role <voter|edge>`：预设单机初始投票角色（默认 `voter`；笔记本等常离线设备可在单机启动时设或组群后在线切为 `edge`）。
+  - `--cluster-bind <IP:PORT>`：显式固定 `iroh` QUIC 集群 UDP 端口。
 
 ---
 
@@ -47,7 +46,7 @@
 5. [05 · Codemode 下篇：前后台分流、原地等信、实时透视与租期恢复](how-it-work/05-codemode-lifecycle.md)
 6. [06 · 外部工具扩展：MCP 协议、双传输与 OAuth 2.1](how-it-work/06-mcp-and-oauth.md)
 7. [07 · 实时流、HTTP API、内置文档与 WebUI](how-it-work/07-realtime-api-and-webui.md)
-8. [08 · 私有集群：无冲突同步与多数派执行控制](how-it-work/08-cluster-sync-and-execution.md)
+8. [08 · 私有集群：无冲突同步与连通图 Gossip 协作](how-it-work/08-cluster-sync-and-execution.md)
 9. [09 · 部署运维、压测验证、瘦身发布与评测体系](how-it-work/09-deployment-testing-and-tooling.md)
 
 ---
