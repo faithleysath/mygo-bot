@@ -1217,6 +1217,7 @@ impl SyncEngine {
             && delta.context_nodes.is_empty()
             && delta.turn_settled.is_empty()
             && delta.invalidated_warnings.is_empty()
+            && delta.pruned_context_nodes.is_empty()
             && total_unpacked_bytes <= MAX_ITEM_PAYLOAD_BYTES;
         if !within_delta && !single_oversized {
             return Err(Error::bad("SessionDelta unpacked payload exceeds page budget"));

@@ -465,6 +465,7 @@ export interface TimelineProps {
   onLoadMore: () => void;
   onWithdraw: (mid: string) => void;
   onOpenSettings?: () => void;
+  onForkFromItem?: (itemId: string) => void;
 }
 
 export function Timeline({
@@ -481,6 +482,7 @@ export function Timeline({
   onLoadMore,
   onWithdraw,
   onOpenSettings,
+  onForkFromItem,
 }: TimelineProps) {
   const { locale, t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -655,6 +657,7 @@ export function Timeline({
               const isWithdrawn = withdrawn.has(item.id);
               const isQueued = !isWithdrawn && queuedIds.has(item.id);
               const msgText = extractMessageText(item.payload?.content);
+              const canFork = Boolean(onForkFromItem && !isWithdrawn && !isQueued);
               return (
                 <div
                   key={item.id}
@@ -663,11 +666,22 @@ export function Timeline({
                 >
                   <div class="user-bubble">
                     <ContentBlocks blocks={item.payload?.content} onPreviewImage={setLightboxSrc} />
-                    {(isWithdrawn || isQueued || msgText) && (
+                    {(isWithdrawn || isQueued || msgText || canFork) && (
                       <div class="msg-foot">
-                        {msgText && (
+                        {(msgText || canFork) && (
                           <span class="msg-copy-wrap">
-                            <CopyBtn text={msgText} />
+                            {msgText && <CopyBtn text={msgText} />}
+                            {canFork && (
+                              <button
+                                type="button"
+                                class="copy-btn msg-action-btn"
+                                title={t("Fork from here")}
+                                aria-label={t("Fork from here")}
+                                onClick={() => onForkFromItem?.(item.id)}
+                              >
+                                <Icon n="gitBranch" s={12} />
+                              </button>
+                            )}
                           </span>
                         )}
                         {isWithdrawn && <span class="pill">{t("withdrawn")}</span>}
@@ -694,9 +708,20 @@ export function Timeline({
               return (
                 <div key={item.id} data-turn-idx={tIdx} class="msg-row msg-assistant">
                   <ContentBlocks blocks={item.payload?.content} markdown onPreviewImage={setLightboxSrc} />
-                  {(msgText || call) && (
+                  {(msgText || call || onForkFromItem) && (
                     <div class="msg-footer-meta">
                       {msgText && <CopyBtn text={msgText} />}
+                      {onForkFromItem && (
+                        <button
+                          type="button"
+                          class="copy-btn msg-action-btn"
+                          title={t("Fork from here")}
+                          aria-label={t("Fork from here")}
+                          onClick={() => onForkFromItem(item.id)}
+                        >
+                          <Icon n="gitBranch" s={12} />
+                        </button>
+                      )}
                       {call && (
                         <span
                           class="meta-chip"

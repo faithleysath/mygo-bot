@@ -1,8 +1,9 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 };
 
+use axum::http::StatusCode;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,6 +15,7 @@ use crate::{
         self, AttachmentId, CallId, ContextNodeId, ItemId, McpServerId, ModelId, ProviderId,
         SessionId,
     },
+    store::{Session, SessionStatus, session},
 };
 
 pub const CALLS_SCOPE: &str = "calls";
@@ -547,6 +549,14 @@ pub struct InvalidatedWarningWire {
     pub origin_seq: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrunedContextNodeWire {
+    pub context_node_id: ContextNodeId,
+    pub session_id: SessionId,
+    pub origin_node_id: String,
+    pub origin_seq: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CatalogDelta {
     pub db_epoch: String,
@@ -584,6 +594,8 @@ pub struct SessionDelta {
     pub turn_settled: Vec<TurnSettledWire>,
     #[serde(default)]
     pub invalidated_warnings: Vec<InvalidatedWarningWire>,
+    #[serde(default)]
+    pub pruned_context_nodes: Vec<PrunedContextNodeWire>,
     #[serde(default)]
     pub advanced_vector: BTreeMap<String, i64>,
 }
@@ -683,11 +695,489 @@ pub fn list_session_leaves(conn: &Connection, sid: SessionId) -> Result<Vec<Bran
     Ok(rows)
 }
 
+pub fn has_pruned_context_nodes(conn: &Connection, sid: SessionId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM pruned_context_nodes WHERE session_id=?1)")?
+        .query_row([sid], |r| r.get(0))?)
+}
+
+fn load_pruned_roots(conn: &Connection, sid: SessionId) -> Result<HashSet<ContextNodeId>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT context_node_id FROM pruned_context_nodes WHERE session_id=?1")?;
+    let rows = stmt
+        .query_map([sid], |r| r.get(0))?
+        .collect::<rusqlite::Result<HashSet<ContextNodeId>>>()?;
+    Ok(rows)
+}
+
+fn is_node_pruned_in_map(
+    start: ContextNodeId,
+    pruned_roots: &HashSet<ContextNodeId>,
+    parent_of: &HashMap<ContextNodeId, Option<ContextNodeId>>,
+    memo: &mut HashMap<ContextNodeId, bool>,
+) -> bool {
+    if let Some(&res) = memo.get(&start) {
+        return res;
+    }
+    if pruned_roots.is_empty() {
+        memo.insert(start, false);
+        return false;
+    }
+    let mut path = Vec::new();
+    let mut cur = Some(start);
+    let mut visited = HashSet::new();
+    let mut result = false;
+    while let Some(nid) = cur {
+        if let Some(&known) = memo.get(&nid) {
+            result = known;
+            break;
+        }
+        if pruned_roots.contains(&nid) {
+            result = true;
+            break;
+        }
+        if !visited.insert(nid) {
+            break;
+        }
+        path.push(nid);
+        cur = parent_of.get(&nid).copied().flatten();
+    }
+    for nid in path {
+        memo.insert(nid, result);
+    }
+    result
+}
+
+pub fn is_node_pruned(conn: &Connection, sid: SessionId, head_id: ContextNodeId) -> Result<bool> {
+    if !has_pruned_context_nodes(conn, sid)? {
+        return Ok(false);
+    }
+    let pruned_roots = load_pruned_roots(conn, sid)?;
+    let mut stmt =
+        conn.prepare_cached("SELECT parent_id FROM context_nodes WHERE id=?1 AND session_id=?2")?;
+    let mut cur = Some(head_id);
+    let mut visited = HashSet::new();
+    while let Some(nid) = cur {
+        if pruned_roots.contains(&nid) {
+            return Ok(true);
+        }
+        if !visited.insert(nid) {
+            break;
+        }
+        cur = stmt
+            .query_row(params![nid, sid], |r| r.get::<_, Option<ContextNodeId>>(0))
+            .optional()?
+            .flatten();
+    }
+    Ok(false)
+}
+
+pub fn rebuild_session_leaves(conn: &Connection, sid: SessionId) -> Result<()> {
+    let pruned_roots = load_pruned_roots(conn, sid)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, parent_id, depth, item_id, origin_node_id
+         FROM context_nodes
+         WHERE session_id=?1",
+    )?;
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(ContextNodeId, Option<ContextNodeId>, i64, ItemId, String)> = stmt
+        .query_map([sid], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let parent_of: HashMap<ContextNodeId, Option<ContextNodeId>> =
+        rows.iter().map(|(id, p, ..)| (*id, *p)).collect();
+    let mut memo: HashMap<ContextNodeId, bool> = HashMap::with_capacity(rows.len());
+    let mut parents_with_unpruned_children: HashSet<ContextNodeId> = HashSet::new();
+
+    for (id, parent_id, ..) in &rows {
+        let pruned = is_node_pruned_in_map(*id, &pruned_roots, &parent_of, &mut memo);
+        if !pruned && let Some(pid) = parent_id {
+            parents_with_unpruned_children.insert(*pid);
+        }
+    }
+
+    conn.prepare_cached("DELETE FROM session_leaves WHERE session_id=?")?
+        .execute([sid])?;
+    let mut ins = conn.prepare_cached(
+        "INSERT INTO session_leaves(session_id, head_id, depth, last_item_id, origin_node_id)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (id, _, depth, item_id, origin_node_id) in rows {
+        if memo.get(&id).copied() == Some(false)
+            && !parents_with_unpruned_children.contains(&id)
+        {
+            ins.execute(params![sid, id, depth, item_id, origin_node_id])?;
+        }
+    }
+    Ok(())
+}
+
+pub fn ensure_active_head_not_pruned(conn: &Connection, sid: SessionId) -> Result<bool> {
+    if !has_pruned_context_nodes(conn, sid)? {
+        return Ok(false);
+    }
+    let active_head: Option<ContextNodeId> = conn
+        .prepare_cached("SELECT active_head FROM sessions WHERE id=? AND deleted=0")?
+        .query_row([sid], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let Some(cur_head) = active_head else {
+        return Ok(false);
+    };
+    if !is_node_pruned(conn, sid, cur_head)? {
+        return Ok(false);
+    }
+    let fallback: Option<ContextNodeId> = conn
+        .prepare_cached(
+            "SELECT head_id FROM session_leaves
+             WHERE session_id=?1
+             ORDER BY depth DESC, head_id DESC LIMIT 1",
+        )?
+        .query_row([sid], |r| r.get(0))
+        .optional()?;
+    conn.prepare_cached("UPDATE sessions SET active_head=?2 WHERE id=?1 AND deleted=0")?
+        .execute(params![sid, fallback])?;
+    Ok(true)
+}
+
+pub fn prune_session_branch(
+    conn: &Connection,
+    sid: SessionId,
+    target_head: ContextNodeId,
+) -> Result<ContextNodeId> {
+    let cur_sess = session(conn, sid)?;
+    if matches!(
+        cur_sess.status,
+        SessionStatus::Running | SessionStatus::Pausing
+    ) {
+        return Err(Error::conflict("pause the session before deleting a branch"));
+    }
+    let exists: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM context_nodes WHERE id=?1 AND session_id=?2)")?
+        .query_row(params![target_head, sid], |r| r.get(0))?;
+    if !exists || is_node_pruned(conn, sid, target_head)? {
+        return Err(Error(StatusCode::NOT_FOUND, "branch not found".into()));
+    }
+    let leaves = list_session_leaves(conn, sid)?;
+    if !leaves.iter().any(|l| l.head_id == target_head) {
+        return Err(Error::conflict("target node is not a branch leaf"));
+    }
+    if cur_sess.active_head == Some(target_head) {
+        return Err(Error::conflict(
+            "cannot delete the active branch; switch branches first or delete the session",
+        ));
+    }
+    if leaves.len() <= 1 {
+        return Err(Error::conflict(
+            "cannot delete the only branch; delete the session instead",
+        ));
+    }
+
+    let mut stmt =
+        conn.prepare_cached("SELECT id, parent_id FROM context_nodes WHERE session_id=?1")?;
+    let parent_of: HashMap<ContextNodeId, Option<ContextNodeId>> = stmt
+        .query_map([sid], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+
+    let mut protected = HashSet::new();
+    let mut stack_roots: Vec<ContextNodeId> = leaves
+        .iter()
+        .filter(|l| l.head_id != target_head)
+        .map(|l| l.head_id)
+        .collect();
+    if let Some(ah) = cur_sess.active_head
+        && ah != target_head
+    {
+        stack_roots.push(ah);
+    }
+    for root in stack_roots {
+        let mut cur = Some(root);
+        while let Some(nid) = cur {
+            if !protected.insert(nid) {
+                break;
+            }
+            cur = parent_of.get(&nid).copied().flatten();
+        }
+    }
+
+    let mut prune_root = target_head;
+    let mut seen = HashSet::new();
+    seen.insert(prune_root);
+    while let Some(Some(parent)) = parent_of.get(&prune_root).copied() {
+        if protected.contains(&parent) || !seen.insert(parent) {
+            break;
+        }
+        prune_root = parent;
+    }
+
+    let node_id = local_node_id(conn)?;
+    let origin_seq = next_origin_seq(conn, &session_scope(sid), &node_id)?;
+    conn.prepare_cached(
+        "INSERT INTO pruned_context_nodes(context_node_id, session_id, origin_node_id, origin_seq)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(context_node_id, origin_node_id) DO NOTHING",
+    )?
+    .execute(params![prune_root, sid, &*node_id, origin_seq])?;
+
+    rebuild_session_leaves(conn, sid)?;
+    mark_session_watched(conn, sid)?;
+    stage_session(sid);
+    Ok(prune_root)
+}
+
+pub fn resolve_fork_target_node(
+    conn: &Connection,
+    sid: SessionId,
+    from_head: Option<ContextNodeId>,
+    from_item: Option<ItemId>,
+) -> Result<Option<ContextNodeId>> {
+    let cur = session(conn, sid)?;
+    if let Some(head) = from_head {
+        return Ok(Some(head));
+    }
+    let Some(item_id) = from_item else {
+        return Ok(cur.active_head);
+    };
+    let active_node: Option<ContextNodeId> = conn
+        .prepare_cached(
+            "SELECT node_id FROM active_context
+             WHERE session_id=?1 AND item_id=?2
+             ORDER BY position DESC LIMIT 1",
+        )?
+        .query_row(params![sid, item_id], |r| r.get(0))
+        .optional()?;
+    if let Some(node) = active_node {
+        return Ok(Some(node));
+    }
+    let item_exists: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM items WHERE id=?1 AND session_id=?2)")?
+        .query_row(params![item_id, sid], |r| r.get(0))?;
+    if item_exists {
+        Err(Error::conflict("item is not in the active branch context"))
+    } else {
+        Err(Error(StatusCode::NOT_FOUND, "item not found".into()))
+    }
+}
+
+fn truncate_utf8_with_suffix(prefix: &str, suffix: &str, max_bytes: usize) -> String {
+    let budget = max_bytes.saturating_sub(suffix.len());
+    let head = crate::calls::truncate_utf8(prefix, budget);
+    format!("{head}{suffix}")
+}
+
+pub fn fork_session_from_node(
+    conn: &Connection,
+    src_sid: SessionId,
+    target_node: Option<ContextNodeId>,
+    title_override: Option<String>,
+    model_override: Option<(ModelId, Option<String>)>,
+) -> Result<Session> {
+    let src = session(conn, src_sid)?;
+    let (model_id, reasoning_effort, validate_modalities) = match model_override {
+        Some((mid, eff)) => {
+            let (modalities, efforts) = crate::catalog::available_capabilities(conn, mid)?;
+            if let Some(ref effort) = eff
+                && !efforts
+                    .as_array()
+                    .is_some_and(|opts| opts.iter().any(|v| v.as_str() == Some(effort)))
+            {
+                return Err(Error::bad(format!(
+                    "model {mid} does not support effort {effort}; available: {efforts}"
+                )));
+            }
+            (mid, eff, Some(modalities))
+        }
+        None => (src.model_id, src.reasoning_effort, None),
+    };
+
+    let new_title = match title_override {
+        Some(t) => t,
+        None if !src.title.is_empty() => truncate_utf8_with_suffix(&src.title, " (fork)", 256),
+        None => String::new(),
+    };
+
+    struct ClonedChainItem {
+        old_item_id: ItemId,
+        kind: String,
+        payload: String,
+        target_id: Option<ItemId>,
+        codemode_call_item_id: Option<ItemId>,
+    }
+
+    let mut chain = Vec::new();
+    let mut was_settled = false;
+    if let Some(head_id) = target_node {
+        let exists: bool = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM context_nodes WHERE id=?1 AND session_id=?2)")?
+            .query_row(params![head_id, src_sid], |r| r.get(0))?;
+        if !exists {
+            return Err(Error(StatusCode::NOT_FOUND, "target branch node not found".into()));
+        }
+        if !node_branch_complete(conn, src_sid, head_id)? {
+            return Err(Error::conflict(
+                "target branch history is incomplete or pruned; sync before forking",
+            ));
+        }
+        let expected_depth: i64 = conn
+            .prepare_cached("SELECT depth FROM context_nodes WHERE id=?1 AND session_id=?2")?
+            .query_row(params![head_id, src_sid], |r| r.get(0))?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT c.parent_id, c.depth, i.id, i.kind, i.payload, i.target_id, i.codemode_call_item_id
+             FROM context_nodes c
+             JOIN items i ON i.id = c.item_id AND i.session_id = c.session_id
+             WHERE c.id = ?1 AND c.session_id = ?2",
+        )?;
+        let mut cur = Some(head_id);
+        let mut expect = expected_depth;
+        chain.reserve(usize::try_from(expected_depth).unwrap_or(0).min(1024));
+        while let Some(nid) = cur {
+            let (parent_id, depth, old_item_id, kind, payload, target_id, codemode_call_item_id): (
+                Option<ContextNodeId>,
+                i64,
+                ItemId,
+                String,
+                String,
+                Option<ItemId>,
+                Option<ItemId>,
+            ) = stmt.query_row(params![nid, src_sid], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?;
+            if depth != expect || expect <= 0 {
+                return Err(Error::conflict("target branch chain is inconsistent"));
+            }
+            chain.push(ClonedChainItem {
+                old_item_id,
+                kind,
+                payload,
+                target_id,
+                codemode_call_item_id,
+            });
+            expect -= 1;
+            cur = parent_id;
+        }
+        chain.reverse();
+
+        let mut open_calls: HashSet<ItemId> = HashSet::new();
+        for item in &chain {
+            if item.kind == "function_call" {
+                open_calls.insert(item.old_item_id);
+            } else if item.kind == "function_call_output"
+                && let Some(target_id) = item.target_id
+            {
+                open_calls.remove(&target_id);
+            }
+        }
+        if !open_calls.is_empty() {
+            return Err(Error::conflict(
+                "cannot fork inside an incomplete tool call; fork from its result or an adjacent message",
+            ));
+        }
+        was_settled = conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM turn_settled WHERE context_node_id=?)")?
+            .query_row([head_id], |r| r.get(0))?;
+    }
+
+    let new_sid = SessionId::new()?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let origin = local_node_id(conn)?;
+    let ts = tick_hlc_for(&origin)?;
+    let rev = next_catalog_rev(conn)?;
+    conn.execute(
+        "INSERT INTO sessions(id,title,title_ts,created_at,updated_at,status_ts,model_id,reasoning_effort,selection_ts,sync_rev)
+         VALUES(?,?,?,?,?,?,?,?,?,?)",
+        params![
+            new_sid,
+            new_title,
+            ts,
+            now,
+            now,
+            ts,
+            model_id,
+            reasoning_effort,
+            ts,
+            rev
+        ],
+    )?;
+
+    if chain.is_empty() {
+        mark_session_watched(conn, new_sid)?;
+        stage_catalog();
+    } else {
+        let scope = session_scope(new_sid);
+        let mut item_map: HashMap<ItemId, ItemId> = HashMap::with_capacity(chain.len());
+        let mut cloned_ids = Vec::with_capacity(chain.len());
+        let mut ins_item = conn.prepare_cached(
+            "INSERT INTO items(id,session_id,kind,payload,target_id,llm_call_id,idempotency_key,codemode_call_item_id,origin_node_id,origin_seq)
+             VALUES(?1,?2,?3,?4,?5,NULL,NULL,?6,?7,?8)",
+        )?;
+        for entry in chain {
+            let new_item_id = ItemId::new()?;
+            let new_target = entry.target_id.and_then(|t| item_map.get(&t).copied());
+            let new_cm = if entry.kind == "function_call_output" {
+                entry.codemode_call_item_id.and(new_target)
+            } else {
+                entry
+                    .codemode_call_item_id
+                    .map(|c| item_map.get(&c).copied().unwrap_or(c))
+            };
+            let seq = next_origin_seq(conn, &scope, &origin)?;
+            let payload_val: Value = serde_json::from_str(&entry.payload)
+                .map_err(|_| Error::internal("stored item payload is invalid JSON"))?;
+            ins_item.execute(params![
+                new_item_id,
+                new_sid,
+                &entry.kind,
+                &entry.payload,
+                new_target,
+                new_cm,
+                &*origin,
+                seq
+            ])?;
+            on_item_inserted(
+                conn,
+                new_sid,
+                new_item_id,
+                &entry.kind,
+                &payload_val,
+                new_target,
+            )?;
+            item_map.insert(entry.old_item_id, new_item_id);
+            cloned_ids.push(new_item_id);
+        }
+        let created_nodes = append_context_items(conn, new_sid, &cloned_ids, Some(now))?;
+        if was_settled && let Some(&tip_node) = created_nodes.last() {
+            mark_turn_settled_node(conn, new_sid, tip_node)?;
+        }
+    }
+
+    if let Some(ref modalities) = validate_modalities {
+        crate::media::check_session(conn, new_sid, modalities)?;
+    }
+
+    session(conn, new_sid)
+}
+
 pub fn node_branch_complete(
     conn: &Connection,
     sid: SessionId,
     head_id: ContextNodeId,
 ) -> Result<bool> {
+    let has_pruned = has_pruned_context_nodes(conn, sid)?;
+    let pruned_roots = if has_pruned {
+        load_pruned_roots(conn, sid)?
+    } else {
+        HashSet::new()
+    };
     let Some(expected_depth) = conn
         .prepare_cached("SELECT depth FROM context_nodes WHERE id=?1 AND session_id=?2")?
         .query_row(params![head_id, sid], |r| r.get::<_, i64>(0))
@@ -705,6 +1195,9 @@ pub fn node_branch_complete(
     let mut expect = expected_depth;
     let mut visited = 0i64;
     while let Some(nid) = cur {
+        if has_pruned && pruned_roots.contains(&nid) {
+            return Ok(false);
+        }
         let Some((parent_id, depth)) = stmt
             .query_row(params![nid, sid], |r| {
                 Ok((r.get::<_, Option<ContextNodeId>>(0)?, r.get::<_, i64>(1)?))
@@ -1070,17 +1563,21 @@ pub fn on_context_node_inserted(
         conn.prepare_cached("DELETE FROM pending_inputs WHERE session_id=?1 AND item_id=?2")?
             .execute(params![sid, item_id])?;
     }
-    if let Some(pid) = parent_id {
-        conn.prepare_cached("DELETE FROM session_leaves WHERE session_id=?1 AND head_id=?2")?
-            .execute(params![sid, pid])?;
+    if has_pruned_context_nodes(conn, sid)? {
+        rebuild_session_leaves(conn, sid)?;
+    } else {
+        if let Some(pid) = parent_id {
+            conn.prepare_cached("DELETE FROM session_leaves WHERE session_id=?1 AND head_id=?2")?
+                .execute(params![sid, pid])?;
+        }
+        conn.prepare_cached(
+            "INSERT INTO session_leaves(session_id, head_id, depth, last_item_id, origin_node_id)
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE NOT EXISTS(SELECT 1 FROM context_nodes WHERE session_id=?1 AND parent_id=?2)
+             ON CONFLICT(session_id, head_id) DO NOTHING",
+        )?
+        .execute(params![sid, id, depth, item_id, origin_node_id])?;
     }
-    conn.prepare_cached(
-        "INSERT INTO session_leaves(session_id, head_id, depth, last_item_id, origin_node_id)
-         SELECT ?1, ?2, ?3, ?4, ?5
-         WHERE NOT EXISTS(SELECT 1 FROM context_nodes WHERE session_id=?1 AND parent_id=?2)
-         ON CONFLICT(session_id, head_id) DO NOTHING",
-    )?
-    .execute(params![sid, id, depth, item_id, origin_node_id])?;
     Ok(())
 }
 
@@ -1243,6 +1740,8 @@ fn cleanup_deleted_session_data(conn: &Connection, sid: SessionId) -> Result<()>
     conn.prepare_cached("DELETE FROM turn_settled WHERE session_id=?")?
         .execute([sid])?;
     conn.prepare_cached("DELETE FROM invalidated_warnings WHERE session_id=?")?
+        .execute([sid])?;
+    conn.prepare_cached("DELETE FROM pruned_context_nodes WHERE session_id=?")?
         .execute([sid])?;
     conn.prepare_cached("DELETE FROM context_nodes WHERE session_id=?")?
         .execute([sid])?;
@@ -2307,6 +2806,10 @@ pub fn merge_session_wire(conn: &Connection, w: &SessionWire) -> Result<SessionM
         rev
     ])?;
 
+    if check_context && has_pruned_context_nodes(conn, w.id)? {
+        let _ = ensure_active_head_not_pruned(conn, w.id)?;
+    }
+
     let (branch_switched, context_advanced) = if check_context {
         reconcile_context_flags(conn, w.id)?
     } else {
@@ -2582,8 +3085,11 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
 
         let scope = session_scope(sid);
         let mut content_touched = false;
-        let (prev_max_visible, prev_active_pos): (Option<ItemId>, i64) =
-            if !delta.items.is_empty() || !delta.context_nodes.is_empty() {
+        let mut pruned_inserted = false;
+        let (prev_max_visible, prev_active_pos): (Option<ItemId>, i64) = if !delta.items.is_empty()
+            || !delta.context_nodes.is_empty()
+            || !delta.pruned_context_nodes.is_empty()
+        {
                 let max_vis: Option<ItemId> = conn
                     .prepare_cached(
                         "SELECT max(id) FROM items
@@ -2750,6 +3256,32 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
             }
         }
 
+        for pn in &delta.pruned_context_nodes {
+            id::observe_id(pn.context_node_id);
+            id::observe_id(pn.session_id);
+            if pn.session_id != sid {
+                return Err(Error::bad("pruned_context_node session mismatch"));
+            }
+            let ins = conn
+                .prepare_cached(
+                    "INSERT INTO pruned_context_nodes(
+                        context_node_id, session_id, origin_node_id, origin_seq
+                     ) VALUES(?1, ?2, ?3, ?4)
+                     ON CONFLICT(context_node_id, origin_node_id) DO NOTHING",
+                )?
+                .execute(params![
+                    pn.context_node_id,
+                    sid,
+                    &pn.origin_node_id,
+                    pn.origin_seq
+                ])?;
+            if ins > 0 {
+                out.changed = true;
+                content_touched = true;
+                pruned_inserted = true;
+            }
+        }
+
         for (origin_node_id, &claimed_seq) in &delta.advanced_vector {
             let cur_seq: i64 = conn
                 .prepare_cached(
@@ -2768,6 +3300,9 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
                      WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3 AND origin_seq<=?4
                      UNION ALL
                      SELECT origin_seq FROM invalidated_warnings
+                     WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3 AND origin_seq<=?4
+                     UNION ALL
+                     SELECT origin_seq FROM pruned_context_nodes
                      WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3 AND origin_seq<=?4",
                 )?;
                 let present: HashSet<i64> = seq_stmt
@@ -2781,6 +3316,13 @@ pub fn apply_session_delta(conn: &Connection, delta: &SessionDelta) -> Result<Se
                     }
                 }
                 advance_vector(conn, &scope, origin_node_id, claimed_seq)?;
+            }
+        }
+
+        if pruned_inserted {
+            rebuild_session_leaves(conn, sid)?;
+            if ensure_active_head_not_pruned(conn, sid)? {
+                out.reset_view = true;
             }
         }
 
@@ -3244,6 +3786,7 @@ enum SessionEventKey {
     ContextNode(ContextNodeId),
     TurnSettled(ContextNodeId),
     InvalidatedWarning(ItemId),
+    PrunedContextNode(ContextNodeId),
 }
 
 struct SessionEventMeta {
@@ -3292,6 +3835,7 @@ pub fn read_session_delta(
             context_nodes: Vec::new(),
             turn_settled: Vec::new(),
             invalidated_warnings: Vec::new(),
+            pruned_context_nodes: Vec::new(),
             advanced_vector: BTreeMap::new(),
         });
     }
@@ -3307,6 +3851,7 @@ pub fn read_session_delta(
         context_nodes: Vec::new(),
         turn_settled: Vec::new(),
         invalidated_warnings: Vec::new(),
+        pruned_context_nodes: Vec::new(),
         advanced_vector: BTreeMap::new(),
     };
     let mut total_bytes = 0usize;
@@ -3337,6 +3882,12 @@ pub fn read_session_delta(
          WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3
          ORDER BY origin_seq ASC, item_id ASC LIMIT ?4",
     )?;
+    let mut pruned_meta_stmt = conn.prepare_cached(
+        "SELECT context_node_id, origin_seq
+         FROM pruned_context_nodes
+         WHERE session_id=?1 AND origin_node_id=?2 AND origin_seq>?3
+         ORDER BY origin_seq ASC, context_node_id ASC LIMIT ?4",
+    )?;
 
     let mut item_full_stmt = conn.prepare_cached(
         "SELECT id, session_id, kind, payload, target_id, llm_call_id,
@@ -3354,6 +3905,10 @@ pub fn read_session_delta(
     let mut warn_full_stmt = conn.prepare_cached(
         "SELECT item_id, session_id, origin_node_id, origin_seq
          FROM invalidated_warnings WHERE item_id=?1 AND session_id=?2 AND origin_node_id=?3",
+    )?;
+    let mut pruned_full_stmt = conn.prepare_cached(
+        "SELECT context_node_id, session_id, origin_node_id, origin_seq
+         FROM pruned_context_nodes WHERE context_node_id=?1 AND session_id=?2 AND origin_node_id=?3",
     )?;
 
     for (origin_node_id, local_max) in local_vec {
@@ -3440,6 +3995,23 @@ pub fn read_session_delta(
                             est_bytes: 192,
                             unpacked_bytes: 192,
                             key: SessionEventKey::InvalidatedWarning(r.get(0)?),
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            collect_bounded_metas(list, |e| e.origin_seq, &mut events, &mut safe_ceiling);
+        }
+
+        {
+            let list = pruned_meta_stmt
+                .query_map(
+                    params![sid, &origin_node_id, remote_seq, DELTA_PAGE_LIMIT as i64],
+                    |r| {
+                        Ok(SessionEventMeta {
+                            origin_seq: r.get(1)?,
+                            est_bytes: 192,
+                            unpacked_bytes: 192,
+                            key: SessionEventKey::PrunedContextNode(r.get(0)?),
                         })
                     },
                 )?
@@ -3551,6 +4123,21 @@ pub fn read_session_delta(
                         .optional()?
                     {
                         delta.invalidated_warnings.push(iw);
+                    }
+                }
+                SessionEventKey::PrunedContextNode(id) => {
+                    if let Some(pn) = pruned_full_stmt
+                        .query_row(params![id, sid, &origin_node_id], |r| {
+                            Ok(PrunedContextNodeWire {
+                                context_node_id: r.get(0)?,
+                                session_id: r.get(1)?,
+                                origin_node_id: r.get(2)?,
+                                origin_seq: r.get(3)?,
+                            })
+                        })
+                        .optional()?
+                    {
+                        delta.pruned_context_nodes.push(pn);
                     }
                 }
             }

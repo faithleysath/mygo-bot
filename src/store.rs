@@ -1112,8 +1112,12 @@ const HISTORY_BRANCH_FILTER: &str = " AND (EXISTS(SELECT 1 FROM active_context a
 fn has_inactive_branch(conn: &Connection, sid: SessionId) -> Result<bool> {
     Ok(conn
         .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM session_leaves l
-             WHERE l.session_id=?1 AND l.head_id != coalesce((SELECT active_head FROM sessions WHERE id=?1), ''))",
+            "SELECT EXISTS(
+                SELECT 1 FROM session_leaves l
+                WHERE l.session_id=?1 AND l.head_id != coalesce((SELECT active_head FROM sessions WHERE id=?1), '')
+             ) OR EXISTS(
+                SELECT 1 FROM pruned_context_nodes p WHERE p.session_id=?1
+             )",
         )?
         .query_row([sid], |r| r.get(0))?)
 }

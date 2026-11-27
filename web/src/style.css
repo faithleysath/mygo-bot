@@ -387,6 +387,74 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 .title-input:hover, .title-input:focus { border-color: var(--border); background: var(--surface-2); }
 
+.branch-menu-wrap { position: relative; }
+.branch-trigger {
+  height: 26px;
+  padding: 0 9px;
+  font-size: 12px;
+  gap: 5px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink);
+}
+.branch-trigger:hover { background: var(--surface-2); }
+.branch-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 300px;
+  max-width: min(440px, calc(100vw - 32px));
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.branch-popover-head {
+  padding: 4px 8px 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.branch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+}
+.branch-row:hover { background: var(--surface-2); }
+.branch-row.is-active { background: var(--accent-soft); border-color: rgba(77, 107, 254, 0.25); }
+.branch-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+.branch-row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.branch-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .view-tabs {
   display: flex;
   align-items: center;
@@ -500,7 +568,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   margin-top: 6px;
   justify-content: flex-end;
 }
-.msg-copy-wrap { opacity: 0; transition: opacity 0.14s; }
+.msg-copy-wrap { opacity: 0; transition: opacity 0.14s; display: inline-flex; align-items: center; gap: 2px; }
 .msg-user:hover .msg-copy-wrap { opacity: 1; }
 .msg-assistant { align-items: flex-start; padding: 2px 2px; font-size: 14.5px; line-height: 1.7; }
 .msg-footer-meta {

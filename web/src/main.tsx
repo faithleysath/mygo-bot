@@ -163,6 +163,8 @@ function TopBar({
   onOpenSidebar,
   onOpenSettings,
   onPatchSession,
+  onForkSession,
+  onDeleteBranch,
 }: {
   session: SessionInfo | null;
   runnerNodeName: string | null;
@@ -178,16 +180,55 @@ function TopBar({
     sid: string,
     patch: Partial<Pick<SessionInfo, "title" | "model_id" | "reasoning_effort" | "active_head">>
   ) => void;
+  onForkSession: (sid: string, opts?: { from_head?: string; from_item?: string }) => void;
+  onDeleteBranch: (sid: string, headId: string) => void;
 }) {
   const { locale, t } = useI18n();
   const [title, setTitle] = useState(session?.title || "");
+  const [branchMenuOpen, setBranchMenuOpen] = useState(false);
+  const [confirmDeleteHead, setConfirmDeleteHead] = useState<string | null>(null);
+  const branchMenuRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     setTitle(session?.title || "");
   }, [session?.id, session?.title]);
 
+  const branches = session?.branches ?? [];
+  useEffect(() => {
+    setBranchMenuOpen(false);
+    setConfirmDeleteHead(null);
+  }, [session?.id]);
+  useEffect(() => {
+    if (branches.length <= 1) {
+      setBranchMenuOpen(false);
+      setConfirmDeleteHead(null);
+    }
+  }, [branches.length]);
+  useEffect(() => {
+    if (!branchMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (branchMenuRef.current && !branchMenuRef.current.contains(e.target as Node)) {
+        setBranchMenuOpen(false);
+        setConfirmDeleteHead(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setBranchMenuOpen(false);
+        setConfirmDeleteHead(null);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [branchMenuOpen]);
+
   if (!session) return null;
 
-  const branches = session.branches ?? [];
+  const isBusy = session.status === "running" || session.status === "pausing";
 
   const commitTitle = () => {
     const next = title.trim();
@@ -222,36 +263,116 @@ function TopBar({
             }}
           />
           <span class={`pill pill-${session.status}`}>
-            {(session.status === "running" || session.status === "pausing") && <span class="pulse-dot" />}
+            {isBusy && <span class="pulse-dot" />}
             {statusText(session.status, locale)}
           </span>
           {runnerNodeName && (
             <span class="pill" title={t("Running on")}>@{runnerNodeName}</span>
           )}
           {branches.length > 1 && (
-            <select
-              class="composer-select"
-              style="width:auto;max-width:220px"
-              title={t("Branch")}
-              aria-label={t("Branch")}
-              disabled={session.status === "running" || session.status === "pausing"}
-              value={session.active_head ?? ""}
-              onChange={(e) => {
-                const nextHead = e.currentTarget.value;
-                if (nextHead && nextHead !== session.active_head) {
-                  onPatchSession(session.id, { active_head: nextHead });
-                }
-              }}
-            >
-              {branches.map((b, idx) => {
-                const nodeLabel = nodeNameById?.get(b.origin_node_id) || b.origin_node_id.slice(0, 8);
-                return (
-                  <option key={b.head_id} value={b.head_id}>
-                    {`#${idx + 1} · ${b.depth} · ${nodeLabel} (${b.head_id.slice(0, 10)})`}
-                  </option>
-                );
-              })}
-            </select>
+            <div class="branch-menu-wrap" ref={branchMenuRef}>
+              <button
+                type="button"
+                class="branch-trigger"
+                title={t("Branches")}
+                aria-label={t("Branches")}
+                aria-expanded={branchMenuOpen}
+                onClick={() => {
+                  setBranchMenuOpen((open) => !open);
+                  setConfirmDeleteHead(null);
+                }}
+              >
+                <Icon n="gitBranch" s={13} />
+                <span>{branches.length} {t("branches")}</span>
+                <Icon n="chevron" s={12} />
+              </button>
+              {branchMenuOpen && (
+                <div class="branch-popover" role="dialog" aria-label={t("Branches")}>
+                  <div class="branch-popover-head">
+                    <span>{t("Branch")}</span>
+                    <span class="mono">{branches.length}</span>
+                  </div>
+                  {branches.map((b, idx) => {
+                    const isActive = b.head_id === session.active_head;
+                    const confirming = confirmDeleteHead === b.head_id;
+                    const nodeLabel = nodeNameById?.get(b.origin_node_id) || b.origin_node_id.slice(0, 8);
+                    return (
+                      <div key={b.head_id} class={`branch-row ${isActive ? "is-active" : ""}`}>
+                        <div class="branch-row-meta">
+                          <span class="branch-row-label" title={b.head_id}>
+                            {`#${idx + 1} · ${b.depth} · ${nodeLabel} (${b.head_id.slice(0, 10)})`}
+                          </span>
+                          {isActive && <span class="pill pill-running">{t("Active")}</span>}
+                        </div>
+                        <div class="branch-row-actions">
+                          {!isActive && (
+                            <button
+                              type="button"
+                              class="btn-ghost btn-xs"
+                              disabled={isBusy}
+                              onClick={() => {
+                                setBranchMenuOpen(false);
+                                setConfirmDeleteHead(null);
+                                onPatchSession(session.id, { active_head: b.head_id });
+                              }}
+                            >
+                              {t("Switch")}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            class="btn-ghost btn-xs"
+                            title={t("Fork from here")}
+                            onClick={() => {
+                              setBranchMenuOpen(false);
+                              setConfirmDeleteHead(null);
+                              onForkSession(session.id, { from_head: b.head_id });
+                            }}
+                          >
+                            {t("Fork")}
+                          </button>
+                          {!isActive && (
+                            confirming ? (
+                              <>
+                                <button
+                                  type="button"
+                                  class="btn-danger btn-xs"
+                                  disabled={isBusy}
+                                  onClick={() => {
+                                    setConfirmDeleteHead(null);
+                                    onDeleteBranch(session.id, b.head_id);
+                                  }}
+                                >
+                                  {t("Confirm?")}
+                                </button>
+                                <button
+                                  type="button"
+                                  class="btn-ghost btn-xs"
+                                  onClick={() => setConfirmDeleteHead(null)}
+                                >
+                                  {t("Cancel")}
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                type="button"
+                                class="btn-icon"
+                                title={t("Delete branch")}
+                                aria-label={t("Delete branch")}
+                                disabled={isBusy}
+                                onClick={() => setConfirmDeleteHead(b.head_id)}
+                              >
+                                <Icon n="trash" s={12} />
+                              </button>
+                            )
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           )}
           {sseStatus === "reconnecting" && (
             <span class="pill pill-paused">{t("reconnecting")}</span>
@@ -259,6 +380,15 @@ function TopBar({
         </div>
 
         <div class="topbar-right">
+          <button
+            type="button"
+            class="btn-icon"
+            title={t("Fork session")}
+            aria-label={t("Fork session")}
+            onClick={() => onForkSession(session.id)}
+          >
+            <Icon n="gitBranch" s={15} />
+          </button>
           <button
             type="button"
             class="btn-icon"
@@ -1045,6 +1175,35 @@ function App() {
     }
   };
 
+  const forkSession = async (sid: string, opts?: { from_head?: string; from_item?: string }) => {
+    setBannerErr("");
+    try {
+      const created = await apiFetch<SessionInfo>(`/sessions/${sid}/fork`, {
+        method: "POST",
+        body: opts ?? {},
+      });
+      const added = globalSyncRef.current
+        ? globalSyncRef.current.onLocalCreated(created)
+        : (setSessions((prev) => applySessionEvent(prev, "session.created", created)), true);
+      if (added) setActiveId(created.id);
+    } catch (e) {
+      setBannerErr(errorMessage(e));
+    }
+  };
+
+  const deleteBranch = async (sid: string, headId: string) => {
+    setBannerErr("");
+    const baseVersion = globalSyncRef.current?.getSessionVersion(sid) ?? 0;
+    try {
+      const updated = await apiFetch<SessionInfo>(`/sessions/${sid}/branches/${headId}`, {
+        method: "DELETE",
+      });
+      if (globalSyncRef.current) globalSyncRef.current.onLocalPatch(updated, baseVersion);
+      else setSessions((prev) => applyLocalPatch(prev, updated));
+    } catch (e) {
+      setBannerErr(errorMessage(e));
+    }
+  };
   const loadMore = async () => {
     if (activeId && itemsState.sid === activeId && items.length) {
       await sessionSyncRef.current?.loadOlder(items[0].id);
@@ -1272,6 +1431,8 @@ function App() {
                   onOpenSidebar={openSidebar}
                   onOpenSettings={() => openSettings("models")}
                   onPatchSession={patchSession}
+                  onForkSession={(sid, opts) => void forkSession(sid, opts)}
+                  onDeleteBranch={(sid, headId) => void deleteBranch(sid, headId)}
                 />
                 {(bannerErr || activeSession.last_error) && (
                   <div class="status-banner">
@@ -1326,6 +1487,7 @@ function App() {
                       onLoadMore={loadMore}
                       onWithdraw={withdrawMsg}
                       onOpenSettings={() => openSettings("models")}
+                      onForkFromItem={(itemId) => void forkSession(activeSession.id, { from_item: itemId })}
                     />
                     <Composer
                       session={activeSession}

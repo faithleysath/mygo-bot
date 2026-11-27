@@ -301,6 +301,14 @@ const ZH = {
   "This node": "本节点",
   "Offline": "离线",
   "Running on": "运行节点",
+  "Branches": "分支列表",
+  "branches": "条分支",
+  "Active": "当前",
+  "Switch": "切换",
+  "Fork": "分叉",
+  "Fork session": "Fork 为新会话",
+  "Fork from here": "从此处 Fork 为新会话",
+  "Delete branch": "删除分支",
 } as const;
 
 export type Msg = keyof typeof ZH;

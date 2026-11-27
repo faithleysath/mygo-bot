@@ -3,7 +3,7 @@ use crate::{
     cluster::exec::{DeleteGateGuard, WriterTarget},
     codemode, events,
     events::Notice,
-    id::{ItemId, ModelId, SessionId},
+    id::{ContextNodeId, ItemId, ModelId, SessionId},
     store::{self, Session, SessionStatus, session},
 };
 use axum::{
@@ -59,6 +59,8 @@ pub fn routes(app: App) -> Router {
             "/sessions/{sid}",
             get(get_session).patch(patch_session).delete(delete_session),
         )
+        .route("/sessions/{sid}/fork", post(fork_session))
+        .route("/sessions/{sid}/branches/{head_id}", delete(delete_branch))
         .route("/sessions/{sid}/messages", post(enqueue).get(messages))
         .route("/sessions/{sid}/messages/{mid}", delete(withdraw))
         .route("/sessions/{sid}/run", put(agent::start).delete(agent::pause))
@@ -323,6 +325,171 @@ pub(crate) async fn patch_session_local(
             },
         )
         .await
+}
+
+async fn fork_session(
+    State(app): State<App>,
+    Path(sid): Path<SessionId>,
+    body: Option<Document>,
+) -> Result<(StatusCode, Json<Session>)> {
+    let mut fields = body.map(|x| x.0).unwrap_or_default();
+    let title_override = extract_title(&mut fields)?;
+    let from_head_req: Option<ContextNodeId> = match fields.remove("from_head") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| Error::bad("from_head must be a ctx_ ID string"))?;
+            Some(
+                s.parse()
+                    .map_err(|e: String| Error::bad(format!("invalid from_head: {e}")))?,
+            )
+        }
+    };
+    let from_item_req: Option<ItemId> = match fields.remove("from_item") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| Error::bad("from_item must be an itm_ ID string"))?;
+            Some(
+                s.parse()
+                    .map_err(|e: String| Error::bad(format!("invalid from_item: {e}")))?,
+            )
+        }
+    };
+    if from_head_req.is_some() && from_item_req.is_some() {
+        return Err(Error::bad("specify at most one of from_head or from_item"));
+    }
+    let has_model_override =
+        fields.contains_key("model_id") || fields.contains_key("reasoning_effort");
+    if !fields.is_empty() {
+        if fields.get("model_id").is_some_and(Value::is_null) {
+            return Err(Error::bad("model_id cannot be null"));
+        }
+        let _: Selection = serde_json::from_value(Value::Object(fields.clone()))
+            .map_err(|e| Error::bad(e.to_string()))?;
+    }
+
+    if app.exec.presence().known_peer_count() > 0 {
+        app.cluster.ensure_session_watched(sid).await?;
+        let need_sync = app
+            .db
+            .call(move |s| {
+                match crate::cluster::ledger::resolve_fork_target_node(
+                    &s.conn,
+                    sid,
+                    from_head_req,
+                    from_item_req,
+                ) {
+                    Ok(Some(h)) => {
+                        Ok(!crate::cluster::ledger::node_branch_complete(&s.conn, sid, h)?)
+                    }
+                    Ok(None) => Ok(false),
+                    Err(_) => Ok(true),
+                }
+            })
+            .await?;
+        if need_sync {
+            let _ = app.cluster.sync.sync_session_best_effort(sid).await;
+        }
+    }
+
+    let created = app
+        .db
+        .write(
+            move |conn| {
+                let target_node = crate::cluster::ledger::resolve_fork_target_node(
+                    conn,
+                    sid,
+                    from_head_req,
+                    from_item_req,
+                )?;
+                let model_override = if has_model_override {
+                    let cur_sess = session(conn, sid)?;
+                    let next = Selection {
+                        model_id: Some(cur_sess.model_id),
+                        reasoning_effort: cur_sess.reasoning_effort,
+                    }
+                    .apply(fields)?;
+                    let mid = next
+                        .model_id
+                        .ok_or_else(|| Error::bad("model_id is required"))?;
+                    Some((mid, next.reasoning_effort))
+                } else {
+                    None
+                };
+                crate::cluster::ledger::fork_session_from_node(
+                    conn,
+                    sid,
+                    target_node,
+                    title_override,
+                    model_override,
+                )
+            },
+            |s, created| {
+                let view = s.session_view(created);
+                if s.global_events.receiver_count() > 0 {
+                    Notice::publish_serializable(&s.global_events, "session.created", &view);
+                }
+                Ok(view)
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn delete_branch(
+    State(app): State<App>,
+    Path((sid, head_id)): Path<(SessionId, ContextNodeId)>,
+) -> Result<Json<Session>> {
+    if app.exec.presence().known_peer_count() > 0 {
+        app.cluster.ensure_session_watched(sid).await?;
+    }
+    let delete_gate = app.exec.acquire_delete_gate(sid).await?;
+    app.workers
+        .clone()
+        .spawn(finish_delete_branch(app, sid, head_id, delete_gate))
+        .await
+        .map_err(|_| Error::internal("branch delete interrupted; check session state"))?
+}
+
+async fn finish_delete_branch(
+    app: App,
+    sid: SessionId,
+    head_id: ContextNodeId,
+    delete_gate: DeleteGateGuard,
+) -> Result<Json<Session>> {
+    let res = app
+        .db
+        .call(move |s| {
+            let current = session(&s.conn, sid)?;
+            if s.active.contains_key(&sid)
+                || s.pending_wakes.contains(&sid)
+                || codemode::has_session_tasks(s, sid)
+                || matches!(current.status, SessionStatus::Running | SessionStatus::Pausing)
+                || s.presence.local_owner(sid).is_some()
+                || s.presence.remote_owner(sid).is_some()
+            {
+                return Err(Error::conflict(
+                    "pause the session and stop active tasks before deleting a branch",
+                ));
+            }
+            let tx = s.conn.transaction()?;
+            crate::cluster::ledger::prune_session_branch(&tx, sid, head_id)?;
+            tx.commit()?;
+            let updated = session(&s.conn, sid)?;
+            let view = s.session_view(updated);
+            let data = json!(view);
+            if let Some(channel) = s.channels.get(&sid).and_then(|w| w.upgrade()) {
+                Notice::publish(&channel, "session.updated", data.clone());
+            }
+            s.publish_global("session.updated", data);
+            Ok(view)
+        })
+        .await;
+    delete_gate.release_now().await;
+    res.map(Json)
 }
 
 async fn delete_session(

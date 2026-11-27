@@ -226,6 +226,16 @@ CREATE TABLE invalidated_warnings (
 ) WITHOUT ROWID;
 CREATE INDEX invalidated_warnings_by_origin ON invalidated_warnings(session_id, origin_node_id, origin_seq);
 
+CREATE TABLE pruned_context_nodes (
+    context_node_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    origin_node_id TEXT NOT NULL,
+    origin_seq INTEGER NOT NULL CHECK (origin_seq > 0),
+    PRIMARY KEY (context_node_id, origin_node_id)
+) WITHOUT ROWID;
+CREATE INDEX pruned_context_nodes_by_origin ON pruned_context_nodes(session_id, origin_node_id, origin_seq);
+CREATE INDEX pruned_context_nodes_by_session ON pruned_context_nodes(session_id, context_node_id);
+
 CREATE TABLE active_context (
     session_id TEXT NOT NULL,
     position INTEGER NOT NULL CHECK (position > 0),
