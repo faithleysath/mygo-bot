@@ -149,9 +149,9 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 3. **无触发器合并与按需清池（`merge_mcp_server_wire`）**：远端回放时先用 `with_savepoint` 按 `EpochLwwAction` 收敛纪元时间戳与凭据，再根据 `Connections::apply_sync_change(McpChange)` 的精确标记决定清池粒度——仅关键变化才驱逐连接（`evict_pool = true`），且只在 `cancel_login = true` 时中断本机登录监听。
 4. **跨节点 OAuth 刷新协调（[src/cluster/sync.rs](../src/cluster/sync.rs) `coordinate_mcp_oauth_refresh`）**：多台机子拿着同一份同步来的单次 `refresh_token`，若同时各自刷新必撞废。因此共享服准备刷新时，先选唯一协调者再单点核对，分四步完成：
    - **选协调者**：群发 `RpcReq::HasMcpServer` 问清谁在线持有该服务，按字典序挑出最小在线 `node_id` 作协调者（若就是自己则直接本地刷新）；
-   - **挂本地 CAS 委派锁**：调用方拿到 `refresh_gate`，用 CAS（`WHERE pending_refresh IS ?` 且凭据指纹未变）把 `{ coordinator, fp }` 写进本地 `pending_refresh` 防并发重触发，再携最新 `caller_server` 与 `rejected_token_hash` 向协调者发 `RpcReq::OAuthRefresh`；
-   - **单点核对再刷新**：协调者锁住 `mcp_locks` 合并入站状态，发现 `rejected_token_hash` 已过时说明别人刚刷过，直接返 `UpToDate` 和新凭据；确认没刷过才单点请求授权方并回传最新 `McpServerWire`；
-   - **异常超时绝不盲目双刷**：若协调者失联或超时，调用方先同步一轮——只有确认凭据指纹已变或授权进终止态才用 `clear_if_current` 摘掉 `pending_refresh`；否则保留标记并报瞬态 `TransportClosed`，严禁重启或无关改动触发二次刷新撞废单次令牌。
+   - **挂本地 CAS 委派锁**：调用方拿到 `refresh_gate`，用 CAS（`WHERE pending_refresh IS ?` 且凭据指纹未变）把 `{ coordinator, fp, created_at }` 写进本地 `pending_refresh` 防并发重触发，再携最新 `caller_server`、`rejected_token_hash` 与 `hops_left = 2` 向协调者发 `RpcReq::OAuthRefresh`；
+   - **单点核对再刷新（含多跳单向委托）**：在 `A — B — C` 等非全互联拓扑中，若收包节点看到在线同伴里存在 `node_id` 更小的可达持有者且 `hops_left > 0`，会先沿 `node_id` 严格递减方向接力转发并合并回传结果；最终唯一协调者锁住 `mcp_locks` 合并入站状态，发现 `rejected_token_hash` 已过时说明别人刚刷过，直接返 `UpToDate` 和新凭据，确认没刷过才单点请求授权方并回传最新 `McpServerWire`；
+   - **异常超时绝不盲目双刷（含过期/孤儿解锁）**：若协调者失联或超时，调用方先同步一轮——只有确认凭据指纹已变或授权进终止态才摘掉 `pending_refresh`；否则保留标记并报瞬态 `TransportClosed`，严禁无关改动触发二次刷新撞废单次令牌。同时靠 `PendingRefreshState::is_stale_or_orphaned` 守底：当委派超过 **300 秒（`PENDING_REFRESH_STALE_SECS`）**、协调者已不在 `cluster_peers` 中，或在退群/换群/删除该同伴时，会自动清掉卡死的 `pending_refresh` 防止永久死锁。
 
 ---
 

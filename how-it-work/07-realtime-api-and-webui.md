@@ -41,18 +41,18 @@
 
 ## HTTP API 全景、三条路由面与内置 OpenAPI 文档
 
-整套系统共暴露 **34 条路径、49 个操作**，完整 OpenAPI `3.1.0` 契约与 **55 个 Schema**（单行压缩 JSON 约 **84.0 KiB / 86,030 字节**）在编译期嵌进 [src/openapi.json](../src/openapi.json)。会话对象携带 `runner_node_id`、`active_head` 与 `branches`（`BranchHead[]`）；`/history`、`/context` 与 `/events` 统一通过 `X-History-View` 与 `?view=` 校验视图连续性（失配即返 `409 Conflict`）。
+整套系统共暴露 **37 条路径、52 个操作**，完整 OpenAPI `3.1.0` 契约与 **56 个 Schema**（单行压缩 JSON 约 **89.0 KiB / 91,091 字节**）在编译期嵌进 [src/openapi.json](../src/openapi.json)。会话对象携带 `runner_node_id`、`active_head` 与 `branches`（`BranchHead[]`）；`/history`、`/context` 与 `/events` 统一通过 `X-History-View` 与 `?view=` 校验视图连续性（失配即返 `409 Conflict`）。
 
 | 模块 | 路由一览 | 核心职责 |
 | :--- | :--- | :--- |
 | **供应商与模型**（12） | `GET/POST /providers`，`GET/PATCH/DELETE /providers/{id}`，`POST .../restore`<br>`GET/POST /models`，`GET/PATCH/DELETE /models/{id}`，`POST .../restore` | 维护多上游地址/密钥（脱敏）、模态/档位/价目表及软归档恢复 |
-| **会话与账本**（7） | `GET/POST /sessions`，`GET/PATCH/DELETE /sessions/{sid}`<br>`GET /sessions/{sid}/history`，`GET /sessions/{sid}/context` | 管理会话生命周期、DAG 叶节点分支切换与基于快照 + `view` 的流式分页 |
+| **会话与账本**（9） | `GET/POST /sessions`，`GET/PATCH/DELETE /sessions/{sid}`<br>`POST /sessions/{sid}/fork`，`DELETE /sessions/{sid}/branches/{head_id}`<br>`GET /sessions/{sid}/history`，`GET /sessions/{sid}/context` | 管理会话生命周期、免切换直接 Fork 独立新会话（支持指定冲突分支或历史消息）、全群剪除并发冲突分支、DAG 分支切换与基于快照 + `view` 的流式分页 |
 | **排队消息**（3） | `GET/POST /sessions/{sid}/messages`，`DELETE /sessions/{sid}/messages/{mid}` | 投信（`Idempotency-Key` 幂等）、查排队、撤回未进上下文输入 |
 | **运行、流与任务**（6） | `GET /events`，`GET /sessions/{sid}/events`<br>`PUT/DELETE /sessions/{sid}/run`，`GET .../tasks`，`DELETE .../tasks/{tid}` | 点火（可传 `{ "node" }` 指定直连同伴，离线返 `503`、群内已占用返 `409`、完全断网本机直接跑）/软硬暂停（`?mode=soft\|hard`）、订阅两级 SSE、查停后台 JS 任务 |
 | **媒体附件**（2） | `POST /attachments`，`GET /attachments/{id}` | 上传不超过 50 MiB 多模态原文件（限流返 `429`）与跨节点分块流式下载 |
 | **调用与计费**（3） | `GET /calls`，`GET /calls/summary`，`GET /calls/{id}` | 查询每轮上游调用明细、token、最新上下文长度与 `cost_nano_usd` 费用 |
 | **MCP 与 OAuth**（10） | `GET/POST /mcp/servers`，`GET/PATCH/DELETE /mcp/servers/{id}`，`POST .../test`<br>`GET/DELETE .../oauth`，`POST .../oauth/login`，`POST .../oauth/callback` | 注册传输与 `shared` 开关、并发 4 体检探测、启动/手动/撤销 OAuth 2.1 |
-| **集群与同步**（6） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync` | 查集群、改节点名称/描述、经 `mygo/join/1` 准入加入（邀请作废或换群未传 `force` 返 `409`、不可达返 `503`、允许带活跃会话入群）、随时删同伴与触发同步（`404`/`503`/`504`） |
+| **集群与同步**（7） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`POST /cluster/leave`，`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync` | 查集群、改节点名称/描述、经 `mygo/join/1` 准入加入、原地轮换密钥安全退群（保留本地数据）、删同伴与触发同步 |
 
 ### 三条不同的路由出口（[src/main.rs](../src/main.rs)、[src/api.rs](../src/api.rs)）
 
@@ -73,8 +73,8 @@
 ### 1. 构建、压缩与强 ETag 嵌入（`web/build.mjs` & `src/webui.rs`）
 
 执行 `bun run build` 先跑 `tsc --noEmit` 全量类型检查，随后输出三份静态资源编译期通过 `include_bytes!` 焊进二进制：
-- `bun` 打包 + `gzip -9` → **`src/webui/app.js.gz`（约 45.3 KiB / 46,382 字节）**；
-- 状态机压缩 CSS + gzip → **`src/webui/app.css.gz`（约 6.6 KiB / 6,736 字节）**；
+- `bun` 打包 + `gzip -9` → **`src/webui/app.js.gz`（约 46.2 KiB / 47,317 字节）**；
+- 状态机压缩 CSS + gzip → **`src/webui/app.css.gz`（约 6.8 KiB / 6,937 字节）**；
 - 内联无闪屏主题探测脚本 → **`src/webui/index.html`（898 字节）**。
 
 服务端对静态资源按 64 位 FNV-1a 算出强 ETag（命中 `If-None-Match` 直接回 `304`），`.js` / `.css` 直接附带 `Content-Encoding: gzip` + `Vary: Accept-Encoding` 输出。
@@ -96,13 +96,13 @@
 ### 4. 四块界面功能速览
 
 - **侧边栏（`Sidebar.tsx`）**：按 `updated_at` 倒序排列并带实时状态圆点；运行中、暂停中或带有 `runner_node_id` 占用的会话禁止删除（删除需 3 秒二次确认）；窄屏自动收起，底部常驻 `Models` / `MCP` / `Cluster` / `Usage` 导航。
-- **时间线（`Timeline.tsx`、`markdown.tsx`）**：撤回消息自动折叠并给原消息画删除线；成对工具卡片语法高亮 `codemode` 脚本并展示返回媒体；自研零依赖 JSX Markdown 解析器（**无 `dangerouslySetInnerHTML`**，单趟线性扫描配对括号与 `new URL` 校验放行 `http/https/mailto`，屏蔽外链图片防跟踪像素）。
-- **输入栏与顶栏（`Composer.tsx`）**：
+- **时间线（`Timeline.tsx`、`markdown.tsx`）**：每条已入上下文的用户消息与助手回复旁均可一键「从此处 Fork 为新会话」；撤回消息自动折叠并给原消息画删除线；成对工具卡片语法高亮 `codemode` 脚本并展示返回媒体；自研零依赖 JSX Markdown 解析器（**无 `dangerouslySetInnerHTML`**，单趟线性扫描配对括号与 `new URL` 校验放行 `http/https/mailto`，屏蔽外链图片防跟踪像素）。
+- **输入栏与顶栏（`Composer.tsx`、`main.tsx`）**：
   - 按会话保存文本草稿与粘贴/拖拽附件；发送锁定快照并生成 `Idempotency-Key`（4xx 重置、5xx/网络报错保留防重投，且仅在发送期间没继续打字才清空框）；
   - 多节点时右下角出现**执行节点选择器**（可指定在线节点跑下一轮）；
   - 运行中支持 **`Pause`**（软暂停） / **`Stop`**（硬暂停）、上方折叠任务栏每 2 秒拉取后台终端尾部并支持 `Kill`；
-  - 顶栏集成 `Chat` / `Trace` / `Context` 三视图、多分支 **`Branch` 切换下拉框**、`@runner` 徽标、标题编辑、模型/推理档位切换以及调用/缓存命中率/费用/上下文占比环。
-- **设置弹窗（`Settings.tsx`）**：`Models`（供应商与模型管理，含密钥编辑与价目 JSON）、`MCP`（含 `shared` 全集群同步开关与告警、OAuth 弹窗登录与跨机手动粘贴 `Submit Callback`）、`Cluster`（本机改名与描述、生成邀请码/加入或带确认 `Force Switch Cluster` 换群、一键同步与成员管理）、`Usage` 与 `General`（深浅主题、`/docs`、登出）。
+  - 顶栏集成 `Chat` / `Trace` / `Context` 三视图、多分支 **`Branches` 管理浮层**（每条分支直接提供切换、运行中免切换 Fork、二次确认删除非激活冲突分支）、右上角一键整会话 Fork 按钮、`@runner` 徽标、标题编辑、模型/推理档位切换以及调用/缓存命中率/费用/上下文占比环。
+- **设置弹窗（`Settings.tsx`）**：`Models`（供应商与模型管理，含密钥编辑与价目 JSON）、`MCP`（含 `shared` 全集群同步开关与告警、OAuth 弹窗登录与跨机手动粘贴 `Submit Callback`）、`Cluster`（本机改名与描述、生成邀请码/加入、带确认 `Force Switch Cluster` 换群与 `Leave Cluster` / `Rotate Secret` 安全退群、一键同步与成员管理）、`Usage` 与 `General`（深浅主题、`/docs`、登出）。
 
 ---
 

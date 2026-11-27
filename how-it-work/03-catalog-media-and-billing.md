@@ -63,6 +63,9 @@ MyGo-Bot 用“目录四道铁门 + 附件分表实时展开 + 开跑冻快照�
 4. **精准验光与 `temp.checked_input` 增量前缀缓存**：
    - 点火开跑（`calls::begin`）与换模型时的 `media::check_session` / `media::check_call_input` 只检查真正进模型槽位的三处数据：① 已入 `active_context` 的消息/推理/图像生成结果；② 尚未归档的 `function_call_output`；③ 门外有效 `pending_inputs` 队列——绝不误查工具参数或普通日志字符串；
    - 为避免几千条消息的长对话每轮从头扫库，独占连接上建了连接级临时表 **`temp.checked_input`**（最多缓存 256 个会话，挂了 7 个 `active_context` / `items` / `attachments` 变更触发器，随事务/`savepoint` 同步回滚失效），记住已验过的 `active_context.position` 前缀，后续回合只增量检查新增行与门外队列。
+5. **本地引用追踪与孤儿附件定时回收（`item_attachments`、`reap_orphan_attachments`）**：
+   - `attachments` 记录上传或登记时间戳 `created_at`；所有消息写入路径统一经 `on_item_inserted` 维护本机专用引用索引表 **`item_attachments(session_id, item_id, attachment_id)`**，删会话时一并清掉该会话的引用行（Fork 出新会话时会共享原 `AttachmentId` 并为新会话登记引用行，零字节拷贝）；
+   - 后台任务 [`media::reap_orphan_attachments`](../src/media.rs)（挂在 `app.workers`）每小时以低优先级分批（每批最多 `ATTACHMENT_GC_BATCH = 64` 条，每轮最多 16 批）扫描并清理超过 **24 小时宽限期（`ATTACHMENT_GC_GRACE_MS`）**且在 `item_attachments` 中已无任何引用的孤儿附件，兼顾上传至发送窗口期安全与长期磁盘空间有界。
 
 ---
 

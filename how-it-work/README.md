@@ -62,8 +62,8 @@ flowchart TB
 | 第 4 篇 | [Codemode 上篇：最小完备原语、独立车间与宿主能力](04-codemode-sandbox.md) | 怎么让模型写 JS 安全干重活，既不冻住主线程也不留孤儿进程 | JS 工人池与 QuickJS 隔离、`cluster.node(target)` 云化句柄、`TextDecoder`/`TextEncoder`、跨节点流句柄与背压、`fs`/`http`/`proc.exec` 进程笼、`node.mygo.request`、`savepoint` 出力 |
 | 第 5 篇 | [Codemode 下篇：前后台分流、原地等信、实时透视与租期恢复](05-codemode-lifecycle.md) | 脚本跑久了怎么办、没跑完怎么不轮询等信、怎么查进度和防死循环 | 90 秒后台欠条、`codemode_event` 与 `wake`、门外双信箱分叉、`codemode_wait` 唤醒弦与 `trigger_code` 探针、`LiveState` 指纹去重、2 小时租期与 `invalidated_warnings`、3 秒等遗言 |
 | 第 6 篇 | [外部工具扩展：MCP 协议、双传输与 OAuth 2.1](06-mcp-and-oauth.md) | 脚本怎么连外部工具，怎么防泄密、防 SSRF、并发和跨节点刷新不丢令牌 | 按会话懒连接池、Streamable HTTP 两阶段握手、Stdio 两槽预占、`BinaryData` 打包、错误脱敏与未知结果语义、诊断体检、OAuth 2.1 全链路、`EpochLwwAction` 纪元时间戳、`shared` 开关与跨节点刷新协调 |
-| 第 7 篇 | [实时流、HTTP API、内置文档与 WebUI](07-realtime-api-and-webui.md) | 打字机实时流怎么不错不漏、前端怎么同步状态、接口怎么暴露 | 两级 SSE（持久 64 + 临时 256）与 `NEXT_SEQ` 定序、`ALPN mygo/exec/1` 跨节点中继、34 路径 / 49 操作接口全景、三条路由面、Scalar 文档、gzip 内嵌 Preact WebUI、`knownView` 防混页状态机 |
-| 第 8 篇 | [私有集群：无冲突同步与连通图 Gossip 协作](08-cluster-sync-and-execution.md) | 多台设备组群后，数据怎么自动合流不打架，同一连通网内怎么防撞车、断网孤岛又如何自由运行 | 单机按需绑定 QUIC、`mygo/join/1` 轻量准入、全节点对等与 PEX 拨号、半格律 CRDT（HLC LWW + 因果向量 + `local_node.catalog_rev` + 256 KiB 分块）、三档同步范围、路径向量 Gossip 占有与水平分割、多跳 `CheckOccupancy` 探测与离线孤岛 DAG 自动分叉合流、控制/执行面分离 |
+| 第 7 篇 | [实时流、HTTP API、内置文档与 WebUI](07-realtime-api-and-webui.md) | 打字机实时流怎么不错不漏、前端怎么同步状态、接口怎么暴露 | 两级 SSE（持久 64 + 临时 256）与 `NEXT_SEQ` 定序、`ALPN mygo/exec/1` 跨节点中继、37 路径 / 52 操作接口全景、三条路由面、Scalar 文档、gzip 内嵌 Preact WebUI、`knownView` 防混页状态机 |
+| 第 8 篇 | [私有集群：无冲突同步与连通图 Gossip 协作](08-cluster-sync-and-execution.md) | 多台设备组群后，数据怎么自动合流不打架，同一连通网内怎么防撞车、断网孤岛又如何自由运行 | 单机按需绑定 QUIC、`mygo/join/1` 入群与 `leave` 退群、PEX 采样与地址变更监听、半格律 CRDT（HLC LWW + 因果向量 + `pruned_context_nodes` + 256 KiB 分块）、三档 21 张表、直接 Fork 与分支剪除、路径向量 Gossip 占有、递减预算 `CheckOccupancy` + `RelaySessionSync` |
 | 第 9 篇 | [部署运维、压测验证、瘦身发布与评测体系](09-deployment-testing-and-tooling.md) | 怎么打包上线、注册系统服务、跑压测和真刀真枪做对比评测 | 启动握手管道、Token 保密、Unix Socket、`install` 与 `launchd`/`systemd`、版本与 UPX/DMG 瘦身、26 场景压测核账、Harbor 59 题评测 |
 
 ---
