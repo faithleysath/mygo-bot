@@ -21,7 +21,6 @@ import type {
   McpToolPolicy,
   McpTransport,
   ModelInfo,
-  NodeRole,
   ProviderInfo,
   SessionInfo,
   ThemePref,
@@ -972,7 +971,6 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
   const [status, setStatus] = useState<ClusterStatus | null>(null);
   const [selfName, setSelfName] = useState("");
   const [selfDesc, setSelfDesc] = useState("");
-  const [selfRole, setSelfRole] = useState<NodeRole>("voter");
   const [inviteCode, setInviteCode] = useState("");
   const [joinInvite, setJoinInvite] = useState("");
   const [pendingForceInvite, setPendingForceInvite] = useState("");
@@ -993,7 +991,6 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     setStatus(st);
     setSelfName(st.self.name);
     setSelfDesc(st.self.description);
-    setSelfRole(st.self.role);
   };
 
   useEffect(() => {
@@ -1007,7 +1004,7 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
     try {
       await apiFetch("/cluster/self", {
         method: "PATCH",
-        body: { name: selfName, description: selfDesc, role: selfRole },
+        body: { name: selfName, description: selfDesc },
       });
       await load();
       onClusterChanged();
@@ -1110,7 +1107,6 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
               <span class="muted">{t("Node ID")}:</span>
               <code class="md-inline-code mono truncate" style="max-width:440px">{status.self.node_id}</code>
               <CopyBtn text={status.self.node_id} />
-              <span class="pill">{status.self.role === "edge" ? t("Edge") : t("Voter")}</span>
               <span class="pill mono">{status.self.os}/{status.self.arch}</span>
             </div>
             <form class="form-box" onSubmit={saveSelf}>
@@ -1123,26 +1119,6 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
                   <span>{t("Description")}</span>
                   <input value={selfDesc} onInput={(e) => setSelfDesc(e.currentTarget.value)} />
                 </label>
-              </div>
-              <div class="field">
-                <span>{t("Role")}</span>
-                <div class="segmented">
-                  {(
-                    [
-                      ["voter", t("Voter")],
-                      ["edge", t("Edge")],
-                    ] as const
-                  ).map(([val, label]) => (
-                    <button
-                      key={val}
-                      type="button"
-                      class={`seg-btn ${selfRole === val ? "active" : ""}`}
-                      onClick={() => setSelfRole(val)}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
               </div>
               <div class="row gap-1">
                 <button type="submit" class="btn-primary btn-xs">{t("Save")}</button>
@@ -1223,7 +1199,6 @@ function ClusterTab({ onClusterChanged }: { onClusterChanged: () => void }) {
                     <span class={`pill ${p.online ? "pill-succeeded" : ""}`}>
                       {p.online ? t("online") : t("offline")}
                     </span>
-                    <span class="pill">{p.role === "edge" ? t("Edge") : t("Voter")}</span>
                     <span class="pill mono">{p.os}/{p.arch}</span>
                   </div>
                   <div class="row gap-1 muted small">

@@ -2,13 +2,16 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use iroh::endpoint::{Connection, RecvStream, SendStream};
-use rusqlite::{OptionalExtension, params};
+use iroh::{
+    EndpointId,
+    endpoint::{Connection, RecvStream, SendStream},
+};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, Semaphore, mpsc, watch};
@@ -17,15 +20,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     App, Error, Result,
     cluster::{
-        identity::{
-            NodeRole, PeerInfo, ResolvedNode, adopt_voter_config,
-            canonicalize_voter_set, commit_voter_config, delete_peer, list_peers, load_local_node,
-            prepare_voter_config, probe_voter_config, resolve_node_target, update_self_meta,
-        },
-        ledger::{AttachmentRef, read_vector, session_branch_complete, session_scope, tick_hlc},
-        net::{
-            ClusterNet, FrameReadErr as ReadExecErr, read_json_frame, write_json_frame,
-        },
+        identity::{MAX_CLUSTER_PEERS, ResolvedNode, list_peers, resolve_node_target},
+        ledger::{AttachmentRef, read_vector, session_branch_complete, session_scope},
+        net::{ClusterNet, FrameReadErr as ReadExecErr, read_json_frame, write_json_frame},
         sync::SyncEngine,
     },
     codemode,
@@ -48,12 +45,14 @@ const MAX_PEER_REMOTE_SSE_SUBS: usize = 32;
 
 const EXEC_REQ_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const EXEC_SHORT_TIMEOUT: Duration = Duration::from_secs(10);
-const EXEC_LEASE_TIMEOUT: Duration = Duration::from_secs(3);
+const EXEC_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const EXEC_OP_TIMEOUT: Duration = Duration::from_secs(30);
-const CLAIM_TTL: Duration = Duration::from_secs(15);
-const LEASE_TTL: Duration = Duration::from_secs(10);
-const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(3);
-const LEASE_SAFETY_MARGIN: Duration = Duration::from_secs(1);
+const CLAIM_TTL: Duration = Duration::from_secs(5);
+
+const MAX_GOSSIP_HOPS: usize = 6;
+const MAX_GOSSIP_ENTRIES: usize = MAX_CLUSTER_PEERS + 1;
+const MAX_PRESENCE_SESSIONS_PER_NODE: usize = 256;
+const MAX_CHECK_HOPS: u8 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionOccupancy {
@@ -66,170 +65,54 @@ pub struct SessionOccupancy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePresence {
+    pub node_id: String,
+    pub instance_id: u64,
+    pub seq: u64,
+    #[serde(default)]
+    pub sessions: Vec<SessionOccupancy>,
+    #[serde(default)]
+    pub path: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunClaim {
     pub claim_id: String,
     pub node_id: String,
     pub started_ms: i64,
-    #[serde(default)]
-    pub term: u64,
-    #[serde(default)]
-    pub voter_epoch: u64,
-    #[serde(default)]
-    pub ttl_ms: u64,
-}
-
-#[derive(Clone)]
-pub enum RunAuth {
-    Standalone,
-    Quorum(Arc<ActiveLease>),
-    ForcedOffline,
-}
-
-pub struct ActiveLease {
-    pub term: u64,
-    pub voter_epoch: u64,
-    pub claim_id: String,
-    deadline: Mutex<Instant>,
-    pub revoked: CancellationToken,
-    pub stopped: CancellationToken,
-}
-
-impl ActiveLease {
-    pub fn new(
-        term: u64,
-        voter_epoch: u64,
-        claim_id: String,
-        initial_deadline: Instant,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            term,
-            voter_epoch,
-            claim_id,
-            deadline: Mutex::new(initial_deadline),
-            revoked: CancellationToken::new(),
-            stopped: CancellationToken::new(),
-        })
-    }
-
-    pub fn deadline(&self) -> Instant {
-        *self.deadline.lock().unwrap()
-    }
-
-    pub fn extend(&self, next_deadline: Instant) {
-        let mut dl = self.deadline.lock().unwrap();
-        if next_deadline > *dl {
-            *dl = next_deadline;
-        }
-    }
-
-    pub fn is_valid(&self) -> bool {
-        !self.revoked.is_cancelled() && Instant::now() < *self.deadline.lock().unwrap()
-    }
-}
-
-#[derive(Clone)]
-pub enum LocalLease {
-    Quorum(Arc<ActiveLease>),
-    ForcedOffline,
-}
-
-impl LocalLease {
-    fn active_term(&self) -> Option<u64> {
-        match self {
-            Self::Quorum(l) if l.is_valid() => Some(l.term),
-            Self::ForcedOffline => Some(0),
-            Self::Quorum(_) => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LocalClaimPhase {
-    Probing,
-    Committing,
-    Yielded(String),
 }
 
 struct LocalClaim {
     claim_id: String,
-    term: u64,
-    phase: LocalClaimPhase,
-    acquired_at: Instant,
+    committing: bool,
+    expires_at: Instant,
 }
 
-#[derive(Clone, Debug)]
-struct GrantedLease {
-    term: u64,
-    holder_node_id: String,
+struct RemoteClaim {
     claim_id: String,
+    node_id: String,
     expires_at: Instant,
-    committed: bool,
 }
 
 struct PresenceInner {
+    local_node_id: String,
     instance_id: u64,
     local_seq: u64,
+    gossip_seq: u64,
     local: HashMap<SessionId, SessionOccupancy>,
-    remote_seq: HashMap<String, (u64, u64)>,
-    remote: HashMap<String, HashMap<SessionId, SessionOccupancy>>,
+    remote_by_via: HashMap<String, HashMap<String, NodePresence>>,
+    peer_sync_cursor: HashMap<String, (u64, u64)>,
+    effective: HashMap<String, NodePresence>,
     local_claims: HashMap<SessionId, LocalClaim>,
-    granted_leases: HashMap<SessionId, GrantedLease>,
-    highest_terms: HashMap<SessionId, u64>,
-    active_local_leases: HashMap<SessionId, LocalLease>,
+    remote_claims: HashMap<SessionId, RemoteClaim>,
     session_watchers: HashMap<SessionId, watch::Sender<Option<String>>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct VoterQuorum {
-    pub total_voters: usize,
-    pub needed: usize,
-    pub acked_voters: usize,
-    pub satisfied: bool,
-}
-
-#[derive(Clone, Debug)]
-struct VoterConfigState {
-    epoch: u64,
-    voters: HashSet<String>,
-    pending_epoch: u64,
-    pending_voters: HashSet<String>,
-    pending_proposal_id: String,
-}
-
-impl Default for VoterConfigState {
-    fn default() -> Self {
-        Self {
-            epoch: 1,
-            voters: HashSet::new(),
-            pending_epoch: 0,
-            pending_voters: HashSet::new(),
-            pending_proposal_id: String::new(),
-        }
-    }
-}
-
-pub struct JoinGuard {
-    presence: Arc<PresenceState>,
-}
-
-impl Drop for JoinGuard {
-    fn drop(&mut self) {
-        self.presence.joining.store(false, Ordering::Release);
-    }
-}
-
 pub struct PresenceState {
-    local_node_id: Mutex<String>,
-    local_role: AtomicU8,
-    peer_roles: Mutex<HashMap<String, NodeRole>>,
-    voter_config: Mutex<VoterConfigState>,
-    want_voter_admission: AtomicBool,
-    voter_config_notify: Notify,
     known_peer_count: AtomicUsize,
     local_nonempty: AtomicBool,
     has_null_attachments: AtomicBool,
-    joining: AtomicBool,
-    membership_grew_notify: Notify,
+    gossip_seq: AtomicU64,
     cluster_active_tx: watch::Sender<bool>,
     inner: Mutex<PresenceInner>,
     local_changed: Notify,
@@ -239,28 +122,9 @@ pub fn refresh_known_peer_count(
     conn: &rusqlite::Connection,
     presence: &PresenceState,
 ) -> Result<usize> {
-    let local = load_local_node(conn)?;
-    let peers = list_peers(conn)?;
-    presence.sync_local_node(&local);
-    presence.set_peer_roles(&peers);
-    let count_usize = peers.len();
-    presence.set_known_peer_count(count_usize);
-    Ok(count_usize)
-}
-
-pub(crate) enum GrantOutcome {
-    Granted {
-        highest_term: u64,
-        expires_at_ms: i64,
-    },
-    Occupied {
-        holder: String,
-        by_claim: bool,
-        highest_term: u64,
-    },
-    StaleTerm {
-        highest_term: u64,
-    },
+    let count = list_peers(conn)?.len();
+    presence.set_known_peer_count(count);
+    Ok(count)
 }
 
 impl PresenceState {
@@ -270,241 +134,40 @@ impl PresenceState {
         let instance_id = u64::from_le_bytes(raw).max(1);
         let (cluster_active_tx, _) = watch::channel(false);
         Arc::new(Self {
-            local_node_id: Mutex::new(String::new()),
-            local_role: AtomicU8::new(0),
-            peer_roles: Mutex::new(HashMap::new()),
-            voter_config: Mutex::default(),
-            want_voter_admission: AtomicBool::new(false),
-            voter_config_notify: Notify::new(),
             known_peer_count: AtomicUsize::new(0),
             local_nonempty: AtomicBool::new(false),
             has_null_attachments: AtomicBool::new(false),
-            joining: AtomicBool::new(false),
-            membership_grew_notify: Notify::new(),
+            gossip_seq: AtomicU64::new(1),
             cluster_active_tx,
             inner: Mutex::new(PresenceInner {
+                local_node_id: String::new(),
                 instance_id,
                 local_seq: 1,
+                gossip_seq: 1,
                 local: HashMap::new(),
-                remote_seq: HashMap::new(),
-                remote: HashMap::new(),
+                remote_by_via: HashMap::new(),
+                peer_sync_cursor: HashMap::new(),
+                effective: HashMap::new(),
                 local_claims: HashMap::new(),
-                granted_leases: HashMap::new(),
-                highest_terms: HashMap::new(),
-                active_local_leases: HashMap::new(),
+                remote_claims: HashMap::new(),
                 session_watchers: HashMap::new(),
             }),
             local_changed: Notify::new(),
         })
     }
 
-    pub fn begin_join(self: &Arc<Self>) -> JoinGuard {
-        self.joining.store(true, Ordering::Release);
-        JoinGuard {
-            presence: self.clone(),
-        }
-    }
-
-    pub fn is_joining(&self) -> bool {
-        self.joining.load(Ordering::Acquire)
-    }
-
-    pub fn sync_local_node(&self, local: &crate::cluster::identity::LocalNode) {
-        self.set_local_role(local.role);
-        self.set_voter_config(
-            local.voter_epoch,
-            &local.voter_set,
-            local.pending_voter_epoch,
-            &local.pending_voter_set,
-            &local.pending_proposal_id,
-        );
-    }
-
     pub fn set_local_node_id(&self, node_id: String) {
-        *self.local_node_id.lock().unwrap() = node_id;
+        self.inner.lock().unwrap().local_node_id = node_id;
     }
 
     pub fn local_node_id(&self) -> String {
-        self.local_node_id.lock().unwrap().clone()
-    }
-
-    pub fn set_local_role(&self, role: NodeRole) {
-        self.local_role.store(
-            match role {
-                NodeRole::Voter => 0,
-                NodeRole::Edge => 1,
-            },
-            Ordering::Release,
-        );
-    }
-
-    pub fn local_role(&self) -> NodeRole {
-        match self.local_role.load(Ordering::Acquire) {
-            1 => NodeRole::Edge,
-            _ => NodeRole::Voter,
-        }
-    }
-
-    pub fn set_want_voter_admission(&self, want: bool) {
-        self.want_voter_admission.store(want, Ordering::Release);
-        if want {
-            self.voter_config_notify.notify_waiters();
-        }
-    }
-
-    pub fn notify_reconcile(&self) {
-        self.membership_grew_notify.notify_one();
-    }
-
-    pub fn want_voter_admission(&self) -> bool {
-        self.want_voter_admission.load(Ordering::Acquire)
-    }
-
-    pub fn set_voter_config(
-        &self,
-        epoch: u64,
-        voters: &[String],
-        pending_epoch: u64,
-        pending_voters: &[String],
-        pending_proposal_id: &str,
-    ) {
-        let next_voters: HashSet<String> = voters.iter().cloned().collect();
-        let next_pending: HashSet<String> = pending_voters.iter().cloned().collect();
-        {
-            let mut cfg = self.voter_config.lock().unwrap();
-            cfg.epoch = epoch;
-            cfg.voters = next_voters;
-            cfg.pending_epoch = pending_epoch;
-            cfg.pending_voters = next_pending;
-            cfg.pending_proposal_id = pending_proposal_id.to_owned();
-        }
-        // Revoke any active local quorum lease issued under an older voter_epoch.
-        {
-            let inner = self.inner.lock().unwrap();
-            for lease in inner.active_local_leases.values() {
-                if let LocalLease::Quorum(l) = lease
-                    && l.voter_epoch < epoch
-                {
-                    l.revoked.cancel();
-                }
-            }
-        }
-        if epoch >= 1 || pending_epoch > 0 {
-            self.voter_config_notify.notify_waiters();
-        }
-    }
-
-    pub fn current_voter_config(&self) -> (u64, Vec<String>, u64, Vec<String>) {
-        let cfg = self.voter_config.lock().unwrap();
-        let mut voters: Vec<String> = cfg.voters.iter().cloned().collect();
-        voters.sort();
-        let mut pending: Vec<String> = cfg.pending_voters.iter().cloned().collect();
-        pending.sort();
-        (cfg.epoch, voters, cfg.pending_epoch, pending)
-    }
-
-    pub fn is_single_node_config_valid(&self) -> bool {
-        if self.known_peer_count.load(Ordering::Acquire) > 0 {
-            return false;
-        }
-        let local_id = self.local_node_id();
-        let role = self.local_role();
-        let cfg = self.voter_config.lock().unwrap();
-        cfg.epoch >= 1
-            && cfg.pending_epoch == 0
-            && ((cfg.voters.len() == 1 && cfg.voters.contains(&local_id))
-                || (cfg.voters.is_empty() && role == NodeRole::Edge))
-    }
-
-    pub fn set_peer_roles(&self, peers: &[PeerInfo]) {
-        let next: HashMap<String, NodeRole> = peers
-            .iter()
-            .map(|p| (p.node_id.clone(), p.role))
-            .collect();
-        *self.peer_roles.lock().unwrap() = next;
-    }
-
-    fn explicit_majority(voters: &[String], responders: &HashSet<String>) -> bool {
-        if voters.is_empty() {
-            return false;
-        }
-        let needed = voters.len() / 2 + 1;
-        let count = voters.iter().filter(|id| responders.contains(*id)).count();
-        count >= needed
-    }
-
-    fn eval_voter_set(
-        local_id: &str,
-        acked: &HashSet<&str>,
-        set: &HashSet<String>,
-    ) -> (usize, usize, usize, bool) {
-        if set.is_empty() {
-            return (0, 1, 0, false);
-        }
-        let total = set.len();
-        let needed = total / 2 + 1;
-        let mut count = usize::from(set.contains(local_id));
-        for p in acked {
-            if *p != local_id && set.contains(*p) {
-                count += 1;
-            }
-        }
-        (total, needed, count, count >= needed)
-    }
-
-    pub fn voter_quorum(&self, acked_peers: &[String]) -> VoterQuorum {
-        let local_id = self.local_node_id();
-        let acked: HashSet<&str> = acked_peers.iter().map(String::as_str).collect();
-        let cfg = self.voter_config.lock().unwrap();
-        if cfg.epoch == 0 || cfg.voters.is_empty() {
-            return VoterQuorum {
-                total_voters: 0,
-                needed: 1,
-                acked_voters: 0,
-                satisfied: false,
-            };
-        }
-        let (total, needed, acked_cnt, cur_ok) = Self::eval_voter_set(&local_id, &acked, &cfg.voters);
-        if cfg.pending_epoch > 0 {
-            let (p_total, p_needed, p_acked, p_ok) =
-                Self::eval_voter_set(&local_id, &acked, &cfg.pending_voters);
-            return VoterQuorum {
-                total_voters: total.max(p_total),
-                needed: needed.max(p_needed),
-                acked_voters: acked_cnt.min(p_acked),
-                satisfied: cur_ok && p_ok,
-            };
-        }
-        VoterQuorum {
-            total_voters: total,
-            needed,
-            acked_voters: acked_cnt,
-            satisfied: cur_ok,
-        }
-    }
-
-    pub fn joint_quorum(
-        &self,
-        old_voters: &[String],
-        new_voters: &[String],
-        acked_peers: &[String],
-    ) -> bool {
-        let local_id = self.local_node_id();
-        let acked: HashSet<&str> = acked_peers.iter().map(String::as_str).collect();
-        let old_set: HashSet<String> = old_voters.iter().cloned().collect();
-        let new_set: HashSet<String> = new_voters.iter().cloned().collect();
-        let (_, _, _, old_ok) = Self::eval_voter_set(&local_id, &acked, &old_set);
-        let (_, _, _, new_ok) = Self::eval_voter_set(&local_id, &acked, &new_set);
-        old_ok && new_ok
+        self.inner.lock().unwrap().local_node_id.clone()
     }
 
     pub fn set_known_peer_count(&self, count: usize) {
         let prev = self.known_peer_count.swap(count, Ordering::AcqRel);
         if (prev == 0) != (count == 0) {
             self.cluster_active_tx.send_replace(count > 0);
-        }
-        if count > prev {
-            self.membership_grew_notify.notify_one();
         }
     }
 
@@ -521,10 +184,8 @@ impl PresenceState {
     }
 
     fn update_local_nonempty_locked(&self, inner: &PresenceInner) {
-        self.local_nonempty.store(
-            !inner.local.is_empty() || !inner.active_local_leases.is_empty(),
-            Ordering::Release,
-        );
+        self.local_nonempty
+            .store(!inner.local.is_empty(), Ordering::Release);
     }
 
     pub fn set_has_null_attachments(&self, v: bool) {
@@ -535,184 +196,27 @@ impl PresenceState {
         self.has_null_attachments.load(Ordering::Acquire)
     }
 
-    pub fn load_persisted_leases(&self, rows: Vec<(SessionId, u64, String, String, i64)>) {
-        let now = Instant::now();
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut inner = self.inner.lock().unwrap();
-        for (sid, term, holder, claim_id, expires_at_ms) in rows {
-            if term > 0 {
-                let entry = inner.highest_terms.entry(sid).or_insert(0);
-                *entry = (*entry).max(term);
-            }
-            if !holder.is_empty() && !claim_id.is_empty() && expires_at_ms > now_ms {
-                let rem_ms = u64::try_from(expires_at_ms - now_ms)
-                    .unwrap_or(0)
-                    .min(LEASE_TTL.as_millis() as u64);
-                if rem_ms > 0 {
-                    inner.granted_leases.insert(
-                        sid,
-                        GrantedLease {
-                            term,
-                            holder_node_id: holder,
-                            claim_id,
-                            expires_at: now + Duration::from_millis(rem_ms),
-                            committed: true,
-                        },
-                    );
-                }
-            }
-        }
+    pub fn gossip_seq(&self) -> u64 {
+        self.gossip_seq.load(Ordering::Acquire)
     }
 
-    pub fn set_active_local_lease(&self, sid: SessionId, lease: Arc<ActiveLease>) {
-        let prev = {
-            let mut inner = self.inner.lock().unwrap();
-            let cur = inner.highest_terms.entry(sid).or_insert(0);
-            *cur = (*cur).max(lease.term);
-            let old = inner
-                .active_local_leases
-                .insert(sid, LocalLease::Quorum(lease));
-            self.update_local_nonempty_locked(&inner);
-            old
-        };
-        if let Some(LocalLease::Quorum(old_l)) = prev {
-            old_l.stopped.cancel();
-        }
+    fn bump_gossip_seq_locked(&self, inner: &mut PresenceInner) {
+        inner.gossip_seq = inner.gossip_seq.saturating_add(1);
+        self.gossip_seq.store(inner.gossip_seq, Ordering::Release);
     }
 
-    pub fn set_active_local_forced_offline(&self, sid: SessionId) {
-        let prev = {
-            let mut inner = self.inner.lock().unwrap();
-            let old = inner
-                .active_local_leases
-                .insert(sid, LocalLease::ForcedOffline);
-            self.update_local_nonempty_locked(&inner);
-            old
-        };
-        if let Some(LocalLease::Quorum(old_l)) = prev {
-            old_l.stopped.cancel();
-        }
-    }
-
-    pub fn clear_non_quorum_local_lease(&self, sid: SessionId) {
-        let mut inner = self.inner.lock().unwrap();
-        if matches!(
-            inner.active_local_leases.get(&sid),
-            Some(LocalLease::ForcedOffline)
-        ) {
-            inner.active_local_leases.remove(&sid);
-            self.update_local_nonempty_locked(&inner);
-        }
-    }
-
-    pub fn clear_active_local_lease(&self, sid: SessionId, claim_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(LocalLease::Quorum(cur)) = inner.active_local_leases.get(&sid)
-            && cur.claim_id == claim_id
-            && let Some(LocalLease::Quorum(lease)) = inner.active_local_leases.remove(&sid)
-        {
-            self.update_local_nonempty_locked(&inner);
-            drop(inner);
-            lease.stopped.cancel();
-        }
-    }
-
-    pub fn active_local_lease(&self, sid: SessionId) -> Option<Arc<ActiveLease>> {
-        let inner = self.inner.lock().unwrap();
-        match inner.active_local_leases.get(&sid) {
-            Some(LocalLease::Quorum(l)) => Some(l.clone()),
-            _ => None,
-        }
-    }
-
-    pub fn active_local_lease_kind(&self, sid: SessionId) -> Option<LocalLease> {
-        self.inner.lock().unwrap().active_local_leases.get(&sid).cloned()
-    }
-
-    pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
-        if self.is_single_node_config_valid() {
-            return true;
-        }
-        let cur_epoch = self.voter_config.lock().unwrap().epoch;
-        let inner = self.inner.lock().unwrap();
-        match inner.active_local_leases.get(&sid) {
-            Some(LocalLease::Quorum(l)) => {
-                cur_epoch > 0 && l.is_valid() && l.voter_epoch == cur_epoch
-            }
-            Some(LocalLease::ForcedOffline) => true,
-            None => false,
-        }
-    }
-
-    pub fn observe_remote_term(&self, sid: SessionId, term: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        let entry = inner.highest_terms.entry(sid).or_insert(0);
-        *entry = (*entry).max(term);
-    }
-
-    pub fn highest_term(&self, sid: SessionId) -> u64 {
-        self.inner
-            .lock()
-            .unwrap()
-            .highest_terms
-            .get(&sid)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub fn check_delete_lease(&self, sid: SessionId, lease: Option<&ActiveLease>) -> Result<()> {
-        let single_node_ok = self.is_single_node_config_valid();
-        let (cur_epoch, pending_epoch) = {
-            let cfg = self.voter_config.lock().unwrap();
-            (cfg.epoch, cfg.pending_epoch)
-        };
-        let Some(lease) = lease else {
-            return if single_node_ok && cur_epoch >= 1 && pending_epoch == 0 {
-                Ok(())
-            } else {
-                Err(Error::conflict(
-                    "cluster membership changed before delete commit; retry",
-                ))
-            };
-        };
-        let inner = self.inner.lock().unwrap();
-        if cur_epoch > 0
-            && pending_epoch == 0
-            && cur_epoch == lease.voter_epoch
-            && lease.is_valid()
-            && inner.highest_terms.get(&sid) == Some(&lease.term)
-            && inner.local_claims.get(&sid).is_some_and(|claim| {
-                claim.claim_id == lease.claim_id && claim.phase == LocalClaimPhase::Committing
-            })
-        {
-            Ok(())
-        } else {
-            Err(Error::conflict(
-                "delete lease expired or superseded before commit; retry",
-            ))
-        }
-    }
-
-    pub fn has_committed_remote_lease(&self, sid: SessionId) -> bool {
-        let now = Instant::now();
-        let local_id = self.local_node_id();
-        let mut inner = self.inner.lock().unwrap();
-        Self::prune_expired_claims_locked(&mut inner, now);
-        inner
-            .granted_leases
-            .get(&sid)
-            .is_some_and(|gl| gl.committed && gl.holder_node_id != local_id)
-    }
-
-    fn remote_owner_locked(inner: &PresenceInner, sid: SessionId) -> Option<(String, SessionOccupancy)> {
+    fn remote_owner_locked(
+        inner: &PresenceInner,
+        sid: SessionId,
+    ) -> Option<(String, SessionOccupancy)> {
         let mut best: Option<(String, SessionOccupancy)> = None;
-        for (peer_id, map) in &inner.remote {
-            if let Some(occ) = map.get(&sid)
+        for (origin, np) in &inner.effective {
+            if let Some(occ) = np.sessions.iter().find(|s| s.session_id == sid)
                 && best
                     .as_ref()
-                    .is_none_or(|(best_id, _)| peer_id.as_str() < best_id.as_str())
+                    .is_none_or(|(best_id, _)| origin.as_str() < best_id.as_str())
             {
-                best = Some((peer_id.clone(), occ.clone()));
+                best = Some((origin.clone(), occ.clone()));
             }
         }
         best
@@ -737,23 +241,95 @@ impl PresenceState {
     }
 
     fn prune_expired_claims_locked(inner: &mut PresenceInner, now: Instant) {
-        inner
-            .local_claims
-            .retain(|_, c| now.saturating_duration_since(c.acquired_at) < CLAIM_TTL);
-        inner
-            .granted_leases
-            .retain(|_, gl| now < gl.expires_at);
+        inner.local_claims.retain(|_, c| now < c.expires_at);
+        inner.remote_claims.retain(|_, c| now < c.expires_at);
+    }
+
+    fn better_presence(candidate: &NodePresence, current: &NodePresence) -> bool {
+        let cand_ver = (candidate.instance_id, candidate.seq);
+        let cur_ver = (current.instance_id, current.seq);
+        if cand_ver != cur_ver {
+            return cand_ver > cur_ver;
+        }
+        if candidate.path.len() != current.path.len() {
+            return candidate.path.len() < current.path.len();
+        }
+        candidate.path < current.path
+    }
+
+    fn recompute_effective_locked(&self, inner: &mut PresenceInner) -> (Vec<SessionId>, bool) {
+        let local_id = inner.local_node_id.clone();
+        let mut next_effective: HashMap<String, NodePresence> = HashMap::new();
+        for by_origin in inner.remote_by_via.values() {
+            for (origin, entry) in by_origin {
+                if origin == &local_id {
+                    continue;
+                }
+                match next_effective.get_mut(origin) {
+                    Some(cur) => {
+                        if Self::better_presence(entry, cur) {
+                            *cur = entry.clone();
+                        }
+                    }
+                    None => {
+                        next_effective.insert(origin.clone(), entry.clone());
+                    }
+                }
+            }
+        }
+        if next_effective == inner.effective {
+            return (Vec::new(), false);
+        }
+
+        let mut old_by_sid: HashMap<SessionId, (String, SessionOccupancy)> = HashMap::new();
+        for (origin, np) in &inner.effective {
+            for occ in &np.sessions {
+                let replace = old_by_sid
+                    .get(&occ.session_id)
+                    .is_none_or(|(best_id, _)| origin.as_str() < best_id.as_str());
+                if replace {
+                    old_by_sid.insert(occ.session_id, (origin.clone(), occ.clone()));
+                }
+            }
+        }
+
+        let mut new_by_sid: HashMap<SessionId, (String, SessionOccupancy)> = HashMap::new();
+        for (origin, np) in &next_effective {
+            for occ in &np.sessions {
+                let replace = new_by_sid
+                    .get(&occ.session_id)
+                    .is_none_or(|(best_id, _)| origin.as_str() < best_id.as_str());
+                if replace {
+                    new_by_sid.insert(occ.session_id, (origin.clone(), occ.clone()));
+                }
+            }
+        }
+
+        let mut affected: HashSet<SessionId> = HashSet::new();
+        for (sid, prev) in &old_by_sid {
+            if new_by_sid.get(sid) != Some(prev) {
+                affected.insert(*sid);
+            }
+        }
+        for (sid, next) in &new_by_sid {
+            if old_by_sid.get(sid) != Some(next) {
+                affected.insert(*sid);
+            }
+        }
+
+        inner.effective = next_effective;
+        self.bump_gossip_seq_locked(inner);
+        let changed: Vec<SessionId> = affected.into_iter().collect();
+        for &sid in &changed {
+            Self::notify_watcher_locked(inner, sid);
+        }
+        (changed, true)
     }
 
     pub fn set_local(&self, sid: SessionId, next: Option<SessionOccupancy>) -> bool {
-        let (changed, cleared_lease) = {
+        let changed = {
             let mut inner = self.inner.lock().unwrap();
             let unchanged = inner.local.get(&sid) == next.as_ref();
-            let cleared = if next.is_none() {
-                inner.active_local_leases.remove(&sid)
-            } else {
-                None
-            };
             if !unchanged {
                 match next {
                     Some(occ) => {
@@ -764,13 +340,11 @@ impl PresenceState {
                     }
                 }
                 inner.local_seq = inner.local_seq.saturating_add(1);
+                self.bump_gossip_seq_locked(&mut inner);
             }
             self.update_local_nonempty_locked(&inner);
-            (!unchanged, cleared)
+            !unchanged
         };
-        if let Some(LocalLease::Quorum(lease)) = cleared_lease {
-            lease.stopped.cancel();
-        }
         if changed && self.known_peer_count.load(Ordering::Acquire) > 0 {
             self.local_changed.notify_one();
         }
@@ -786,155 +360,157 @@ impl PresenceState {
         Self::remote_owner_locked(&inner, sid)
     }
 
-    pub fn remote_owner_excluding(
-        &self,
-        sid: SessionId,
-        exclude_peer: &str,
-    ) -> Option<(String, SessionOccupancy)> {
-        let inner = self.inner.lock().unwrap();
-        let mut best: Option<(String, SessionOccupancy)> = None;
-        for (peer_id, map) in &inner.remote {
-            if peer_id == exclude_peer {
-                continue;
-            }
-            if let Some(occ) = map.get(&sid)
-                && best
-                    .as_ref()
-                    .is_none_or(|(best_id, _)| peer_id.as_str() < best_id.as_str())
-            {
-                best = Some((peer_id.clone(), occ.clone()));
-            }
-        }
-        best
-    }
-
     pub fn active_claim_holder_excluding(
         &self,
         sid: SessionId,
-        exclude_peer: &str,
+        exclude_node_id: &str,
     ) -> Option<(String, bool)> {
         let now = Instant::now();
-        let local_id = self.local_node_id();
         let mut inner = self.inner.lock().unwrap();
         Self::prune_expired_claims_locked(&mut inner, now);
-        if let Some(c) = inner.local_claims.get(&sid) {
-            match c.phase {
-                LocalClaimPhase::Probing => return Some((local_id, true)),
-                LocalClaimPhase::Committing => return Some((local_id, false)),
-                LocalClaimPhase::Yielded(_) => {}
-            }
-        }
-        if let Some(lease) = inner.active_local_leases.get(&sid)
-            && lease.active_term().is_some()
+        let local_id = inner.local_node_id.clone();
+        if local_id != exclude_node_id
+            && let Some(c) = inner.local_claims.get(&sid)
         {
-            return Some((local_id, false));
+            return Some((local_id, !c.committing));
         }
-        if let Some(gl) = inner.granted_leases.get(&sid)
-            && gl.holder_node_id != exclude_peer
+        if let Some(rc) = inner.remote_claims.get(&sid)
+            && rc.node_id != exclude_node_id
         {
-            return Some((gl.holder_node_id.clone(), !gl.committed));
+            return Some((rc.node_id.clone(), true));
         }
         None
     }
 
-    pub fn snapshot_local(&self) -> (u64, u64, Vec<SessionOccupancy>) {
+    pub fn snapshot_for_peer(&self, target_peer: &str) -> (u64, u64, Vec<NodePresence>) {
         let inner = self.inner.lock().unwrap();
-        let mut list: Vec<SessionOccupancy> = inner.local.values().cloned().collect();
-        list.sort_by_key(|o| o.session_id);
-        (inner.instance_id, inner.local_seq, list)
+        let local_id = inner.local_node_id.clone();
+        let mut local_sessions: Vec<SessionOccupancy> = inner.local.values().cloned().collect();
+        local_sessions.sort_by_key(|o| o.session_id);
+        local_sessions.truncate(MAX_PRESENCE_SESSIONS_PER_NODE);
+
+        let mut entries = Vec::with_capacity(1 + inner.effective.len().min(MAX_GOSSIP_ENTRIES - 1));
+        entries.push(NodePresence {
+            node_id: local_id.clone(),
+            instance_id: inner.instance_id,
+            seq: inner.local_seq,
+            sessions: local_sessions,
+            path: vec![local_id.clone()],
+        });
+
+        let mut others: Vec<&NodePresence> = inner
+            .effective
+            .values()
+            .filter(|entry| {
+                entry.node_id != target_peer
+                    && entry.node_id != local_id
+                    && entry.path.len() < MAX_GOSSIP_HOPS
+                    && !entry.path.iter().any(|p| p == target_peer)
+            })
+            .collect();
+        others.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        for entry in others {
+            if entries.len() >= MAX_GOSSIP_ENTRIES {
+                break;
+            }
+            let mut forwarded = entry.clone();
+            forwarded.path.push(local_id.clone());
+            entries.push(forwarded);
+        }
+        (inner.instance_id, inner.gossip_seq, entries)
     }
 
-    pub fn apply_remote(
+    pub fn apply_remote_gossip(
         &self,
-        peer_id: &str,
-        instance_id: u64,
-        seq: u64,
-        sessions: Vec<SessionOccupancy>,
-        clear_claim: Option<(SessionId, String)>,
+        from_peer: &str,
+        sender_instance_id: u64,
+        sender_gossip_seq: u64,
+        entries: Vec<NodePresence>,
     ) -> Vec<SessionId> {
         let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
-        Self::prune_expired_claims_locked(&mut inner, now);
-        if let Some((claim_sid, claim_id)) = clear_claim
-            && inner
-                .granted_leases
-                .get(&claim_sid)
-                .is_some_and(|gl| gl.holder_node_id == peer_id && gl.claim_id == claim_id)
-        {
-            inner.granted_leases.remove(&claim_sid);
-        }
-        for occ in &sessions {
-            if let Some(gl) = inner.granted_leases.get_mut(&occ.session_id)
-                && gl.holder_node_id == peer_id
+        let (changed, effective_changed) = {
+            let mut inner = self.inner.lock().unwrap();
+            Self::prune_expired_claims_locked(&mut inner, now);
+            if let Some(&(prev_inst, prev_seq)) = inner.peer_sync_cursor.get(from_peer)
+                && sender_instance_id != 0
+                && prev_inst == sender_instance_id
+                && sender_gossip_seq < prev_seq
             {
-                gl.committed = true;
+                return Vec::new();
             }
-        }
-        if let Some(&(prev_inst, prev_seq)) = inner.remote_seq.get(peer_id)
-            && instance_id != 0
-            && prev_inst == instance_id
-            && seq < prev_seq
-        {
-            return Vec::new();
-        }
-        inner
-            .remote_seq
-            .insert(peer_id.to_owned(), (instance_id, seq));
-        let mut next_map = HashMap::with_capacity(sessions.len());
-        for occ in sessions {
-            next_map.insert(occ.session_id, occ);
-        }
-        inner.granted_leases.retain(|sid, gl| {
-            !(gl.holder_node_id == peer_id && gl.committed && !next_map.contains_key(sid))
-        });
-        let prev_map = inner.remote.remove(peer_id).unwrap_or_default();
-        let mut affected = HashSet::new();
-        for (sid, prev_occ) in &prev_map {
-            if next_map.get(sid) != Some(prev_occ) {
-                affected.insert(*sid);
+            inner
+                .peer_sync_cursor
+                .insert(from_peer.to_owned(), (sender_instance_id, sender_gossip_seq));
+
+            let local_id = inner.local_node_id.clone();
+            let mut next_via: HashMap<String, NodePresence> = HashMap::new();
+            for mut entry in entries.into_iter().take(MAX_GOSSIP_ENTRIES) {
+                if entry.node_id.is_empty()
+                    || entry.node_id == local_id
+                    || entry.path.is_empty()
+                    || entry.path.len() > MAX_GOSSIP_HOPS
+                    || entry.path.first().map(String::as_str) != Some(entry.node_id.as_str())
+                    || entry.path.last().map(String::as_str) != Some(from_peer)
+                    || entry.path.iter().any(|p| p == &local_id)
+                {
+                    continue;
+                }
+                let unique_len = entry.path.iter().collect::<HashSet<_>>().len();
+                if unique_len != entry.path.len() {
+                    continue;
+                }
+                entry.sessions.sort_by_key(|o| o.session_id);
+                entry.sessions.dedup_by_key(|o| o.session_id);
+                entry.sessions.truncate(MAX_PRESENCE_SESSIONS_PER_NODE);
+
+                match next_via.get_mut(&entry.node_id) {
+                    Some(cur) => {
+                        if Self::better_presence(&entry, cur) {
+                            *cur = entry;
+                        }
+                    }
+                    None => {
+                        next_via.insert(entry.node_id.clone(), entry);
+                    }
+                }
             }
-        }
-        for (sid, next_occ) in &next_map {
-            if prev_map.get(sid) != Some(next_occ) {
-                affected.insert(*sid);
+            if next_via.is_empty() {
+                inner.remote_by_via.remove(from_peer);
+            } else {
+                inner.remote_by_via.insert(from_peer.to_owned(), next_via);
             }
+            self.recompute_effective_locked(&mut inner)
+        };
+        if effective_changed && self.known_peer_count.load(Ordering::Acquire) > 0 {
+            self.local_changed.notify_one();
         }
-        if !next_map.is_empty() {
-            inner.remote.insert(peer_id.to_owned(), next_map);
-        }
-        let changed: Vec<SessionId> = affected.into_iter().collect();
-        for &sid in &changed {
-            Self::notify_watcher_locked(&mut inner, sid);
-        }
-        drop(inner);
         changed
     }
 
     pub fn clear_peer(&self, peer_id: &str) -> Vec<SessionId> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.remote_seq.remove(peer_id);
-        inner
-            .granted_leases
-            .retain(|_, gl| gl.holder_node_id != peer_id || gl.committed);
-        let removed = inner.remote.remove(peer_id).unwrap_or_default();
-        let changed: Vec<SessionId> = removed.into_keys().collect();
-        for &sid in &changed {
-            Self::notify_watcher_locked(&mut inner, sid);
+        let (changed, effective_changed) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.peer_sync_cursor.remove(peer_id);
+            inner.remote_claims.retain(|_, rc| rc.node_id != peer_id);
+            inner.remote_by_via.remove(peer_id);
+            self.recompute_effective_locked(&mut inner)
+        };
+        if effective_changed && self.known_peer_count.load(Ordering::Acquire) > 0 {
+            self.local_changed.notify_one();
         }
         changed
     }
 
     pub fn clear_all_remote(&self) -> Vec<SessionId> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.remote_seq.clear();
-        inner.granted_leases.clear();
-        let mut affected = HashSet::new();
-        for (_, map) in inner.remote.drain() {
-            affected.extend(map.into_keys());
-        }
-        let changed: Vec<SessionId> = affected.into_iter().collect();
-        for &sid in &changed {
-            Self::notify_watcher_locked(&mut inner, sid);
+        let (changed, effective_changed) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.peer_sync_cursor.clear();
+            inner.remote_claims.clear();
+            inner.remote_by_via.clear();
+            self.recompute_effective_locked(&mut inner)
+        };
+        if effective_changed && self.known_peer_count.load(Ordering::Acquire) > 0 {
+            self.local_changed.notify_one();
         }
         changed
     }
@@ -942,42 +518,63 @@ impl PresenceState {
     pub fn try_acquire_local_claim(
         &self,
         sid: SessionId,
-    ) -> std::result::Result<(String, u64), (String, bool)> {
+    ) -> std::result::Result<(String, i64), (String, bool)> {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).map_err(|_| ("entropy unavailable".to_owned(), false))?;
         let claim_id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let started_ms = chrono::Utc::now().timestamp_millis();
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         Self::prune_expired_claims_locked(&mut inner, now);
+        if inner.local.contains_key(&sid) {
+            return Err(("session is already occupied on this node".to_owned(), false));
+        }
         if inner.local_claims.contains_key(&sid) {
             return Err((
                 "session run is already starting on this node".to_owned(),
                 true,
             ));
         }
-        if let Some(lease) = inner.active_local_leases.get(&sid)
-            && lease.active_term().is_some()
-        {
-            return Err(("session is already running on this node".to_owned(), false));
-        }
-        if let Some(gl) = inner.granted_leases.get(&sid) {
+        if let Some(rc) = inner.remote_claims.get(&sid) {
             return Err((
-                format!("session is held by node {}", gl.holder_node_id),
-                !gl.committed,
+                format!("session is currently occupied on node {}", rc.node_id),
+                true,
             ));
         }
-        let term = inner.highest_terms.get(&sid).copied().unwrap_or(0).saturating_add(1);
-        inner.highest_terms.insert(sid, term);
         inner.local_claims.insert(
             sid,
             LocalClaim {
                 claim_id: claim_id.clone(),
-                term,
-                phase: LocalClaimPhase::Probing,
-                acquired_at: now,
+                committing: false,
+                expires_at: now + CLAIM_TTL,
             },
         );
-        Ok((claim_id, term))
+        Ok((claim_id, started_ms))
+    }
+
+    pub fn promote_local_claim_to_committing(
+        &self,
+        sid: SessionId,
+        claim_id: &str,
+    ) -> std::result::Result<(), (String, bool)> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        Self::prune_expired_claims_locked(&mut inner, now);
+        if let Some(rc) = inner.remote_claims.get(&sid) {
+            return Err((
+                format!("session is currently occupied on node {}", rc.node_id),
+                true,
+            ));
+        }
+        let Some(local) = inner.local_claims.get_mut(&sid) else {
+            return Err(("session run claim expired; retry".to_owned(), true));
+        };
+        if local.claim_id != claim_id {
+            return Err(("session run claim superseded; retry".to_owned(), true));
+        }
+        local.committing = true;
+        local.expires_at = now + CLAIM_TTL;
+        Ok(())
     }
 
     pub fn release_local_claim(&self, sid: SessionId, claim_id: &str) {
@@ -991,217 +588,49 @@ impl PresenceState {
         }
     }
 
-    pub(crate) fn accept_remote_claim(
+    pub fn check_or_register_remote_claim(
         &self,
         sid: SessionId,
         claim: &RunClaim,
-        local_occupied: bool,
-    ) -> GrantOutcome {
-        let now = Instant::now();
-        let local_id = self.local_node_id();
-        let mut inner = self.inner.lock().unwrap();
-        Self::prune_expired_claims_locked(&mut inner, now);
-        let cur_term = inner.highest_terms.get(&sid).copied().unwrap_or(0);
-        if local_occupied {
-            return GrantOutcome::Occupied {
-                holder: local_id,
-                by_claim: false,
-                highest_term: cur_term,
-            };
-        }
-        if let Some(term) = inner
-            .active_local_leases
-            .get(&sid)
-            .and_then(LocalLease::active_term)
-        {
-            return GrantOutcome::Occupied {
-                holder: local_id,
-                by_claim: false,
-                highest_term: cur_term.max(term),
-            };
-        }
-        let same_holder = inner
-            .granted_leases
-            .get(&sid)
-            .is_some_and(|gl| gl.holder_node_id == claim.node_id && gl.claim_id == claim.claim_id);
-        if let Some(gl) = inner.granted_leases.get(&sid)
-            && (gl.holder_node_id != claim.node_id || gl.claim_id != claim.claim_id)
-        {
-            return GrantOutcome::Occupied {
-                holder: gl.holder_node_id.clone(),
-                by_claim: !gl.committed,
-                highest_term: cur_term.max(gl.term),
-            };
-        }
-        if claim.term == 0 || (!same_holder && claim.term <= cur_term) {
-            return GrantOutcome::StaleTerm {
-                highest_term: cur_term,
-            };
-        }
-        if let Some(local) = inner.local_claims.get_mut(&sid) {
-            match &local.phase {
-                LocalClaimPhase::Probing => {
-                    let incoming_wins = claim.term > local.term
-                        || (claim.term == local.term && claim.node_id < local_id);
-                    if !incoming_wins {
-                        return GrantOutcome::Occupied {
-                            holder: local_id,
-                            by_claim: true,
-                            highest_term: cur_term.max(local.term),
-                        };
-                    }
-                    local.phase = LocalClaimPhase::Yielded(claim.node_id.clone());
-                }
-                LocalClaimPhase::Committing => {
-                    return GrantOutcome::Occupied {
-                        holder: local_id,
-                        by_claim: false,
-                        highest_term: cur_term.max(local.term),
-                    };
-                }
-                LocalClaimPhase::Yielded(winner) => {
-                    if winner != &claim.node_id {
-                        return GrantOutcome::Occupied {
-                            holder: winner.clone(),
-                            by_claim: true,
-                            highest_term: cur_term,
-                        };
-                    }
-                }
-            }
-        }
-        let new_term = cur_term.max(claim.term);
-        inner.highest_terms.insert(sid, new_term);
-        let ttl_ms = claim.ttl_ms.clamp(2_000, 30_000);
-        let expires_at = now + Duration::from_millis(ttl_ms);
-        let was_committed = inner
-            .granted_leases
-            .get(&sid)
-            .is_some_and(|gl| gl.holder_node_id == claim.node_id && gl.claim_id == claim.claim_id && gl.committed);
-        inner.granted_leases.insert(
-            sid,
-            GrantedLease {
-                term: new_term,
-                holder_node_id: claim.node_id.clone(),
-                claim_id: claim.claim_id.clone(),
-                expires_at,
-                committed: was_committed,
-            },
-        );
-        let expires_at_ms = chrono::Utc::now().timestamp_millis() + i64::try_from(ttl_ms).unwrap_or(10_000);
-        GrantOutcome::Granted {
-            highest_term: new_term,
-            expires_at_ms,
-        }
-    }
-
-    pub fn renew_remote_lease(
-        &self,
-        sid: SessionId,
-        peer_id: &str,
-        claim_id: &str,
-        term: u64,
-        ttl_ms: u64,
-        local_occupied: bool,
-        remote_occupied: bool,
-    ) -> std::result::Result<i64, u64> {
-        let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
-        Self::prune_expired_claims_locked(&mut inner, now);
-        let cur_term = inner.highest_terms.get(&sid).copied().unwrap_or(0);
-        let clamped_ms = ttl_ms.clamp(2_000, 30_000);
-        let expires_at = now + Duration::from_millis(clamped_ms);
-        let expires_at_ms =
-            chrono::Utc::now().timestamp_millis() + i64::try_from(clamped_ms).unwrap_or(10_000);
-
-        if let Some(gl) = inner.granted_leases.get_mut(&sid) {
-            if term < cur_term
-                || gl.holder_node_id != peer_id
-                || gl.claim_id != claim_id
-                || gl.term != term
-            {
-                return Err(cur_term.max(gl.term));
-            }
-            gl.committed = true;
-            gl.expires_at = expires_at;
-            return Ok(expires_at_ms);
-        }
-
-        // Newly joined peer can adopt an active remote runner's live term when locally free and higher than cur_term.
-        if term == 0
-            || term <= cur_term
-            || claim_id.is_empty()
-            || local_occupied
-            || remote_occupied
-            || inner.local_claims.contains_key(&sid)
-            || inner
-                .active_local_leases
-                .get(&sid)
-                .and_then(LocalLease::active_term)
-                .is_some()
-        {
-            return Err(cur_term);
-        }
-        inner.highest_terms.insert(sid, term);
-        inner.granted_leases.insert(
-            sid,
-            GrantedLease {
-                term,
-                holder_node_id: peer_id.to_owned(),
-                claim_id: claim_id.to_owned(),
-                expires_at,
-                committed: true,
-            },
-        );
-        Ok(expires_at_ms)
-    }
-
-    pub fn promote_local_claim_to_committing(
-        &self,
-        sid: SessionId,
-        claim_id: &str,
     ) -> std::result::Result<(), (String, bool)> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         Self::prune_expired_claims_locked(&mut inner, now);
-        let remote_holder = inner
-            .granted_leases
-            .get(&sid)
-            .map(|gl| (gl.holder_node_id.clone(), !gl.committed));
-        let Some(local) = inner.local_claims.get_mut(&sid) else {
-            return Err(("session run claim expired; retry".to_owned(), true));
-        };
-        if local.claim_id != claim_id {
-            return Err(("session run claim expired; retry".to_owned(), true));
+        let local_id = inner.local_node_id.clone();
+        if inner.local.contains_key(&sid) {
+            return Err((local_id, false));
         }
-        match &local.phase {
-            LocalClaimPhase::Probing => {
-                if let Some((holder, by_claim)) = remote_holder {
-                    return Err((
-                        format!("session is currently occupied on node {holder}"),
-                        by_claim,
-                    ));
-                }
-                local.phase = LocalClaimPhase::Committing;
-                local.acquired_at = now;
-                Ok(())
+        if let Some(lc) = inner.local_claims.get(&sid) {
+            if lc.committing || claim.node_id >= local_id {
+                return Err((local_id, !lc.committing));
             }
-            LocalClaimPhase::Yielded(winner) => Err((
-                format!("session is currently occupied on node {winner}"),
-                true,
-            )),
-            LocalClaimPhase::Committing => Ok(()),
+            // Local probing claim yields to smaller node_id on simultaneous probe tie-break.
+            inner.local_claims.remove(&sid);
         }
+        if let Some(rc) = inner.remote_claims.get(&sid)
+            && (rc.node_id != claim.node_id || rc.claim_id != claim.claim_id)
+        {
+            return Err((rc.node_id.clone(), true));
+        }
+        inner.remote_claims.insert(
+            sid,
+            RemoteClaim {
+                claim_id: claim.claim_id.clone(),
+                node_id: claim.node_id.clone(),
+                expires_at: now + CLAIM_TTL,
+            },
+        );
+        Ok(())
     }
 
-    pub fn release_remote_claim(&self, sid: SessionId, peer_id: &str, claim_id: &str) {
+    pub fn release_remote_claim(&self, sid: SessionId, holder_node_id: &str, claim_id: &str) {
         let mut inner = self.inner.lock().unwrap();
         if inner
-            .granted_leases
+            .remote_claims
             .get(&sid)
-            .is_some_and(|gl| gl.holder_node_id == peer_id && gl.claim_id == claim_id)
+            .is_some_and(|rc| rc.node_id == holder_node_id && rc.claim_id == claim_id)
         {
-            inner.granted_leases.remove(&sid);
+            inner.remote_claims.remove(&sid);
         }
     }
 
@@ -1223,111 +652,37 @@ impl PresenceState {
     }
 }
 
-fn persist_lease_term(conn: &rusqlite::Connection, sid: SessionId, term: u64) -> Result<()> {
-    conn.prepare_cached(
-        "INSERT INTO session_leases(session_id, highest_term, holder_node_id, claim_id, expires_at_ms)
-         VALUES(?1, ?2, '', '', 0)
-         ON CONFLICT(session_id) DO UPDATE SET
-           highest_term = max(session_leases.highest_term, excluded.highest_term)",
-    )?
-    .execute(params![sid, i64::try_from(term).unwrap_or(i64::MAX)])?;
-    Ok(())
-}
-
-fn persist_lease_grant(
-    conn: &rusqlite::Connection,
-    sid: SessionId,
-    term: u64,
-    holder: &str,
-    claim_id: &str,
-    expires_at_ms: i64,
-) -> Result<()> {
-    conn.prepare_cached(
-        "INSERT INTO session_leases(session_id, highest_term, holder_node_id, claim_id, expires_at_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(session_id) DO UPDATE SET
-           highest_term = max(session_leases.highest_term, excluded.highest_term),
-           holder_node_id = excluded.holder_node_id,
-           claim_id = excluded.claim_id,
-           expires_at_ms = excluded.expires_at_ms",
-    )?
-    .execute(params![
-        sid,
-        i64::try_from(term).unwrap_or(i64::MAX),
-        holder,
-        claim_id,
-        expires_at_ms
-    ])?;
-    Ok(())
-}
-
-fn clear_persisted_lease(
-    conn: &rusqlite::Connection,
-    sid: SessionId,
-    holder: &str,
-    claim_id: &str,
-) -> Result<()> {
-    conn.prepare_cached(
-        "UPDATE session_leases SET holder_node_id='', claim_id='', expires_at_ms=0
-         WHERE session_id=?1 AND holder_node_id=?2 AND claim_id=?3",
-    )?
-    .execute(params![sid, holder, claim_id])?;
-    Ok(())
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum ExecReq {
     PresenceSync {
-        instance_id: u64,
-        seq: u64,
-        sessions: Vec<SessionOccupancy>,
+        sender_instance_id: u64,
+        sender_gossip_seq: u64,
+        #[serde(default)]
+        entries: Vec<NodePresence>,
         #[serde(default)]
         want_reply: bool,
-        #[serde(default)]
-        clear_claim: Option<(SessionId, String)>,
     },
     CheckOccupancy {
         session_id: SessionId,
         #[serde(default)]
         claim: Option<RunClaim>,
         #[serde(default)]
-        voter_epoch: u64,
+        visited: Vec<String>,
+        #[serde(default)]
+        hops_left: u8,
     },
     ReleaseClaim {
         session_id: SessionId,
+        holder_node_id: String,
         claim_id: String,
-    },
-    RenewLease {
-        session_id: SessionId,
-        claim_id: String,
-        term: u64,
-        ttl_ms: u64,
         #[serde(default)]
-        voter_epoch: u64,
-    },
-    ProbeVoterConfig {
-        expected_epoch: u64,
-        next_epoch: u64,
-        ballot: String,
-    },
-    PrepareVoterConfig {
-        expected_epoch: u64,
-        next_epoch: u64,
+        visited: Vec<String>,
         #[serde(default)]
-        proposal_id: String,
-        new_voters: Vec<String>,
-    },
-    CommitVoterConfig {
-        epoch: u64,
-        voters: Vec<String>,
-        #[serde(default)]
-        proposal_id: String,
+        hops_left: u8,
     },
     StartRun {
         session_id: SessionId,
-        #[serde(default)]
-        force_offline: bool,
     },
     PauseRun {
         session_id: SessionId,
@@ -1369,9 +724,10 @@ enum ExecReq {
 enum ExecResp {
     Ack,
     Presence {
-        instance_id: u64,
-        seq: u64,
-        sessions: Vec<SessionOccupancy>,
+        sender_instance_id: u64,
+        sender_gossip_seq: u64,
+        #[serde(default)]
+        entries: Vec<NodePresence>,
     },
     Occupancy {
         occupied: bool,
@@ -1379,17 +735,7 @@ enum ExecResp {
         status: Option<SessionStatus>,
         active_tasks: usize,
         #[serde(default)]
-        lease_granted: bool,
-        #[serde(default)]
         occupied_by_claim: bool,
-        #[serde(default)]
-        highest_term: u64,
-        #[serde(default)]
-        voter_epoch: u64,
-        #[serde(default)]
-        voter_set: Vec<String>,
-        #[serde(default)]
-        voter_epoch_mismatch: bool,
         #[serde(default)]
         session_deleted: bool,
         #[serde(default)]
@@ -1398,38 +744,6 @@ enum ExecResp {
         session_active_head_ts: String,
         #[serde(default)]
         session_vector: BTreeMap<String, i64>,
-    },
-    LeaseRenewed {
-        granted: bool,
-        highest_term: u64,
-        #[serde(default)]
-        voter_epoch: u64,
-        #[serde(default)]
-        voter_set: Vec<String>,
-        #[serde(default)]
-        voter_epoch_mismatch: bool,
-    },
-    VoterConfigProbe {
-        promised: bool,
-        voter_epoch: u64,
-        voter_set: Vec<String>,
-        pending_voter_epoch: u64,
-        #[serde(default)]
-        pending_proposal_id: String,
-        #[serde(default)]
-        pending_voter_set: Vec<String>,
-    },
-    VoterConfigAck {
-        ok: bool,
-        voter_epoch: u64,
-        voter_set: Vec<String>,
-        #[serde(default)]
-        pending_voter_epoch: u64,
-        #[serde(default)]
-        pending_proposal_id: String,
-        #[serde(default)]
-        pending_voter_set: Vec<String>,
-        reason: Option<String>,
     },
     Session {
         session: Value,
@@ -1501,94 +815,25 @@ fn wire_error(status: u16, message: String) -> Error {
 }
 
 #[derive(Clone, Copy)]
-enum LeasePurpose {
-    Run {
-        force_offline: bool,
-        require_model_caps: bool,
-    },
+enum GatePurpose {
+    Run { require_model_caps: bool },
     Delete,
 }
 
-enum GateMode {
-    Standalone,
-    Quorum(Arc<ActiveLease>),
-    ForcedOffline,
-}
-
-impl GateMode {
-    fn as_auth(&self) -> RunAuth {
-        match self {
-            Self::Standalone => RunAuth::Standalone,
-            Self::Quorum(l) => RunAuth::Quorum(l.clone()),
-            Self::ForcedOffline => RunAuth::ForcedOffline,
-        }
-    }
-
-    fn take_quorum_lease(&mut self) -> Option<Arc<ActiveLease>> {
-        match std::mem::replace(self, Self::Standalone) {
-            Self::Quorum(l) => Some(l),
-            other => {
-                *self = other;
-                None
-            }
-        }
-    }
-
-    fn quorum_lease(&self) -> Option<&Arc<ActiveLease>> {
-        match self {
-            Self::Quorum(l) => Some(l),
-            _ => None,
-        }
-    }
-}
-
-struct AcquiredLeaseGate {
-    mode: GateMode,
-    granted_peers: Vec<String>,
+struct ConnectedGate {
+    online_peers: Vec<String>,
     claim_guard: Option<ClaimReleaseGuard>,
 }
 
 pub struct DeleteGateGuard {
-    lease: Option<Arc<ActiveLease>>,
     guard: Option<ClaimReleaseGuard>,
     _lock: Option<OwnedMutexGuard<()>>,
 }
 
 impl DeleteGateGuard {
-    pub fn lease(&self) -> Option<Arc<ActiveLease>> {
-        self.lease.clone()
-    }
-
     pub async fn release_now(mut self) {
         if let Some(guard) = self.guard.take() {
             guard.release_now().await;
-        }
-    }
-}
-
-enum VoterDelta {
-    Add(String),
-    Remove(String),
-}
-
-impl VoterDelta {
-    fn apply(&self, current: &[String]) -> Result<Vec<String>> {
-        let mut next = current.to_vec();
-        match self {
-            Self::Add(id) => {
-                if !next.contains(id) {
-                    next.push(id.clone());
-                }
-            }
-            Self::Remove(id) => next.retain(|existing| existing != id),
-        }
-        canonicalize_voter_set(&next)
-    }
-
-    fn is_satisfied_by(&self, current: &[String]) -> bool {
-        match self {
-            Self::Add(id) => current.iter().any(|existing| existing == id),
-            Self::Remove(id) => !current.iter().any(|existing| existing == id),
         }
     }
 }
@@ -1602,11 +847,9 @@ pub struct ExecPlane {
     workers: TaskTracker,
     byte_budget: Arc<Semaphore>,
     start_locks: Mutex<HashMap<SessionId, Weak<AsyncMutex<()>>>>,
-    reconfig_lock: AsyncMutex<()>,
     peer_sync_wake: Arc<Notify>,
     pending_peer_sync: Mutex<HashSet<String>>,
     acked_presence: Mutex<HashMap<String, u64>>,
-    app_slot: Mutex<Option<App>>,
     self_weak: OnceLock<Weak<ExecPlane>>,
 }
 
@@ -1633,19 +876,16 @@ impl ExecPlane {
             workers,
             byte_budget: Arc::new(Semaphore::new(MAX_EXEC_BYTE_PERMITS)),
             start_locks: Mutex::default(),
-            reconfig_lock: AsyncMutex::new(()),
             peer_sync_wake: Arc::new(Notify::new()),
             pending_peer_sync: Mutex::default(),
             acked_presence: Mutex::default(),
-            app_slot: Mutex::default(),
             self_weak: OnceLock::new(),
         });
         let _ = arc.self_weak.set(Arc::downgrade(&arc));
         arc
     }
 
-    pub fn spawn_loops(self: &Arc<Self>, app: App) {
-        *self.app_slot.lock().unwrap() = Some(app.clone());
+    pub fn spawn_loops(self: &Arc<Self>, _app: App) {
         let plane_bcast = self.clone();
         self.workers.spawn(async move {
             plane_bcast.presence_broadcast_loop().await;
@@ -1653,11 +893,6 @@ impl ExecPlane {
         let plane_sync = self.clone();
         self.workers.spawn(async move {
             plane_sync.peer_presence_sync_loop().await;
-        });
-        let plane_mem = self.clone();
-        self.workers.spawn(async move {
-            plane_mem.membership_reconcile_loop(app).await;
-            *plane_mem.app_slot.lock().unwrap() = None;
         });
     }
 
@@ -1681,685 +916,10 @@ impl ExecPlane {
     }
 
     pub async fn on_peer_connected(&self, peer_id: String) {
-        let app = self.app_slot.lock().unwrap().clone();
-        if let Some(app) = app {
-            self.try_recover_pending_voter_config(Some(&app)).await;
-            if self.presence.want_voter_admission() {
-                self.try_auto_admit_voter(&app).await;
-            }
-            self.reconcile_offline_sessions(&app).await;
-        }
         {
             self.pending_peer_sync.lock().unwrap().insert(peer_id);
         }
         self.peer_sync_wake.notify_one();
-    }
-
-    async fn membership_reconcile_loop(&self, app: App) {
-        loop {
-            if self.presence.known_peer_count() > 0 {
-                self.try_recover_pending_voter_config(Some(&app)).await;
-                if self.presence.want_voter_admission() {
-                    self.try_auto_admit_voter(&app).await;
-                }
-                self.reconcile_offline_sessions(&app).await;
-            }
-            tokio::select! {
-                biased;
-                _ = self.stopping.cancelled() => return,
-                _ = self.presence.membership_grew_notify.notified() => (),
-                _ = self.presence.voter_config_notify.notified() => (),
-            }
-        }
-    }
-
-    async fn adopt_voter_epoch(&self, epoch: u64, voters: Vec<String>) -> Result<bool> {
-        if epoch == 0 || voters.is_empty() || epoch <= self.presence.current_voter_config().0 {
-            return Ok(false);
-        }
-        self.db
-            .call(move |s| {
-                let prev = load_local_node(&s.conn)?.voter_epoch;
-                let (local, _) = adopt_voter_config(&s.conn, epoch, &voters)?;
-                s.presence.sync_local_node(&local);
-                Ok(local.voter_epoch > prev)
-            })
-            .await
-    }
-
-    async fn try_recover_pending_voter_config(&self, maybe_app: Option<&App>) {
-        if self.stopping.is_cancelled() || self.presence.current_voter_config().2 == 0 {
-            return;
-        }
-        let _reconfig = self.reconfig_lock.lock().await;
-        let _ = self.recover_pending_voter_config_locked(maybe_app, false).await;
-    }
-
-    async fn probe_voter_epoch_locked(
-        &self,
-        expected_epoch: u64,
-        next_epoch: u64,
-        ballot: &str,
-        online: &[String],
-    ) -> Result<(
-        Option<(u64, Vec<String>)>,
-        HashSet<String>,
-        Option<Vec<String>>,
-    )> {
-        let ballot_local = ballot.to_owned();
-        let (local_promised, local_after) = self
-            .db
-            .call(move |s| {
-                let (promised, updated) =
-                    probe_voter_config(&s.conn, expected_epoch, next_epoch, &ballot_local)?;
-                s.presence.sync_local_node(&updated);
-                Ok((promised, updated))
-            })
-            .await?;
-
-        let probe_req = ExecReq::ProbeVoterConfig {
-            expected_epoch,
-            next_epoch,
-            ballot: ballot.to_owned(),
-        };
-        let probe_replies = futures_util::future::join_all(online.iter().map(|peer_id| {
-            let req_ref = &probe_req;
-            async move { (peer_id.clone(), self.exec_rpc(peer_id, req_ref, EXEC_SHORT_TIMEOUT).await) }
-        }))
-        .await;
-
-        let mut max_committed: Option<(u64, Vec<String>)> = None;
-        let mut promised_ids: HashSet<String> = HashSet::new();
-        let mut chosen: Option<(String, Vec<String>)> = None;
-
-        let mut consider_candidate = |ep: u64, pid: String, set: Vec<String>| {
-            if ep == next_epoch
-                && !pid.is_empty()
-                && !set.is_empty()
-                && chosen.as_ref().is_none_or(|(best_pid, _)| pid > *best_pid)
-            {
-                chosen = Some((pid, set));
-            }
-        };
-
-        if local_promised {
-            promised_ids.insert(local_after.node_id.clone());
-            consider_candidate(
-                local_after.pending_voter_epoch,
-                local_after.pending_proposal_id.clone(),
-                local_after.pending_voter_set.clone(),
-            );
-        }
-
-        for (peer_id, res) in probe_replies {
-            if let Ok(ExecResp::VoterConfigProbe {
-                promised,
-                voter_epoch,
-                voter_set,
-                pending_voter_epoch,
-                pending_proposal_id,
-                pending_voter_set,
-            }) = res
-            {
-                if voter_epoch >= next_epoch
-                    && !voter_set.is_empty()
-                    && max_committed.as_ref().is_none_or(|(e, _)| voter_epoch > *e)
-                {
-                    max_committed = Some((voter_epoch, voter_set));
-                }
-                if promised {
-                    promised_ids.insert(peer_id);
-                    consider_candidate(pending_voter_epoch, pending_proposal_id, pending_voter_set);
-                }
-            }
-        }
-
-        Ok((max_committed, promised_ids, chosen.map(|(_, voters)| voters)))
-    }
-
-    async fn load_and_sync_cluster_state(&self) -> Result<(crate::cluster::identity::LocalNode, Vec<PeerInfo>)> {
-        self.db
-            .call(move |s| {
-                let local = load_local_node(&s.conn)?;
-                let peers = list_peers(&s.conn)?;
-                s.presence.sync_local_node(&local);
-                s.presence.set_peer_roles(&peers);
-                s.presence.set_known_peer_count(peers.len());
-                Ok((local, peers))
-            })
-            .await
-    }
-
-    async fn recover_pending_voter_config_locked(
-        &self,
-        maybe_app: Option<&App>,
-        probe_peers: bool,
-    ) -> Result<()> {
-        let (local, _) = self.load_and_sync_cluster_state().await?;
-
-        if local.voter_epoch == 0 {
-            return Ok(());
-        }
-        if local.pending_voter_epoch == 0 && !probe_peers {
-            return Ok(());
-        }
-        let online = self.net.online_peer_ids();
-        if local.pending_voter_epoch == 0 && online.is_empty() {
-            return Ok(());
-        }
-
-        let expected_epoch = local.voter_epoch;
-        let next_epoch = if local.pending_voter_epoch != 0 {
-            local.pending_voter_epoch
-        } else {
-            expected_epoch.saturating_add(1)
-        };
-        self.propose_voter_config_locked(
-            maybe_app, expected_epoch, next_epoch, &local.voter_set, &online, None,
-        )
-        .await
-    }
-
-    fn stale_local_leases(&self, min_epoch: u64) -> Vec<(SessionId, u64)> {
-        let inner = self.presence.inner.lock().unwrap();
-        inner
-            .active_local_leases
-            .iter()
-            .filter_map(|(&sid, lease)| match lease {
-                LocalLease::Quorum(l) if l.voter_epoch < min_epoch => Some((sid, l.term)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    async fn fence_stale_local_leases(&self, app: Option<&App>, min_epoch: u64) {
-        let Some(app) = app.cloned().or_else(|| self.app_slot.lock().unwrap().clone()) else {
-            return;
-        };
-        for (sid, term) in self.stale_local_leases(min_epoch) {
-            app.fence_session_local(
-                sid,
-                Some(term),
-                "cluster voter configuration changed; session paused",
-            )
-            .await;
-        }
-    }
-
-    async fn try_auto_admit_voter(&self, app: &App) {
-        for attempt in 0..4 {
-            if self.stopping.is_cancelled() || !self.presence.want_voter_admission() {
-                return;
-            }
-            let (epoch, voters, pending_epoch, _) = self.presence.current_voter_config();
-            if epoch == 0 {
-                return;
-            }
-            let local_id = self.presence.local_node_id();
-            if voters.contains(&local_id) {
-                self.presence.set_want_voter_admission(false);
-                return;
-            }
-            if pending_epoch == 0 {
-                let _reconfig = self.reconfig_lock.lock().await;
-                match self
-                    .reconfigure_voters_locked(Some(app), VoterDelta::Add(local_id))
-                    .await
-                {
-                    Ok(()) => {
-                        self.presence.set_want_voter_admission(false);
-                        return;
-                    }
-                    Err(err) if err.0 == axum::http::StatusCode::SERVICE_UNAVAILABLE => {
-                        return;
-                    }
-                    Err(_) => {}
-                }
-            }
-            if attempt < 3 {
-                tokio::select! {
-                    biased;
-                    _ = self.stopping.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(80)) => (),
-                }
-            }
-        }
-    }
-
-    async fn reconfigure_voters_locked(
-        &self,
-        maybe_app: Option<&App>,
-        delta: VoterDelta,
-    ) -> Result<()> {
-        let (mut local, mut peers) = self.load_and_sync_cluster_state().await?;
-
-        if local.voter_epoch == 0 {
-            return Err(Error(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "cluster voter configuration not yet synchronized; retry".into(),
-            ));
-        }
-        if local.pending_voter_epoch != 0 {
-            self.recover_pending_voter_config_locked(maybe_app, true)
-                .await?;
-            let refreshed = self.load_and_sync_cluster_state().await?;
-            local = refreshed.0;
-            peers = refreshed.1;
-            if local.pending_voter_epoch != 0 {
-                return Err(Error::conflict(
-                    "cluster voter reconfiguration already in progress",
-                ));
-            }
-        }
-        let canonical = delta.apply(&local.voter_set)?;
-        if canonical.is_empty() && !peers.is_empty() {
-            return Err(Error::conflict("cluster must retain at least one voter"));
-        }
-        if canonical == local.voter_set {
-            return Ok(());
-        }
-        for id in &canonical {
-            if id != &local.node_id && !peers.iter().any(|p| &p.node_id == id) {
-                return Err(Error::bad(format!(
-                    "unknown node {id} in cluster voter configuration"
-                )));
-            }
-        }
-        let online = self.net.online_peer_ids();
-        let epoch = local.voter_epoch;
-        self.propose_voter_config_locked(
-            maybe_app, epoch, epoch.saturating_add(1), &local.voter_set, &online, Some(canonical),
-        ).await?;
-        let (_, committed, pending, _) = self.presence.current_voter_config();
-        if pending != 0 || !delta.is_satisfied_by(&committed) {
-            return Err(Error::conflict("resolved a concurrent voter configuration; retry"));
-        }
-        Ok(())
-    }
-
-    async fn propose_voter_config_locked(
-        &self,
-        maybe_app: Option<&App>,
-        expected_epoch: u64,
-        next_epoch: u64,
-        old_voters: &[String],
-        online: &[String],
-        requested: Option<Vec<String>>,
-    ) -> Result<()> {
-        let proposal_id = self.db.call(|s| tick_hlc(&s.conn)).await?;
-        let (committed, promised_ids, accepted) = self
-            .probe_voter_epoch_locked(expected_epoch, next_epoch, &proposal_id, online)
-            .await?;
-        if let Some((epoch, voters)) = committed {
-            self.adopt_voter_epoch(epoch, voters).await?;
-            self.fence_stale_local_leases(maybe_app, epoch).await;
-            return Ok(());
-        }
-        // A prior majority may have chosen this value without delivering its commit.
-        // Carry the highest accepted value forward under this probe's ballot.
-        let Some(canonical) = accepted.or(requested) else {
-            return Ok(());
-        };
-        if !PresenceState::explicit_majority(old_voters, &promised_ids)
-            || !PresenceState::explicit_majority(&canonical, &promised_ids)
-        {
-            return Err(Error(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "cluster joint voter quorum unavailable for voter configuration change".into(),
-            ));
-        }
-
-        let prepare_set = canonical.clone();
-        let prepare_id = proposal_id.clone();
-        self.db
-            .call(move |s| {
-                let updated = prepare_voter_config(
-                    &s.conn,
-                    expected_epoch,
-                    next_epoch,
-                    &prepare_id,
-                    &prepare_set,
-                )?;
-                s.presence.sync_local_node(&updated);
-                Ok(())
-            })
-            .await?;
-
-        let prep_req = ExecReq::PrepareVoterConfig {
-            expected_epoch,
-            next_epoch,
-            proposal_id: proposal_id.clone(),
-            new_voters: canonical.clone(),
-        };
-        let prep_replies = futures_util::future::join_all(online.iter().map(|peer_id| {
-            let req_ref = &prep_req;
-            async move {
-                (
-                    peer_id.clone(),
-                    self.exec_rpc(peer_id, req_ref, EXEC_SHORT_TIMEOUT).await,
-                )
-            }
-        }))
-        .await;
-
-        let mut acked_prep = Vec::new();
-        let mut max_seen: Option<(u64, Vec<String>)> = None;
-        for (peer_id, res) in prep_replies {
-            if let Ok(ExecResp::VoterConfigAck {
-                ok,
-                voter_epoch,
-                voter_set,
-                pending_voter_epoch,
-                pending_proposal_id,
-                ..
-            }) = res
-            {
-                if voter_epoch > expected_epoch
-                    && !voter_set.is_empty()
-                    && max_seen.as_ref().is_none_or(|(e, _)| voter_epoch > *e)
-                {
-                    max_seen = Some((voter_epoch, voter_set));
-                }
-                if ok || (pending_voter_epoch == next_epoch && pending_proposal_id == proposal_id) {
-                    acked_prep.push(peer_id);
-                }
-            }
-        }
-
-        if !self
-            .presence
-            .joint_quorum(old_voters, &canonical, &acked_prep)
-        {
-            if let Some((higher_ep, higher_set)) = max_seen {
-                let _ = self.adopt_voter_epoch(higher_ep, higher_set).await;
-                self.fence_stale_local_leases(maybe_app, higher_ep).await;
-                return Err(Error::conflict(
-                    "cluster voter configuration superseded by concurrent update; retry",
-                ));
-            }
-            return Err(Error(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "cluster joint voter quorum not reached while preparing voter configuration".into(),
-            ));
-        }
-
-        let commit_set = canonical.clone();
-        let role_changed = self
-            .db
-            .call(move |s| {
-                let (updated, role_changed) =
-                    commit_voter_config(&s.conn, next_epoch, &commit_set)?;
-                s.presence.sync_local_node(&updated);
-                if role_changed {
-                    s.sync_signal(crate::cluster::SyncSignal::SelfMetaChanged);
-                }
-                Ok(role_changed)
-            })
-            .await?;
-
-        self.fence_stale_local_leases(maybe_app, next_epoch).await;
-
-        let commit_targets = self.net.online_peer_ids();
-        let commit_req = ExecReq::CommitVoterConfig {
-            epoch: next_epoch,
-            voters: canonical,
-            proposal_id,
-        };
-        let _ = futures_util::future::join_all(commit_targets.iter().map(|peer_id| {
-            let req_ref = &commit_req;
-            async move {
-                let _ = self.exec_rpc(peer_id, req_ref, EXEC_SHORT_TIMEOUT).await;
-            }
-        }))
-        .await;
-
-        if role_changed {
-            self.sync.broadcast_peers().await;
-        }
-        Ok(())
-    }
-
-    pub async fn change_self_role(
-        &self,
-        name: Option<String>,
-        description: Option<String>,
-        role: Option<NodeRole>,
-    ) -> Result<crate::cluster::identity::LocalNode> {
-        let _reconfig = self.reconfig_lock.lock().await;
-        if let Some(target_role) = role {
-            let (local, has_peers) = self
-                .db
-                .call(|s| {
-                    let local = load_local_node(&s.conn)?;
-                    let peers = list_peers(&s.conn)?;
-                    Ok((local, !peers.is_empty()))
-                })
-                .await?;
-            if !has_peers {
-                let n = name;
-                let d = description;
-                let (updated, prev_gen) = self
-                    .db
-                    .write(
-                        move |conn| {
-                            let prev_gen = load_local_node(conn)?.membership_gen;
-                            let updated = crate::cluster::identity::set_local_role(conn, target_role)?;
-                            let updated = if n.is_some() || d.is_some() {
-                                update_self_meta(conn, n, d)?
-                            } else {
-                                updated
-                            };
-                            Ok((updated, prev_gen))
-                        },
-                        |s, (updated, prev_gen)| {
-                            s.presence.sync_local_node(&updated);
-                            s.sync_signal(crate::cluster::SyncSignal::SelfMetaChanged);
-                            Ok((updated, prev_gen))
-                        },
-                    )
-                    .await?;
-                if updated.membership_gen != prev_gen {
-                    self.net
-                        .switch_membership(updated.membership_gen, updated.cluster_secret);
-                    self.sync.on_membership_switched();
-                }
-                return Ok(updated);
-            }
-            if target_role != local.role || local.pending_voter_epoch != 0 {
-                let delta = if target_role.is_voter() {
-                    VoterDelta::Add(local.node_id.clone())
-                } else {
-                    VoterDelta::Remove(local.node_id.clone())
-                };
-                self.reconfigure_voters_locked(None, delta).await?;
-                self.presence.set_want_voter_admission(false);
-            }
-        }
-
-        if name.is_some() || description.is_some() {
-            return self
-                .db
-                .write(
-                    move |conn| update_self_meta(conn, name, description),
-                    |s, updated| {
-                        s.presence.set_local_role(updated.role);
-                        s.sync_signal(crate::cluster::SyncSignal::SelfMetaChanged);
-                        Ok(updated)
-                    },
-                )
-                .await;
-        }
-        self.db.call(|s| load_local_node(&s.conn)).await
-    }
-
-    pub async fn remove_peer_safe(&self, node_id: &str) -> Result<bool> {
-        let _reconfig = self.reconfig_lock.lock().await;
-        let target = node_id.to_owned();
-        let (mut local, mut peers) = self
-            .db
-            .call(|s| Ok((load_local_node(&s.conn)?, list_peers(&s.conn)?)))
-            .await?;
-        if !peers.iter().any(|p| p.node_id == target) {
-            return Ok(false);
-        }
-        if local.pending_voter_epoch != 0 {
-            self.recover_pending_voter_config_locked(None, true).await?;
-            let refreshed = self
-                .db
-                .call(|s| Ok((load_local_node(&s.conn)?, list_peers(&s.conn)?)))
-                .await?;
-            local = refreshed.0;
-            peers = refreshed.1;
-            if !peers.iter().any(|p| p.node_id == target) {
-                return Ok(false);
-            }
-            if local.pending_voter_epoch != 0 {
-                return Err(Error::conflict(
-                    "cluster voter reconfiguration already in progress",
-                ));
-            }
-        }
-        if local.voter_set.iter().any(|id| id == &target) {
-            if local.voter_epoch == 0 {
-                return Err(Error(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "cluster voter configuration not yet synchronized; cannot remove voter".into(),
-                ));
-            }
-            if local.voter_set.iter().filter(|id| *id != &target).count() == 0 {
-                return Err(Error::conflict("cluster must retain at least one voter"));
-            }
-            self.reconfigure_voters_locked(None, VoterDelta::Remove(target.clone()))
-                .await?;
-        }
-        let target = node_id.to_owned();
-        let presence = self.presence.clone();
-        let removed = self
-            .db
-            .write(
-                move |conn| {
-                    let after = load_local_node(conn)?;
-                    if after.voter_set.iter().any(|id| id == &target)
-                        || after.pending_voter_epoch != 0
-                    {
-                        return Err(Error::conflict(
-                            "cluster voter configuration changed before removing peer; retry",
-                        ));
-                    }
-                    let removed = delete_peer(conn, &target)?;
-                    let peers = if removed { list_peers(conn)? } else { Vec::new() };
-                    Ok((removed, peers, target))
-                },
-                move |_, (removed, peers, target)| {
-                    if removed {
-                        presence.set_peer_roles(&peers);
-                        presence.set_known_peer_count(peers.len());
-                        let _ = presence.clear_peer(&target);
-                    }
-                    Ok(removed)
-                },
-            )
-            .await?;
-        Ok(removed)
-    }
-
-    async fn reconcile_offline_sessions(&self, _app: &App) {
-        let presence = self.presence.clone();
-        let Ok((known_peers, candidates)) = self
-            .db
-            .call(move |s| {
-                let peers = refresh_known_peer_count(&s.conn, &presence)?;
-                if peers == 0 {
-                    return Ok((0usize, Vec::new()));
-                }
-                let mut seen = HashSet::new();
-                seen.extend(s.active.keys().copied());
-                seen.extend(s.pending_wakes.iter().copied());
-                seen.extend(codemode::task_session_ids(s));
-                let candidates: Vec<SessionId> = seen
-                    .into_iter()
-                    .filter(|&sid| {
-                        !matches!(
-                            s.presence.active_local_lease_kind(sid),
-                            Some(LocalLease::Quorum(_))
-                        )
-                    })
-                    .collect();
-                Ok((peers, candidates))
-            })
-            .await
-        else {
-            return;
-        };
-        if known_peers == 0 || candidates.is_empty() {
-            return;
-        }
-
-        for sid in candidates {
-            if self.stopping.is_cancelled() {
-                return;
-            }
-            let lock = self.start_lock(sid);
-            let _guard = lock.lock().await;
-            let online_now = self.net.online_peer_ids();
-            let quorum_now =
-                !online_now.is_empty() && self.presence.voter_quorum(&online_now).satisfied;
-            let _ = self
-                .db
-                .call(move |s| {
-                    let occupied = s.active.contains_key(&sid)
-                        || s.pending_wakes.contains(&sid)
-                        || codemode::has_session_tasks(s, sid);
-                    if !occupied || s.presence.known_peer_count() == 0 {
-                        return Ok(());
-                    }
-                    match s.presence.active_local_lease_kind(sid) {
-                        Some(LocalLease::Quorum(_)) => Ok(()),
-                        Some(LocalLease::ForcedOffline) => {
-                            if !quorum_now {
-                                return Ok(());
-                            }
-                            if let Some(ctrl) = s.active.get(&sid).cloned() {
-                                if !ctrl.soft.is_cancelled() {
-                                    let now = chrono::Utc::now().timestamp_millis();
-                                    let update = s.conn.execute(
-                                        "UPDATE sessions SET local_status='pausing',local_error=?2,updated_at=max(updated_at,?3) WHERE id=?1 AND deleted=0",
-                                        (sid, crate::agent::RECONNECT_PAUSE_REASON, now),
-                                    );
-                                    s.refresh_local_presence_with(
-                                        sid,
-                                        SessionStatus::Pausing,
-                                        crate::agent::RECONNECT_PAUSE_REASON,
-                                        now,
-                                    );
-                                    ctrl.soft.cancel();
-                                    s.wake_waiters(sid);
-                                    update?;
-                                    s.notify_status(
-                                        sid,
-                                        "pausing",
-                                        crate::agent::RECONNECT_PAUSE_REASON,
-                                        now,
-                                    );
-                                }
-                                Ok(())
-                            } else {
-                                crate::agent::fence_local_run(
-                                    s,
-                                    sid,
-                                    "reconnected to cluster; offline tasks paused",
-                                )
-                            }
-                        }
-                        None => crate::agent::fence_local_run(
-                            s,
-                            sid,
-                            "cluster quorum unavailable; session paused",
-                        ),
-                    }
-                })
-                .await;
-        }
     }
 
     pub fn on_peer_offline(&self, peer_id: &str) {
@@ -2411,15 +971,17 @@ impl ExecPlane {
 
     fn apply_remote_presence(
         &self,
-        peer_id: &str,
-        instance_id: u64,
-        seq: u64,
-        sessions: Vec<SessionOccupancy>,
-        clear_claim: Option<(SessionId, String)>,
+        from_peer: &str,
+        sender_instance_id: u64,
+        sender_gossip_seq: u64,
+        entries: Vec<NodePresence>,
     ) {
-        let changed = self
-            .presence
-            .apply_remote(peer_id, instance_id, seq, sessions, clear_claim);
+        let changed = self.presence.apply_remote_gossip(
+            from_peer,
+            sender_instance_id,
+            sender_gossip_seq,
+            entries,
+        );
         self.publish_presence_changes(changed);
     }
 
@@ -2430,7 +992,7 @@ impl ExecPlane {
             if self.stopping.is_cancelled() {
                 return;
             }
-            let (instance_id, seq, sessions) = self.presence.snapshot_local();
+            let seq = self.presence.gossip_seq();
             if seq != last_seen_seq {
                 backoff.clear();
                 last_seen_seq = seq;
@@ -2460,22 +1022,25 @@ impl ExecPlane {
             }
 
             if !due.is_empty() {
-                let req = ExecReq::PresenceSync {
-                    instance_id,
-                    seq,
-                    sessions,
-                    want_reply: false,
-                    clear_claim: None,
-                };
                 let results = futures_util::future::join_all(due.into_iter().map(|peer_id| {
-                    let req_ref = &req;
-                    async move { (peer_id.clone(), self.exec_rpc(&peer_id, req_ref, EXEC_SHORT_TIMEOUT).await) }
+                    let (sender_instance_id, sender_gossip_seq, entries) =
+                        self.presence.snapshot_for_peer(&peer_id);
+                    let req = ExecReq::PresenceSync {
+                        sender_instance_id,
+                        sender_gossip_seq,
+                        entries,
+                        want_reply: false,
+                    };
+                    async move {
+                        let res = self.exec_rpc(&peer_id, &req, EXEC_SHORT_TIMEOUT).await;
+                        (peer_id, sender_gossip_seq, res)
+                    }
                 }))
                 .await;
                 let retry_base = Instant::now();
-                for (peer_id, res) in results {
+                for (peer_id, sent_seq, res) in results {
                     if res.is_ok() {
-                        self.mark_presence_acked(&peer_id, seq);
+                        self.mark_presence_acked(&peer_id, sent_seq);
                         backoff.remove(&peer_id);
                     } else if self.net.is_peer_online(&peer_id) {
                         let next_delay = backoff
@@ -2514,12 +1079,7 @@ impl ExecPlane {
         }
     }
 
-    async fn broadcast_presence_to(
-        &self,
-        peers: &[String],
-        clear_claim: Option<(SessionId, String)>,
-    ) {
-        let (instance_id, seq, sessions) = self.presence.snapshot_local();
+    async fn broadcast_presence_to(&self, peers: &[String]) {
         let mut targets = Vec::new();
         for peer_id in peers {
             if self.net.is_peer_online(peer_id) && !targets.contains(peer_id) {
@@ -2529,21 +1089,24 @@ impl ExecPlane {
         if targets.is_empty() {
             return;
         }
-        let req = ExecReq::PresenceSync {
-            instance_id,
-            seq,
-            sessions,
-            want_reply: false,
-            clear_claim,
-        };
         let results = futures_util::future::join_all(targets.into_iter().map(|peer_id| {
-            let req_ref = &req;
-            async move { (peer_id.clone(), self.exec_rpc(&peer_id, req_ref, EXEC_LEASE_TIMEOUT).await) }
+            let (sender_instance_id, sender_gossip_seq, entries) =
+                self.presence.snapshot_for_peer(&peer_id);
+            let req = ExecReq::PresenceSync {
+                sender_instance_id,
+                sender_gossip_seq,
+                entries,
+                want_reply: false,
+            };
+            async move {
+                let res = self.exec_rpc(&peer_id, &req, EXEC_PROBE_TIMEOUT).await;
+                (peer_id, sender_gossip_seq, res)
+            }
         }))
         .await;
-        for (peer_id, res) in results {
+        for (peer_id, sent_seq, res) in results {
             if res.is_ok() {
-                self.mark_presence_acked(&peer_id, seq);
+                self.mark_presence_acked(&peer_id, sent_seq);
             }
         }
     }
@@ -2565,29 +1128,26 @@ impl ExecPlane {
                 }
                 continue;
             }
-            let (instance_id, seq, sessions) = self.presence.snapshot_local();
-            let req = ExecReq::PresenceSync {
-                instance_id,
-                seq,
-                sessions,
-                want_reply: true,
-                clear_claim: None,
-            };
-            futures_util::future::join_all(peers.into_iter().map(|peer_id| {
-                let req_ref = &req;
-                async move {
-                    if !self.net.is_peer_online(&peer_id) {
-                        return;
-                    }
-                    if let Ok(ExecResp::Presence {
-                        instance_id: r_inst,
-                        seq: r_seq,
-                        sessions: r_sessions,
-                    }) = self.exec_rpc(&peer_id, req_ref, EXEC_SHORT_TIMEOUT).await
-                    {
-                        self.mark_presence_acked(&peer_id, seq);
-                        self.apply_remote_presence(&peer_id, r_inst, r_seq, r_sessions, None);
-                    }
+            futures_util::future::join_all(peers.into_iter().map(|peer_id| async move {
+                if !self.net.is_peer_online(&peer_id) {
+                    return;
+                }
+                let (sender_instance_id, sender_gossip_seq, entries) =
+                    self.presence.snapshot_for_peer(&peer_id);
+                let req = ExecReq::PresenceSync {
+                    sender_instance_id,
+                    sender_gossip_seq,
+                    entries,
+                    want_reply: true,
+                };
+                if let Ok(ExecResp::Presence {
+                    sender_instance_id: r_inst,
+                    sender_gossip_seq: r_seq,
+                    entries: r_entries,
+                }) = self.exec_rpc(&peer_id, &req, EXEC_SHORT_TIMEOUT).await
+                {
+                    self.mark_presence_acked(&peer_id, sender_gossip_seq);
+                    self.apply_remote_presence(&peer_id, r_inst, r_seq, r_entries);
                 }
             }))
             .await;
@@ -2613,7 +1173,7 @@ impl ExecPlane {
         }
     }
 
-    async fn peer_info(&self, peer_id: &str) -> Result<PeerInfo> {
+    async fn peer_info(&self, peer_id: &str) -> Result<crate::cluster::identity::PeerInfo> {
         let target = peer_id.to_owned();
         let peer = self
             .db
@@ -2712,15 +1272,17 @@ impl ExecPlane {
 
     async fn probe_online_occupancy(&self, sid: SessionId) -> Result<Option<String>> {
         let local_id = self.presence.local_node_id();
-        if let Some((holder, by_claim)) = self.presence.active_claim_holder_excluding(sid, &local_id) {
+        if let Some((holder, by_claim)) = self.presence.active_claim_holder_excluding(sid, &local_id)
+        {
             if by_claim {
                 return Err(Error::conflict(format!(
                     "session run is starting on node {holder}"
                 )));
             }
-            if holder != local_id {
-                return Ok(Some(holder));
-            }
+            return Ok(Some(holder));
+        }
+        if let Some((owner, _)) = self.presence.remote_owner(sid) {
+            return Ok(Some(owner));
         }
         let online = self.net.online_peer_ids();
         if online.is_empty() {
@@ -2729,71 +1291,45 @@ impl ExecPlane {
         let req = ExecReq::CheckOccupancy {
             session_id: sid,
             claim: None,
-            voter_epoch: self.presence.current_voter_config().0,
+            visited: vec![local_id.clone()],
+            hops_left: MAX_CHECK_HOPS,
         };
         let replies = futures_util::future::join_all(online.into_iter().map(|peer_id| {
             let req_ref = &req;
-            async move { (peer_id.clone(), self.exec_rpc(&peer_id, req_ref, EXEC_LEASE_TIMEOUT).await) }
+            async move { (peer_id.clone(), self.exec_rpc(&peer_id, req_ref, EXEC_PROBE_TIMEOUT).await) }
         }))
         .await;
         let mut best: Option<String> = None;
         let mut starting_holder: Option<String> = None;
-        let mut unoccupied_peers = Vec::new();
         let mut deleted_peers = Vec::new();
-        let mut online_err: Option<Error> = None;
-        let cur_epoch = self.presence.current_voter_config().0;
-        let mut max_seen_epoch: Option<(u64, Vec<String>)> = None;
         for (peer_id, res) in replies {
-            match res {
-                Ok(ExecResp::Occupancy {
-                    occupied,
-                    runner_node_id,
-                    status,
-                    occupied_by_claim,
-                    voter_epoch,
-                    voter_set,
-                    session_deleted,
-                    ..
-                }) => {
-                    if voter_epoch > cur_epoch
-                        && max_seen_epoch.as_ref().is_none_or(|(e, _)| voter_epoch > *e)
-                    {
-                        max_seen_epoch = Some((voter_epoch, voter_set));
-                    }
-                    if session_deleted {
-                        deleted_peers.push(peer_id);
+            if let Ok(ExecResp::Occupancy {
+                occupied,
+                runner_node_id,
+                status,
+                occupied_by_claim,
+                session_deleted,
+                ..
+            }) = res
+            {
+                if session_deleted {
+                    deleted_peers.push(peer_id);
+                    continue;
+                }
+                if occupied {
+                    let owner = runner_node_id.unwrap_or(peer_id);
+                    if owner == local_id {
                         continue;
                     }
-                    if occupied {
-                        let owner = runner_node_id.unwrap_or(peer_id);
-                        if owner == local_id {
-                            continue;
-                        }
-                        if status.is_none() || occupied_by_claim {
-                            starting_holder.get_or_insert(owner);
-                            continue;
-                        }
-                        if best.as_ref().is_none_or(|b| owner.as_str() < b.as_str()) {
-                            best = Some(owner);
-                        }
-                    } else {
-                        unoccupied_peers.push(peer_id);
+                    if status.is_none() || occupied_by_claim {
+                        starting_holder.get_or_insert(owner);
+                        continue;
                     }
-                }
-                Ok(_) => {
-                    online_err.get_or_insert_with(|| {
-                        Error::internal("unexpected CheckOccupancy response")
-                    });
-                }
-                Err(err) => {
-                    if self.net.is_peer_online(&peer_id) {
-                        online_err.get_or_insert(err);
+                    if best.as_ref().is_none_or(|b| owner.as_str() < b.as_str()) {
+                        best = Some(owner);
                     }
                 }
             }
-        }
-        if let Some((ep, set)) = max_seen_epoch {
-            let _ = self.adopt_voter_epoch(ep, set).await;
         }
         if !deleted_peers.is_empty() {
             let _ = self.sync.sync_session_strict(sid, &deleted_peers).await;
@@ -2807,12 +1343,6 @@ impl ExecPlane {
                 "session run is starting on node {holder}"
             )));
         }
-        if self.presence.voter_quorum(&unoccupied_peers).satisfied {
-            return Ok(None);
-        }
-        if let Some(err) = online_err {
-            return Err(err);
-        }
         Ok(None)
     }
 
@@ -2821,7 +1351,6 @@ impl ExecPlane {
         app: &App,
         sid: SessionId,
         node: Option<String>,
-        force_offline: bool,
     ) -> Result<Session> {
         if let Some(raw_target) = node {
             let trimmed = raw_target.trim();
@@ -2839,7 +1368,7 @@ impl ExecPlane {
                     _ => Error::internal(msg),
                 })?;
             match resolved {
-                ResolvedNode::Local { .. } => self.start_run_local(app, sid, force_offline).await,
+                ResolvedNode::Local { .. } => self.start_run_local(app, sid).await,
                 ResolvedNode::Remote(peer) => {
                     if !self.net.is_peer_online(&peer.node_id) {
                         return Err(Error(
@@ -2850,37 +1379,25 @@ impl ExecPlane {
                     match self
                         .exec_rpc(
                             &peer.node_id,
-                            &ExecReq::StartRun {
-                                session_id: sid,
-                                force_offline,
-                            },
+                            &ExecReq::StartRun { session_id: sid },
                             EXEC_OP_TIMEOUT,
                         )
                         .await?
                     {
-                        ExecResp::Session { session } => {
-                            let parsed: Session = serde_json::from_value(session)
-                                .map_err(|e| Error::internal(format!("invalid remote session reply: {e}")))?;
-                            Ok(parsed)
-                        }
+                        ExecResp::Session { session } => serde_json::from_value(session)
+                            .map_err(|e| Error::internal(format!("invalid remote session reply: {e}"))),
                         _ => Err(Error::internal("unexpected remote StartRun response")),
                     }
                 }
             }
         } else {
-            self.start_run_local(app, sid, force_offline).await
+            self.start_run_local(app, sid).await
         }
     }
 
-    pub async fn start_run_local(
-        &self,
-        app: &App,
-        sid: SessionId,
-        force_offline: bool,
-    ) -> Result<Session> {
-        // Single-node fast path: zero start_lock, net mutex, or redundant DB pre-checks.
-        if self.presence.is_single_node_config_valid() {
-            match app.start_local_checked(sid, RunAuth::Standalone).await {
+    pub async fn start_run_local(&self, app: &App, sid: SessionId) -> Result<Session> {
+        if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
+            match app.start_local_checked(sid, true).await {
                 Err(err) if is_membership_changed_err(&err) => {}
                 other => return other,
             }
@@ -2889,18 +1406,18 @@ impl ExecPlane {
         let lock = self.start_lock(sid);
         let _guard = lock.lock().await;
 
-        if self.presence.is_single_node_config_valid() && self.net.online_peer_ids().is_empty() {
-            match app.start_local_checked(sid, RunAuth::Standalone).await {
+        if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
+            match app.start_local_checked(sid, true).await {
                 Err(err) if is_membership_changed_err(&err) => {}
                 other => return other,
             }
         }
 
-        // Fast idempotent path if this node ALREADY owns an active worker with a valid lease.
+        // Fast idempotent path if this node already owns an active session worker.
         let fast_local = self
             .db
             .call(move |s| {
-                if s.active.contains_key(&sid) && s.presence.is_local_lease_valid(sid) {
+                if s.active.contains_key(&sid) {
                     let current = session(&s.conn, sid)?;
                     if current.status == SessionStatus::Pausing {
                         return Err(Error::conflict("session is pausing"));
@@ -2914,69 +1431,39 @@ impl ExecPlane {
             return Ok(view);
         }
 
-        // Idle lease holder with active background tasks already holds a valid LocalLease.
-        let existing_auth = match self.presence.active_local_lease_kind(sid) {
-            Some(LocalLease::Quorum(existing)) => {
-                if !existing.is_valid()
-                    || existing.voter_epoch != self.presence.current_voter_config().0
-                {
-                    return Err(Error::conflict("execution lease lost"));
-                }
-                let term = existing.term;
-                Some((RunAuth::Quorum(existing), false, Some(term)))
-            }
-            Some(LocalLease::ForcedOffline)
-                if force_offline
-                    && !self
-                        .presence
-                        .voter_quorum(&self.net.online_peer_ids())
-                        .satisfied =>
-            {
-                Some((RunAuth::ForcedOffline, true, None))
-            }
-            Some(LocalLease::ForcedOffline) | None => None,
-        };
-        if let Some((auth, offline, persist_term)) = existing_auth {
+        // Fast local path when this node already occupies the session (e.g., background tasks).
+        if self.presence.local_owner(sid).is_some() {
             self.validate_local_gate_preconditions(
                 sid,
-                LeasePurpose::Run {
-                    force_offline: offline,
+                GatePurpose::Run {
                     require_model_caps: true,
                 },
-                persist_term,
             )
             .await?;
             self.sync.ensure_session_attachments(sid).await?;
-            let started = app.start_local_checked(sid, auth).await?;
+            let started = app.start_local_checked(sid, false).await?;
             let peers = self.net.online_peer_ids();
             if !peers.is_empty() {
-                self.broadcast_presence_to(&peers, None).await;
+                self.broadcast_presence_to(&peers).await;
             }
             return Ok(started);
         }
 
         let gate = self
-            .acquire_session_lease(
+            .acquire_connected_gate(
                 sid,
-                LeasePurpose::Run {
-                    force_offline,
+                GatePurpose::Run {
                     require_model_caps: true,
                 },
             )
             .await?;
-        let auth = gate.mode.as_auth();
-        match &gate.mode {
-            GateMode::Quorum(lease) => self.presence.set_active_local_lease(sid, lease.clone()),
-            GateMode::ForcedOffline => self.presence.set_active_local_forced_offline(sid),
-            GateMode::Standalone => {}
-        }
-        let started = app.start_local_checked(sid, auth).await;
-        self.finish_leased_start(app, sid, gate, started).await
+        let started = app.start_local_checked(sid, false).await;
+        self.finish_connected_start(sid, gate, started).await
     }
 
     pub async fn start_wake_run(&self, app: &App, sid: SessionId) -> Result<Session> {
-        if self.presence.is_single_node_config_valid() {
-            match app.start_wake_checked(sid, RunAuth::Standalone).await {
+        if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
+            match app.start_wake_checked(sid, true).await {
                 Err(err) if is_membership_changed_err(&err) => {}
                 other => return other,
             }
@@ -2985,100 +1472,45 @@ impl ExecPlane {
         let lock = self.start_lock(sid);
         let _guard = lock.lock().await;
 
-        if self.presence.is_single_node_config_valid() && self.net.online_peer_ids().is_empty() {
-            match app.start_wake_checked(sid, RunAuth::Standalone).await {
+        if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
+            match app.start_wake_checked(sid, true).await {
                 Err(err) if is_membership_changed_err(&err) => {}
                 other => return other,
             }
         }
-        match self.presence.active_local_lease_kind(sid) {
-            Some(LocalLease::Quorum(existing)) => {
-                if existing.is_valid()
-                    && existing.voter_epoch == self.presence.current_voter_config().0
-                {
-                    return app.start_wake_checked(sid, RunAuth::Quorum(existing)).await;
-                }
-                return Err(Error::conflict("execution lease lost"));
-            }
-            Some(LocalLease::ForcedOffline) => {
-                if !self
-                    .presence
-                    .voter_quorum(&self.net.online_peer_ids())
-                    .satisfied
-                {
-                    return app.start_wake_checked(sid, RunAuth::ForcedOffline).await;
-                }
-            }
-            None => {}
+        if self.presence.local_owner(sid).is_some() {
+            return app.start_wake_checked(sid, false).await;
         }
 
         let gate = self
-            .acquire_session_lease(
+            .acquire_connected_gate(
                 sid,
-                LeasePurpose::Run {
-                    force_offline: false,
+                GatePurpose::Run {
                     require_model_caps: true,
                 },
             )
             .await?;
-        let auth = gate.mode.as_auth();
-        match &gate.mode {
-            GateMode::Quorum(lease) => self.presence.set_active_local_lease(sid, lease.clone()),
-            GateMode::ForcedOffline => self.presence.set_active_local_forced_offline(sid),
-            GateMode::Standalone => {}
-        }
-        let started = app.start_wake_checked(sid, auth).await;
-        self.finish_leased_start(app, sid, gate, started).await
+        let started = app.start_wake_checked(sid, false).await;
+        self.finish_connected_start(sid, gate, started).await
     }
 
-    async fn release_failed_gate(&self, sid: SessionId, gate: &mut AcquiredLeaseGate) {
-        if let Some(lease) = gate.mode.quorum_lease() {
-            self.presence.clear_active_local_lease(sid, &lease.claim_id);
-        } else if matches!(gate.mode, GateMode::ForcedOffline)
-            && self.presence.local_owner(sid).is_none()
-            && matches!(
-                self.presence.active_local_lease_kind(sid),
-                Some(LocalLease::ForcedOffline)
-            )
-        {
-            self.presence.set_local(sid, None);
-        }
-        if let Some(cg) = gate.claim_guard.take() {
-            cg.release_now().await;
-        }
-    }
-
-    async fn finish_leased_start(
+    async fn finish_connected_start(
         &self,
-        app: &App,
         sid: SessionId,
-        mut gate: AcquiredLeaseGate,
+        mut gate: ConnectedGate,
         started: Result<Session>,
     ) -> Result<Session> {
         let Ok(session) = started else {
-            self.release_failed_gate(sid, &mut gate).await;
+            if let Some(cg) = gate.claim_guard.take() {
+                cg.release_now().await;
+            }
             return started;
         };
-        let lease_still_active = match &gate.mode {
-            GateMode::Quorum(l) => self
-                .presence
-                .active_local_lease(sid)
-                .is_some_and(|cur| cur.claim_id == l.claim_id),
-            GateMode::ForcedOffline => self.presence.local_owner(sid).is_some(),
-            GateMode::Standalone => true,
-        };
-        if lease_still_active {
-            if let Some(cg) = gate.claim_guard.take() {
-                cg.release_local_only();
-            }
-            if let Some(lease) = gate.mode.take_quorum_lease() {
-                self.spawn_lease_renew_loop(app.clone(), sid, lease);
-            }
-            if !gate.granted_peers.is_empty() {
-                self.broadcast_presence_to(&gate.granted_peers, None).await;
-            }
-        } else {
-            self.release_failed_gate(sid, &mut gate).await;
+        if !gate.online_peers.is_empty() && self.presence.local_owner(sid).is_some() {
+            self.broadcast_presence_to(&gate.online_peers).await;
+        }
+        if let Some(cg) = gate.claim_guard.take() {
+            cg.release_now().await;
         }
         Ok(session)
     }
@@ -3086,30 +1518,31 @@ impl ExecPlane {
     async fn validate_local_gate_preconditions(
         &self,
         sid: SessionId,
-        purpose: LeasePurpose,
-        persist_term: Option<u64>,
-    ) -> Result<(String, usize, String, BTreeMap<String, i64>)> {
+        purpose: GatePurpose,
+    ) -> Result<(String, String, BTreeMap<String, i64>)> {
         let presence = self.presence.clone();
         self.db
             .call(move |s| {
-                let known_peers = refresh_known_peer_count(&s.conn, &presence)?;
+                refresh_known_peer_count(&s.conn, &presence)?;
                 let current = session(&s.conn, sid)?;
                 match purpose {
-                    LeasePurpose::Delete => {
+                    GatePurpose::Delete => {
                         if s.active.contains_key(&sid)
                             || s.pending_wakes.contains(&sid)
                             || codemode::has_session_tasks(s, sid)
-                            || matches!(current.status, SessionStatus::Running | SessionStatus::Pausing)
+                            || matches!(
+                                current.status,
+                                SessionStatus::Running | SessionStatus::Pausing
+                            )
                             || presence.local_owner(sid).is_some()
                             || presence.remote_owner(sid).is_some()
-                            || presence.has_committed_remote_lease(sid)
                         {
                             return Err(Error::conflict(
                                 "pause the session and stop active tasks before deleting",
                             ));
                         }
                     }
-                    LeasePurpose::Run { require_model_caps, .. } => {
+                    GatePurpose::Run { require_model_caps } => {
                         if require_model_caps {
                             crate::catalog::available_capabilities(&s.conn, current.model_id)?;
                             if current.status == SessionStatus::Pausing {
@@ -3128,23 +1561,19 @@ impl ExecPlane {
                     .prepare_cached("SELECT active_head_ts FROM sessions WHERE id=? AND deleted=0")?
                     .query_row([sid], |r| r.get(0))?;
                 let vector = read_vector(&s.conn, &session_scope(sid))?;
-                if let Some(term) = persist_term {
-                    persist_lease_term(&s.conn, sid, term)?;
-                }
-                Ok((s.local_node_id.clone(), known_peers, head_ts, vector))
+                Ok((s.local_node_id.clone(), head_ts, vector))
             })
             .await
     }
 
-    async fn acquire_session_lease(
+    async fn acquire_connected_gate(
         &self,
         sid: SessionId,
-        purpose: LeasePurpose,
-    ) -> Result<AcquiredLeaseGate> {
-        let force_offline = matches!(purpose, LeasePurpose::Run { force_offline: true, .. });
+        purpose: GatePurpose,
+    ) -> Result<ConnectedGate> {
         let require_model_caps =
-            matches!(purpose, LeasePurpose::Run { require_model_caps: true, .. });
-        let is_delete = matches!(purpose, LeasePurpose::Delete);
+            matches!(purpose, GatePurpose::Run { require_model_caps: true });
+        let is_delete = matches!(purpose, GatePurpose::Delete);
         let max_attempts = if is_delete { 4 } else { 6 };
 
         for attempt in 0..max_attempts {
@@ -3156,108 +1585,41 @@ impl ExecPlane {
                 })
                 .await?;
             let online = self.net.online_peer_ids();
-            let q_pre = self.presence.voter_quorum(&online);
-            let (cur_epoch, _, pending_epoch, _) = self.presence.current_voter_config();
 
-            if known_pre == 0 && online.is_empty() {
-                if !self.presence.is_single_node_config_valid() {
-                    return Err(Error::conflict(
-                        "cluster voter configuration is not valid for standalone execution",
-                    ));
+            if online.is_empty() {
+                if known_pre > 0 {
+                    // Isolated partition: allow local start/delete without remote consensus.
+                    self.validate_local_gate_preconditions(sid, purpose).await?;
+                    if require_model_caps {
+                        self.sync.ensure_session_attachments(sid).await?;
+                    }
+                } else {
+                    self.validate_local_gate_preconditions(sid, purpose).await?;
                 }
-                self.validate_local_gate_preconditions(sid, purpose, None)
-                    .await?;
-                if self.presence.is_single_node_config_valid()
-                    && self.net.online_peer_ids().is_empty()
-                {
-                    return Ok(AcquiredLeaseGate {
-                        mode: GateMode::Standalone,
-                        granted_peers: Vec::new(),
+                if self.net.online_peer_ids().is_empty() {
+                    return Ok(ConnectedGate {
+                        online_peers: Vec::new(),
                         claim_guard: None,
                     });
                 }
                 continue;
             }
 
-            if !q_pre.satisfied || cur_epoch == 0 || pending_epoch != 0 {
-                if !force_offline {
-                    let msg = if is_delete {
-                        format!(
-                            "cluster voter quorum unavailable ({}/{} voters online, need {}); cannot safely delete session while partitioned",
-                            q_pre.acked_voters, q_pre.total_voters, q_pre.needed
-                        )
-                    } else if cur_epoch == 0 {
-                        "cluster voter configuration not yet synchronized; reconnect peers or pass force_offline=true".into()
-                    } else if pending_epoch != 0 {
-                        "cluster voter reconfiguration in progress; retry or pass force_offline=true".into()
-                    } else {
-                        format!(
-                            "cluster voter quorum unavailable ({}/{} voters online, need {}); reconnect peers or pass force_offline=true",
-                            q_pre.acked_voters, q_pre.total_voters, q_pre.needed
-                        )
-                    };
-                    return Err(Error(axum::http::StatusCode::SERVICE_UNAVAILABLE, msg));
-                }
-                if !online.is_empty() {
-                    if let Some(owner) = self.probe_online_occupancy(sid).await? {
-                        return Err(Error::conflict(format!(
-                            "session is currently occupied on node {owner}"
-                        )));
-                    }
-                    self.sync.sync_session_latest(sid).await?;
-                }
-                self.validate_local_gate_preconditions(sid, purpose, None)
-                    .await?;
-                if require_model_caps {
-                    self.sync.ensure_session_attachments(sid).await?;
-                }
-                return Ok(AcquiredLeaseGate {
-                    mode: if self.presence.known_peer_count() > 0 {
-                        GateMode::ForcedOffline
-                    } else {
-                        GateMode::Standalone
-                    },
-                    granted_peers: Vec::new(),
-                    claim_guard: None,
-                });
+            if self.presence.local_owner(sid).is_some()
+                || self.presence.remote_owner(sid).is_some()
+            {
+                let err_msg = if is_delete {
+                    "pause the session and stop active tasks before deleting".to_owned()
+                } else if let Some((owner_id, _)) = self.presence.remote_owner(sid) {
+                    format!("session is currently occupied on node {owner_id}")
+                } else {
+                    "session is already occupied on this node".to_owned()
+                };
+                return Err(Error::conflict(err_msg));
             }
 
-            if is_delete
-                && (self.presence.local_owner(sid).is_some()
-                    || self.presence.remote_owner(sid).is_some()
-                    || self.presence.has_committed_remote_lease(sid))
-            {
-                return Err(Error::conflict(
-                    "pause the session and stop active tasks before deleting",
-                ));
-            }
-            if !is_delete
-                && let Some((owner_id, _)) = self.presence.remote_owner(sid)
-                && self.net.is_peer_online(&owner_id)
-                && let Ok(ExecResp::Occupancy {
-                    occupied: true,
-                    runner_node_id,
-                    occupied_by_claim: false,
-                    ..
-                }) = self
-                    .exec_rpc(
-                        &owner_id,
-                        &ExecReq::CheckOccupancy {
-                            session_id: sid,
-                            claim: None,
-                            voter_epoch: cur_epoch,
-                        },
-                        EXEC_LEASE_TIMEOUT,
-                    )
-                    .await
-            {
-                let holder = runner_node_id.unwrap_or(owner_id);
-                return Err(Error::conflict(format!(
-                    "session is currently occupied on node {holder}"
-                )));
-            }
-
-            let (claim_id, term) = match self.presence.try_acquire_local_claim(sid) {
+            let local_id_pre = self.presence.local_node_id();
+            let (claim_id, started_ms) = match self.presence.try_acquire_local_claim(sid) {
                 Ok(pair) => pair,
                 Err((_msg, true)) if !is_delete && attempt + 1 < max_attempts => {
                     sleep_jitter(true).await;
@@ -3269,23 +1631,22 @@ impl ExecPlane {
                 self.presence.clone(),
                 self.self_weak.get().and_then(Weak::upgrade),
                 sid,
+                local_id_pre,
                 claim_id.clone(),
             );
 
-            if let Err(err) = self.sync.sync_session_latest(sid).await {
+            if let Err(err) = self.sync.sync_session_best_effort(sid).await {
                 claim_guard.release_now().await;
                 return Err(err);
             }
-            let (local_id, known_peers_now, local_head_ts, local_vector) = match self
-                .validate_local_gate_preconditions(sid, purpose, Some(term))
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    claim_guard.release_now().await;
-                    return Err(err);
-                }
-            };
+            let (local_id, local_head_ts, local_vector) =
+                match self.validate_local_gate_preconditions(sid, purpose).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        claim_guard.release_now().await;
+                        return Err(err);
+                    }
+                };
             if require_model_caps
                 && let Err(err) = self.sync.ensure_session_attachments(sid).await
             {
@@ -3293,70 +1654,33 @@ impl ExecPlane {
                 return Err(err);
             }
 
-            let total_now = 1usize.saturating_add(known_peers_now);
             let online = self.net.online_peer_ids();
-            let q_now = self.presence.voter_quorum(&online);
-            let (epoch_now, _, pending_now, _) = self.presence.current_voter_config();
-            if !q_now.satisfied || epoch_now == 0 || pending_now != 0 {
+            if online.is_empty() {
                 claim_guard.release_now().await;
-                if force_offline {
-                    return Ok(AcquiredLeaseGate {
-                        mode: if total_now > 1 {
-                            GateMode::ForcedOffline
-                        } else {
-                            GateMode::Standalone
-                        },
-                        granted_peers: Vec::new(),
-                        claim_guard: None,
-                    });
-                }
-                let msg = if is_delete {
-                    format!(
-                        "cluster voter quorum unavailable ({}/{} voters online, need {}); cannot safely delete session while partitioned",
-                        q_now.acked_voters, q_now.total_voters, q_now.needed
-                    )
-                } else {
-                    format!(
-                        "cluster voter quorum unavailable ({}/{} voters online, need {}); reconnect peers or pass force_offline=true",
-                        q_now.acked_voters, q_now.total_voters, q_now.needed
-                    )
-                };
-                return Err(Error(axum::http::StatusCode::SERVICE_UNAVAILABLE, msg));
-            }
-            if total_now == 1
-                && online.is_empty()
-                && self.presence.is_single_node_config_valid()
-            {
-                claim_guard.release_local_only();
-                return Ok(AcquiredLeaseGate {
-                    mode: GateMode::Standalone,
-                    granted_peers: Vec::new(),
+                return Ok(ConnectedGate {
+                    online_peers: Vec::new(),
                     claim_guard: None,
                 });
             }
 
-            // Track every queried peer BEFORE sending CheckOccupancy so aborted/partial rounds always release synchronously.
             claim_guard.track_peers(&online);
-            let grant_start = Instant::now();
             let claim = RunClaim {
                 claim_id: claim_id.clone(),
                 node_id: local_id.clone(),
-                started_ms: chrono::Utc::now().timestamp_millis(),
-                term,
-                voter_epoch: epoch_now,
-                ttl_ms: u64::try_from(LEASE_TTL.as_millis()).unwrap_or(10_000),
+                started_ms,
             };
             let req = ExecReq::CheckOccupancy {
                 session_id: sid,
                 claim: Some(claim),
-                voter_epoch: epoch_now,
+                visited: vec![local_id.clone()],
+                hops_left: MAX_CHECK_HOPS,
             };
-            let replies = futures_util::future::join_all(online.into_iter().map(|peer_id| {
+            let replies = futures_util::future::join_all(online.iter().cloned().map(|peer_id| {
                 let req_ref = &req;
                 async move {
                     (
                         peer_id.clone(),
-                        self.exec_rpc(&peer_id, req_ref, EXEC_LEASE_TIMEOUT).await,
+                        self.exec_rpc(&peer_id, req_ref, EXEC_PROBE_TIMEOUT).await,
                     )
                 }
             }))
@@ -3372,44 +1696,24 @@ impl ExecPlane {
                 })
                 .collect();
 
-            let mut granted_peers = Vec::new();
-            let mut max_seen_term = term;
-            let mut max_seen_epoch: Option<(u64, Vec<String>)> = None;
-            let mut saw_epoch_mismatch = false;
             let mut deleted_peers = Vec::new();
             let mut ahead_peers = Vec::new();
             let mut retry_by_claim: Option<String> = None;
-            let mut retry_stale_term = false;
             let mut hard_occupied: Option<String> = None;
-            let mut online_err: Option<Error> = None;
 
             for (peer_id, reply) in replies {
                 match reply {
                     Ok(ExecResp::Occupancy {
                         occupied,
                         runner_node_id,
-                        lease_granted,
                         occupied_by_claim,
-                        highest_term,
-                        voter_epoch,
-                        voter_set,
-                        voter_epoch_mismatch,
                         session_deleted,
                         session_active_head_ts,
                         session_vector,
                         ..
                     }) => {
-                        max_seen_term = max_seen_term.max(highest_term);
-                        if voter_epoch > epoch_now
-                            && max_seen_epoch.as_ref().is_none_or(|(e, _)| voter_epoch > *e)
-                        {
-                            max_seen_epoch = Some((voter_epoch, voter_set));
-                        }
-                        if voter_epoch_mismatch {
-                            saw_epoch_mismatch = true;
-                        }
                         if session_deleted {
-                            deleted_peers.push(peer_id.clone());
+                            deleted_peers.push(peer_id);
                             continue;
                         }
                         if peer_ahead_of_local(
@@ -3422,38 +1726,23 @@ impl ExecPlane {
                             ahead_peers.push(peer_id.clone());
                         }
                         if occupied {
-                            let holder = runner_node_id.unwrap_or_else(|| peer_id.clone());
-                            if !is_delete && (occupied_by_claim || idle_confirmers.contains(&holder))
+                            let holder = runner_node_id.unwrap_or(peer_id);
+                            if !is_delete
+                                && (occupied_by_claim || idle_confirmers.contains(&holder))
                             {
                                 retry_by_claim.get_or_insert(holder);
                             } else {
                                 hard_occupied.get_or_insert(holder);
                             }
-                        } else if lease_granted && !voter_epoch_mismatch {
-                            granted_peers.push(peer_id);
-                        } else if !voter_epoch_mismatch {
-                            retry_stale_term = true;
                         }
                     }
-                    Ok(_) => {
-                        online_err.get_or_insert_with(|| {
-                            Error::internal("unexpected CheckOccupancy response")
-                        });
-                    }
+                    Ok(_) => {}
                     Err(err) => {
-                        if self.net.is_peer_online(&peer_id) {
-                            online_err.get_or_insert(err);
-                        }
+                        tracing::debug!(%sid, %peer_id, error = %err, "peer unreachable during connected-component occupancy check");
                     }
                 }
             }
 
-            let adopted_higher_epoch = if let Some((higher_ep, higher_set)) = max_seen_epoch {
-                let _ = self.adopt_voter_epoch(higher_ep, higher_set).await;
-                true
-            } else {
-                false
-            };
             if !deleted_peers.is_empty() {
                 claim_guard.release_now().await;
                 let _ = self.sync.sync_session_strict(sid, &deleted_peers).await;
@@ -3467,93 +1756,27 @@ impl ExecPlane {
                     format!("session is currently occupied on node {holder}")
                 }));
             }
-            if adopted_higher_epoch {
+            if !ahead_peers.is_empty() {
                 claim_guard.release_now().await;
+                let _ = self.sync.sync_session_strict(sid, &ahead_peers).await;
                 if attempt + 1 < max_attempts {
                     sleep_jitter(false).await;
                     continue;
                 }
                 return Err(Error::conflict(if is_delete {
-                    "cluster voter configuration changed before delete; retry"
+                    "session state advanced on cluster peers during delete gate; retry"
                 } else {
-                    "cluster voter configuration changed while acquiring lease; retry"
+                    "session state advanced on cluster peers while starting; retry"
                 }));
             }
-            if !ahead_peers.is_empty() {
-                claim_guard.release_now().await;
-                self.sync.sync_session_strict(sid, &ahead_peers).await?;
-                if attempt + 1 < max_attempts {
-                    sleep_jitter(false).await;
-                    continue;
-                }
-                return Err(Error(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    if is_delete {
-                        "session state advanced on cluster peers during delete gate; retry".into()
-                    } else {
-                        "session state advanced on cluster peers during lease acquisition; retry"
-                            .into()
-                    },
-                ));
-            }
-            if max_seen_term > term {
-                self.presence.observe_remote_term(sid, max_seen_term);
-            }
-            if saw_epoch_mismatch || retry_by_claim.is_some() || retry_stale_term {
+            if let Some(holder) = retry_by_claim {
                 claim_guard.release_now().await;
                 if attempt + 1 < max_attempts {
-                    let prefer_early = retry_by_claim
-                        .as_ref()
-                        .is_some_and(|holder| local_id < *holder);
+                    let prefer_early = local_id < holder;
                     sleep_jitter(prefer_early).await;
                     continue;
                 }
-                return Err(Error::conflict(if is_delete {
-                    "session lease term or epoch changed on cluster before delete; retry"
-                } else if saw_epoch_mismatch {
-                    "cluster voter configuration mismatch; retry"
-                } else if retry_by_claim.is_some() {
-                    "concurrent cluster start detected; retry"
-                } else {
-                    "cluster execution term advanced; retry"
-                }));
-            }
-            let (epoch_check, _, pending_check, _) = self.presence.current_voter_config();
-            if epoch_check != epoch_now || pending_check != 0 {
-                claim_guard.release_now().await;
-                if attempt + 1 < max_attempts {
-                    sleep_jitter(false).await;
-                    continue;
-                }
-                return Err(Error::conflict(if is_delete {
-                    "cluster voter configuration changed before delete; retry"
-                } else {
-                    "cluster voter configuration changed before committing lease; retry"
-                }));
-            }
-            if !self.presence.voter_quorum(&granted_peers).satisfied {
-                claim_guard.release_now().await;
-                if force_offline {
-                    return Ok(AcquiredLeaseGate {
-                        mode: if self.presence.known_peer_count() > 0 {
-                            GateMode::ForcedOffline
-                        } else {
-                            GateMode::Standalone
-                        },
-                        granted_peers: Vec::new(),
-                        claim_guard: None,
-                    });
-                }
-                return Err(online_err.unwrap_or_else(|| {
-                    Error(
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        if is_delete {
-                            "cluster voter quorum not reached for session delete".into()
-                        } else {
-                            "cluster voter quorum not reached for execution lease".into()
-                        },
-                    )
-                }));
+                return Err(Error::conflict("concurrent cluster start detected; retry"));
             }
 
             match self.presence.promote_local_claim_to_committing(sid, &claim_id) {
@@ -3567,161 +1790,18 @@ impl ExecPlane {
                     return Err(Error::conflict(msg));
                 }
             }
-            let lease_ttl = LEASE_TTL.saturating_sub(LEASE_SAFETY_MARGIN);
-            let lease = ActiveLease::new(term, epoch_now, claim_id, grant_start + lease_ttl);
-            return Ok(AcquiredLeaseGate {
-                mode: GateMode::Quorum(lease),
-                granted_peers,
+
+            return Ok(ConnectedGate {
+                online_peers: online,
                 claim_guard: Some(claim_guard),
             });
         }
 
         Err(Error::conflict(if is_delete {
-            "failed to acquire cluster delete gate"
+            "failed to acquire delete gate"
         } else {
-            "failed to acquire cluster execution lease"
+            "concurrent cluster start conflict; retry"
         }))
-    }
-
-    fn spawn_lease_renew_loop(&self, app: App, sid: SessionId, lease: Arc<ActiveLease>) {
-        let Some(plane) = self.self_weak.get().and_then(Weak::upgrade) else {
-            return;
-        };
-        let mut fast_retry = false;
-        self.workers.spawn(async move {
-            loop {
-                let now = Instant::now();
-                let deadline = lease.deadline();
-                if now >= deadline {
-                    lease.revoked.cancel();
-                    app.fence_session_local(sid, Some(lease.term), "execution lease lost")
-                        .await;
-                    return;
-                }
-                let rem = deadline.saturating_duration_since(now);
-                let wait = if fast_retry {
-                    Duration::from_secs(1).min(rem)
-                } else {
-                    LEASE_RENEW_INTERVAL.min(rem)
-                };
-                tokio::select! {
-                    biased;
-                    _ = plane.stopping.cancelled() => return,
-                    _ = lease.revoked.cancelled() => {
-                        app.fence_session_local(sid, Some(lease.term), "execution lease revoked")
-                            .await;
-                        return;
-                    }
-                    _ = lease.stopped.cancelled() => {
-                        let online = plane.net.online_peer_ids();
-                        if !online.is_empty() {
-                            let req = ExecReq::ReleaseClaim {
-                                session_id: sid,
-                                claim_id: lease.claim_id.clone(),
-                            };
-                            futures_util::future::join_all(online.into_iter().map(|peer_id| {
-                                let req_ref = &req;
-                                let plane = plane.clone();
-                                async move {
-                                    let _ = plane.exec_rpc(&peer_id, req_ref, Duration::from_secs(2)).await;
-                                }
-                            }))
-                            .await;
-                        }
-                        return;
-                    }
-                    _ = tokio::time::sleep(wait) => {}
-                }
-                if lease.revoked.is_cancelled()
-                    || lease.stopped.is_cancelled()
-                    || plane.stopping.is_cancelled()
-                {
-                    continue;
-                }
-                let round_start = Instant::now();
-                let online = plane.net.online_peer_ids();
-                let ttl_ms = u64::try_from(LEASE_TTL.as_millis()).unwrap_or(10_000);
-                let req = ExecReq::RenewLease {
-                    session_id: sid,
-                    claim_id: lease.claim_id.clone(),
-                    term: lease.term,
-                    ttl_ms,
-                    voter_epoch: lease.voter_epoch,
-                };
-                let replies = futures_util::future::join_all(online.into_iter().map(|peer_id| {
-                    let req_ref = &req;
-                    let plane = plane.clone();
-                    async move { (peer_id.clone(), plane.exec_rpc(&peer_id, req_ref, Duration::from_secs(2)).await) }
-                }))
-                .await;
-
-                let mut acked_peers = Vec::new();
-                let mut max_term = lease.term;
-                let mut epoch_mismatch = false;
-                let mut higher_epoch: Option<(u64, Vec<String>)> = None;
-                for (peer_id, r) in replies {
-                    if let Ok(ExecResp::LeaseRenewed {
-                        granted,
-                        highest_term,
-                        voter_epoch,
-                        voter_set,
-                        voter_epoch_mismatch,
-                    }) = r
-                    {
-                        max_term = max_term.max(highest_term);
-                        if voter_epoch > lease.voter_epoch
-                            && higher_epoch.as_ref().is_none_or(|(e, _)| voter_epoch > *e)
-                        {
-                            higher_epoch = Some((voter_epoch, voter_set));
-                        }
-                        if voter_epoch_mismatch {
-                            epoch_mismatch = true;
-                        } else if granted {
-                            acked_peers.push(peer_id);
-                        }
-                    }
-                }
-                if let Some((ep, set)) = higher_epoch {
-                    let _ = plane.adopt_voter_epoch(ep, set).await;
-                    lease.revoked.cancel();
-                    app.fence_session_local(
-                        sid,
-                        Some(lease.term),
-                        "cluster voter configuration changed; session paused",
-                    )
-                    .await;
-                    return;
-                }
-                if epoch_mismatch || plane.presence.current_voter_config().0 != lease.voter_epoch {
-                    lease.revoked.cancel();
-                    app.fence_session_local(
-                        sid,
-                        Some(lease.term),
-                        "cluster voter configuration changed; session paused",
-                    )
-                    .await;
-                    return;
-                }
-                if max_term > lease.term {
-                    lease.revoked.cancel();
-                    plane.presence.observe_remote_term(sid, max_term);
-                    app.fence_session_local(sid, Some(lease.term), "execution lease lost")
-                        .await;
-                    return;
-                }
-                if plane.presence.voter_quorum(&acked_peers).satisfied {
-                    lease.extend(round_start + LEASE_TTL.saturating_sub(LEASE_SAFETY_MARGIN));
-                    fast_retry = false;
-                } else if Instant::now() >= lease.deadline() {
-                    lease.revoked.cancel();
-                    app.fence_session_local(sid, Some(lease.term), "execution lease lost")
-                        .await;
-                    return;
-                } else {
-                    fast_retry = true;
-                }
-            }
-        });
     }
 
     pub async fn pause_run(&self, app: &App, sid: SessionId, hard: bool) -> Result<Session> {
@@ -3737,6 +1817,12 @@ impl ExecPlane {
             None => self.probe_online_occupancy(sid).await?,
         };
         if let Some(peer_id) = target {
+            if !self.net.is_peer_online(&peer_id) {
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("session is running on node {peer_id}, which is not directly reachable from this node"),
+                ));
+            }
             match self
                 .exec_rpc(
                     &peer_id,
@@ -3765,19 +1851,24 @@ impl ExecPlane {
         if self.presence.local_owner(sid).is_some() {
             return Ok(WriterTarget::Local);
         }
-        if let Some((peer_id, _)) = self.presence.remote_owner(sid)
-            && self.net.is_peer_online(&peer_id)
-        {
-            return Ok(WriterTarget::Remote(peer_id));
-        }
-        if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
-            return Ok(WriterTarget::Local);
+        if let Some((peer_id, _)) = self.presence.remote_owner(sid) {
+            if self.net.is_peer_online(&peer_id) {
+                return Ok(WriterTarget::Remote(peer_id));
+            }
+            return Err(Error::conflict(format!(
+                "session is currently occupied on node {peer_id} (not directly reachable)"
+            )));
         }
         if !self.net.online_peer_ids().is_empty() {
             if let Some(peer_id) = self.probe_online_occupancy(sid).await? {
-                return Ok(WriterTarget::Remote(peer_id));
+                if self.net.is_peer_online(&peer_id) {
+                    return Ok(WriterTarget::Remote(peer_id));
+                }
+                return Err(Error::conflict(format!(
+                    "session is currently occupied on node {peer_id} (not directly reachable)"
+                )));
             }
-            self.sync.sync_session_latest(sid).await?;
+            self.sync.sync_session_best_effort(sid).await?;
         } else {
             self.sync.ensure_session_watched(sid).await?;
         }
@@ -3855,33 +1946,44 @@ impl ExecPlane {
     }
 
     pub async fn acquire_delete_gate(&self, sid: SessionId) -> Result<DeleteGateGuard> {
-        if self.presence.is_single_node_config_valid() {
+        if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
             return Ok(DeleteGateGuard {
-                lease: None,
                 guard: None,
                 _lock: None,
             });
         }
         let lock_guard = self.start_lock(sid).lock_owned().await;
-        if self.presence.is_single_node_config_valid() && self.net.online_peer_ids().is_empty() {
+        if self.presence.known_peer_count() == 0 && self.net.online_peer_ids().is_empty() {
             return Ok(DeleteGateGuard {
-                lease: None,
                 guard: None,
                 _lock: Some(lock_guard),
             });
         }
-        let mut gate = self.acquire_session_lease(sid, LeasePurpose::Delete).await?;
+        let mut gate = self
+            .acquire_connected_gate(sid, GatePurpose::Delete)
+            .await?;
         Ok(DeleteGateGuard {
-            lease: gate.mode.take_quorum_lease(),
             guard: gate.claim_guard.take(),
             _lock: Some(lock_guard),
         })
     }
 
     pub async fn list_tasks(&self, sid: SessionId) -> Result<Value> {
-        if let Some(peer_id) = self.remote_runner_id(sid) {
+        if self.presence.local_owner(sid).is_none()
+            && let Some(peer_id) = self.remote_runner_id(sid)
+        {
+            if !self.net.is_peer_online(&peer_id) {
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("session is active on node {peer_id}, which is not directly reachable from this node"),
+                ));
+            }
             match self
-                .exec_rpc(&peer_id, &ExecReq::ListTasks { session_id: sid }, EXEC_SHORT_TIMEOUT)
+                .exec_rpc(
+                    &peer_id,
+                    &ExecReq::ListTasks { session_id: sid },
+                    EXEC_SHORT_TIMEOUT,
+                )
                 .await?
             {
                 ExecResp::Tasks { tasks } => return Ok(tasks),
@@ -3898,7 +2000,15 @@ impl ExecPlane {
 
     pub async fn kill_task(&self, sid: SessionId, tid: String) -> Result<Value> {
         let id = crate::tools::task_id(&tid).map_err(Error::bad)?;
-        if let Some(peer_id) = self.remote_runner_id(sid) {
+        if self.presence.local_owner(sid).is_none()
+            && let Some(peer_id) = self.remote_runner_id(sid)
+        {
+            if !self.net.is_peer_online(&peer_id) {
+                return Err(Error(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("session is active on node {peer_id}, which is not directly reachable from this node"),
+                ));
+            }
             match self
                 .exec_rpc(
                     &peer_id,
@@ -3917,8 +2027,9 @@ impl ExecPlane {
         self.db
             .call(move |s| {
                 session(&s.conn, sid)?;
-                codemode::stop_task(s, sid, id)
-                    .ok_or_else(|| Error(axum::http::StatusCode::NOT_FOUND, "task is not active".into()))
+                codemode::stop_task(s, sid, id).ok_or_else(|| {
+                    Error(axum::http::StatusCode::NOT_FOUND, "task is not active".into())
+                })
             })
             .await
     }
@@ -4039,6 +2150,7 @@ struct ClaimReleaseGuard {
     presence: Arc<PresenceState>,
     plane: Option<Arc<ExecPlane>>,
     sid: SessionId,
+    holder_node_id: String,
     claim_id: String,
     peers: Vec<String>,
     armed: bool,
@@ -4049,12 +2161,14 @@ impl ClaimReleaseGuard {
         presence: Arc<PresenceState>,
         plane: Option<Arc<ExecPlane>>,
         sid: SessionId,
+        holder_node_id: String,
         claim_id: String,
     ) -> Self {
         Self {
             presence,
             plane,
             sid,
+            holder_node_id,
             claim_id,
             peers: Vec::new(),
             armed: true,
@@ -4067,11 +2181,6 @@ impl ClaimReleaseGuard {
                 self.peers.push(peer_id.clone());
             }
         }
-    }
-
-    fn release_local_only(mut self) {
-        self.presence.release_local_claim(self.sid, &self.claim_id);
-        self.armed = false;
     }
 
     async fn release_now(mut self) {
@@ -4087,15 +2196,19 @@ impl ClaimReleaseGuard {
         let Some(plane) = self.plane.take() else {
             return;
         };
+        let holder = std::mem::take(&mut self.holder_node_id);
         let req = ExecReq::ReleaseClaim {
             session_id: self.sid,
+            visited: vec![holder.clone()],
+            holder_node_id: holder,
             claim_id: std::mem::take(&mut self.claim_id),
+            hops_left: MAX_CHECK_HOPS,
         };
         futures_util::future::join_all(peers.into_iter().map(|peer_id| {
             let req_ref = &req;
             let plane = plane.clone();
             async move {
-                let _ = plane.exec_rpc(&peer_id, req_ref, EXEC_LEASE_TIMEOUT).await;
+                let _ = plane.exec_rpc(&peer_id, req_ref, EXEC_PROBE_TIMEOUT).await;
             }
         }))
         .await;
@@ -4116,18 +2229,22 @@ impl Drop for ClaimReleaseGuard {
         };
         let peers = std::mem::take(&mut self.peers);
         let sid = self.sid;
+        let holder = std::mem::take(&mut self.holder_node_id);
         let claim_id = std::mem::take(&mut self.claim_id);
         let workers = plane.workers.clone();
         workers.spawn(async move {
             let req = ExecReq::ReleaseClaim {
                 session_id: sid,
+                visited: vec![holder.clone()],
+                holder_node_id: holder,
                 claim_id,
+                hops_left: MAX_CHECK_HOPS,
             };
             futures_util::future::join_all(peers.into_iter().map(|peer_id| {
                 let req_ref = &req;
                 let plane = plane.clone();
                 async move {
-                    let _ = plane.exec_rpc(&peer_id, req_ref, EXEC_LEASE_TIMEOUT).await;
+                    let _ = plane.exec_rpc(&peer_id, req_ref, EXEC_PROBE_TIMEOUT).await;
                 }
             }))
             .await;
@@ -4224,7 +2341,12 @@ impl ExecServer {
 
         let req = match tokio::time::timeout(
             EXEC_REQ_READ_TIMEOUT,
-            read_exec_frame::<ExecReq>(&mut recv, EXEC_REQ_HEADER_MAX, EXEC_REQ_BODY_MAX, &self.byte_budget),
+            read_exec_frame::<ExecReq>(
+                &mut recv,
+                EXEC_REQ_HEADER_MAX,
+                EXEC_REQ_BODY_MAX,
+                &self.byte_budget,
+            ),
         )
         .await
         {
@@ -4245,35 +2367,26 @@ impl ExecServer {
 
         match req {
             ExecReq::PresenceSync {
-                instance_id,
-                seq,
-                sessions,
+                sender_instance_id,
+                sender_gossip_seq,
+                entries,
                 want_reply,
-                clear_claim,
             } => {
                 self.app.exec.apply_remote_presence(
                     &from_peer,
-                    instance_id,
-                    seq,
-                    sessions,
-                    clear_claim.clone(),
+                    sender_instance_id,
+                    sender_gossip_seq,
+                    entries,
                 );
-                if let Some((csid, cid)) = clear_claim {
-                    let holder = from_peer.clone();
-                    let _ = self
-                        .app
-                        .db
-                        .call(move |s| clear_persisted_lease(&s.conn, csid, &holder, &cid))
-                        .await;
-                }
                 if want_reply {
-                    let (my_inst, my_seq, my_sessions) = self.app.exec.presence().snapshot_local();
+                    let (my_inst, my_seq, my_entries) =
+                        self.app.exec.presence().snapshot_for_peer(&from_peer);
                     Self::send_reply(
                         &mut send,
                         &ExecResp::Presence {
-                            instance_id: my_inst,
-                            seq: my_seq,
-                            sessions: my_sessions,
+                            sender_instance_id: my_inst,
+                            sender_gossip_seq: my_seq,
+                            entries: my_entries,
                         },
                     )
                     .await;
@@ -4284,214 +2397,34 @@ impl ExecServer {
             ExecReq::CheckOccupancy {
                 session_id,
                 claim,
-                voter_epoch,
+                visited,
+                hops_left,
             } => {
                 let resp = self
-                    .handle_check_occupancy(&from_peer, session_id, claim, voter_epoch)
+                    .handle_check_occupancy(&from_peer, session_id, claim, visited, hops_left)
                     .await;
                 Self::send_reply(&mut send, &resp).await;
             }
             ExecReq::ReleaseClaim {
                 session_id,
+                holder_node_id,
                 claim_id,
+                visited,
+                hops_left,
             } => {
-                self.app
-                    .exec
-                    .presence()
-                    .release_remote_claim(session_id, &from_peer, &claim_id);
-                let holder = from_peer.clone();
-                let _ = self
-                    .app
-                    .db
-                    .call(move |s| clear_persisted_lease(&s.conn, session_id, &holder, &claim_id))
-                    .await;
+                self.handle_release_claim(
+                    &from_peer,
+                    session_id,
+                    holder_node_id,
+                    claim_id,
+                    visited,
+                    hops_left,
+                )
+                .await;
                 Self::send_reply(&mut send, &ExecResp::Ack).await;
             }
-            ExecReq::RenewLease {
-                session_id,
-                claim_id,
-                term,
-                ttl_ms,
-                voter_epoch,
-            } => {
-                let presence = self.app.exec.presence().clone();
-                let holder = from_peer.clone();
-                let resp = match self
-                    .app
-                    .db
-                    .call(move |s| {
-                        let (cur_epoch, cur_set, pending_epoch, _) = presence.current_voter_config();
-                        if cur_epoch == 0 || pending_epoch != 0 || voter_epoch != cur_epoch {
-                            return Ok(ExecResp::LeaseRenewed {
-                                granted: false,
-                                highest_term: presence.highest_term(session_id),
-                                voter_epoch: cur_epoch,
-                                voter_set: cur_set,
-                                voter_epoch_mismatch: true,
-                            });
-                        }
-                        let local_occupied = s.active.contains_key(&session_id)
-                            || s.pending_wakes.contains(&session_id)
-                            || codemode::count_session_tasks(s, session_id) > 0
-                            || presence.local_owner(session_id).is_some();
-                        let remote_occupied =
-                            presence.remote_owner_excluding(session_id, &holder).is_some();
-                        match presence.renew_remote_lease(
-                            session_id,
-                            &holder,
-                            &claim_id,
-                            term,
-                            ttl_ms,
-                            local_occupied,
-                            remote_occupied,
-                        ) {
-                            Ok(expires_at_ms) => {
-                                persist_lease_grant(
-                                    &s.conn,
-                                    session_id,
-                                    term,
-                                    &holder,
-                                    &claim_id,
-                                    expires_at_ms,
-                                )?;
-                                Ok(ExecResp::LeaseRenewed {
-                                    granted: true,
-                                    highest_term: term,
-                                    voter_epoch: cur_epoch,
-                                    voter_set: cur_set,
-                                    voter_epoch_mismatch: false,
-                                })
-                            }
-                            Err(highest_term) => Ok(ExecResp::LeaseRenewed {
-                                granted: false,
-                                highest_term,
-                                voter_epoch: cur_epoch,
-                                voter_set: cur_set,
-                                voter_epoch_mismatch: false,
-                            }),
-                        }
-                    })
-                    .await
-                {
-                    Ok(resp) => resp,
-                    Err(e) => Self::to_wire_err(e),
-                };
-                Self::send_reply(&mut send, &resp).await;
-            }
-            ExecReq::ProbeVoterConfig {
-                expected_epoch,
-                next_epoch,
-                ballot,
-            } => {
-                let presence = self.app.exec.presence().clone();
-                let resp = match self
-                    .app
-                    .db
-                    .call(move |s| {
-                        let (promised, local) =
-                            probe_voter_config(&s.conn, expected_epoch, next_epoch, &ballot)?;
-                        presence.sync_local_node(&local);
-                        Ok(ExecResp::VoterConfigProbe {
-                            promised,
-                            voter_epoch: local.voter_epoch,
-                            voter_set: local.voter_set,
-                            pending_voter_epoch: local.pending_voter_epoch,
-                            pending_proposal_id: local.pending_proposal_id,
-                            pending_voter_set: local.pending_voter_set,
-                        })
-                    })
-                    .await
-                {
-                    Ok(resp) => resp,
-                    Err(e) => Self::to_wire_err(e),
-                };
-                Self::send_reply(&mut send, &resp).await;
-            }
-            ExecReq::PrepareVoterConfig {
-                expected_epoch,
-                next_epoch,
-                proposal_id,
-                new_voters,
-            } => {
-                let presence = self.app.exec.presence().clone();
-                let resp = match self
-                    .app
-                    .db
-                    .call(move |s| {
-                        let res = prepare_voter_config(
-                            &s.conn,
-                            expected_epoch,
-                            next_epoch,
-                            &proposal_id,
-                            &new_voters,
-                        );
-                        let local = load_local_node(&s.conn)?;
-                        presence.sync_local_node(&local);
-                        Ok(ExecResp::VoterConfigAck {
-                            ok: res.is_ok(),
-                            voter_epoch: local.voter_epoch,
-                            voter_set: local.voter_set,
-                            pending_voter_epoch: local.pending_voter_epoch,
-                            pending_proposal_id: local.pending_proposal_id,
-                            pending_voter_set: local.pending_voter_set,
-                            reason: res.err().map(|e| e.1),
-                        })
-                    })
-                    .await
-                {
-                    Ok(resp) => resp,
-                    Err(e) => Self::to_wire_err(e),
-                };
-                Self::send_reply(&mut send, &resp).await;
-            }
-            ExecReq::CommitVoterConfig {
-                epoch,
-                voters,
-                proposal_id: _,
-            } => {
-                let presence = self.app.exec.presence().clone();
-                let res = self
-                    .app
-                    .db
-                    .call(move |s| {
-                        let (local, role_changed) = commit_voter_config(&s.conn, epoch, &voters)?;
-                        presence.sync_local_node(&local);
-                        if role_changed {
-                            s.sync_signal(crate::cluster::SyncSignal::SelfMetaChanged);
-                        }
-                        Ok(local)
-                    })
-                    .await;
-                let resp = match res {
-                    Ok(local) => {
-                        self.app
-                            .exec
-                            .fence_stale_local_leases(Some(&self.app), local.voter_epoch)
-                            .await;
-                        ExecResp::VoterConfigAck {
-                            ok: true,
-                            voter_epoch: local.voter_epoch,
-                            voter_set: local.voter_set,
-                            pending_voter_epoch: local.pending_voter_epoch,
-                            pending_proposal_id: local.pending_proposal_id,
-                            pending_voter_set: local.pending_voter_set,
-                            reason: None,
-                        }
-                    }
-                    Err(e) => Self::to_wire_err(e),
-                };
-                Self::send_reply(&mut send, &resp).await;
-            }
-            ExecReq::StartRun {
-                session_id,
-                force_offline,
-            } => {
-                let resp = match self
-                    .app
-                    .exec
-                    .start_run_local(&self.app, session_id, force_offline)
-                    .await
-                {
+            ExecReq::StartRun { session_id } => {
+                let resp = match self.app.exec.start_run_local(&self.app, session_id).await {
                     Ok(session) => ExecResp::Session {
                         session: json!(session),
                     },
@@ -4625,181 +2558,436 @@ impl ExecServer {
         }
     }
 
+    async fn handle_release_claim(
+        &self,
+        from_peer: &str,
+        sid: SessionId,
+        holder_node_id: String,
+        claim_id: String,
+        mut visited: Vec<String>,
+        hops_left: u8,
+    ) {
+        self.app
+            .exec
+            .presence()
+            .release_remote_claim(sid, &holder_node_id, &claim_id);
+        let hops = hops_left.min(MAX_CHECK_HOPS);
+        if hops == 0 {
+            return;
+        }
+        visited.truncate(MAX_GOSSIP_ENTRIES);
+        let local_id = self.app.exec.presence().local_node_id();
+        let visited_set: HashSet<&str> = visited.iter().map(String::as_str).collect();
+        let downstream: Vec<String> = self
+            .app
+            .cluster
+            .net
+            .online_peer_ids()
+            .into_iter()
+            .filter(|p| {
+                p != from_peer
+                    && p != &holder_node_id
+                    && p != &local_id
+                    && !visited_set.contains(p.as_str())
+            })
+            .collect();
+        if downstream.is_empty() {
+            return;
+        }
+        if !visited.contains(&local_id) {
+            visited.push(local_id);
+        }
+        let req = ExecReq::ReleaseClaim {
+            session_id: sid,
+            holder_node_id,
+            claim_id,
+            visited,
+            hops_left: hops - 1,
+        };
+        futures_util::future::join_all(downstream.into_iter().map(|peer_id| {
+            let req_ref = &req;
+            async move {
+                let _ = self.app.exec.exec_rpc(&peer_id, req_ref, EXEC_PROBE_TIMEOUT).await;
+            }
+        }))
+        .await;
+    }
+
     async fn handle_check_occupancy(
         &self,
         from_peer: &str,
         sid: SessionId,
         claim: Option<RunClaim>,
-        req_voter_epoch: u64,
+        mut visited: Vec<String>,
+        hops_left: u8,
     ) -> ExecResp {
         if let Some(ref c) = claim
-            && c.node_id != from_peer
+            && c.node_id.parse::<EndpointId>().is_err()
         {
             return ExecResp::Error {
                 status: 400,
-                message: "claim node_id mismatch".into(),
+                message: "invalid claim node_id".into(),
             };
         }
         let presence = self.app.exec.presence().clone();
-        let from_peer_owned = from_peer.to_owned();
+        let local_id = presence.local_node_id();
+        let claim_owner = claim
+            .as_ref()
+            .map(|c| c.node_id.clone())
+            .unwrap_or_else(|| from_peer.to_owned());
+
+        visited.truncate(MAX_GOSSIP_ENTRIES);
+        let hops = hops_left.min(MAX_CHECK_HOPS);
+
         let db_res = self
             .app
             .db
-            .call(move |s| {
-                let local_occ = presence.local_owner(sid);
-                let active_worker = s.active.contains_key(&sid) || s.pending_wakes.contains(&sid);
-                let local_active_tasks = codemode::count_session_tasks(s, sid);
-                let local_occupied =
-                    active_worker || local_active_tasks > 0 || local_occ.is_some();
-                let remote_occ = presence.remote_owner_excluding(sid, &from_peer_owned);
-                let local_status = if let Some(occ) = &local_occ {
-                    Some(occ.status.clone())
-                } else if local_occupied {
-                    session(&s.conn, sid).ok().map(|row| row.status)
-                } else {
-                    remote_occ.as_ref().map(|(_, o)| o.status.clone())
-                };
-                let sess_row: Option<(bool, Option<ContextNodeId>, String)> = s
-                    .conn
-                    .prepare_cached("SELECT deleted, active_head, active_head_ts FROM sessions WHERE id=?")?
-                    .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                    .optional()?;
-                let (session_deleted, session_active_head, session_active_head_ts) = match sess_row {
-                    Some((true, _, _)) => (true, None, String::new()),
-                    Some((false, head, ts)) => (false, head, ts),
-                    None => (false, None, String::new()),
-                };
-                let session_vector = if session_deleted {
-                    BTreeMap::new()
-                } else {
-                    read_vector(&s.conn, &session_scope(sid))?
-                };
-                let (cur_epoch, cur_set, pending_epoch, _) = presence.current_voter_config();
-                let mut resp = ExecResp::Occupancy {
+            .call({
+                let presence = presence.clone();
+                let claim_owner = claim_owner.clone();
+                move |s| {
+                    let local_occ = presence.local_owner(sid);
+                    let active_worker =
+                        s.active.contains_key(&sid) || s.pending_wakes.contains(&sid);
+                    let local_active_tasks = codemode::count_session_tasks(s, sid);
+                    let local_occupied =
+                        active_worker || local_active_tasks > 0 || local_occ.is_some();
+                    let claim_holder = presence.active_claim_holder_excluding(sid, &claim_owner);
+                    let local_status = if let Some(occ) = &local_occ {
+                        Some(occ.status.clone())
+                    } else if local_occupied {
+                        session(&s.conn, sid).ok().map(|row| row.status)
+                    } else {
+                        None
+                    };
+                    let sess_row: Option<(bool, Option<ContextNodeId>, String)> = s
+                        .conn
+                        .prepare_cached(
+                            "SELECT deleted, active_head, active_head_ts FROM sessions WHERE id=?",
+                        )?
+                        .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                        .optional()?;
+                    let (session_deleted, session_active_head, session_active_head_ts) =
+                        match sess_row {
+                            Some((true, _, _)) => (true, None, String::new()),
+                            Some((false, head, ts)) => (false, head, ts),
+                            None => (false, None, String::new()),
+                        };
+                    let session_vector = if session_deleted {
+                        BTreeMap::new()
+                    } else {
+                        read_vector(&s.conn, &session_scope(sid))?
+                    };
+                    Ok((
+                        local_occupied,
+                        local_status,
+                        local_active_tasks,
+                        claim_holder,
+                        session_deleted,
+                        session_active_head,
+                        session_active_head_ts,
+                        session_vector,
+                    ))
+                }
+            })
+            .await;
+
+        let (
+            local_occupied,
+            local_status,
+            local_active_tasks,
+            claim_holder,
+            session_deleted,
+            session_active_head,
+            session_active_head_ts,
+            session_vector,
+        ) = match db_res {
+            Ok(v) => v,
+            Err(e) => return Self::to_wire_err(e),
+        };
+
+        if session_deleted {
+            return ExecResp::Occupancy {
+                occupied: false,
+                runner_node_id: None,
+                status: None,
+                active_tasks: 0,
+                occupied_by_claim: false,
+                session_deleted: true,
+                session_active_head: None,
+                session_active_head_ts: String::new(),
+                session_vector: BTreeMap::new(),
+            };
+        }
+
+        if local_occupied {
+            return ExecResp::Occupancy {
+                occupied: true,
+                runner_node_id: Some(local_id),
+                status: local_status,
+                active_tasks: local_active_tasks,
+                occupied_by_claim: false,
+                session_deleted: false,
+                session_active_head,
+                session_active_head_ts,
+                session_vector,
+            };
+        }
+
+        if claim.is_none()
+            && let Some((holder, by_claim)) = claim_holder
+        {
+            return ExecResp::Occupancy {
+                occupied: true,
+                runner_node_id: Some(holder),
+                status: None,
+                active_tasks: 0,
+                occupied_by_claim: by_claim,
+                session_deleted: false,
+                session_active_head,
+                session_active_head_ts,
+                session_vector,
+            };
+        }
+
+        // Forward across online downstream peers in the connected component.
+        let visited_set: HashSet<String> = visited.iter().cloned().collect();
+        let downstream: Vec<String> = if hops > 0 {
+            self.app
+                .cluster
+                .net
+                .online_peer_ids()
+                .into_iter()
+                .filter(|p| {
+                    p != from_peer
+                        && p != &claim_owner
+                        && p != &local_id
+                        && !visited_set.contains(p)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut confirmed_idle: HashSet<String> = HashSet::new();
+        if !downstream.is_empty() {
+            let mut next_visited = visited.clone();
+            if !next_visited.contains(&local_id) && next_visited.len() < MAX_GOSSIP_ENTRIES {
+                next_visited.push(local_id.clone());
+            }
+            let fwd_req = ExecReq::CheckOccupancy {
+                session_id: sid,
+                claim: claim.clone(),
+                visited: next_visited,
+                hops_left: hops - 1,
+            };
+            let fwd_replies =
+                futures_util::future::join_all(downstream.into_iter().map(|peer_id| {
+                    let req_ref = &fwd_req;
+                    async move {
+                        (
+                            peer_id.clone(),
+                            self.app
+                                .exec
+                                .exec_rpc(&peer_id, req_ref, EXEC_PROBE_TIMEOUT)
+                                .await,
+                        )
+                    }
+                }))
+                .await;
+
+            let mut deleted_peers = Vec::new();
+            let mut ahead_peers = Vec::new();
+            let mut fwd_occupied: Option<(String, Option<SessionStatus>, usize, bool)> = None;
+
+            for (peer_id, reply) in fwd_replies {
+                if let Ok(ExecResp::Occupancy {
+                    occupied,
+                    runner_node_id,
+                    status,
+                    active_tasks,
+                    occupied_by_claim,
+                    session_deleted: d_del,
+                    session_active_head_ts: d_ts,
+                    session_vector: d_vec,
+                    ..
+                }) = reply
+                {
+                    if d_del {
+                        deleted_peers.push(peer_id);
+                        continue;
+                    }
+                    if peer_ahead_of_local(false, &d_ts, &d_vec, &session_active_head_ts, &session_vector) {
+                        ahead_peers.push(peer_id.clone());
+                    }
+                    if occupied {
+                        let holder = runner_node_id.unwrap_or(peer_id);
+                        if holder != claim_owner && fwd_occupied.is_none() {
+                            fwd_occupied = Some((holder, status, active_tasks, occupied_by_claim));
+                        }
+                    } else {
+                        confirmed_idle.insert(peer_id);
+                    }
+                }
+            }
+
+            if !deleted_peers.is_empty() {
+                let _ = self.app.cluster.sync.sync_session_strict(sid, &deleted_peers).await;
+                return ExecResp::Occupancy {
                     occupied: false,
                     runner_node_id: None,
                     status: None,
                     active_tasks: 0,
-                    lease_granted: false,
                     occupied_by_claim: false,
-                    highest_term: presence.highest_term(sid),
-                    voter_epoch: cur_epoch,
-                    voter_set: cur_set,
-                    voter_epoch_mismatch: false,
-                    session_deleted,
+                    session_deleted: true,
+                    session_active_head: None,
+                    session_active_head_ts: String::new(),
+                    session_vector: BTreeMap::new(),
+                };
+            }
+
+            if let Some((holder, status, active_tasks, by_claim)) = fwd_occupied {
+                return ExecResp::Occupancy {
+                    occupied: true,
+                    runner_node_id: Some(holder),
+                    status,
+                    active_tasks,
+                    occupied_by_claim: by_claim,
+                    session_deleted: false,
                     session_active_head,
                     session_active_head_ts,
                     session_vector,
                 };
+            }
 
-                let Some(claim) = claim else {
-                    let claim_holder = if !local_occupied && remote_occ.is_none() {
-                        presence.active_claim_holder_excluding(sid, &from_peer_owned)
-                    } else {
-                        None
-                    };
-                    if let ExecResp::Occupancy {
-                        ref mut occupied,
-                        ref mut runner_node_id,
-                        ref mut status,
-                        ref mut active_tasks,
-                        ref mut occupied_by_claim,
-                        ..
-                    } = resp
-                    {
-                        *occupied = local_occupied || remote_occ.is_some() || claim_holder.is_some();
-                        *occupied_by_claim = claim_holder.as_ref().is_some_and(|(_, by)| *by);
-                        *runner_node_id = if local_occupied {
-                            Some(s.local_node_id.clone())
-                        } else if let Some((h, _)) = claim_holder {
-                            Some(h)
-                        } else {
-                            remote_occ.map(|(id, _)| id)
-                        };
-                        *status = local_status;
-                        *active_tasks = if local_occupied { local_active_tasks } else { 0 };
-                    }
-                    return Ok(resp);
+            if !ahead_peers.is_empty() {
+                let _ = self.app.cluster.sync.sync_session_strict(sid, &ahead_peers).await;
+            }
+        }
+
+        // Check Gossip table for any node not equal to requester/visited/live-confirmed idle.
+        if let Some((owner_id, occ)) = presence.remote_owner(sid)
+            && owner_id != claim_owner
+            && owner_id != from_peer
+            && owner_id != local_id
+            && !visited_set.contains(&owner_id)
+            && !confirmed_idle.contains(&owner_id)
+        {
+            return ExecResp::Occupancy {
+                occupied: true,
+                runner_node_id: Some(owner_id),
+                status: Some(occ.status),
+                active_tasks: occ.active_tasks,
+                occupied_by_claim: false,
+                session_deleted: false,
+                session_active_head,
+                session_active_head_ts,
+                session_vector,
+            };
+        }
+
+        // Final local re-check and atomic remote claim registration.
+        let final_res = self
+            .app
+            .db
+            .call(move |s| {
+                let local_occ = presence.local_owner(sid);
+                let active_worker =
+                    s.active.contains_key(&sid) || s.pending_wakes.contains(&sid);
+                let local_active_tasks = codemode::count_session_tasks(s, sid);
+                let local_occupied_now =
+                    active_worker || local_active_tasks > 0 || local_occ.is_some();
+
+                let sess_row: Option<(bool, Option<ContextNodeId>, String)> = s
+                    .conn
+                    .prepare_cached(
+                        "SELECT deleted, active_head, active_head_ts FROM sessions WHERE id=?",
+                    )?
+                    .query_row([sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .optional()?;
+                let (deleted_now, head_now, ts_now) = match sess_row {
+                    Some((true, _, _)) => (true, None, String::new()),
+                    Some((false, head, ts)) => (false, head, ts),
+                    None => (false, None, String::new()),
                 };
+                if deleted_now {
+                    return Ok(ExecResp::Occupancy {
+                        occupied: false,
+                        runner_node_id: None,
+                        status: None,
+                        active_tasks: 0,
+                        occupied_by_claim: false,
+                        session_deleted: true,
+                        session_active_head: None,
+                        session_active_head_ts: String::new(),
+                        session_vector: BTreeMap::new(),
+                    });
+                }
+                let vec_now = read_vector(&s.conn, &session_scope(sid))?;
 
-                if session_deleted {
-                    return Ok(resp);
+                if local_occupied_now {
+                    let st = local_occ
+                        .map(|o| o.status)
+                        .or_else(|| session(&s.conn, sid).ok().map(|r| r.status));
+                    return Ok(ExecResp::Occupancy {
+                        occupied: true,
+                        runner_node_id: Some(s.local_node_id.clone()),
+                        status: st,
+                        active_tasks: local_active_tasks,
+                        occupied_by_claim: false,
+                        session_deleted: false,
+                        session_active_head: head_now,
+                        session_active_head_ts: ts_now,
+                        session_vector: vec_now,
+                    });
                 }
-                if let ExecResp::Occupancy {
-                    ref mut occupied,
-                    ref mut runner_node_id,
-                    ref mut status,
-                    ref mut active_tasks,
-                    ref mut lease_granted,
-                    ref mut occupied_by_claim,
-                    ref mut highest_term,
-                    ref mut voter_epoch_mismatch,
-                    ..
-                } = resp
-                {
-                    if cur_epoch == 0
-                        || pending_epoch != 0
-                        || claim.voter_epoch != cur_epoch
-                        || (req_voter_epoch != 0 && req_voter_epoch != cur_epoch)
+
+                if let Some(ref c) = claim {
+                    if let Err((holder, by_claim)) = presence.check_or_register_remote_claim(sid, c)
                     {
-                        *occupied = local_occupied || remote_occ.is_some();
-                        *runner_node_id = if local_occupied {
-                            Some(s.local_node_id.clone())
-                        } else {
-                            remote_occ.as_ref().map(|(id, _)| id.clone())
-                        };
-                        *status = local_status;
-                        *active_tasks = if local_occupied { local_active_tasks } else { 0 };
-                        *voter_epoch_mismatch = true;
-                    } else if local_occupied {
-                        *occupied = true;
-                        *runner_node_id = Some(s.local_node_id.clone());
-                        *status = local_status;
-                        *active_tasks = local_active_tasks;
-                        if let Some(l) = presence.active_local_lease(sid) {
-                            *highest_term = l.term;
-                        }
-                    } else if let Some((owner_id, occ)) = remote_occ {
-                        *occupied = true;
-                        *runner_node_id = Some(owner_id);
-                        *status = Some(occ.status);
-                    } else {
-                        match presence.accept_remote_claim(sid, &claim, false) {
-                            GrantOutcome::Granted {
-                                highest_term: ht,
-                                expires_at_ms,
-                            } => {
-                                persist_lease_grant(
-                                    &s.conn,
-                                    sid,
-                                    ht,
-                                    &claim.node_id,
-                                    &claim.claim_id,
-                                    expires_at_ms,
-                                )?;
-                                *lease_granted = true;
-                                *highest_term = ht;
-                            }
-                            GrantOutcome::Occupied {
-                                holder,
-                                by_claim,
-                                highest_term: ht,
-                            } => {
-                                *occupied = true;
-                                *runner_node_id = Some(holder);
-                                *occupied_by_claim = by_claim;
-                                *highest_term = ht;
-                            }
-                            GrantOutcome::StaleTerm { highest_term: ht } => {
-                                *highest_term = ht;
-                            }
-                        }
+                        return Ok(ExecResp::Occupancy {
+                            occupied: true,
+                            runner_node_id: Some(holder),
+                            status: None,
+                            active_tasks: 0,
+                            occupied_by_claim: by_claim,
+                            session_deleted: false,
+                            session_active_head: head_now,
+                            session_active_head_ts: ts_now,
+                            session_vector: vec_now,
+                        });
                     }
+                } else if let Some((holder, by_claim)) =
+                    presence.active_claim_holder_excluding(sid, &claim_owner)
+                {
+                    return Ok(ExecResp::Occupancy {
+                        occupied: true,
+                        runner_node_id: Some(holder),
+                        status: None,
+                        active_tasks: 0,
+                        occupied_by_claim: by_claim,
+                        session_deleted: false,
+                        session_active_head: head_now,
+                        session_active_head_ts: ts_now,
+                        session_vector: vec_now,
+                    });
                 }
-                Ok(resp)
+
+                Ok(ExecResp::Occupancy {
+                    occupied: false,
+                    runner_node_id: None,
+                    status: None,
+                    active_tasks: 0,
+                    occupied_by_claim: false,
+                    session_deleted: false,
+                    session_active_head: head_now,
+                    session_active_head_ts: ts_now,
+                    session_vector: vec_now,
+                })
             })
             .await;
-        match db_res {
+
+        match final_res {
             Ok(resp) => resp,
             Err(e) => Self::to_wire_err(e),
         }
@@ -4846,7 +3034,11 @@ impl ExecServer {
         crate::api::withdraw_local(&self.app, sid, mid).await
     }
 
-    async fn handle_patch_local(&self, sid: SessionId, fields: Map<String, Value>) -> Result<Session> {
+    async fn handle_patch_local(
+        &self,
+        sid: SessionId,
+        fields: Map<String, Value>,
+    ) -> Result<Session> {
         self.ensure_local_writer_allowed(sid).await?;
         self.app.cluster.ensure_session_watched(sid).await?;
         crate::api::patch_session_local(&self.app, sid, fields).await

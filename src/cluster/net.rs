@@ -70,9 +70,6 @@ enum AuthMsg {
     Ok,
     Admission {
         ok: bool,
-        voter_epoch: u64,
-        #[serde(default)]
-        voter_set: Vec<String>,
         #[serde(default)]
         reason: Option<String>,
     },
@@ -843,7 +840,7 @@ impl ClusterNet {
         self: &Arc<Self>,
         secret: &[u8; 32],
         peer: &PeerInfo,
-    ) -> Result<(u64, Vec<String>)> {
+    ) -> Result<()> {
         let endpoint = self.ensure_endpoint().await?;
         let addr = decode_endpoint_addr(&peer.node_id, &peer.addrs)?;
         let conn = match tokio::time::timeout(
@@ -902,12 +899,7 @@ impl ClusterNet {
         let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_auth(&mut recv)).await;
         conn.close(0u32.into(), b"admission complete");
         match reply {
-            Ok(Ok(AuthMsg::Admission {
-                ok: true,
-                voter_epoch,
-                voter_set,
-                ..
-            })) if voter_epoch > 0 && !voter_set.is_empty() => Ok((voter_epoch, voter_set)),
+            Ok(Ok(AuthMsg::Admission { ok: true, .. })) => Ok(()),
             Ok(Ok(AuthMsg::Admission { reason, .. })) => Err(Error::conflict(
                 reason.unwrap_or_else(|| "invite peer cannot accept cluster joins".into()),
             )),
@@ -1146,32 +1138,14 @@ impl ClusterNet {
             conn.close(1u32.into(), b"self connection");
             return;
         }
-        // Register before acknowledging. Reject standalone 0-peer inviters with active runs/tasks
-        // so single-node sessions never become stranded without a quorum lease.
+        // Register before acknowledging so immediate reconnects recognize the joining peer.
         let admission = self
             .db
             .call(move |s| {
                 let tx = s.conn.transaction()?;
                 let local = load_local_node(&tx)?;
-                if local.membership_gen != mgen
-                    || local.voter_epoch == 0
-                    || local.voter_set.is_empty()
-                {
-                    return Err(Error::conflict(
-                        "invite source has no current voter configuration",
-                    ));
-                }
-                let existing_empty: bool = !tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM cluster_peers)",
-                    [],
-                    |r| r.get::<_, bool>(0),
-                )?;
-                if existing_empty
-                    && (!s.active.is_empty() || !s.pending_wakes.is_empty() || !s.tasks.is_empty())
-                {
-                    return Err(Error::conflict(
-                        "invite source has active standalone sessions or background tasks; pause or stop them before joining",
-                    ));
+                if local.membership_gen != mgen {
+                    return Err(Error::conflict("membership changed during admission"));
                 }
                 let now = chrono::Utc::now().timestamp_millis();
                 upsert_peer_if_gen(&tx, &local.node_id, &remote_peer, now, true, mgen)?;
@@ -1180,22 +1154,17 @@ impl ClusterNet {
                     return Err(Error::bad("invalid joining peer"));
                 }
                 tx.commit()?;
-                s.presence.set_peer_roles(&peers);
                 s.presence.set_known_peer_count(peers.len());
-                Ok((local.voter_epoch, local.voter_set))
+                Ok(())
             })
             .await;
         let msg = match admission {
-            Ok((voter_epoch, voter_set)) => AuthMsg::Admission {
+            Ok(()) => AuthMsg::Admission {
                 ok: true,
-                voter_epoch,
-                voter_set,
                 reason: None,
             },
             Err(err) => AuthMsg::Admission {
                 ok: false,
-                voter_epoch: 0,
-                voter_set: Vec::new(),
                 reason: Some(if err.0 == axum::http::StatusCode::CONFLICT {
                     err.1
                 } else {
@@ -1515,17 +1484,6 @@ impl ClusterNet {
                 let local = load_local_node(&s.conn)?;
                 if local.membership_gen != mgen {
                     return Err(Error::conflict("membership changed during register"));
-                }
-                let peers = list_peers(&s.conn)?;
-                let known = peers.iter().any(|p| p.node_id == remote_peer.node_id);
-                if !is_outbound
-                    && !known
-                    && peers.is_empty()
-                    && (local.voter_epoch == 0 || local.voter_set.is_empty())
-                {
-                    return Err(Error::conflict(
-                        "standalone node without a committed voter cannot admit peers",
-                    ));
                 }
                 let now = chrono::Utc::now().timestamp_millis();
                 upsert_peer_if_gen(&s.conn, &self_id, &remote_peer, now, true, mgen)?;

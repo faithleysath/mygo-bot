@@ -188,14 +188,8 @@ impl Cluster {
         self.workers
             .spawn(async move {
                 let _guard = join_gate.lock().await;
-                let _joining = presence.begin_join();
                 let precheck_secret = secret;
                 db.call(move |s| {
-                    if !s.active.is_empty() || !s.pending_wakes.is_empty() || !s.tasks.is_empty() {
-                        return Err(Error::conflict(
-                            "cannot join cluster while sessions or background tasks are active; pause or stop them first",
-                        ));
-                    }
                     let local = identity::load_local_node(&s.conn)?;
                     let has_peers: bool = s.conn.query_row(
                         "SELECT EXISTS(SELECT 1 FROM cluster_peers)",
@@ -210,28 +204,21 @@ impl Cluster {
                     Ok(())
                 })
                 .await?;
-                let (epoch, voters) = net.request_admission(&secret, &peer).await?;
-                let (secret_changed, new_gen, new_secret, peer, _) = db
+                net.request_admission(&secret, &peer).await?;
+                let (secret_changed, new_gen, new_secret, peer) = db
                     .write(
                         move |conn| {
-                            let prev_local = identity::load_local_node(conn)?;
-                            let want_voter = prev_local.role.is_voter();
                             let (changed, next_gen, secret, peer) =
                                 identity::apply_join(conn, secret, peer, force)?;
-                            let (local, _) = identity::adopt_voter_config(conn, epoch, &voters)?;
                             let peers = identity::list_peers(conn)?;
-                            Ok((changed, next_gen, secret, peer, peers, local, want_voter))
+                            Ok((changed, next_gen, secret, peer, peers.len()))
                         },
-                        move |_, (changed, next_gen, secret, peer, peers, local, want_voter)| {
-                            let count = peers.len();
+                        move |_, (changed, next_gen, secret, peer, count)| {
                             if changed {
-                                presence.set_want_voter_admission(want_voter && !local.role.is_voter());
                                 presence.clear_all_remote();
                             }
-                            presence.sync_local_node(&local);
-                            presence.set_peer_roles(&peers);
                             presence.set_known_peer_count(count);
-                            Ok((changed, next_gen, secret, peer, count))
+                            Ok((changed, next_gen, secret, peer))
                         },
                     )
                     .await?;

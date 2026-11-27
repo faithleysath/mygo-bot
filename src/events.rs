@@ -816,7 +816,11 @@ pub async fn subscribe(State(app): State<App>, Path(sid): Path<SessionId>) -> Re
         let mut runner_rx = app.exec.presence().watch_remote_runner(sid);
         let mut relay: Option<ActiveRelay> = None;
         let mut seen: Option<SeenSavedItems> = None;
-        if let Some(peer_id) = runner_rx.borrow().clone() {
+        if let Some(peer_id) = runner_rx
+            .borrow()
+            .clone()
+            .filter(|id| app.cluster.net.is_peer_online(id))
+        {
             let cancel = app.stopping.child_token();
             let rx = app.exec.spawn_event_relay(peer_id.clone(), sid, cancel.clone());
             relay = Some(ActiveRelay { peer_id, cancel, rx });
@@ -860,7 +864,10 @@ pub async fn subscribe(State(app): State<App>, Path(sid): Path<SessionId>) -> Re
             };
             match turn {
                 SseTurn::RunnerChanged(Ok(())) => {
-                    let next_peer = runner_rx.borrow().clone();
+                    let next_peer = runner_rx
+                        .borrow()
+                        .clone()
+                        .filter(|id| app.cluster.net.is_peer_online(id));
                     if relay.as_ref().map(|r| &r.peer_id) != next_peer.as_ref() {
                         if let Some(old) = relay.take() {
                             old.cancel.cancel();
@@ -881,7 +888,10 @@ pub async fn subscribe(State(app): State<App>, Path(sid): Path<SessionId>) -> Re
                 SseTurn::RetryTimer => {
                     retry_at = None;
                     if relay.is_none()
-                        && let Some(peer_id) = runner_rx.borrow().clone()
+                        && let Some(peer_id) = runner_rx
+                            .borrow()
+                            .clone()
+                            .filter(|id| app.cluster.net.is_peer_online(id))
                     {
                         let cancel = app.stopping.child_token();
                         let rx = app.exec.spawn_event_relay(peer_id.clone(), sid, cancel.clone());

@@ -1,13 +1,8 @@
-use std::{
-    cell::RefCell, collections::HashSet, fmt, fs, net::SocketAddr, rc::Rc, str::FromStr,
-};
+use std::{cell::RefCell, collections::HashSet, fs, net::SocketAddr, rc::Rc};
 
 use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine as _};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
-use rusqlite::{
-    Connection, OptionalExtension, ToSql, params,
-    types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
-};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -17,60 +12,6 @@ pub const MAX_CLUSTER_PEERS: usize = 256;
 pub const MAX_PEX_PEERS: usize = 64;
 const MAX_ADDRS_PER_PEER: usize = 16;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeRole {
-    #[default]
-    Voter,
-    Edge,
-}
-
-impl NodeRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Voter => "voter",
-            Self::Edge => "edge",
-        }
-    }
-
-    pub fn is_voter(self) -> bool {
-        matches!(self, Self::Voter)
-    }
-}
-
-impl fmt::Display for NodeRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for NodeRole {
-    type Err = String;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "voter" => Ok(Self::Voter),
-            "edge" => Ok(Self::Edge),
-            _ => Err(format!("invalid cluster role '{s}'; expected 'voter' or 'edge'")),
-        }
-    }
-}
-
-impl ToSql for NodeRole {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(ValueRef::Text(self.as_str().as_bytes())))
-    }
-}
-
-impl FromSql for NodeRole {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        value
-            .as_str()?
-            .parse::<Self>()
-            .map_err(|e| FromSqlError::Other(e.into()))
-    }
-}
-
 #[derive(Clone)]
 pub struct LocalNode {
     pub secret_key: [u8; 32],
@@ -78,16 +19,9 @@ pub struct LocalNode {
     pub cluster_secret: [u8; 32],
     pub name: String,
     pub description: String,
-    pub role: NodeRole,
     pub db_epoch: String,
     pub meta_seq: i64,
     pub membership_gen: i64,
-    pub voter_epoch: u64,
-    pub voter_set: Vec<String>,
-    pub voter_ballot: String,
-    pub pending_voter_epoch: u64,
-    pub pending_voter_set: Vec<String>,
-    pub pending_proposal_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,8 +31,6 @@ pub struct PeerInfo {
     pub description: String,
     pub os: String,
     pub arch: String,
-    #[serde(default)]
-    pub role: NodeRole,
     pub meta_seq: i64,
     pub addrs: Vec<String>,
     #[serde(default)]
@@ -174,32 +106,6 @@ fn validate_peer_fields(peer: &PeerInfo) -> Result<()> {
     Ok(())
 }
 
-pub fn canonicalize_voter_set(set: &[String]) -> Result<Vec<String>> {
-    if set.len() > MAX_CLUSTER_PEERS + 1 {
-        return Err(Error::bad("voter_set exceeds maximum cluster size"));
-    }
-    let mut out = Vec::with_capacity(set.len());
-    for entry in set {
-        entry
-            .parse::<EndpointId>()
-            .map_err(|_| Error::bad("invalid node_id in voter_set"))?;
-        out.push(entry.clone());
-    }
-    out.sort();
-    out.dedup();
-    if out.len() > MAX_CLUSTER_PEERS + 1 {
-        return Err(Error::bad("voter_set exceeds maximum cluster size"));
-    }
-    Ok(out)
-}
-
-fn parse_voter_set_json(raw: &str) -> Vec<String> {
-    let mut v: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
-    v.sort();
-    v.dedup();
-    v
-}
-
 pub fn ensure_local_node(conn: &Connection) -> Result<()> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM local_node WHERE id=1)",
@@ -223,14 +129,11 @@ pub fn ensure_local_node(conn: &Connection) -> Result<()> {
         let _ = write!(db_epoch, "{b:02x}");
     }
     let name = default_node_name();
-    let voter_set_json = serde_json::to_string(&[&node_id])
-        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
     conn.execute(
         "INSERT INTO local_node(
-            id,secret_key,node_id,cluster_secret,name,description,role,db_epoch,
-            meta_seq,membership_gen,catalog_rev,voter_epoch,voter_set_json,voter_ballot,
-            pending_voter_epoch,pending_voter_set_json,pending_proposal_id
-         ) VALUES(1,?,?,?,?,?,'voter',?,1,1,0,1,?,'',0,'[]','')",
+            id,secret_key,node_id,cluster_secret,name,description,db_epoch,
+            meta_seq,membership_gen,catalog_rev
+         ) VALUES(1,?,?,?,?,?,?,1,1,0)",
         params![
             secret_key.as_slice(),
             node_id,
@@ -238,7 +141,6 @@ pub fn ensure_local_node(conn: &Connection) -> Result<()> {
             name,
             "",
             db_epoch,
-            voter_set_json,
         ],
     )?;
     Ok(())
@@ -267,8 +169,7 @@ pub fn local_node_id(conn: &Connection) -> Result<Rc<str>> {
 
 pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
     conn.query_row(
-        "SELECT secret_key,node_id,cluster_secret,name,description,role,db_epoch,meta_seq,membership_gen,
-                voter_epoch,voter_set_json,voter_ballot,pending_voter_epoch,pending_voter_set_json,pending_proposal_id
+        "SELECT secret_key,node_id,cluster_secret,name,description,db_epoch,meta_seq,membership_gen
          FROM local_node WHERE id=1",
         [],
         |r| {
@@ -284,28 +185,15 @@ pub fn load_local_node(conn: &Connection) -> Result<LocalNode> {
                     rusqlite::types::Type::Blob,
                 )
             })?;
-            let voter_epoch_i64: i64 = r.get(9)?;
-            let voter_set_raw: String = r.get(10)?;
-            let voter_ballot: String = r.get(11)?;
-            let pending_epoch_i64: i64 = r.get(12)?;
-            let pending_set_raw: String = r.get(13)?;
-            let pending_proposal_id: String = r.get(14)?;
             Ok(LocalNode {
                 secret_key,
                 node_id: r.get(1)?,
                 cluster_secret,
                 name: r.get(3)?,
                 description: r.get(4)?,
-                role: r.get(5)?,
-                db_epoch: r.get(6)?,
-                meta_seq: r.get(7)?,
-                membership_gen: r.get(8)?,
-                voter_epoch: u64::try_from(voter_epoch_i64).unwrap_or(0),
-                voter_set: parse_voter_set_json(&voter_set_raw),
-                voter_ballot,
-                pending_voter_epoch: u64::try_from(pending_epoch_i64).unwrap_or(0),
-                pending_voter_set: parse_voter_set_json(&pending_set_raw),
-                pending_proposal_id,
+                db_epoch: r.get(5)?,
+                meta_seq: r.get(6)?,
+                membership_gen: r.get(7)?,
             })
         },
     )
@@ -331,223 +219,6 @@ pub fn update_self_meta(
         params![next_name, next_desc],
     )?;
     load_local_node(conn)
-}
-
-pub fn set_local_role(conn: &Connection, role: NodeRole) -> Result<LocalNode> {
-    let current = load_local_node(conn)?;
-    let has_peers: bool =
-        conn.query_row("SELECT EXISTS(SELECT 1 FROM cluster_peers)", [], |r| r.get(0))?;
-    if has_peers {
-        if current.role != role {
-            return Err(Error::conflict(
-                "cannot change cluster role offline while cluster peers exist",
-            ));
-        }
-        return Ok(current);
-    }
-    let next_set = if role.is_voter() {
-        vec![current.node_id.clone()]
-    } else {
-        Vec::new()
-    };
-    let next_json = serde_json::to_string(&next_set)
-        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
-    let next_epoch = i64::try_from(current.voter_epoch.max(1)).unwrap_or(1);
-    if current.role != role
-        || current.voter_epoch == 0
-        || current.voter_set != next_set
-        || current.pending_voter_epoch != 0
-    {
-        if !role.is_voter() && !current.voter_set.is_empty() {
-            let mut next_secret = [0u8; 32];
-            getrandom::fill(&mut next_secret)
-                .map_err(|_| Error::internal("entropy unavailable"))?;
-            conn.execute(
-                "UPDATE local_node
-                 SET role=?1,
-                     meta_seq=CASE WHEN role != ?1 THEN meta_seq+1 ELSE meta_seq END,
-                     voter_epoch=?2,
-                     voter_set_json=?3,
-                     pending_voter_epoch=0,
-                     pending_voter_set_json='[]',
-                     pending_proposal_id='',
-                     cluster_secret=?4,
-                     membership_gen=membership_gen+1
-                 WHERE id=1",
-                params![role, next_epoch, next_json, next_secret.as_slice()],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE local_node
-                 SET role=?1,
-                     meta_seq=CASE WHEN role != ?1 THEN meta_seq+1 ELSE meta_seq END,
-                     voter_epoch=?2,
-                     voter_set_json=?3,
-                     pending_voter_epoch=0,
-                     pending_voter_set_json='[]',
-                     pending_proposal_id=''
-                 WHERE id=1",
-                params![role, next_epoch, next_json],
-            )?;
-        }
-    }
-    load_local_node(conn)
-}
-
-pub fn probe_voter_config(
-    conn: &Connection,
-    expected_epoch: u64,
-    next_epoch: u64,
-    ballot: &str,
-) -> Result<(bool, LocalNode)> {
-    if ballot.is_empty() || next_epoch == 0 || next_epoch <= expected_epoch {
-        return Err(Error::bad("invalid voter recovery ballot"));
-    }
-    crate::cluster::ledger::validate_hlc(ballot)?;
-    crate::cluster::ledger::observe_hlc(ballot);
-    let local = load_local_node(conn)?;
-    if local.voter_epoch >= next_epoch {
-        return Ok((false, local));
-    }
-    if local.voter_epoch != expected_epoch && local.voter_epoch != 0 {
-        return Ok((false, local));
-    }
-    if ballot <= local.voter_ballot.as_str() {
-        return Ok((false, local));
-    }
-    conn.execute(
-        "UPDATE local_node SET voter_ballot=?1 WHERE id=1",
-        [ballot],
-    )?;
-    Ok((true, load_local_node(conn)?))
-}
-
-pub fn prepare_voter_config(
-    conn: &Connection,
-    expected_epoch: u64,
-    next_epoch: u64,
-    proposal_id: &str,
-    new_set: &[String],
-) -> Result<LocalNode> {
-    let canonical = canonicalize_voter_set(new_set)?;
-    if canonical.is_empty() {
-        return Err(Error::conflict("cluster must retain at least one voter"));
-    }
-    if proposal_id.is_empty() || next_epoch == 0 || next_epoch <= expected_epoch {
-        return Err(Error::bad("invalid voter epoch transition"));
-    }
-    crate::cluster::ledger::validate_hlc(proposal_id)?;
-    crate::cluster::ledger::observe_hlc(proposal_id);
-    let local = load_local_node(conn)?;
-    if local.voter_epoch >= next_epoch {
-        return Err(Error::conflict("voter epoch already advanced"));
-    }
-    if local.voter_epoch != expected_epoch && local.voter_epoch != 0 {
-        return Err(Error::conflict(format!(
-            "voter_epoch mismatch: expected {expected_epoch}, local is {}",
-            local.voter_epoch
-        )));
-    }
-    if proposal_id < local.voter_ballot.as_str() {
-        return Err(Error::conflict("stale voter configuration ballot"));
-    }
-    if local.pending_voter_epoch != 0 {
-        if local.pending_voter_epoch != next_epoch {
-            return Err(Error::conflict("voter reconfiguration already pending"));
-        }
-        if local.pending_proposal_id == proposal_id {
-            if local.pending_voter_set == canonical {
-                return Ok(local);
-            }
-            return Err(Error::conflict("conflicting voter proposal_id"));
-        }
-        if proposal_id < local.pending_proposal_id.as_str() {
-            return Err(Error::conflict("stale voter configuration ballot"));
-        }
-    }
-    let pending_json = serde_json::to_string(&canonical)
-        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
-    let next_i64 = i64::try_from(next_epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
-    conn.execute(
-        "UPDATE local_node
-         SET voter_ballot=CASE WHEN ?3 > voter_ballot THEN ?3 ELSE voter_ballot END,
-             pending_voter_epoch=?1,
-             pending_voter_set_json=?2,
-             pending_proposal_id=?3
-         WHERE id=1",
-        params![next_i64, pending_json, proposal_id],
-    )?;
-    load_local_node(conn)
-}
-
-pub fn commit_voter_config(
-    conn: &Connection,
-    epoch: u64,
-    new_set: &[String],
-) -> Result<(LocalNode, bool)> {
-    if epoch == 0 {
-        return Err(Error::bad("committed voter_epoch must be positive"));
-    }
-    let canonical = canonicalize_voter_set(new_set)?;
-    if canonical.is_empty() {
-        return Err(Error::conflict("cluster must retain at least one voter"));
-    }
-    let local = load_local_node(conn)?;
-    if local.voter_epoch > epoch {
-        return Ok((local, false));
-    }
-    if local.voter_epoch == epoch {
-        if local.voter_set != canonical {
-            return Err(Error::conflict(
-                "conflicting voter_set for already-committed voter_epoch",
-            ));
-        }
-        if local.pending_voter_epoch == epoch {
-            conn.execute(
-                "UPDATE local_node
-                 SET pending_voter_epoch=0, pending_voter_set_json='[]', pending_proposal_id=''
-                 WHERE id=1",
-                [],
-            )?;
-            return Ok((load_local_node(conn)?, false));
-        }
-        return Ok((local, false));
-    }
-    let should_be_voter = canonical.iter().any(|id| id == &local.node_id);
-    let next_role = if should_be_voter {
-        NodeRole::Voter
-    } else {
-        NodeRole::Edge
-    };
-    let role_changed = local.role != next_role;
-    let json = serde_json::to_string(&canonical)
-        .map_err(|e| Error::internal(format!("failed to encode voter_set: {e}")))?;
-    let epoch_i64 = i64::try_from(epoch).map_err(|_| Error::bad("voter_epoch overflow"))?;
-    conn.execute(
-        "UPDATE local_node
-         SET voter_epoch=?1,
-             voter_set_json=?2,
-             pending_voter_epoch=CASE WHEN pending_voter_epoch <= ?1 THEN 0 ELSE pending_voter_epoch END,
-             pending_voter_set_json=CASE WHEN pending_voter_epoch <= ?1 THEN '[]' ELSE pending_voter_set_json END,
-             pending_proposal_id=CASE WHEN pending_voter_epoch <= ?1 THEN '' ELSE pending_proposal_id END,
-             role=?3,
-             meta_seq=CASE WHEN role != ?3 THEN meta_seq+1 ELSE meta_seq END
-         WHERE id=1",
-        params![epoch_i64, json, next_role],
-    )?;
-    Ok((load_local_node(conn)?, role_changed))
-}
-
-pub fn adopt_voter_config(
-    conn: &Connection,
-    epoch: u64,
-    set: &[String],
-) -> Result<(LocalNode, bool)> {
-    let local = load_local_node(conn)?;
-    if epoch == 0 || set.is_empty() || epoch <= local.voter_epoch || epoch < local.pending_voter_epoch {
-        return Ok((local, false));
-    }
-    commit_voter_config(conn, epoch, set)
 }
 
 pub fn encode_endpoint_addrs(addr: &EndpointAddr) -> Vec<String> {
@@ -617,7 +288,6 @@ pub fn self_peer_info(local: &LocalNode, addr: &EndpointAddr) -> PeerInfo {
         description: local.description.clone(),
         os: current_os().to_owned(),
         arch: current_arch().to_owned(),
-        role: local.role,
         meta_seq: local.meta_seq,
         addrs: sanitize_addrs(&encode_endpoint_addrs(addr)),
         addrs_ts: now,
@@ -688,11 +358,7 @@ pub fn apply_join(
         }
         let next_gen = local.membership_gen + 1;
         conn.execute(
-            "UPDATE local_node
-             SET cluster_secret=?1, membership_gen=?2,
-                 voter_epoch=0, voter_set_json='[]', voter_ballot='',
-                 pending_voter_epoch=0, pending_voter_set_json='[]', pending_proposal_id=''
-             WHERE id=1",
+            "UPDATE local_node SET cluster_secret=?1, membership_gen=?2 WHERE id=1",
             params![new_secret.as_slice(), next_gen],
         )?;
         conn.execute("DELETE FROM cluster_peers", [])?;
@@ -752,11 +418,9 @@ pub fn upsert_peer(
     let addrs_json = serde_json::to_string(&sanitized_addrs)
         .map_err(|e| Error::internal(format!("failed to encode peer addrs: {e}")))?;
 
-    let existing: Option<(i64, String, i64, NodeRole)> = conn
-        .prepare_cached("SELECT meta_seq, addrs_json, addrs_ts, role FROM cluster_peers WHERE node_id=?")?
-        .query_row([&peer.node_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })
+    let existing: Option<(i64, String, i64)> = conn
+        .prepare_cached("SELECT meta_seq, addrs_json, addrs_ts FROM cluster_peers WHERE node_id=?")?
+        .query_row([&peer.node_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
 
     let incoming_ts = if direct {
@@ -781,15 +445,14 @@ pub fn upsert_peer(
                 incoming_ts
             };
             conn.execute(
-                "INSERT INTO cluster_peers(node_id,name,description,os,arch,role,meta_seq,addrs_json,addrs_ts,last_seen_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cluster_peers(node_id,name,description,os,arch,meta_seq,addrs_json,addrs_ts,last_seen_at)
+                 VALUES(?,?,?,?,?,?,?,?,?)",
                 params![
                     peer.node_id,
                     peer.name,
                     peer.description,
                     peer.os,
                     peer.arch,
-                    peer.role,
                     peer.meta_seq,
                     addrs_json,
                     ts,
@@ -798,7 +461,7 @@ pub fn upsert_peer(
             )?;
             Ok(true)
         }
-        Some((old_seq, old_addrs, old_addrs_ts, old_role)) => {
+        Some((old_seq, old_addrs, old_addrs_ts)) => {
             let take_addrs = !sanitized_addrs.is_empty()
                 && (direct
                     || old_addrs == "[]"
@@ -812,8 +475,8 @@ pub fn upsert_peer(
             if peer.meta_seq > old_seq {
                 conn.execute(
                     "UPDATE cluster_peers
-                     SET name=?2, description=?3, os=?4, arch=?5, role=?6, meta_seq=?7, addrs_json=?8, addrs_ts=?9,
-                         last_seen_at=CASE WHEN ?10>0 THEN max(last_seen_at, ?10) ELSE last_seen_at END
+                     SET name=?2, description=?3, os=?4, arch=?5, meta_seq=?6, addrs_json=?7, addrs_ts=?8,
+                         last_seen_at=CASE WHEN ?9>0 THEN max(last_seen_at, ?9) ELSE last_seen_at END
                      WHERE node_id=?1",
                     params![
                         peer.node_id,
@@ -821,14 +484,13 @@ pub fn upsert_peer(
                         peer.description,
                         peer.os,
                         peer.arch,
-                        peer.role,
                         peer.meta_seq,
                         next_addrs,
                         next_ts,
                         direct_seen
                     ],
                 )?;
-                Ok(next_addrs != old_addrs || peer.role != old_role)
+                Ok(next_addrs != old_addrs)
             } else if take_addrs || direct {
                 conn.execute(
                     "UPDATE cluster_peers
@@ -847,12 +509,12 @@ pub fn upsert_peer(
 
 pub fn list_peers(conn: &Connection) -> Result<Vec<PeerInfo>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT node_id,name,description,os,arch,role,meta_seq,addrs_json,addrs_ts,last_seen_at
+        "SELECT node_id,name,description,os,arch,meta_seq,addrs_json,addrs_ts,last_seen_at
          FROM cluster_peers ORDER BY name, node_id",
     )?;
     let rows = stmt
         .query_map([], |r| {
-            let addrs_raw: String = r.get(7)?;
+            let addrs_raw: String = r.get(6)?;
             let addrs: Vec<String> = serde_json::from_str(&addrs_raw).unwrap_or_default();
             Ok(PeerInfo {
                 node_id: r.get(0)?,
@@ -860,11 +522,10 @@ pub fn list_peers(conn: &Connection) -> Result<Vec<PeerInfo>> {
                 description: r.get(2)?,
                 os: r.get(3)?,
                 arch: r.get(4)?,
-                role: r.get(5)?,
-                meta_seq: r.get(6)?,
+                meta_seq: r.get(5)?,
                 addrs,
-                addrs_ts: r.get(8)?,
-                last_seen_at: r.get(9)?,
+                addrs_ts: r.get(7)?,
+                last_seen_at: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -929,7 +590,6 @@ pub fn list_cluster_nodes(
             "description": local.description,
             "os": current_os(),
             "arch": current_arch(),
-            "role": local.role.as_str(),
             "online": true,
         }),
     ));
@@ -944,7 +604,6 @@ pub fn list_cluster_nodes(
                 "description": peer.description,
                 "os": peer.os,
                 "arch": peer.arch,
-                "role": peer.role.as_str(),
                 "online": online,
             }),
         ));

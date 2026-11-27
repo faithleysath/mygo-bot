@@ -139,36 +139,14 @@ impl Db {
         let local = crate::cluster::identity::load_local_node(&tx)?;
         let local_node_id = local.node_id.clone();
         presence.set_local_node_id(local_node_id.clone());
-        presence.sync_local_node(&local);
         let peers = crate::cluster::identity::list_peers(&tx)?;
-        let peer_count = peers.len();
-        if local.voter_epoch == 0 && peer_count > 0 && local.role.is_voter() {
-            presence.set_want_voter_admission(true);
-        }
-        presence.set_peer_roles(&peers);
-        presence.set_known_peer_count(peer_count);
+        presence.set_known_peer_count(peers.len());
         let has_null_att: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM attachments WHERE data IS NULL)",
             [],
             |r| r.get(0),
         )?;
         presence.set_has_null_attachments(has_null_att);
-        let lease_rows = {
-            let mut stmt = tx.prepare(
-                "SELECT session_id, highest_term, holder_node_id, claim_id, expires_at_ms FROM session_leases",
-            )?;
-            stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, SessionId>(0)?,
-                    u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        presence.load_persisted_leases(lease_rows);
         let call_ids = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM llm_calls WHERE status='in_flight' AND origin_node_id=?1",
@@ -518,21 +496,17 @@ impl Store {
                     "shutting down".into(),
                 ));
             }
-            if starting && self.presence.is_joining() {
-                return Err(Error::conflict("cluster join in progress; retry"));
-            }
             let active_map = &self.active;
             let mut tx = self.conn.transaction()?;
             for write in pending.by_ref() {
                 if let Some((sid, expected_gen)) = write.expected_run_gen {
                     let valid = active_map
                         .get(&sid)
-                        .is_some_and(|run| run.run_gen == expected_gen)
-                        && self.presence.is_local_lease_valid(sid);
+                        .is_some_and(|run| run.run_gen == expected_gen);
                     if !valid {
                         let (_, reply) = (write.apply)(
                             Err(Error::conflict(
-                                "session superseded by cluster replacement or expired execution lease",
+                                "session superseded by cluster update",
                             )),
                             false,
                         );
@@ -681,10 +655,6 @@ impl Store {
         self.refresh_local_presence_with(sid, status_enum, reason, now);
         self.notify_status(sid, state, reason, now);
         Ok(())
-    }
-
-    pub fn is_local_lease_valid(&self, sid: SessionId) -> bool {
-        self.presence.is_local_lease_valid(sid)
     }
 
     pub fn effective_runner_node_id(&self, sid: SessionId) -> Option<Cow<'_, str>> {

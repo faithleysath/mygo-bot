@@ -21,8 +21,8 @@ use crate::{
     cluster::{
         ClusterSignal,
         identity::{
-            MAX_PEX_PEERS, PeerInfo, adopt_voter_config, assert_membership_gen, list_peers,
-            load_local_node, self_peer_info, upsert_peer_if_gen,
+            MAX_PEX_PEERS, PeerInfo, assert_membership_gen, list_peers, load_local_node,
+            self_peer_info, upsert_peer_if_gen,
         },
         ledger::{
             self, CALLS_SCOPE, CatalogDelta, McpServerWire, SessionDelta, apply_catalog_delta,
@@ -61,10 +61,6 @@ enum RpcReq {
     ExchangePeers {
         self_info: PeerInfo,
         peers: Vec<PeerInfo>,
-        #[serde(default)]
-        voter_epoch: u64,
-        #[serde(default)]
-        voter_set: Vec<String>,
     },
     NotifyDirty {
         catalog: bool,
@@ -124,10 +120,6 @@ enum RpcResp {
     Peers {
         self_info: PeerInfo,
         peers: Vec<PeerInfo>,
-        #[serde(default)]
-        voter_epoch: u64,
-        #[serde(default)]
-        voter_set: Vec<String>,
     },
     Ack,
     CatalogDelta(CatalogDelta),
@@ -710,28 +702,18 @@ impl SyncEngine {
             RpcReq::ExchangePeers {
                 self_info,
                 mut peers,
-                voter_epoch,
-                voter_set,
             } => {
                 if peers.len() > MAX_PEX_PEERS {
                     peers.truncate(MAX_PEX_PEERS);
                 }
                 let addr = self.net.endpoint_addr();
-                let (my_info, my_peers, discovered, my_voter_epoch, my_voter_set) = self
+                let (my_info, my_peers, discovered) = self
                     .db
                     .call(move |s| {
                         let now = chrono::Utc::now().timestamp_millis();
                         let local = load_local_node(&s.conn)?;
                         if local.membership_gen != conn_gen {
                             return Err(Error::conflict("membership changed during PEX"));
-                        }
-                        let existing_peers = list_peers(&s.conn)?;
-                        if existing_peers.is_empty()
-                            && (local.voter_epoch == 0 || local.voter_set.is_empty())
-                        {
-                            return Err(Error::conflict(
-                                "standalone node without a committed voter cannot admit peers",
-                            ));
                         }
                         let mut changed = upsert_peer_if_gen(
                             &s.conn,
@@ -751,14 +733,11 @@ impl SyncEngine {
                                 conn_gen,
                             )?;
                         }
-                        let (local, _) = adopt_voter_config(&s.conn, voter_epoch, &voter_set)?;
                         let my_info = self_peer_info(&local, &addr);
                         let mut my_peers = list_peers(&s.conn)?;
-                        s.presence.sync_local_node(&local);
-                        s.presence.set_peer_roles(&my_peers);
                         s.presence.set_known_peer_count(my_peers.len());
                         my_peers.truncate(MAX_PEX_PEERS);
-                        Ok((my_info, my_peers, changed, local.voter_epoch, local.voter_set))
+                        Ok((my_info, my_peers, changed))
                     })
                     .await?;
                 if discovered {
@@ -768,8 +747,6 @@ impl SyncEngine {
                     RpcResp::Peers {
                         self_info: my_info,
                         peers: my_peers,
-                        voter_epoch: my_voter_epoch,
-                        voter_set: my_voter_set,
                     },
                     None,
                 ))
@@ -1013,7 +990,7 @@ impl SyncEngine {
     async fn exchange_peers_with(&self, peer_id: &str) -> Result<()> {
         let mgen = self.net.membership_gen();
         let addr = self.net.endpoint_addr();
-        let (self_info, peers, voter_epoch, voter_set) = self
+        let (self_info, peers) = self
             .db
             .call(move |s| {
                 let local = load_local_node(&s.conn)?;
@@ -1022,23 +999,13 @@ impl SyncEngine {
                 }
                 let mut my_peers = list_peers(&s.conn)?;
                 my_peers.truncate(MAX_PEX_PEERS);
-                Ok((
-                    self_peer_info(&local, &addr),
-                    my_peers,
-                    local.voter_epoch,
-                    local.voter_set,
-                ))
+                Ok((self_peer_info(&local, &addr), my_peers))
             })
             .await?;
         let (resp, _) = self
             .rpc(
                 peer_id,
-                &RpcReq::ExchangePeers {
-                    self_info,
-                    peers,
-                    voter_epoch,
-                    voter_set,
-                },
+                &RpcReq::ExchangePeers { self_info, peers },
                 RPC_TIMEOUT_SHORT,
             )
             .await?;
@@ -1048,8 +1015,6 @@ impl SyncEngine {
         if let RpcResp::Peers {
             self_info,
             mut peers,
-            voter_epoch,
-            voter_set,
         } = resp
         {
             if peers.len() > MAX_PEX_PEERS {
@@ -1069,10 +1034,7 @@ impl SyncEngine {
                         changed |=
                             upsert_peer_if_gen(&s.conn, &local.node_id, &p, now, false, mgen)?;
                     }
-                    let (local, _) = adopt_voter_config(&s.conn, voter_epoch, &voter_set)?;
                     let all = list_peers(&s.conn)?;
-                    s.presence.sync_local_node(&local);
-                    s.presence.set_peer_roles(&all);
                     s.presence.set_known_peer_count(all.len());
                     Ok(changed)
                 })
@@ -1699,6 +1661,59 @@ impl SyncEngine {
             .await
     }
 
+    pub async fn sync_session_best_effort(&self, sid: SessionId) -> Result<()> {
+        if self.is_session_deleted_local(sid).await? {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+        let mgen = self.net.membership_gen();
+        let peers = self.net.online_peer_ids();
+        if !peers.is_empty() {
+            let results: Vec<Result<()>> = stream::iter(peers.into_iter())
+                .map(|peer_id| async move {
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    if let Err(err) = self.pull_catalog_from_peer(&peer_id, mgen).await {
+                        if self.net.membership_gen() != mgen {
+                            return Err(Error::conflict("membership generation changed"));
+                        }
+                        tracing::debug!(%sid, %peer_id, error = %err, "best-effort catalog pull skipped unreachable peer");
+                        return Ok(());
+                    }
+                    if self.net.membership_gen() != mgen {
+                        return Err(Error::conflict("membership generation changed"));
+                    }
+                    if let Err(err) = self.pull_session_from_peer(sid, &peer_id, mgen).await {
+                        if self.net.membership_gen() != mgen {
+                            return Err(Error::conflict("membership generation changed"));
+                        }
+                        tracing::debug!(%sid, %peer_id, error = %err, "best-effort session pull skipped unreachable peer");
+                    }
+                    Ok(())
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
+            for res in results {
+                res?;
+            }
+        }
+        self.db
+            .call(move |s| {
+                let row: Option<bool> = s
+                    .conn
+                    .prepare_cached("SELECT deleted FROM sessions WHERE id=?")?
+                    .query_row([sid], |r| r.get(0))
+                    .optional()?;
+                if row != Some(false) {
+                    return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                }
+                mark_session_watched(&s.conn, sid)?;
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn sync_now(&self, session_id: Option<SessionId>) -> Result<SyncSummary> {
         let _gate = self.sync_now_gate.lock().await;
         let Some(sid) = session_id else {
@@ -1782,11 +1797,6 @@ impl SyncEngine {
             catalog_rows_updated,
             sessions_updated: usize::from(session_updated),
         })
-    }
-
-    pub async fn sync_session_latest(&self, sid: SessionId) -> Result<()> {
-        let peers = self.net.online_peer_ids();
-        self.sync_session_strict(sid, &peers).await
     }
 
     pub async fn ensure_session_watched(&self, sid: SessionId) -> Result<()> {
@@ -2369,15 +2379,7 @@ fn abort_active_session_worker(s: &mut Store, streams: &Hub, sid: SessionId) {
     if let Some(ctrl) = s.active.remove(&sid) {
         ctrl.soft.cancel();
         ctrl.hard.cancel();
-        if let Some(ref lease) = ctrl.lease {
-            lease.stopped.cancel();
-            s.presence.clear_active_local_lease(sid, &lease.claim_id);
-        }
-    } else if let Some(lease) = s.presence.active_local_lease(sid) {
-        lease.stopped.cancel();
-        s.presence.clear_active_local_lease(sid, &lease.claim_id);
     }
-    s.presence.clear_non_quorum_local_lease(sid);
     s.pending_wakes.remove(&sid);
     crate::codemode::stop_session(s, sid);
     let _ = s.conn.execute(

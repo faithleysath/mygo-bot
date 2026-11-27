@@ -264,9 +264,7 @@ impl Host {
                 if task.reason.is_some() || task.expired() || task.cancel.is_cancelled() {
                     return Err(Error::conflict("task stopped or expired"));
                 }
-                if task_superseded(&s.conn, s.reset_gen(sid), task)?
-                    || !s.is_local_lease_valid(sid)
-                {
+                if task_superseded(&s.conn, s.reset_gen(sid), task)? {
                     return Err(Error::conflict("session superseded or conflicted"));
                 }
                 if blocks.parts.is_empty() {
@@ -421,10 +419,6 @@ pub fn stop_session(s: &mut Store, sid: SessionId) {
 
 pub fn has_session_tasks(s: &Store, sid: SessionId) -> bool {
     s.task_counts.contains_key(&sid)
-}
-
-pub fn task_session_ids(s: &Store) -> impl Iterator<Item = SessionId> + '_ {
-    s.task_counts.keys().copied()
 }
 
 pub fn count_session_tasks(s: &Store, sid: SessionId) -> usize {
@@ -906,10 +900,6 @@ fn tick(s: &mut Store, app: &App, id: ItemId) -> Result<Option<Instant>> {
         s.tasks.get_mut(&id).unwrap().stop("superseded");
         return Ok(None);
     }
-    if !s.is_local_lease_valid(sid) {
-        s.tasks.get_mut(&id).unwrap().stop("superseded");
-        return Ok(None);
-    }
     let now = Instant::now();
     if s.tasks[&id].kill.as_ref().is_some_and(|k| now >= k.until) {
         let saved = {
@@ -1056,7 +1046,7 @@ fn complete(
         (task.origin.sid, s.reset_gen(task.origin.sid))
     };
     let superseded = task_superseded(&s.conn, cur_gen, &s.tasks[&id])?;
-    if superseded || !s.is_local_lease_valid(sid) {
+    if superseded {
         let mut task = remove_task(s, id);
         s.refresh_local_presence(sid);
         if !s.active.contains_key(&sid)

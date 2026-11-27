@@ -4,8 +4,6 @@ export type MainTab = "chat" | "trace" | "context";
 export type SseStatus = "open" | "reconnecting";
 export type SessionStatus = "idle" | "running" | "pausing" | "paused";
 
-export type NodeRole = "voter" | "edge";
-
 export interface BranchHead {
   head_id: string;
   depth: number;
@@ -43,7 +41,6 @@ export interface SelfNodeStatus {
   node_id: string;
   name: string;
   description: string;
-  role: NodeRole;
   os: string;
   arch: string;
   meta_seq: number;
@@ -55,7 +52,6 @@ export interface ClusterPeerView {
   node_id: string;
   name: string;
   description: string;
-  role: NodeRole;
   os: string;
   arch: string;
   meta_seq: number;

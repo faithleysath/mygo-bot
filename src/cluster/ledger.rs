@@ -268,19 +268,6 @@ pub fn seed_hlc_from_db(conn: &Connection) -> Result<()> {
             observe_hlc(&ts);
         }
     }
-    {
-        let ballots: Option<(String, String)> = conn
-            .query_row(
-                "SELECT voter_ballot, pending_proposal_id FROM local_node WHERE id=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if let Some((ballot, prop)) = ballots {
-            observe_hlc(&ballot);
-            observe_hlc(&prop);
-        }
-    }
     Ok(())
 }
 

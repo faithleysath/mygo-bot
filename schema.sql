@@ -254,17 +254,10 @@ CREATE TABLE local_node (
     cluster_secret BLOB NOT NULL CHECK (length(cluster_secret) = 32),
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    role TEXT NOT NULL DEFAULT 'voter' CHECK (role IN ('voter','edge')),
     db_epoch TEXT NOT NULL CHECK (db_epoch != ''),
     meta_seq INTEGER NOT NULL DEFAULT 1 CHECK (meta_seq > 0),
     membership_gen INTEGER NOT NULL DEFAULT 1 CHECK (membership_gen > 0),
-    catalog_rev INTEGER NOT NULL DEFAULT 0 CHECK (catalog_rev >= 0),
-    voter_epoch INTEGER NOT NULL DEFAULT 1 CHECK (voter_epoch >= 0),
-    voter_set_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(voter_set_json) = 'array'),
-    voter_ballot TEXT NOT NULL DEFAULT '',
-    pending_voter_epoch INTEGER NOT NULL DEFAULT 0 CHECK (pending_voter_epoch >= 0),
-    pending_voter_set_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(pending_voter_set_json) = 'array'),
-    pending_proposal_id TEXT NOT NULL DEFAULT ''
+    catalog_rev INTEGER NOT NULL DEFAULT 0 CHECK (catalog_rev >= 0)
 );
 
 CREATE TABLE cluster_peers (
@@ -273,7 +266,6 @@ CREATE TABLE cluster_peers (
     description TEXT NOT NULL DEFAULT '',
     os TEXT NOT NULL DEFAULT '',
     arch TEXT NOT NULL DEFAULT '',
-    role TEXT NOT NULL DEFAULT 'voter' CHECK (role IN ('voter','edge')),
     meta_seq INTEGER NOT NULL DEFAULT 0,
     addrs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_type(addrs_json) = 'array'),
     addrs_ts INTEGER NOT NULL DEFAULT 0,
@@ -296,13 +288,5 @@ CREATE TABLE peer_catalog_cursors (
 CREATE TABLE watched_sessions (
     session_id TEXT PRIMARY KEY
 ) WITHOUT ROWID;
-
-CREATE TABLE session_leases (
-    session_id TEXT PRIMARY KEY,
-    highest_term INTEGER NOT NULL DEFAULT 0 CHECK (highest_term >= 0),
-    holder_node_id TEXT NOT NULL DEFAULT '',
-    claim_id TEXT NOT NULL DEFAULT '',
-    expires_at_ms INTEGER NOT NULL DEFAULT 0
-);
 
 PRAGMA user_version = 1;

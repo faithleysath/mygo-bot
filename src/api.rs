@@ -342,7 +342,6 @@ async fn delete_session(
 }
 
 async fn finish_delete(app: App, sid: SessionId, delete_gate: DeleteGateGuard) -> Result<StatusCode> {
-    let delete_lease = delete_gate.lease();
     let res = app
         .db
         .call(move |s| {
@@ -351,24 +350,16 @@ async fn finish_delete(app: App, sid: SessionId, delete_gate: DeleteGateGuard) -
                 || s.pending_wakes.contains(&sid)
                 || codemode::has_session_tasks(s, sid)
                 || matches!(current.status, SessionStatus::Running | SessionStatus::Pausing)
+                || s.presence.local_owner(sid).is_some()
                 || s.presence.remote_owner(sid).is_some()
-                || s.presence.has_committed_remote_lease(sid)
             {
                 return Err(Error::conflict(
                     "pause the session and stop active tasks before deleting",
                 ));
             }
             let tx = s.conn.transaction()?;
-            s.presence.check_delete_lease(sid, delete_lease.as_deref())?;
-            if s.presence.remote_owner(sid).is_some() || s.presence.has_committed_remote_lease(sid)
-            {
-                return Err(Error::conflict(
-                    "pause the session and stop active tasks before deleting",
-                ));
-            }
             let now = chrono::Utc::now().timestamp_millis();
             crate::cluster::ledger::tombstone_session(&tx, sid, now)?;
-            s.presence.check_delete_lease(sid, delete_lease.as_deref())?;
             tx.commit()?;
             s.mcp.forget_session(sid);
             s.channels.remove(&sid);

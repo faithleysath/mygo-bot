@@ -11,8 +11,8 @@ use crate::{
     App, Error, Result,
     cluster::{
         identity::{
-            NodeRole, current_arch, current_os, encode_endpoint_addrs, encode_invite,
-            list_peers, load_local_node,
+            current_arch, current_os, delete_peer, encode_endpoint_addrs, encode_invite,
+            list_peers, load_local_node, update_self_meta,
         },
         sync::SyncSummary,
     },
@@ -34,7 +34,6 @@ struct SelfNodeStatus {
     node_id: String,
     name: String,
     description: String,
-    role: NodeRole,
     os: &'static str,
     arch: &'static str,
     meta_seq: i64,
@@ -47,7 +46,6 @@ struct ClusterPeerView {
     node_id: String,
     name: String,
     description: String,
-    role: NodeRole,
     os: String,
     arch: String,
     meta_seq: i64,
@@ -80,7 +78,6 @@ async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
         node_id: local.node_id,
         name: local.name,
         description: local.description,
-        role: local.role,
         os: current_os(),
         arch: current_arch(),
         meta_seq: local.meta_seq,
@@ -95,7 +92,6 @@ async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
                 node_id: p.node_id,
                 name: p.name,
                 description: p.description,
-                role: p.role,
                 os: p.os,
                 arch: p.arch,
                 meta_seq: p.meta_seq,
@@ -113,27 +109,31 @@ async fn status(State(app): State<App>) -> Result<Json<ClusterStatus>> {
 struct PatchSelf {
     name: Option<String>,
     description: Option<String>,
-    role: Option<NodeRole>,
 }
 
 async fn patch_self(
     State(app): State<App>,
     Json(body): Json<PatchSelf>,
 ) -> Result<Json<SelfNodeStatus>> {
-    if body.name.is_none() && body.description.is_none() && body.role.is_none() {
-        return Err(Error::bad("expected name, description, or role"));
+    if body.name.is_none() && body.description.is_none() {
+        return Err(Error::bad("expected name or description"));
     }
     let addrs = encode_endpoint_addrs(&app.cluster.net.endpoint_addr());
     let local_only = app.cluster.net.is_local_only();
     let local = app
-        .exec
-        .change_self_role(body.name, body.description, body.role)
+        .db
+        .write(
+            move |conn| update_self_meta(conn, body.name, body.description),
+            |s, updated| {
+                s.sync_signal(crate::cluster::SyncSignal::SelfMetaChanged);
+                Ok(updated)
+            },
+        )
         .await?;
     Ok(Json(SelfNodeStatus {
         node_id: local.node_id,
         name: local.name,
         description: local.description,
-        role: local.role,
         os: current_os(),
         arch: current_arch(),
         meta_seq: local.meta_seq,
@@ -149,11 +149,6 @@ struct InviteResponse {
 
 async fn invite(State(app): State<App>) -> Result<Json<InviteResponse>> {
     let local = app.db.call(|s| load_local_node(&s.conn)).await?;
-    if local.voter_epoch == 0 || local.voter_set.is_empty() {
-        return Err(Error::conflict(
-            "cannot invite peers from a node without a committed voter; set cluster role to voter first",
-        ));
-    }
     let addr = app.cluster.net.ensure_endpoint().await?.addr();
     let invite = encode_invite(&local, &addr)?;
     Ok(Json(InviteResponse { invite }))
@@ -175,7 +170,6 @@ async fn join(State(app): State<App>, Json(body): Json<JoinBody>) -> Result<Json
             "node_id": peer.node_id,
             "name": peer.name,
             "description": peer.description,
-            "role": peer.role,
             "os": peer.os,
             "arch": peer.arch,
         }
@@ -186,11 +180,29 @@ async fn remove_peer(
     State(app): State<App>,
     Path(node_id): Path<String>,
 ) -> Result<StatusCode> {
-    let removed = app.exec.remove_peer_safe(&node_id).await?;
+    let target = node_id.clone();
+    let presence = app.exec.presence().clone();
+    let removed = app
+        .db
+        .write(
+            move |conn| {
+                let removed = delete_peer(conn, &target)?;
+                let count = if removed { list_peers(conn)?.len() } else { 0 };
+                Ok((removed, count))
+            },
+            move |_, (removed, count)| {
+                if removed {
+                    presence.set_known_peer_count(count);
+                }
+                Ok(removed)
+            },
+        )
+        .await?;
     if !removed {
         return Err(rusqlite::Error::QueryReturnedNoRows.into());
     }
     app.cluster.net.disconnect_peer(&node_id);
+    app.exec.on_peer_offline(&node_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
