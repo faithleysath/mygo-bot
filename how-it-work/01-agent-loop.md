@@ -11,7 +11,7 @@ MyGo-Bot 把会话引擎拆得非常干净：**先把账目和排队分开，再
 在聊对话循环前，先理清上游配置（详见 [第 3 篇](03-catalog-media-and-billing.md)）：
 
 - **供应商与模型目录**：`llm_providers` 存上游地址和密钥，`llm_models` 存模型代号、上下文窗口、模态、推理档位和价目表。
-- **不再有全局默认 `config` 表**：建会话时 `POST /sessions` **必须显式传入**一个未归档的 `model_id`（缺省或传 `null` 直接 `400`），省掉多节点同步全局配置的包袱；WebUI 会在浏览器记住上次使用的模型，已有会话可随时用 `PATCH /sessions/{sid}` 换模型。
+- **显式按会话选模**：系统不设全局默认模型。建会话时 `POST /sessions` **必须显式传入**一个未归档的 `model_id`（缺省或传 `null` 直接 `400`），省去多节点之间同步全局默认配置的冲突包袱；WebUI 会在浏览器记住上次使用的模型，已有会话可随时用 `PATCH /sessions/{sid}` 换模型。
 - **静态开发指令前缀**：发请求给模型时，程序会在输入最前面实时拼入一条静态英文 `role: "developer"` 指南（位于 [src/model.rs](../src/model.rs) 并通过 `OnceLock` 缓存前缀，不写入流水账），引导模型用 `cluster.nodes()` / `cluster.node(target)` 发现并调用任意集群节点能力，跨节点也能稳定命中上游 Prompt Cache。
 
 ---
@@ -55,10 +55,10 @@ MyGo-Bot 把会话引擎拆得非常干净：**先把账目和排队分开，再
 
 **在 MyGo-Bot 里，“投信”和“点火”是两件事。** 会话停在 `idle` 或 `paused` 时，调 `POST /sessions/{sid}/messages` 只是把信投进门外信箱（`items` + `pending_inputs`）；必须再调一次 `PUT /sessions/{sid}/run` 才真正点火开工。
 
-多节点下怎么决定谁来跑、怎么防撞车？规则可以压成三句话（完整 Gossip 扩散与多跳互斥协议见 [第 8 篇](08-cluster-sync-and-execution.md)）：
-- **纯单机或无在线同伴（孤岛模式）**：纯单机（`known_peer_count == 0` 且无在线邻居）走零锁零 RPC 快路径直接开跑；即便已入群但此刻完全断网成孤岛，仍直接验完本地分支与附件后自由开跑（不报 `503`，重连后由 DAG 自动保留并合流分支）。
-- **连通群内并发防护**：开跑前可选 `{ "node": "..." }` 指定哪台直连在线节点执行；当存在在线同伴时，走 [src/cluster/exec.rs](../src/cluster/exec.rs) 的 `acquire_connected_gate` 先通过 `sync_session_best_effort` 拉齐可达节点更新与缺失附件，再沿着连通图发最多 4 跳的 `CheckOccupancy` 探测占有（含路径向量 Gossip 已感知的节点）和最新进度，配合 5 秒内存短声明 `RunClaim` 按 `node_id` 决胜并发抢跑，无人占着即可点火，不锁死心跳也不要求全群多数派在线。
-- **控制指令找人与安全删会话**：只要会话正被直连在线的远端 Runner 占着，发信、撤回、改标题、暂停与查停任务会自动单跳转发过去处理；`DELETE /sessions/{sid}` 共用同一套连通图门禁 `acquire_delete_gate` 确认可达节点无人占用、无人领先后再写墓碑。
+多节点下怎么决定谁来跑、怎么防撞车？规则可以压成三句话（完整的路径向量 Gossip 与多跳互斥协议见 [第 8 篇](08-cluster-sync-and-execution.md)）：
+- **纯单机或断网孤岛**：纯单机（`known_peer_count == 0` 且无在线邻居）走零锁零 RPC 快路径直接开跑；即便已经入群，只要此刻一台在线邻居也没有（成为孤岛），仍直接在本地验完分支与附件后自由开跑，等连上网再由上下文 DAG 自动保留并合流分支。
+- **连通图内防撞车**：开跑前可选传 `{ "node": "..." }` 指定直连在线节点执行；当存在在线同伴时，先由 [src/cluster/exec.rs](../src/cluster/exec.rs) 的 `acquire_connected_gate` 借助 `sync_session_best_effort` 从可达节点拉齐更新与缺失附件，再沿着连通图发最多 4 跳的 `CheckOccupancy` 核实占有情况（结合路径向量 Gossip 实时视图）与最新进度，配合 5 秒内存临时声明 `RunClaim` 按 `node_id` 决胜并发抢跑，确认空闲即可本地落盘点火。
+- **控制转发与安全删会话**：会话被直连在线的远端 Runner 占着时，发信、撤回、改标题、暂停与查停任务自动单跳转发过去处理；`DELETE /sessions/{sid}` 复用同一套门禁 `acquire_delete_gate`，确认连通图里无人占用、无人领先后再写墓碑。
 
 一旦点火成功（本机进入 `running`），Worker 会一轮接一轮跑下去，直到活干完为止。每一趟的具体动作如下：
 
@@ -79,9 +79,9 @@ MyGo-Bot 把会话引擎拆得非常干净：**先把账目和排队分开，再
 
 ---
 
-## 告别可变书签：`pending_inputs` 与 `turn_settled`
+## 不用可变书签：用两个防覆盖集合推导断点
 
-早期单机靠“门外游标”和“是否欠模型布尔列”两个可改书签追踪断点；放到并发与分布式环境下，可改书签极易覆盖漏账。MyGo-Bot 改用两张防覆盖集合从底层推导状态：
+如果拿“门外游标”和“是否欠模型布尔列”这类可以原地覆写的书签追踪断点，在并发投信与多节点乱序同步下极易互相覆盖漏账。MyGo-Bot 直接从两张防覆盖集合底层推导出状态：
 
 1. **门外信箱 `pending_inputs`（与 `pending` 视图，[schema.sql](../schema.sql)）**：
    - **它只管一件事**：此刻门外还躺着哪些既没撤回、没作废、也没进过 `context_nodes` 的有效输入（`user_message` 和 `notify = true` 的 `codemode_event`）。
@@ -95,7 +95,7 @@ MyGo-Bot 把会话引擎拆得非常干净：**先把账目和排队分开，再
 
 ## 会话状态机、双轨状态与软/硬暂停
 
-为了既全集群同步“静止态”，又不让某台机器跑到一半或断网熔断的现场污染同伴，数据库把会话状态显式拆成**两组列**：
+为了把会话的稳定态同步给全集群，同时又不让某台机器跑到一半或意外崩溃的临时现场污染同伴，数据库把会话状态显式拆成**两组列**：
 
 - **共享持久态（`sessions.status` + `last_error` + `status_ts`）**：只存 `'idle'` 或 `'paused'` 两个稳态，带 HLC 时间戳全群同步；
 - **仅本机叠加态（`sessions.local_status` + `local_error`）**：可为 `NULL`、`'running'`、`'pausing'` 或 `'paused'`，**永远不上网**。
@@ -150,7 +150,7 @@ stateDiagram-v2
 ### 3. 崩溃恢复与 Schema `v1` 守门（[src/store.rs](../src/store.rs)）
 
 硬暂停还来得及自己结账，`SIGKILL` 或断电则根本没给机会。进程重启打开 `Db::open` 时，只信 WAL 最后一笔已提交事务，在一个启动事务里做三件事：
-1. **验库与对齐单调水位**：核对 `PRAGMA user_version == 1`（Schema `v1` 不写迁移脚本，不匹配直接报错拒绝启动）；接着对齐 `id::seed_from_db`、带 `MAX_HLC_WALL_MS` 守卫的 [`seed_hlc_from_db`](../src/cluster/ledger.rs) 和持久化在 `local_node.catalog_rev` 里的目录水位（[`next_catalog_rev`](../src/cluster/ledger.rs)），加载本机身份与已登记同伴数量。
+1. **验库与对齐单调水位**：核对 `PRAGMA user_version == 1`（版本不匹配直接报错拒绝启动）；接着对齐 `id::seed_from_db`、带 `MAX_HLC_WALL_MS` 守卫的 [`seed_hlc_from_db`](../src/cluster/ledger.rs) 和持久化在 `local_node.catalog_rev` 里的目录水位（[`next_catalog_rev`](../src/cluster/ledger.rs)），加载本机身份与已登记同伴数量。
 2. **原地按来源恢复本机残局**：只按 `origin_node_id == local_node_id` 过滤，把本机仍挂着 `'in_flight'` 的 `llm_calls` 标成 `'interrupted'`（`"daemon restarted"`）；把停在 `local_status IN ('running', 'pausing')` 的会话收成持久 `'paused'` 并清掉叠加态；并就地跑一遍 `codemode::ledger::recover` 处理本机中断任务与作废提醒。绝不误伤群里别的机器还在跑的会话。
 3. **等人工重开才按 `input_head` 补工具残局**：重启时**绝不自动重跑未回结果的普通工具**（因为没落盘结果不等于没执行过副作用）。空缺先留着，等你下次手动点 `/run` 时，由 [`publish_tools`](../src/store.rs) 严格核对 `llm_calls.input_head` 分支归属后只补齐属于当前分支的未果调用（`"Execution interrupted; result unknown."`——绝不把另一条分叉上死掉的工具错拉过来），然后再查 `needs_model` 与 `pending_inputs` 决定接着跑还是回 `idle`。
 

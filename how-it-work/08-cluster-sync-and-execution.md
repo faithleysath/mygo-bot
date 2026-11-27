@@ -3,9 +3,9 @@
 前面几篇把单台机器上的会话账本、记账员、JS 沙箱和前端界面都立起来了。可当你手里同时有办公室主机、云端服务器和随身携带的笔记本，想让它们既能各自独立工作，又能在连上网后合成同一套系统，立刻会撞上两个问题：
 
 1. **断网各自改记录、聊对话时，怎么做到连上网不弹出“同步冲突”让我选边？**
-2. **同一张连通网里总不能随便两台机器同时替同一个会话烧双份模型钱，也不能这边正跑着另一边趁手删掉会话；可要是某台机器真的完全离线成孤岛了，怎么保证它别被多数派锁死、照样随时能用？**
+2. **连着网时总不能两台机器同时替同一个会话烧双份模型钱，也不能这边正跑着另一边趁手删掉；可要是某台笔记本真的彻底断网成了孤岛，又怎么保证它随时想跑就能跑？**
 
-MyGo-Bot 的答案是一脉相承的纯 AP（高可用 + 最终一致）本地优先设计：**所有节点完全对等，数据靠半格律 CRDT + DAG 永远自动合流；执行互斥只向当前能连通的同伴做路径向量 Gossip 扩散与多跳探测，断网孤岛直接放行开跑。**
+MyGo-Bot 的答案是一脉相承的纯 AP（高可用 + 最终一致）本地优先设计：**所有节点完全对等，数据靠半格律 CRDT + DAG 永远自动合流；执行互斥像一张带敲门确认的合租白板，只在当前连通图内做路径向量 Gossip 扩散与多跳探测，彻底断网的孤岛直接本地放行。**
 
 ```mermaid
 flowchart LR
@@ -27,7 +27,7 @@ flowchart LR
 
 在 MyGo-Bot 里，**没有“主从/选民/边缘”身份区分，也没有“单机版”和“集群版”两套代码**。
 
-首次开库建表（Schema `v1`）时，程序会在 `local_node` 表里写入本机 Ed25519 身份（`node_id`）、32 字节集群密钥（`cluster_secret`）、持久化目录高水位 `catalog_rev = 0`、随机数据库纪元 `db_epoch` 与 `membership_gen = 1`。这时候你就是一台 **1 节点私有集群**。
+首次开库建表时，程序会在 `local_node` 表里写入本机 Ed25519 身份（`node_id`）、32 字节集群密钥（`cluster_secret`）、持久化目录高水位 `catalog_rev = 0`、随机数据库纪元 `db_epoch` 与 `membership_gen = 1`。这时候你就是一台 **1 节点私有集群**。
 
 - **按需延迟开网**：单机启动且未传 `--cluster-bind` 时，连 `iroh` QUIC 端点都通过 `OnceCell` 延迟到真正调用 `POST /cluster/invite` 或 `POST /cluster/join`（或库里已有 `cluster_peers`）才绑定 UDP 端口；日常写库先走 `known_peer_count() == 0` 原子快路径，不碰集群锁、不发唤醒信号，单机吞吐零损耗。
 - **轻量准入入群（`JOIN_ALPN = b"mygo/join/1"`）**：
@@ -36,9 +36,9 @@ flowchart LR
   3. 邀请方在 `admit_joining_peer`（[src/cluster/net.rs](../src/cluster/net.rs)）确认集群密钥有效并把新同伴登记进 `cluster_peers` 后回传 `Admission { ok: true }`，接入方再把对方写入自己 `cluster_peers` 并按需切换 `membership_gen`。
 - **换群隔离、全网拨号与半连通现实**：
   - 已经入过群的节点如果粘贴不同群的邀请码，必须显式传 `force: true`（否则先返 `409 Conflict` 防误操作）。切换时保留本地数据、清空旧 `cluster_peers` 和游标、原子递增 `membership_gen`，并立即调 `net.switch_membership` 切断旧连接，靠 `assert_membership_gen` 把跨世代迟到同步包当场丢弃；
-  - 任意两台节点握手通过后，靠 **PEX（`ExchangePeers`）** 自动交换全群成员清单与地址，`ClusterNet::dial_loop` 会主动拨号尝试与每位已知同伴建立直连（同毫秒互相拨通时按 `node_id` 字典序破冰，每同伴只保留一条主连接）；
-  - 当公网开启中继/发现或局域网完全互通时，集群呈近似**全互联（Full Mesh）**；但在 `--cluster-local` 跨跳板网段、单向防火墙或链路局部抖动时，图会自然退化成 **`A — B — C` 这类非直连的多跳连通图**——这正是后面 Gossip 与多跳探测发挥威力的舞台。
-- **随时离线删同伴**：因为没有 Voter 多数派束缚，调用 `DELETE /cluster/peers/{node_id}` 可以直接删库清理对应同步游标、撤回该节点的占有视图并断开连接，哪怕对方长期关机也能瞬间清干净。
+  - 任意两台节点握手连上后，`on_peer_connected` 立刻跑 **PEX（`ExchangePeers`）** 交换自己名片和最多 `64` 个已知成员（`MAX_PEX_PEERS`，群上限 `MAX_CLUSTER_PEERS = 256`）。只要通讯录里出现新节点或新地址，`upsert_peer_if_gen` 就会唤醒后台拨号器 `ClusterNet::dial_loop`（平时每 `15` 秒 `RECONNECT_INTERVAL` 也会巡检重拨，单次超时 `10` 秒 `DIAL_TIMEOUT`），并发直连所有未在线的已知同伴；双向同时拨通时，`register_peer_conn` 按 `node_id` 字典序确定性破冰，只留一条主连接；
+  - 公网互通环境下，集群自然连成两两直连的**全互联（Full Mesh）**；但在 `--cluster-local` 跨双网卡跳板机、单边防火墙、链路局部抖动或刚入群拨号的短暂窗口期里，网络也会自然呈 **`A — B — C` 这类多跳连通图**。因此同步与执行互斥都从设计上兼容非全互联拓扑，绝不假设群内必须两两直连。
+- **随时删除离线或在线同伴**：因为全群完全对等且无中心仲裁约束，调 `DELETE /cluster/peers/{node_id}` 可以直接删库清理对应同步游标、撤回该节点的占有视图并断开连接，哪怕对方长期关机也能瞬间清干净。
 
 ---
 
@@ -53,8 +53,8 @@ MyGo-Bot 的同步模型建立在**半格律（Semilattice）CRDT** 上。本质
 ### 1. 轨道一：`CatalogSync`（全局目录 + `llm_calls` 账单）
 
 - **固定宽度 HLC 逐字段取新（LWW）**：供应商、模型、共享 MCP 和会话封面字段都带混合逻辑时钟戳，格式统一为 `"{wall_ms:016x}:{logical:08x}:{node_id}"`（配 `MAX_HLC_WALL_MS = 1 << 60` 上界守卫与启动水印对齐 `seed_hlc_from_db`）。字符串字典序直接可比，同微秒撞车就按全局唯一的 `node_id` 决胜负。
-- **语义绑定的字段必须一起比**：比如供应商把地址和密钥绑在同一个 `endpoint_ts`（`lww_take_pair`），防“新钥匙寄给老地址”；共享 MCP 用四枚时间戳与 `auth_fingerprint`（`EpochLww`），防换了服务端点还错发旧 OAuth 令牌。
-- **两阶段有界差量拉取（`read_catalog_delta`）**：本地目录版本号不再启动重算，而是持久化在 `local_node.catalog_rev`（事务内经 `next_catalog_rev` 推进），绑着开库生成的 `db_epoch`。发包前第一阶段只扫索引和字段字节估算，严格把每页钳在 **`DELTA_PAGE_LIMIT`（256 行）** 与 **`MAX_DELTA_BYTES`（1.5 MB）** 以内再读完整行；同时顺路按 `scope = "calls"` 的因果向量把 `llm_calls` 账单增量捎带上。
+- **语义绑定的字段必须一起比**：比如供应商把地址和密钥绑在同一枚 `endpoint_ts`（`lww_take_pair`），防“新钥匙寄给老地址”；共享 MCP 则以 `auth_config_ts` 为纪元锚点，配套 `headers_epoch_ts`/`headers_ts` 和 `oauth_epoch_ts`/`oauth_ts`（`EpochLwwAction`）与 `auth_fingerprint`（详见 [第 6 篇](06-mcp-and-oauth.md)），防换了服务端点还错发旧 OAuth 令牌。
+- **两阶段有界差量拉取（`read_catalog_delta`）**：本地目录水位持久化在 `local_node.catalog_rev`（事务内经 `next_catalog_rev` 推进），并绑定开库生成的 `db_epoch`。发包前第一阶段只扫索引和字段字节估算，严格把每页钳在 **`DELTA_PAGE_LIMIT`（256 行）** 与 **`MAX_DELTA_BYTES`（1.5 MB）** 以内再读完整行；同时顺路按 `scope = "calls"` 的因果向量把 `llm_calls` 账单增量捎带上。
 
 ### 2. 轨道二：`SessionSync`（上下文 DAG 正文 + 超大分块）
 
@@ -73,7 +73,10 @@ MyGo-Bot 的同步模型建立在**半格律（Semilattice）CRDT** 上。本质
 | **按需 / 部分同步** | `items`、`context_nodes`、`turn_settled`、`invalidated_warnings`、`attachments`、`mcp_servers`、`mcp_oauth` | • 会话正文仅对记入 `watched_sessions` 的会话追更；<br>• 附件仅同步元数据，原始字节（上限 50 MiB）在下载或跑模型前才按 **256 KiB 并发分块**从在线持有者拉取并算 BLAKE3 校验；<br>• MCP 服务仅当 `shared = 1` 时连同已授权/已拒 `mcp_oauth` 同步，`shared = 0` 留在本地（仍可跨机远程调用） | 小容量设备被无关历史正文/视频撑爆，或本机 `stdio` 工具误传他机 |
 | **死守本机** | `local_node`、`sessions.local_status` / `local_error`、`mcp_oauth.pending` / `pending_refresh`、`watched_sessions`、`peer_catalog_cursors`、`sync_vectors`、以及 3 张派生缓存表（`active_context`、`pending_inputs`、`session_leaves`） | 节点 Ed25519 私钥、运行中叠加态、登录中临时态与各节点同步游标**永远不上网**；3 张派生表由本地事务实时重算 | 私钥泄漏、本机未收尾状态污染共享字段、同步进度互相错乱 |
 
-> **工程防护边界**：后台同步由 4 个固定入站工人配 `InboundState` 有界队列（`MAX_INBOUND_QUEUE = 4096`，`pop_inbound_work` 防单个慢 peer 堵死他人），每 **30 秒**跑一次后台反熵；按 `peer` 和 `(sid, peer)` 加细粒度锁，`buffer_unordered(4)` 并发拉取；单条 RPC 封顶 2 MiB 请求头 / 12 MiB 响应头 / 2 MiB 体、全局 **32 MiB** 帧字节预算，超过 **64 KiB** 的 JSON 编解码自动卸去阻塞线程池。开跑或写入口先走尽最大努力不阻塞失联节点的 **`sync_session_best_effort`**；而一旦探测到某在线邻居记录领先于本机，则调 **`sync_session_strict`** 把那台落后进度精确追齐。
+**工程防护边界**：
+- **入站队列与反熵**：4 个固定入站工人配 `InboundState` 有界队列（`MAX_INBOUND_QUEUE = 4096`），由 `pop_inbound_work` 防止单个慢 peer 堵死他人，每 **30 秒**跑一次后台反熵；
+- **并发与帧预算**：按 `peer` 和 `(sid, peer)` 加细粒度锁，`buffer_unordered(4)` 并发拉取；单条 RPC 封顶 2 MiB 请求头 / 12 MiB 响应头 / 2 MiB 体、全局 **32 MiB** 帧字节预算，超过 **64 KiB** 的 JSON 编解码自动卸去阻塞线程池；
+- **尽力同步 vs 严格同步**：常规写入口与探测先走不阻塞失联节点的 **`sync_session_best_effort`**；一旦发现某在线邻居记录领先于本机，再调 **`sync_session_strict`** 把对方进度精确追齐。
 
 ### 4. 离线并发之后，怎么自然合拢？
 
@@ -84,47 +87,55 @@ MyGo-Bot 的同步模型建立在**半格律（Semilattice）CRDT** 上。本质
 
 ---
 
-## 三、连通图里的实时互斥：路径向量 Gossip 与多跳 `CheckOccupancy`
+## 三、连通图里的执行控制：白板传话、门口敲门与孤岛放行
 
-私人集群用户就是调度者自己，真遇到断网成孤岛的场景与其让 `503` 把用户拦在门外，不如像数据层一样坚持 **AP**：**连通网络之内尽量防呆拦截、孤岛之中放手自由运行**（[src/cluster/exec.rs](../src/cluster/exec.rs)）。
+私人集群只有一个主人——用户在多台设备之间调度任务时，最怕两件事：连着网时手抖在两台机子上同时点跑同一个会话（白烧两份模型钱），或者彻底断网时被“联系不上别人”挡在门外。
 
-### 1. 平时主动扩散：路径向量 Gossip `PresenceSync`
+MyGo-Bot 的执行控制顺着纯 AP 哲学，像一套**“合租白板 + 进屋前贴 5 秒便签敲门 + 断网自己做主”**的机制（[src/cluster/exec.rs](../src/cluster/exec.rs)）。从底往上由三层拼成：
 
-为了在连网后（哪怕不是全互联，而是 `A — B — C` 这样的多跳链路）随时看清全连通分量里哪个节点占着哪条会话，节点之间通过 `ExecReq::PresenceSync` 交换 `NodePresence`：
+### 1. 本机账本：先认清自己正忙着什么（`SessionOccupancy` 与 `local_status`）
 
-- **只传源节点自己的全量声明（含 `path`）**：每个条目带源站 `(node_id, instance_id, seq, sessions)` 和一条经过路径 `path`（上限 `MAX_GOSSIP_HOPS = 6`、表上限 `MAX_GOSSIP_ENTRIES = 257`、每节点最多列 `MAX_PRESENCE_SESSIONS_PER_NODE = 256` 条）。
-- **按来源分表 + 无环水平分割（Split Horizon）**：
-  - 本地收到邻居发来的通告后先整体替换 `remote_by_via[from_peer]`，拒绝 `path` 里已经出现自己 `local_node_id` 或有重复节点的包，再按 `(instance_id, seq)` 最大、路径最短的规则确定性算出汇总表 `effective`；
-  - 只有 `effective` 真正发生变化时才递增本机 `gossip_seq` 唤醒 `presence_broadcast_loop` 往下游邻居扩散（**同一条通告重复收到不会再回传，零广播风暴**）；
-  - 向某个直连邻居 `target` 打包时，**凡是 `entry.node_id == target` 或 `entry.path` 里已经含着 `target` 的条目一律剔除（水平分割）**——比如环形网 `A — B — C — A` 里如果 `C` 同时从两边掉线，`A` 与 `B` 靠各自最后一次无 `C` 快照在一轮交换内就能同时把 `C` 撤回干净，彻底杜绝计数到无穷大。
+每台节点先管好本机这一亩三分地：
+- **本地占有（`SessionOccupancy`）**：只要某个会话在本机跑着模型循环，或者还挂着没退完的后台 `codemode` 任务（含唤醒交接 `pending_wakes`），内存表 `PresenceState` 就会把这台会话记进本地占有列表；
+- **私有叠加态（`sessions.local_status`）**：会话处于 `running` 或 `pausing` 期间，高频率的状态切换只写本机列 `local_status`、**永远不上网刷全群**；等回合真正停稳回 `idle` 或 `paused` 才写回共享列 `status` 并同步全群。**`local_status` 只管两件事**：避免半截运行状态污染其他机器，以及在进程意外崩溃重启时让 `Db::open` 精确挑出 `local_status IN ('running', 'pausing')` 收成 `paused`。省掉它，要么高频跑图把同期同步刷爆，要么进程挂掉时没法分清是本机卡死还是别人在跑。
 
-### 2. 开跑/删会话前实时探路：`acquire_connected_gate`（多跳 `CheckOccupancy`）
+### 2. 合租白板：路径向量 Gossip 传话（`PresenceSync`）
 
-Gossip 负责把占有状态平顺地推送给全连通图；而真正准备点火开跑或删除会话时，为了不撞上“另一台机器刚刚点下启动、Gossip 还在路上的那几十毫秒并发窗口”，`acquire_connected_gate` 会实时走一趟轻量多跳探测：
+节点连通后，大家共享同一块“谁占着哪个会话”的内存白板（`PresenceState`），靠 `ExecReq::PresenceSync` 在三个时机互相传话：
+1. **刚握上手互换底账（`peer_presence_sync_loop`）**：新邻居一连上，双方立刻交换全部占有声明，刚入网或刚重连的节点瞬间对齐视野；
+2. **占有变化时即时扩散（`presence_broadcast_loop`）**：只要本机开跑、停稳，或学到了新的远端占有使 `gossip_seq` 递增，就往所有直连邻居推送最新快照（让网页与 `GET /sessions` 实时展示 `@runner`）；
+3. **邻居掉线时立刻撤回（`clear_peer`）**：某邻居一断线，本机立刻抹掉经它学来的占有条目并再传播一次，防止僵尸占有把后续操作一直卡住。
 
-1. **单机 / 离线孤岛零阻拦**：若 `known_peer_count == 0` 且无在线邻居，零锁零 RPC 直接起跑；若已有同行节点但当前 `online_peer_ids()` 全空（完全孤岛），只在本地核对模型、分支完整性与可用附件后直接放行。
-2. **拉齐直连进度并挂临时短声明（`RunClaim`）**：存在在线直连同伴时，先在内存里立一块 **5 秒自清（`CLAIM_TTL`）** 的临时声明 `LocalClaim`（仅用于并发抢跑决胜，不写盘、不需要任何心跳续租），调用 `sync_session_best_effort` 从可达邻居拉齐最新目录、正文与所需附件（任一邻居超时仅跳过，不再整群卡死返 `503`）。
-3. **带去重与跳数上限的多跳 `CheckOccupancy`**：把 `{ claim, visited: [self], hops_left: 4 }` 群发给直连邻居；中间节点若自己未占着，就把自己的 `node_id` 压进 `visited`、跳数减一继续转发给其他未访问的在线邻居，并汇聚三类结果：
-   - **已删墓碑**：沿途任一节点已标记 `deleted = 1` → 拉取墓碑并返回 **`404`**；
-   - **活跃占有 / 并发抢占**：沿途任一节点本地跑着会话、挂着后台 `codemode` 任务、或感知到非发起方的远端/声明占有 → 返回 **`409 Conflict`**（若对方只是未提交的并发短声明，则按 `node_id` 字典序让小 ID 优先、大 ID 退避抖动重试最多 6 次）；
-   - **进度接力追平**：下游节点的 `active_head_ts` 或 `session_vector` 比自己更新时，**中间跳点先向领先下游走一趟 `sync_session_strict`，回到起点时发起者再向直连邻居走 `sync_session_strict` 并重试**，保证即便在 `A — B — C` 链路上接力切换机器跑下一轮，也能带着刚刚 `C` 提交的最新回复开跑！
-4. **点火通知并清理短声明**：确认无冲突且完成本地写库启动后，把包含本地活跃占有的新 `NodePresence` 立刻广播给直连邻居（进而 Gossip 到其余节点），同时发送带 `holder_node_id` 的多跳 `ReleaseClaim` 清掉 5 秒临时声明。
+> **为什么哪怕连成 `A — B — C` 或环网也不会转圈死循环？**
+> 每条声明 `NodePresence { node_id, instance_id, seq, sessions, path }`（上限 `MAX_GOSSIP_HOPS = 6` 跳、表上限 `MAX_GOSSIP_ENTRIES = 257`、单节点最多 `MAX_PRESENCE_SESSIONS_PER_NODE = 256` 会话）都带着走过的路径 `path`。收方先整份替换 `remote_by_via[from_peer]`，拒绝 `path` 里含本机 `local_node_id` 或重复节点的包，并按 `(instance_id, seq)` 最大、路径最短选出汇总表 `effective`（没变化就不推 `gossip_seq`，零广播风暴）；往某直连邻居 `target` 打包时，**凡是 `node_id == target` 或 `path` 里已经出现 `target` 的条目一律剔除（水平分割 / Split Horizon）**——在 `A — B — C — A` 环网里，就算 `C` 突然从两边掉线，`A` 和 `B` 一轮交换即可彻底撤回，不会互相绕圈。
 
-> **为什么还保留 `sessions.local_status`？**
-> 哪怕已经彻底去掉失租熔断，`local_status` 依然不可缺少：只要会话还处于 `running` 或 `pausing`，状态变更只写本地列、不上网刷全群广播，等回合结算回到 `idle`/`paused` 再写回共享 `status` 同步全群；进程意外崩溃重启时，`Db::open` 也正靠 `local_status IN ('running', 'pausing')` 精确把本机残局收成 `paused`。
+### 3. 门口敲门：点火开跑与删会话的实时门禁（`acquire_connected_gate`）
+
+Gossip 白板本质是异步传话，路上总有几十毫秒延迟——如果两台机器恰好同一毫秒点开跑，光靠白板拦不住。所以真正调 `PUT /sessions/{sid}/run` 点火时，系统会在门口走一趟轻量实时敲门：
+
+1. **单机或断网孤岛直接放行**：如果 `known_peer_count == 0` 且无在线邻居，零锁零 RPC 直接开跑；若已入群但此刻 `online_peer_ids()` 为空（完全孤岛），只在本地验完模型、分支历史完整与可用附件后直接放行。
+2. **查白板、贴 5 秒便签并尽力拉同步**：有在线同伴时先看一眼白板——写着别人占着直接返 `409 Conflict`；白板上空闲，则在内存里立一块 **5 秒自清（`CLAIM_TTL`）的临时抢跑便签**（`LocalClaim` / `RunClaim`，不写盘、也不做任何心跳续租），随即调 `sync_session_best_effort` 从可达邻居拉齐最新对话与附件（超时的失联同伴直接跳过）。
+3. **最多 4 跳主动敲门（`CheckOccupancy`）**：拿着 `{ claim, visited: [self], hops_left: 4 }`（单跳探测超时 `EXEC_PROBE_TIMEOUT = 3s`）沿在线边群发给直连邻居；未占用的中间跳把自己的 `node_id` 压入 `visited`、跳数减一续转未访问邻居，统一汇聚三类答案：
+   - **已删墓碑** → 拉取墓碑并返回 **`404`**；
+   - **活跃占有 / 同毫秒抢跑** → 沿途任一节点本地跑着会话、挂着 `codemode` 任务或确认非发起方的占有，返回 **`409 Conflict`**；如果恰好两台机器同时贴出未提交的 `RunClaim`，按 `node_id` 字典序让小 ID 优先、大 ID 主动退让并退避抖动重试（最多试 `6` 次）；
+   - **进度接力追平** → 若下游节点（比如 `A — B — C` 里的 `C`）的 `active_head_ts` 或 `session_vector` 比自己更新（`peer_ahead_of_local`），**中间跳 `B` 先向 `C` 走一趟 `sync_session_strict`，回到发起端 `A` 再拉齐重试**，确保哪怕隔着跳点换机开跑下一轮，也能接着 `C` 刚提交的最新回复往下聊。
+4. **正式落盘、上白板并撕掉便签**：确认没人抢也没人领先后，把本地便签升格为 `committing` 并落库点火 → 把包含本地占有的新 `NodePresence` 立刻广播上白板 → 发多跳 `ReleaseClaim` 清掉 5 秒临时便签。**一旦正式开跑，运行途中绝不再发任何租约心跳；半路断网也不会杀掉正在跑的任务。**
+
+**删除会话（`DELETE /sessions/{sid}`）走的是同一套门禁的分叉（`acquire_delete_gate`）**：前半截同样是“孤岛直接放行、连网贴 5 秒便签做 4 跳 `CheckOccupancy` 排查”；分叉点在于删除不检查模型与附件、最多重试 `4` 次，只要连通图里确认没人跑着此会话也没挂着后台 `codemode` 任务（否则返 `409`），立刻写下不可逆墓碑 `deleted = 1`。
 
 ---
 
-## 四、控制面与执行面分离：直连单跳转发与非直连边界
+## 四、跑起来之后：控制面转发与直连单跳边界
 
-因为每台在线节点内存里都借 Gossip 实时掌握着全连通图的 `PresenceState`（哪个会话正由哪个 `runner_node_id` 占着），所以网页和 HTTP 控制口不区分主从节点，同时对直连与间接多跳保持清晰可预期的边界：
+会话在某台 `Runner` 上跑起来之后，因为各节点靠 Gossip 实时掌握着白板上的 `runner_node_id`，网页端与 HTTP 控制面就能按“是否直连在线”清晰路由：
 
-1. **指定执行节点**：调 `PUT /sessions/{sid}/run` 可传 `{ "node": "<id或节点名>" }`（WebUI 输入框右下角直接下拉选人），控制面经 `mygo/exec/1` 转发给该直连在线节点开跑（若目标当前离线返 `503`）。
-2. **控制指令与状态查询**：
-   - 当占有节点 `runner_node_id` 与接入端**直连在线**时，发消息（会打包发送端登记的 `AttachmentRef` 元数据）、撤回消息、改标题、软硬暂停及查/杀 `codemode` 任务全部自动单跳转发过去处理；
-   - 当占有节点在 **`A — B — C` 两跳之外与当前节点非直连** 时，写操作会看到它的 Gossip 占有并安全返 `409 Conflict` 拒绝本地覆写，暂停/任务操作则返 `503` 明确提示该执行节点当前与本机非直连。
-3. **实时打字机 SSE 跨机中继**：浏览器连向**直连非执行节点**的 `GET /sessions/{sid}/events` 时，接入端沿 `mygo/exec/1` 向 Runner 订阅 `SubscribeSessionEvents` 中继转发（上限 64 路并发，`SeenSavedItems` 容积 256 条去重）；如果占有者在非直连的多跳远端，接入端不陷入无意义直连重试，直接依靠本地 Gossip 同步的 `session.status` 更新与会话落盘通知驱动界面状态切换。
-4. **跨节点原语沙箱**：至于脚本里 `cluster.node(target)` 如何走 `mygo/cap/1` 跨节点调文件、命令行、HTTP 和 MCP，见 [第 4 篇](04-codemode-sandbox.md)。
+1. **指定执行节点**：调 `PUT /sessions/{sid}/run` 可传 `{ "node": "<id或节点名>" }`（WebUI 输入框右下角可直接选人），控制面经 `mygo/exec/1` 发 `StartRun` 给该直连在线节点点火（若目标当前离线直接返 `503`）。
+2. **与 `Runner` 直连在线（单跳可达）**：
+   - 发消息（会一并附带发送端登记的 `AttachmentRef` 元数据）、撤回消息、改标题、软硬暂停及查/杀 `codemode` 任务全部自动单跳转发给 `Runner` 处理；
+   - 浏览器打开 `GET /sessions/{sid}/events` 时，接入端沿 `mygo/exec/1` 订阅 `SubscribeSessionEvents` 中继转发逐字打字机 SSE（最多 **64 路**并发，出口 `SeenSavedItems` 保留 256 条去重窗口防重放）。
+3. **与 `Runner` 隔跳非直连（如 `A — B — C` 里在 `A` 操作跑在 `C` 的会话）**：
+   - 写操作（发/撤消息、改配置、开跑、删会话）会看清白板上的 `C` 占有并安全返 **`409 Conflict`** 拒绝本地覆写；暂停与任务操作返 **`503 Service Unavailable`** 提示该执行节点与本机非直连；界面只靠本地 Gossip 同步的 `session.status` 更新追踪“运行中 / 已结束”，不做无意义的直连重试。
+4. **跨节点原语沙箱**：至于脚本里 `cluster.node(target)` 如何走 `mygo/cap/1` 跨节点调文件、命令行、HTTP 和 MCP（同样要求目标直连在线，否则返 `ENODEUNREACH`），见 [第 4 篇](04-codemode-sandbox.md)。
 
 ---
 

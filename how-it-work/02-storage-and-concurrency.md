@@ -53,12 +53,10 @@
 
 ### 细节二：谁绝不能拼进同一趟车？——`Write::can_join`
 
-记账规则把写单分成“普通写（包括 `Db::write` 和运行期 `Db::write_for_run`）”与“启动运行写（`start_session`）”两类（[src/store.rs](../src/store.rs)）：
-- **同会话两次点火绝不混批**：若把同一个 `sid` 的两次 `/run` 塞进同一外层事务，第一笔还没 `publish` 进内存 `s.active`，第二笔进事务就会误以为还没人跑从而起出重复 Worker！所以同会话点火必须拆批（不同会话的点火照常拼车；优雅退出 `self.closing == true` 时统一拒开返 `503`）。
-- **运行世代拦截过期旧 Worker**：每次开跑递增 `Store.session_run_gen` 钉在 `Control` 上，Worker 的每笔落库全走 `Db::write_for_run` 带上 `expected_run_gen`。记账员在 `commit_batch` 严格核对：
-  - 若运行世代已被新 Worker 或分支切换/删除动作顶掉，当场拒写返 **`409 Conflict`**；
-  - 错误摘要统一用 `truncate_utf8(..., MAX_STORED_ERROR_SUMMARY_BYTES)` 钳在 **8192 字节**内，绝不切断多字节 UTF-8 字符。
-- **分叉/删除重置世代 `session_reset_gen`**：仅在切换 `active_head` 或删除会话时递增，供后台 `codemode` 任务在 `task_superseded` 里核对。正常重开新回合不会递增它，免得误吞跨回合后台完工信。
+记账规则把写单分成两类（[src/store.rs](../src/store.rs)）：一类是普通写（`Db::write` 与运行期 `Db::write_for_run`），另一类是启动运行写（`start_session`）。具体通过 `Write::can_join` 卡住三道规矩：
+- **同会话两次点火绝不混批**：如果把同一个 `sid` 的两次 `/run` 塞进同一外层事务，第一笔还没 `publish` 进内存 `s.active`，第二笔进事务就会误以为还没人跑从而起出重复 Worker。因此同会话点火必须拆批；不同会话的点火仍正常拼车，进程进入优雅退出（`self.closing == true`）时则统一拒开并返 `503`。
+- **运行世代 `session_run_gen` 拦截旧 Worker**：每次开跑都会递增 `Store.session_run_gen` 并钉在内存 `Control` 上，Worker 的每笔落库都通过 `Db::write_for_run` 带上 `expected_run_gen`。记账员在 `commit_batch` 核对一致才放行，否则当场拒写返 **`409 Conflict`**。所有错误摘要同时经 `truncate_utf8(..., MAX_STORED_ERROR_SUMMARY_BYTES)` 安全截断在 **8192 字节**内，绝不劈断多字节 UTF-8 字符。
+- **分叉/删除重置世代 `session_reset_gen`**：仅在切换 `active_head` 或删除会话时递增，供后台 `codemode` 任务在 `task_superseded` 里核对。正常重开新回合不会递增它，避免误吞跨回合的后台完工信。
 
 ---
 
@@ -67,8 +65,8 @@
 当长会话攒了几千条记录或大媒体附件，若一口气查全表拼几十兆 JSON，既爆内存又堵死记账员窗口。程序在分页与喂模型两条路上用同一招解法——**先把主键抓进内存，再一小瓢一小瓢往外舀**（[src/store.rs](../src/store.rs)、[src/media/wire.rs](../src/media/wire.rs)）：
 
 1. **三选一分页与两类游标**：`limit` 统一为 `1..=200`（默认 50）。只有 `/sessions/{sid}/history`（`itm_...`）和 `/sessions/{sid}/context`（`active_context` 从 1 递增的整型 `position`）完整支持 `after`、`before`、`tail=true` 三种互斥游标；其余列表接口仅支持 `after`。
-2. **先拍主键快照、再校验 `X-History-View`**：`JsonRows` 在开读瞬间调 `history_snapshot` 或 `context_snapshot`，先把这页命中的最多 200 条主键清单连同 **`X-History-View`**（`<instance_id>:<view_rev>`）抓在手里；单分支会话走 `has_inactive_branch` 零开销直读快路径，有多条并行分支时则只留当前活分支和未入枝的排队/撤回项。调用方传回 `?view=<token>` 时若发现服务重启、切分支或同步乱序插旧项导致视图号变了，直接返 **`409 Conflict`** 催前端整页重拉，彻底防死混页。
-3. **分瓢接力释放库锁**：拿到主键清单后，每趟最多捞 **256 行 / 64 KiB**（单条本身超 64 KiB 也完整放行）立刻松开 SQLite 窗口，通过 `async_stream` 边吐边去队列排下一瓢；喂模型时由 `media::wire::model_input` 同样复核 `active_head == pinned_head`，并通过 `AttachmentBlob::chunks` 用 `blob_open` 每批读最多 4 帧 × 192 KiB 实时编码 Base64 往外流，不在库里冗余存 Base64 也不憋大缓冲区。
+2. **先拍主键快照、再校验 `X-History-View`**：`JsonRows` 在开读瞬间调 `history_snapshot` 或 `context_snapshot`，先把这页命中的最多 200 条主键清单连同 **`X-History-View`**（`<instance_id>:<view_rev>`）抓在手里。单分支会话走 `has_inactive_branch` 零开销快路径；存在并行分支时则只过滤保留当前活跃分支与未入枝的排队/撤回项。调用方传回 `?view=<token>` 时，只要服务重启、切换分支或乱序同步推进了视图号，就直接返 **`409 Conflict`** 催前端整页重拉，防死混页。
+3. **分瓢接力释放库锁**：拿到主键清单后，每次捞取最多 **256 行 / 64 KiB**（单条本身超 64 KiB 也完整放行）就立刻松开 SQLite 窗口，通过 `async_stream` 边吐结果边排下一瓢。喂模型时，`media::wire::model_input` 也同样在翻页前复核 `active_head == pinned_head`，再由 `AttachmentBlob::chunks` 用 `blob_open` 每批最多读 4 帧 × 192 KiB 实时编码 Base64 往外流，不在库里存冗余 Base64，也不在内存憋大缓冲区。
 
 > **能力边界**：它省下的是本机**峰值内存**和**占锁时长**；最终喂给上游模型的总上下文字符和字节数并不会变少。
 
@@ -76,7 +74,7 @@
 
 ## 网络断了重发不算重账：无跨表外键与纯应用层防重
 
-为了防止多节点间乱序送达的 CRDT 同步包被 SQL 外键或全局 `UNIQUE` 报死，Schema `v1` **刻意拿掉了跨表 `FOREIGN KEY` 约束以及共享同步表上的 SQL `UNIQUE` 约束**——`items_by_idempotency`、`tools_by_call`、`items_by_target` 全是非唯一部分索引。防重与收敛全部收拢在独占记账员写事务里按编号卡死：
+为了让多节点之间乱序送达的 CRDT 同步包随时能够直接落盘，而不被数据库外键先后顺序或全局 `UNIQUE` 卡死，**表结构刻意不设跨表 `FOREIGN KEY`，共享同步表上也只建非唯一部分索引**——`items_by_idempotency`、`tools_by_call`、`items_by_target` 都只用于加速检索，防重与收敛全部收拢在独占记账员的写事务里按编号卡死：
 
 | 场景 | 依据编号与索引 | 处理规则与跨节点收敛 |
 | :--- | :--- | :--- |
@@ -102,7 +100,7 @@
 
 ## 从单机记账走向多节点集群
 
-看到这里你会发现，单机这一层几乎所有看似“怪异”的决定——**去掉跨表外键和全局唯一索引、拆出永不上网的 `local_status`、把 `deleted=1` 洗成全零对称墓碑、严格在 `COMMIT` 后才推脏标记**——全都是在为分布式合流铺平地基。
+看到这里你会发现，单机这一层几乎所有看似“怪异”的决定——**不设跨表外键与共享唯一索引、拆出永不上网的 `local_status`、把 `deleted=1` 洗成全零对称墓碑、严格在 `COMMIT` 后才推脏标记**——全都是在为分布式合流铺平地基。
 
 至于把多台 MyGo-Bot 连成一个私人小群后，数据如何按半格律 CRDT 自动合流、执行面又怎么靠路径向量 Gossip 占有与多跳探测防撞车，我们放到专门的 **[第 8 篇 · 私有集群：无冲突同步与连通图 Gossip 协作](08-cluster-sync-and-execution.md)** 里一次讲透。
 

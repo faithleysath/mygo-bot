@@ -34,7 +34,10 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 
 通过 `POST /mcp/servers` 和 `PATCH /mcp/servers/{id}` 登记外部服务，存进 `mcp_servers` 表：
 - **两大传输模式**：`streamable-http`（配 `url`、可选静态请求头 `headers`、可选 `oauth` 配置）和 `stdio`（配本地 `command`、`args`、`env`、`cwd`）。两种模式的字段互斥，切换 `transport` 时程序会自动清空旧模式下的全部传输字段；
-- **公共控制字段**：`name`（活跃服务重名在写入层靠非唯一索引 `mcp_servers_active_name` 拦截防重、新建后**不可改名**）、`description`、`enabled`（禁用后就算脚本背出了服务名和工具名也发不起新调用）、`shared`（布尔开关，默认 `false`，决定该服务是否同步到集群其他节点）、`allowed_tools`（`null` 全放行、`[]` 全禁止，或精确工具名白名单）、`timeout_ms`（默认 **60 秒**，合法范围 1 毫秒到 24 小时）、以及只在本地单调递增、不同步到网络的 **`revision`**；
+- **公共控制字段**：
+  - `name`（活跃服务重名在写入层靠非唯一索引 `mcp_servers_active_name` 拦截防重，新建后不可改名）、`description` 与 `enabled`（禁用后脚本也发不起新调用）；
+  - `shared`（布尔开关，默认 `false`，决定该服务是否同步到集群其他节点）；
+  - `allowed_tools`（`null` 全放行、`[]` 全禁止，或填精确工具名白名单）、`timeout_ms`（默认 **60 秒**，范围 1 毫秒到 24 小时），以及只在本地递增、不上网同步的 **`revision`**。
 - **三道凭据防护**：
   1. **只写不读的投影**：`GET /mcp/servers` 返回的 `McpServerInfo` 绝不回显静态 `headers` 内容、`oauth` 凭据、stdio 的 `args`/`env` 明文，连 `url` 里的 `?query` 都会剥掉只留 `has_url_query: true`（防 URL 参数里带 API Key 泄密）；
   2. **禁覆盖协议头**：HTTP 模式禁止在静态 `headers` 里乱填 `mcp-*`、`accept`、`content-type`、`host`、`content-length`、`transfer-encoding`、`connection`、`last-event-id`；一旦启用 OAuth，也不许同时写死静态 `Authorization` 头；
@@ -121,15 +124,15 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 其中藏着四个一不小心就会踩坑的保命设计：
 
 1. **SSRF 与重定向防火墙（`MetadataResolver`）**：发现元数据和动态注册都要按服务端吐出来的 URL 去发请求，绝不能被恶意服务端引去扫内网或云厂商元数据（`metadata.google.internal` 等）。所以自研 DNS 解析器会把所有 IP（包括 IPv4-mapped IPv6、NAT64、6to4 等变形地址）分类：链路本地/保留段一律死封；私网和回环地址**只有当管理员最初配的 MCP 地址本身就是私网字面 IP 或回环地址时才放行对应网段**；发现过程最多跟 10 跳**同源**重定向且严禁 HTTPS 降级为 HTTP。
-2. **用 `generation` 世代号与四时间戳 + 端点指纹锁死状态归属（`mcp_oauth` 表）**：
-   - 每次发起新登录都发一块全新的 48 位十六进制随机 `generation` 牌子，只有 `login` 接口允许往 `mcp_oauth` 插行；后续回调、刷新、标拒全都改成 `WHERE server_id=? AND generation=?` 的 `UPDATE`，绝不让超时掉队的旧请求把注销掉的账号写回来。
-   - 同时 `v1` 不依赖表级持久化触发器，而是把时间轴拆成四枚 HLC 时间戳（`config_ts`、**`auth_config_ts`**、**`oauth_epoch_ts`**、`oauth_ts`），并给 `mcp_oauth` 配上 `auth_config_ts` 与 **`auth_fingerprint`**（由 [src/cluster/ledger.rs](../src/cluster/ledger.rs) 的 `auth_config_fingerprint` 对 `{ transport, url, oauth }` 算 BLAKE3 摘要）：
-     - 本机改静态 `headers` / 描述 / 超时等，只推进 `config_ts`，**不动已有 OAuth 授权**；只有改 `transport`、`url` 或 `oauth` 才判定 `oauth_invalidated` 推进 `auth_config_ts` / `oauth_epoch_ts` 并淘汰旧授权。
-     - 远端同步走 `merge_mcp_server_wire`（`with_savepoint`）原子对比四枚时间戳，并在落盘与发请求前双重校验 `auth_fingerprint` 一致，彻底防住换端点后错寄旧令牌。
+2. **用 `generation` 世代号与纪元 HLC + 端点指纹锁死状态归属（`mcp_oauth` 表）**：
+   - 每次发起新登录都发一块全新的 48 位十六进制随机 `generation` 牌子，只有 `login` 接口允许往 `mcp_oauth` 插行；后续回调、刷新、标拒全都按 `WHERE server_id=? AND generation=?` 更新，绝不让超时掉队的旧请求把已注销账号写回来。
+   - 普通标量字段（`name_ts`、`description_ts`、`enabled_ts`、`allowed_tools_ts`、`timeout_ts`）各自独立比新；涉及鉴权边界的配置则以 **`auth_config_ts`** 为纪元锚点，配套 **`headers_epoch_ts` / `headers_ts`** 与 **`oauth_epoch_ts` / `oauth_ts`** 经 `EpochLwwAction` 原语合流，并在 `mcp_oauth` 表记下 `auth_config_ts` 与 **`auth_fingerprint`**（由 [src/cluster/ledger.rs](../src/cluster/ledger.rs) 的 `auth_config_fingerprint` 对 `{ transport, url, oauth }` 算 BLAKE3 摘要）：
+     - 改描述、超时或启停不动授权；改静态 `headers` 只推进 `headers_ts`，**不动已有 OAuth 授权**；只有改 `transport`、`url` 或 `oauth` 配置才推进 `auth_config_ts`（连带重置 `headers_epoch_ts` 与 `oauth_epoch_ts`）并淘汰旧授权。
+     - 远端同步走 `merge_mcp_server_wire`（`with_savepoint`）按纪元 HLC 原子合并，落盘与发请求前均双重校验 `auth_fingerprint` 一致，彻底防住换端点后错寄旧令牌。
 3. **跨取消中保住轮换令牌（`oauth/transport.rs`、`oauth/storage.rs`）**：很多 OAuth 服务启用了 Refresh Token Rotation（每次刷新都会作废旧 `refresh_token`）。若外层 MCP 调用刚好超时取消，新旧令牌就全毁了！
-   - 因此 `acquire_token` 拿到同世代 `gate` 锁后，特意把 `acquire_valid_token` 放进**独立的 `tokio::spawn`（设 45 秒超时）**里跑完并落盘，外层调用就算被取消也不会弄丢新换回来的令牌；
+   - 因此 `acquire_token` 拿到同世代 `gate` 锁后，把 `acquire_valid_token` 放进**独立的 `tokio::spawn`（设 45 秒超时）**里跑完并落盘，外层调用就算取消也不会弄丢新换回来的令牌；
    - **纯令牌刷新或轮换只写 `mcp_oauth`**（共享服顺手推 `oauth_ts` 与 `sync_rev`），既不递增 `mcp_servers.revision`，也不驱逐连接池里好好的连接（`McpChange.evict_pool = false`）；只有关键配置或绑定变动才淘汰老槽位。
-4. **登出与远程撤销（`DELETE /oauth`、`oauth/revoke.rs`）**：点登出时，先等一把在途的 `gate` 刷新任务（最多 5 秒）并核对 `generation` 未切换，删光本地 `mcp_oauth` 行并踢掉相关连接，再并行按 RFC 7009 去同源端点撤销远端令牌。就算远端撤销失败，**绝不回滚本地已完成的登出清理**，而是直接返 `502 Bad Gateway` 提醒手动撤权。
+4. **登出与远程撤销（`DELETE /oauth`、`oauth/revoke.rs`）**：点登出时，先等一把在途的 `gate` 刷新任务（最多 5 秒）并核对 `generation` 未切换，删光本地 `mcp_oauth` 行并踢掉相关连接，再并行按 RFC 7009 去同源端点撤销远端令牌。就算远端撤销失败，**绝不回滚本地已完成的登出清理**，直接返 `502 Bad Gateway` 提醒手动撤权。
 
 ---
 
@@ -139,16 +142,16 @@ Exa 返回的第一条就是 SQLite 官方发布说明，模型据此答出 2025
 
 1. **双态控制与临时态隔离（[src/cluster/ledger.rs](../src/cluster/ledger.rs)、[src/mcp/config.rs](../src/mcp/config.rs)）**：
    - `shared = false` 时配置与 OAuth 全留本机（`sync_rev = 0`）；
-   - `shared = true` 时，配置和已进终态（已授权或已拒绝）的 `mcp_oauth` 随 `CatalogSync` 同步全群；**唯独 `pending`（一次性的 PKCE 挑战）和 `pending_refresh` 严格留在本地**。
-2. **共享切回私有、删服的规范墓碑与清密（`true -> false` / `DELETE`）**：
-   - 关闭同步拆成私有副本时，先在事务内确认 `pending_refresh IS NULL` 且抢到 `refresh_gate`（若有刷新在途直接返 `409 Conflict` 防单次轮换令牌被双花吊销），克隆出全新的本地 `McpServerId`（`shared = 0`、只带走终态授权）；
-   - 随后连同直接删除操作一样，通过 `tombstone_shared_mcp` 将旧共享 ID 的 `deleted` 推向单调 `1`、把 `config_json` 清空为 `{}` 并删掉原 `mcp_oauth`，让在线与重连同伴一并清密且永不复活（底层同步机制见 [第 8 篇](08-cluster-sync-and-execution.md)）。
-3. **无触发器合并与按需清池（`merge_mcp_server_wire`）**：远端回放时先用 `with_savepoint` 按 `EpochLww` 原语收敛四枚时间戳与凭据，再根据 `Connections::apply_sync_change(McpChange)` 的精确标记决定操作——仅关键变化才驱逐连接（`evict_pool = true`），且只在 `cancel_login = true` 时中断本机登录监听。
-4. **跨节点 OAuth 刷新协调（[src/cluster/sync.rs](../src/cluster/sync.rs) `coordinate_mcp_oauth_refresh`）**：多台机子拿着同一份同步来的单次 `refresh_token`，若同时各自刷新必撞废。因此共享服准备刷新时按四步串行协调：
-   - **选协调者**：先群发 `RpcReq::HasMcpServer` 问清谁在线持有该服务，按字典序挑出最小在线 `node_id` 做唯一协调者（若就是自己就直接本地刷新）；
-   - **本地挂 CAS 委派锁**：请求方拿到 `refresh_gate`，用 CAS（`WHERE pending_refresh IS ?` 且凭据指纹未变）把 `{ coordinator, fp }` 写进本地 `pending_refresh` 防止自己被并发重触发，再携最新 `caller_server` 与 `rejected_token_hash` 向协调者发 `RpcReq::OAuthRefresh`；
-   - **单点核对再刷新**：协调者锁住 `mcp_locks` 合并入站状态，发现 `rejected_token_hash` 已经过时说明刚才别人已经刷过了，直接返 `UpToDate` 和新凭据；确认没刷过才单点请求授权方并回传最新 `McpServerWire`；
-   - **异常超时绝不盲目双刷**：若协调者半途失联或超时，调用方先同步一轮——只有确认凭据指纹已变或授权进入终止态才用 `clear_if_current` 摘掉 `pending_refresh`；否则刻意留着标记并报出瞬态 `TransportClosed`，严禁重启或无关改动触发二次刷新撞废单次令牌。
+   - `shared = true` 时，配置和已进终态（已授权或已拒绝）的 `mcp_oauth` 随 `CatalogSync` 同步全群；**唯独 `pending`（一次性 PKCE 挑战）和 `pending_refresh` 严格留在本地**。
+2. **共享切回私有或删服的规范墓碑与清密（`true -> false` / `DELETE`）**：
+   - 关闭同步拆成私有副本时，先在事务内确认 `pending_refresh IS NULL` 且抢到 `refresh_gate`（若有刷新在途直接返 `409 Conflict`，防单次轮换令牌被双花吊销），再克隆出全新的本地 `McpServerId`（`shared = 0`，只带走终态授权）；
+   - 随后连同直接删除操作一样，通过 `tombstone_shared_mcp` 将旧共享 ID 的 `deleted` 推向单调 `1`、把 `config_json` 清空为 `{}` 并删掉原 `mcp_oauth`，让在线与重连同伴一并清密且永不复活（同步细节见 [第 8 篇](08-cluster-sync-and-execution.md)）。
+3. **无触发器合并与按需清池（`merge_mcp_server_wire`）**：远端回放时先用 `with_savepoint` 按 `EpochLwwAction` 收敛纪元时间戳与凭据，再根据 `Connections::apply_sync_change(McpChange)` 的精确标记决定清池粒度——仅关键变化才驱逐连接（`evict_pool = true`），且只在 `cancel_login = true` 时中断本机登录监听。
+4. **跨节点 OAuth 刷新协调（[src/cluster/sync.rs](../src/cluster/sync.rs) `coordinate_mcp_oauth_refresh`）**：多台机子拿着同一份同步来的单次 `refresh_token`，若同时各自刷新必撞废。因此共享服准备刷新时，先选唯一协调者再单点核对，分四步完成：
+   - **选协调者**：群发 `RpcReq::HasMcpServer` 问清谁在线持有该服务，按字典序挑出最小在线 `node_id` 作协调者（若就是自己则直接本地刷新）；
+   - **挂本地 CAS 委派锁**：调用方拿到 `refresh_gate`，用 CAS（`WHERE pending_refresh IS ?` 且凭据指纹未变）把 `{ coordinator, fp }` 写进本地 `pending_refresh` 防并发重触发，再携最新 `caller_server` 与 `rejected_token_hash` 向协调者发 `RpcReq::OAuthRefresh`；
+   - **单点核对再刷新**：协调者锁住 `mcp_locks` 合并入站状态，发现 `rejected_token_hash` 已过时说明别人刚刷过，直接返 `UpToDate` 和新凭据；确认没刷过才单点请求授权方并回传最新 `McpServerWire`；
+   - **异常超时绝不盲目双刷**：若协调者失联或超时，调用方先同步一轮——只有确认凭据指纹已变或授权进终止态才用 `clear_if_current` 摘掉 `pending_refresh`；否则保留标记并报瞬态 `TransportClosed`，严禁重启或无关改动触发二次刷新撞废单次令牌。
 
 ---
 

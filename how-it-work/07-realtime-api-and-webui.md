@@ -10,7 +10,7 @@
 
 ## 两级实时 SSE 流：围观再多也不堵门
 
-早期架构只推写进 SQLite 的成品 `item`，人要等整段话说完才看得见。为了做到实时跳字又不污染只增不删的账本，[src/events.rs](../src/events.rs) 和 [src/model.rs](../src/model.rs) 搭了一套**“两级广播 + 全局递增序号”**中心（`events::Hub`）。
+如果只推写进 SQLite 的成品 `item`，人要干等整段话说完才看得见；可要是把模型吐出的每个半截字符都塞进数据库，又会污染只增不删的账本。[src/events.rs](../src/events.rs) 和 [src/model.rs](../src/model.rs) 为此搭了一套**“两级广播 + 全局递增序号”**中心（`events::Hub`），既能实时跳字，又不把半成品记进账本。
 
 ### 1. 全局流与单会话双通道
 
@@ -41,21 +41,18 @@
 
 ## HTTP API 全景、三条路由面与内置 OpenAPI 文档
 
-整套系统共暴露 **34 条路径、49 个操作**，完整 OpenAPI `3.1.0` 契约与 **55 个 Schema**（单行压缩 JSON 约 **84.0 KiB / 86,030 字节**）编译期嵌在 [src/openapi.json](../src/openapi.json) 里：
-- 会话模型涵盖 `runner_node_id`、`active_head`、`branches`（`BranchHead[]`）；支持 `/history` 与 `/context` 的 `?view=` 校验与 `X-History-View`（失配返 `409`）；
-- `PUT /sessions/{sid}/run` 支持可选请求体 `{ "node" }`（指定目标直连节点但对方离线时返 `503`；若群内已有节点占用则返 `409`；完全断网时本机可直接开跑）；
-- `POST /cluster/join` 在邀请作废或换群未传 `force` 时返 **`409 Conflict`**（不可达返 `503`，允许带活跃会话入群）；`DELETE /cluster/peers/{node_id}` 直接清理离线或在线同伴并断开连接；`POST /cluster/sync` 支持 `404` / `503` / `504`。
+整套系统共暴露 **34 条路径、49 个操作**，完整 OpenAPI `3.1.0` 契约与 **55 个 Schema**（单行压缩 JSON 约 **84.0 KiB / 86,030 字节**）在编译期嵌进 [src/openapi.json](../src/openapi.json)。会话对象携带 `runner_node_id`、`active_head` 与 `branches`（`BranchHead[]`）；`/history`、`/context` 与 `/events` 统一通过 `X-History-View` 与 `?view=` 校验视图连续性（失配即返 `409 Conflict`）。
 
 | 模块 | 路由一览 | 核心职责 |
 | :--- | :--- | :--- |
 | **供应商与模型**（12） | `GET/POST /providers`，`GET/PATCH/DELETE /providers/{id}`，`POST .../restore`<br>`GET/POST /models`，`GET/PATCH/DELETE /models/{id}`，`POST .../restore` | 维护多上游地址/密钥（脱敏）、模态/档位/价目表及软归档恢复 |
 | **会话与账本**（7） | `GET/POST /sessions`，`GET/PATCH/DELETE /sessions/{sid}`<br>`GET /sessions/{sid}/history`，`GET /sessions/{sid}/context` | 管理会话生命周期、DAG 叶节点分支切换与基于快照 + `view` 的流式分页 |
 | **排队消息**（3） | `GET/POST /sessions/{sid}/messages`，`DELETE /sessions/{sid}/messages/{mid}` | 投信（`Idempotency-Key` 幂等）、查排队、撤回未进上下文输入 |
-| **运行、流与任务**（6） | `GET /events`，`GET /sessions/{sid}/events`<br>`PUT/DELETE /sessions/{sid}/run`，`GET .../tasks`，`DELETE .../tasks/{tid}` | 点火/软硬暂停（`?mode=soft\|hard`）、订阅两级 SSE、查停后台 JS 任务 |
+| **运行、流与任务**（6） | `GET /events`，`GET /sessions/{sid}/events`<br>`PUT/DELETE /sessions/{sid}/run`，`GET .../tasks`，`DELETE .../tasks/{tid}` | 点火（可传 `{ "node" }` 指定直连同伴，离线返 `503`、群内已占用返 `409`、完全断网本机直接跑）/软硬暂停（`?mode=soft\|hard`）、订阅两级 SSE、查停后台 JS 任务 |
 | **媒体附件**（2） | `POST /attachments`，`GET /attachments/{id}` | 上传不超过 50 MiB 多模态原文件（限流返 `429`）与跨节点分块流式下载 |
 | **调用与计费**（3） | `GET /calls`，`GET /calls/summary`，`GET /calls/{id}` | 查询每轮上游调用明细、token、最新上下文长度与 `cost_nano_usd` 费用 |
 | **MCP 与 OAuth**（10） | `GET/POST /mcp/servers`，`GET/PATCH/DELETE /mcp/servers/{id}`，`POST .../test`<br>`GET/DELETE .../oauth`，`POST .../oauth/login`，`POST .../oauth/callback` | 注册传输与 `shared` 开关、并发 4 体检探测、启动/手动/撤销 OAuth 2.1 |
-| **集群与同步**（6） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync` | 查集群、改节点名称/描述、经 `mygo/join/1` 准入加入（`409`/`503`）、随时移出同伴与触发同步 |
+| **集群与同步**（6） | `GET /cluster`，`PATCH /cluster/self`，`POST /cluster/invite`，`POST /cluster/join`<br>`DELETE /cluster/peers/{node_id}`，`POST /cluster/sync` | 查集群、改节点名称/描述、经 `mygo/join/1` 准入加入（邀请作废或换群未传 `force` 返 `409`、不可达返 `503`、允许带活跃会话入群）、随时删同伴与触发同步（`404`/`503`/`504`） |
 
 ### 三条不同的路由出口（[src/main.rs](../src/main.rs)、[src/api.rs](../src/api.rs)）
 
@@ -93,7 +90,7 @@
 | :--- | :--- |
 | **1. 全局快照与增量缓冲**<br>（`activeBuffer` + `latestSeq`） | 拉 `GET /sessions` 半路时收到 SSE 或刚做完的本地改动，先记进缓冲并在全量回来后重放叠加；省掉它，列表刷新瞬间会把刚建好的会话或新标题抹回旧值。 |
 | **2. 单会话版本与墓碑集**<br>（`baseVersion` + `deletedIds`） | `PATCH /sessions/{sid}` 返回前若版本已被 SSE 推高或会话已入 `deletedIds`，严禁回包覆盖或复活已删会话；冲突时退避 `1s..8s` 重拉单会话权威状态（`404` 转删除）。 |
-| **3. 首屏游标、视图校验与重拉**<br>（`knownView` + `gapOpen` + `onReset`） | • 切进会话先拉 `?tail=true&limit=50` 记下 `syncedThroughId` 与 **`knownView`**；<br>• 翻老历史和补缺口均附带 `?view=${knownView}` 与 `AbortController`；`ready`/`resync` 若 `view` 失配当场触发 `onReset()`；<br>• 连上期间开 `gapOpen` 锁游标先渲染新 `item.saved`，补齐缺口再推进；<br>• 一旦遇到 `409`、`session.reset` 或本机切完 `active_head`，`onReset()` 立即取消在途分页、递增 `resetGen`、清游标重拉最新一页并整表替换（用量只按屏幕 `llm_call_id` 合并拉取）。 |
+| **3. 首屏游标、视图校验与重拉**<br>（`knownView` + `gapOpen` + `onReset`） | 进会话先拉 `?tail=true&limit=50` 记下 `syncedThroughId` 与 **`knownView`**；翻老历史和补缺口均附带 `?view=${knownView}` 与 `AbortController`。连上期间开 `gapOpen` 锁游标先渲染新 `item.saved`，补齐缺口再推进。只要遇到 `ready`/`resync` 视图失配、`409`、`session.reset` 或本机切分支，`onReset()` 立即取消在途分页、递增 `resetGen`、清游标重拉最新一页并整表替换（用量仅按屏幕 `llm_call_id` 合并拉取）。 |
 | **4. 草稿防幽灵重现**<br>（`closedCalls` / `closedItems`） | 某项一旦 `item.saved` 或收到 `stream.clear` / `attempt.retry`，立刻清理草稿并封禁不晚于该单调 `CallId` 的旧碎片（重连 `stream.snapshot` 同样过滤），防止同一句话闪回屏幕两次。 |
 
 ### 4. 四块界面功能速览
